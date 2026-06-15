@@ -1,8 +1,9 @@
 {
   "schedule": "*/15 * * * *",
   "agent": "marveen",
-  "enabled": true,
+  "enabled": false,
   "type": "heartbeat",
   "skipIfBusy": true,
-  "createdAt": 1775669364
+  "createdAt": 1775669364,
+  "disabledReason": "duplicate of ~/.claude/scheduled-tasks/memoria-heartbeat; project-dir leftover, disabled 2026-06-15 to stop double-runs"
 }

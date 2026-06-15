@@ -1,8 +1,9 @@
 {
   "schedule": "7 2 * * *",
   "agent": "marveen",
-  "enabled": true,
+  "enabled": false,
   "type": "dream-engine",
   "skipIfBusy": false,
-  "createdAt": 1778480400
+  "createdAt": 1778480400,
+  "disabledReason": "duplicate of ~/.claude/scheduled-tasks/dream-engine; project-dir leftover, disabled 2026-06-15 to stop double-runs"
 }

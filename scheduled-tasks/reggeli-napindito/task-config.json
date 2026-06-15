@@ -1,7 +1,8 @@
 {
   "schedule": "30 7 * * *",
   "agent": "marveen",
-  "enabled": true,
+  "enabled": false,
   "type": "task",
-  "createdAt": 1776153060
+  "createdAt": 1776153060,
+  "disabledReason": "duplicate of ~/.claude/scheduled-tasks/reggeli-napindito (atlas); caused double morning message 2026-06-15"
 }
