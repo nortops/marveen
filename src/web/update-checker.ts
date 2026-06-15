@@ -1,6 +1,13 @@
 import { execFileSync } from 'node:child_process'
 import { PROJECT_ROOT } from '../config.js'
 
+const GIT = '/usr/bin/git'
+
+// Upstream (Szotasz) release branch we integrate from. The deploy branch
+// (main_atlas) tracks this channel via dev-clone merges, never the bleeding
+// edge develop branch.
+const RELEASE_CHANNEL_BRANCH = 'main'
+
 export interface UpdateCommit {
   sha: string
   short: string
@@ -16,6 +23,13 @@ export interface UpdateStatus {
   commits: UpdateCommit[]
   remote: string
   lastChecked: number
+  // How many upstream (Szotasz) release commits are NOT yet integrated into
+  // our deploy branch. This is the "van mit integralni" signal: it does not
+  // drive the dashboard button (which only fast-forwards the fork), it tells
+  // the maintainer agent that a dev-clone merge run is due. Absent when
+  // upstream is in sync or unreachable.
+  upstreamBehind?: number
+  upstreamRemote?: string
   error?: string
 }
 
@@ -24,7 +38,7 @@ let updateStatusCache: UpdateStatus = {
   latest: '',
   behind: 0,
   commits: [],
-  remote: 'Szotasz/marveen',
+  remote: '',
   lastChecked: 0,
 }
 
@@ -32,90 +46,103 @@ export function getUpdateStatus(): UpdateStatus {
   return updateStatusCache
 }
 
-export function currentGitHead(): string {
+function git(args: string[], timeout = 15000): string {
+  return execFileSync(GIT, args, { cwd: PROJECT_ROOT, timeout, encoding: 'utf-8' }).trim()
+}
+
+function gitSafe(args: string[], timeout = 15000): string | null {
   try {
-    return execFileSync('/usr/bin/git', ['rev-parse', 'HEAD'], { cwd: PROJECT_ROOT, timeout: 3000, encoding: 'utf-8' }).trim()
+    return git(args, timeout)
   } catch {
-    return ''
+    return null
   }
 }
 
-export function parseGitHubRemote(): string {
-  try {
-    const url = execFileSync('/usr/bin/git', ['config', '--get', 'remote.origin.url'], { cwd: PROJECT_ROOT, timeout: 3000, encoding: 'utf-8' }).trim()
-    // Normalize "git@github.com:Owner/Repo.git" or "https://github.com/Owner/Repo.git" to "Owner/Repo"
-    const m = url.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/i)
-    if (m) return m[1]
-  } catch { /* fall through */ }
-  return 'Szotasz/marveen'
+export function currentGitHead(): string {
+  return gitSafe(['rev-parse', 'HEAD'], 3000) ?? ''
+}
+
+// "git@github.com:Owner/Repo.git" | "https://github.com/Owner/Repo.git" -> "Owner/Repo"
+function remoteSlug(remote: string): string {
+  const url = gitSafe(['config', '--get', `remote.${remote}.url`], 3000)
+  if (!url) return remote
+  const m = url.match(/github\.com[:/]([^/]+\/[^/]+?)(?:\.git)?$/i)
+  return m ? m[1] : remote
+}
+
+// git log records: field sep \x1f, record sep \x1e, newest-first (log default).
+function parseCommits(raw: string): UpdateCommit[] {
+  if (!raw) return []
+  return raw
+    .split('\x1e')
+    .map((r) => r.trim())
+    .filter(Boolean)
+    .map((rec) => {
+      const [sha = '', author = '', date = '', ...rest] = rec.split('\x1f')
+      return { sha, short: sha.slice(0, 7), author, date, message: rest.join('\x1f') }
+    })
 }
 
 export async function refreshUpdateStatus(): Promise<UpdateStatus> {
+  const branch = gitSafe(['rev-parse', '--abbrev-ref', 'HEAD'], 3000) ?? ''
   const current = currentGitHead()
-  const remote = parseGitHubRemote()
   const status: UpdateStatus = {
     current,
     latest: '',
     behind: 0,
     commits: [],
-    remote,
+    remote: `${remoteSlug('origin')} (${branch || '?'})`,
     lastChecked: Date.now(),
   }
+
   if (!current) {
     status.error = 'Not a git checkout'
     updateStatusCache = status
     return status
   }
+  if (!branch || branch === 'HEAD') {
+    status.error = 'Detached HEAD -- check out the deploy branch (main_atlas)'
+    updateStatusCache = status
+    return status
+  }
+
+  // 1) Fork channel: what "Frissites most" would fast-forward in. The button
+  //    pulls origin/<branch>; an agent has already merged upstream and resolved
+  //    any conflicts in the dev clone, so this is always a clean fast-forward.
   try {
-    // 1) find HEAD of default branch (main) via the commits endpoint
-    const latestRes = await fetch(`https://api.github.com/repos/${remote}/commits/main`, {
-      headers: { 'Accept': 'application/vnd.github+json', 'User-Agent': 'marveen-update-check' },
-    })
-    if (!latestRes.ok) throw new Error(`GitHub /commits/main -> ${latestRes.status}`)
-    const latestJson = await latestRes.json() as { sha?: string }
-    if (!latestJson.sha) throw new Error('No sha on commits/main response')
-    status.latest = latestJson.sha
-
-    if (status.latest === current) {
-      updateStatusCache = status
-      return status
-    }
-
-    // 2) list commits between current and latest via the compare endpoint
-    const cmpRes = await fetch(`https://api.github.com/repos/${remote}/compare/${current}...${status.latest}`, {
-      headers: { 'Accept': 'application/vnd.github+json', 'User-Agent': 'marveen-update-check' },
-    })
-    if (cmpRes.ok) {
-      const cmp = await cmpRes.json() as {
-        ahead_by?: number
-        commits?: { sha: string; commit: { message: string; author: { name: string; date: string } } }[]
-      }
-      status.behind = cmp.ahead_by ?? 0
-      // GitHub returns commits oldest-first; flip to newest-first for the UI.
-      const raw = (cmp.commits ?? []).slice().reverse()
-      status.commits = raw.map(c => ({
-        sha: c.sha,
-        short: c.sha.slice(0, 7),
-        message: (c.commit.message || '').split('\n')[0],
-        author: c.commit.author?.name || '',
-        date: c.commit.author?.date || '',
-      }))
-    } else if (cmpRes.status === 404) {
-      // Local HEAD not on the remote (detached local commit / different base).
-      status.error = 'Local HEAD not found on GitHub -- different fork or unpushed commits?'
+    git(['fetch', '--quiet', 'origin', branch])
+    const remoteRef = `origin/${branch}`
+    status.latest = git(['rev-parse', remoteRef], 5000)
+    if (status.latest !== current) {
+      status.behind = Number.parseInt(git(['rev-list', '--count', `${current}..${remoteRef}`], 5000), 10) || 0
+      const raw = git(['log', `${current}..${remoteRef}`, '--format=%H%x1f%an%x1f%aI%x1f%s%x1e'], 5000)
+      status.commits = parseCommits(raw)
     }
   } catch (err) {
     status.error = err instanceof Error ? err.message : String(err)
   }
+
+  // 2) Upstream channel (informational): Szotasz releases not yet integrated
+  //    into the deploy branch. Best-effort -- a fetch failure here never fails
+  //    the fork-channel result above.
+  try {
+    git(['fetch', '--quiet', 'upstream', RELEASE_CHANNEL_BRANCH])
+    const upRef = `upstream/${RELEASE_CHANNEL_BRANCH}`
+    status.upstreamBehind = Number.parseInt(git(['rev-list', '--count', `${current}..${upRef}`], 5000), 10) || 0
+    status.upstreamRemote = `${remoteSlug('upstream')} (${RELEASE_CHANNEL_BRANCH})`
+  } catch {
+    /* upstream unreachable: leave upstreamBehind undefined */
+  }
+
   updateStatusCache = status
   return status
 }
 
-// Polls the GitHub repo's main branch for new commits and compares to the
-// local HEAD. Lets the dashboard show a "new version available" badge
-// without anyone having to SSH in and run update.sh.
+// Polls the fork's deploy branch (and the upstream release branch) and caches
+// the result so the dashboard shows a "new version ready" badge without anyone
+// SSHing in. All comparisons are local git -- no GitHub API, no rate limits,
+// no 422 from a fork that lacks a 'main' branch.
 export function startUpdateChecker(): NodeJS.Timeout {
-  // First check shortly after startup; then every 15 minutes.
   setTimeout(() => { refreshUpdateStatus().catch(() => {}) }, 10_000)
   return setInterval(() => { refreshUpdateStatus().catch(() => {}) }, 15 * 60_000)
 }
