@@ -5,6 +5,7 @@ import { execSync, execFileSync } from 'node:child_process'
 import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL } from './config.js'
 import { loadOrCreateDashboardToken, checkBearerToken } from './web/dashboard-auth.js'
 import { json } from './web/http-helpers.js'
+import { detectLanIp } from './web/network-info.js'
 import { AGENTS_BASE_DIR, listAgentNames } from './web/agent-config.js'
 import { ensureAgentHooks, ensureDefaultScheduledTasks } from './web/agent-scaffold.js'
 import { refreshMarveenBotUsername } from './web/telegram.js'
@@ -18,10 +19,12 @@ import { startStuckInputWatcher } from './web/stuck-input-watcher.js'
 import { startStuckToolCallWatcher } from './web/stuck-tool-call-watcher.js'
 import { startReauthHealer } from './web/reauth-healer.js'
 import { startAutoRestartRunner } from './web/auto-restart-runner.js'
+import { collectTokenUsage } from './web/token-usage.js'
 import { logger } from './logger.js'
 import { tryHandleProfiles } from './web/routes/profiles.js'
 import { tryHandleMessages } from './web/routes/messages.js'
 import { tryHandleAgentTerminal } from './web/routes/agent-terminal.js'
+import { tryHandleAgentConversation } from './web/routes/agent-conversation.js'
 import { tryHandleAgentTaskState } from './web/routes/agent-taskstate.js'
 import { sweepOrphanTaskStates } from './web/agent-taskstate.js'
 import { tryHandleDailyLog } from './web/routes/daily-log.js'
@@ -122,6 +125,15 @@ export function startWebServer(port = 3420): http.Server {
       }
     }
 
+    // The mobile-login QR needs a URL the phone can actually reach. When the
+    // desktop opens the dashboard on localhost, window.location.origin is
+    // useless (the phone would hit its OWN localhost), so the client asks the
+    // server for its LAN IP and builds the QR from that. Auth is already
+    // enforced by the /api/* gate above.
+    if (path === '/api/network-info' && method === 'GET') {
+      return json(res, { lan_ip: detectLanIp(), port })
+    }
+
     try {
       const routeCtx: RouteContext = { req, res, path, method, url }
 
@@ -138,6 +150,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleAgentsSkills(routeCtx)) return
       if (await tryHandleSkills(routeCtx)) return
       if (await tryHandleAgentTerminal(routeCtx)) return
+      if (await tryHandleAgentConversation(routeCtx)) return
       if (await tryHandleAgentTaskState(routeCtx)) return
       if (await tryHandleAgents(routeCtx, WEB_DIR)) return
       if (await tryHandleMarveen(routeCtx, WEB_DIR)) return
@@ -273,6 +286,14 @@ export function startWebServer(port = 3420): http.Server {
   const updateCheckerInterval = startUpdateChecker()
   logger.info('Update checker started (15min poll)')
 
+  // Collect token usage from JSONL transcripts every hour so the run-history
+  // token estimates stay fresh without requiring a manual dashboard visit.
+  const tokenCollectInterval = setInterval(() => {
+    collectTokenUsage().catch(err => logger.warn({ err }, 'Periodic token usage collection failed'))
+  }, 60 * 60 * 1000)
+  collectTokenUsage().catch(err => logger.warn({ err }, 'Startup token usage collection failed'))
+  logger.info('Token usage auto-collect started (1h poll + startup)')
+
   // NOTE: startMcpListChecker() is intentionally NOT called here.
   //
   // Root cause: calling `claude mcp list` at boot time (30s delay) spawns the
@@ -337,6 +358,7 @@ export function startWebServer(port = 3420): http.Server {
     if (reauthHealerInterval) clearInterval(reauthHealerInterval)
     clearInterval(autoRestartInterval)
     clearInterval(updateCheckerInterval)
+    clearInterval(tokenCollectInterval)
     return origClose(cb)
   }
 

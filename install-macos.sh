@@ -345,12 +345,21 @@ if [ "$MAIN_AGENT_ID" != "marveen" ]; then
   echo -e "  ${DIM}Ügynök belső azonosító: ${MAIN_AGENT_ID}${NC}"
 fi
 
+# Product / system brand. Per Szabi's decision the installer does NOT prompt for
+# a brand -- the product is always named after the main agent. BRAND_NAME and
+# SERVICE_ID remain as fields (config.ts keeps the env support as a dormant
+# capability, default = the agent name), but the install flow hardcodes them to
+# the defaults, so the launchd labels below stay byte-identical to a
+# brand-unaware install.
+BRAND_NAME="$BOT_NAME"
+SERVICE_ID="$MAIN_AGENT_ID"
+
 # Step 5: Install dependencies
 INSTALL_STEP="npm-install"
 echo ""
 echo -e "${BOLD}[5/7] Függőségek telepítése...${NC}"
 cd "$INSTALL_DIR"
-if ! npm install --loglevel warn; then
+if ! npm install --loglevel warn || ! npm rebuild better-sqlite3 --build-from-source; then
   fail "npm install sikertelen. Ellenorizd a hibauzeneteket fentebb."
 fi
 ok "npm csomagok telepítve"
@@ -374,7 +383,9 @@ echo -e "${BOLD}[6/7] Konfiguráció létrehozása...${NC}"
 CHANNEL_PROVIDER=${CHANNEL_PROVIDER}
 OWNER_NAME=${OWNER_NAME}
 BOT_NAME=${BOT_NAME}
+BRAND_NAME=${BRAND_NAME}
 MAIN_AGENT_ID=${MAIN_AGENT_ID}
+SERVICE_ID=${SERVICE_ID}
 ENVEOF
 )
 # Append provider-specific tokens
@@ -679,8 +690,11 @@ PLIST_DIR="$HOME/Library/LaunchAgents"
 mkdir -p "$PLIST_DIR"
 
 NODE_PATH="$(which node)"
-DASHBOARD_PLIST="com.${MAIN_AGENT_ID}.dashboard"
-CHANNELS_PLIST="com.${MAIN_AGENT_ID}.channels"
+# Launchd labels key off SERVICE_ID. SERVICE_ID == MAIN_AGENT_ID for a
+# brand-unaware (default) install, so these labels are unchanged unless the
+# operator picked a distinct brand above.
+DASHBOARD_PLIST="com.${SERVICE_ID}.dashboard"
+CHANNELS_PLIST="com.${SERVICE_ID}.channels"
 
 # Dashboard service
 cat > "$PLIST_DIR/${DASHBOARD_PLIST}.plist" << PLISTEOF

@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import { logger } from '../logger.js'
-import { MAIN_AGENT_ID } from '../config.js'
+import { MAIN_AGENT_ID, SERVICE_ID } from '../config.js'
 import { listAgentNames, readAgentRemoteHost } from './agent-config.js'
 import {
   agentRunState,
@@ -9,7 +9,7 @@ import {
   capturePane,
 } from './agent-process.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
-import { detectPaneState } from '../pane-state.js'
+import { paneLooksIdle } from '../pane-state.js'
 import { readAutoRestartConfig } from './auto-restart-store.js'
 import { restartDue, dailyDueAtMs, parseHHMM, type AutoRestartConfig } from '../auto-restart.js'
 
@@ -59,7 +59,7 @@ function sessionFor(name: string): string {
 function paneIsIdle(session: string, host: string | null): boolean {
   const pane = capturePane(session, host)
   if (pane == null) return false
-  return detectPaneState(pane) === 'idle'
+  return paneLooksIdle(pane)
 }
 
 function performRestart(name: string, cfg: AutoRestartConfig): void {
@@ -68,7 +68,9 @@ function performRestart(name: string, cfg: AutoRestartConfig): void {
     // starts a fresh conversation, so 'continue' is not applicable here -- a
     // kickstart is always a fresh restart. KeepAlive brings it straight back.
     const uid = typeof process.getuid === 'function' ? process.getuid() : ''
-    execFileSync('/bin/launchctl', ['kickstart', '-k', `gui/${uid}/com.${MAIN_AGENT_ID}.channels`], { timeout: 10_000 })
+    // Label keys off SERVICE_ID (defaults to MAIN_AGENT_ID) so it matches the
+    // launchd label the installer wrote.
+    execFileSync('/bin/launchctl', ['kickstart', '-k', `gui/${uid}/com.${SERVICE_ID}.channels`], { timeout: 10_000 })
   } else {
     restartAgentProcess(name, { fresh: cfg.mode === 'fresh' })
   }

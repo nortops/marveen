@@ -573,6 +573,15 @@ if [ "$MAIN_AGENT_ID" != "marveen" ]; then
   echo -e "  ${DIM}Ügynök belső azonosító: ${MAIN_AGENT_ID}${NC}"
 fi
 
+# Product / system brand. Per Szabi's decision the installer does NOT prompt for
+# a brand -- the product is always named after the main agent. BRAND_NAME and
+# SERVICE_ID remain as fields (config.ts keeps the env support as a dormant
+# capability, default = the agent name), but the install flow hardcodes them to
+# the defaults, so the systemd unit names below stay byte-identical to a
+# brand-unaware install.
+BRAND_NAME="$BOT_NAME"
+SERVICE_ID="$MAIN_AGENT_ID"
+
 INSTALL_STEP="npm-install"
 # ─────────────────────────────────────────────
 # [5/7] Fuggosegek telepitese + konfiguracic
@@ -609,7 +618,9 @@ echo -e "${BOLD}  Konfiguracio letrehozasa...${NC}"
 CHANNEL_PROVIDER=${CHANNEL_PROVIDER}
 OWNER_NAME=${OWNER_NAME}
 BOT_NAME=${BOT_NAME}
+BRAND_NAME=${BRAND_NAME}
 MAIN_AGENT_ID=${MAIN_AGENT_ID}
+SERVICE_ID=${SERVICE_ID}
 ENVEOF
 )
 if [ "$CHANNEL_PROVIDER" = "telegram" ]; then
@@ -956,9 +967,14 @@ SYSTEMD_DIR="$HOME/.config/systemd/user"
 mkdir -p "$SYSTEMD_DIR"
 
 NODE_PATH="$(which node)"
-DASH_UNIT="${MAIN_AGENT_ID}-dashboard"
-CHAN_UNIT="${MAIN_AGENT_ID}-channels"
-MORN_UNIT="${MAIN_AGENT_ID}-morning"
+# Unit names key off SERVICE_ID. SERVICE_ID == MAIN_AGENT_ID for a brand-unaware
+# (default) install, so these unit names are unchanged unless the operator chose
+# a distinct brand above. The channels unit still runs channels.sh, which names
+# its tmux session ${MAIN_AGENT_ID}-channels (the session id the backend uses);
+# the unit name and the session name are independent.
+DASH_UNIT="${SERVICE_ID}-dashboard"
+CHAN_UNIT="${SERVICE_ID}-channels"
+MORN_UNIT="${SERVICE_ID}-morning"
 
 # Detect the host timezone so the scheduled-task runner (which reads
 # cron expressions in Node's local TZ) fires at the operator's wall
