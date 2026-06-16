@@ -84,6 +84,11 @@ export const WEB_PORT = parseInt(env['WEB_PORT'] ?? '3420', 10)
 
 export const WEB_HOST = env['WEB_HOST'] ?? '127.0.0.1'
 export const DASHBOARD_PUBLIC_URL = env['DASHBOARD_PUBLIC_URL'] ?? ''
+// Extra browser origins allowed to make state-changing dashboard requests
+// (CORS + CSRF allowlist), comma-separated, e.g. for VPN/LAN addresses that
+// aren't covered by WEB_HOST or DASHBOARD_PUBLIC_URL. Empty by default so
+// existing installs keep the same allowlist as before.
+export const DASHBOARD_ALLOWED_ORIGINS = env['DASHBOARD_ALLOWED_ORIGINS'] ?? ''
 export const OLLAMA_URL = env['OLLAMA_URL'] ?? 'http://localhost:11434'
 
 export const CHANNEL_PROVIDER: ChannelProviderType = getProviderType(env['CHANNEL_PROVIDER'])
