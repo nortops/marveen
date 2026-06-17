@@ -1,6 +1,13 @@
 import { existsSync, unlinkSync, copyFileSync, writeFileSync } from 'node:fs'
 import { join, extname } from 'node:path'
-import { PROJECT_ROOT, OWNER_NAME, BOT_NAME, BRAND_NAME, MAIN_AGENT_ID, CHANNEL_PROVIDER } from '../../config.js'
+import {
+  PROJECT_ROOT, OWNER_NAME, BOT_NAME, BRAND_NAME, MAIN_AGENT_ID, CHANNEL_PROVIDER,
+  KANBAN_AGING_WARN_H, KANBAN_AGING_CAUTION_H, KANBAN_AGING_CRITICAL_H,
+  KANBAN_AGING_WARN_COLOR, KANBAN_AGING_CAUTION_COLOR, KANBAN_AGING_CRITICAL_COLOR,
+  KANBAN_SWIMLANE_DEFAULT_GROUP, KANBAN_SWIMLANE_SEPARATOR_COLOR,
+  KANBAN_LABEL_COLORS,
+} from '../../config.js'
+import { getEffectiveSettingValue } from '../../settings-store.js'
 import { readMarveenTelegramConfig, readMarveenDiscordConfig, readMarveenSlackConfig, sendMarveenAvatarChange } from '../telegram.js'
 import { hardRestartMarveenChannels } from '../channel-monitor.js'
 import { readFileOr } from '../agent-config.js'
@@ -86,6 +93,38 @@ export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promi
       // CHANNEL_PROVIDER env-jébe pinneljük, hogy a UI ne hardcode-olt
       // 'telegram'-mal induljon.
       channelProvider: CHANNEL_PROVIDER,
+      kanbanAging: {
+        warnH: KANBAN_AGING_WARN_H,
+        cautionH: KANBAN_AGING_CAUTION_H,
+        criticalH: KANBAN_AGING_CRITICAL_H,
+        warnColor: KANBAN_AGING_WARN_COLOR,
+        cautionColor: KANBAN_AGING_CAUTION_COLOR,
+        criticalColor: KANBAN_AGING_CRITICAL_COLOR,
+      },
+      // Resolved through the settings overrides layer (override > .env >
+      // registry default) instead of the boot-time config.ts constants, so a
+      // value saved on the Settings page takes effect immediately -- no
+      // process restart needed for these 9 keys.
+      kanbanWip: {
+        limits: {
+          planned: getEffectiveSettingValue('KANBAN_WIP_PLANNED'),
+          in_progress: getEffectiveSettingValue('KANBAN_WIP_IN_PROGRESS'),
+          waiting: getEffectiveSettingValue('KANBAN_WIP_WAITING'),
+          done: getEffectiveSettingValue('KANBAN_WIP_DONE'),
+        },
+        warnPct: getEffectiveSettingValue('KANBAN_WIP_WARN_PCT'),
+        okColor: getEffectiveSettingValue('KANBAN_WIP_OK_COLOR'),
+        warnColor: getEffectiveSettingValue('KANBAN_WIP_WARN_COLOR'),
+        fullColor: getEffectiveSettingValue('KANBAN_WIP_FULL_COLOR'),
+        overColor: getEffectiveSettingValue('KANBAN_WIP_OVER_COLOR'),
+      },
+      kanbanSwimlanes: {
+        defaultGroup: KANBAN_SWIMLANE_DEFAULT_GROUP,
+        separatorColor: KANBAN_SWIMLANE_SEPARATOR_COLOR || null,
+      },
+      kanbanLabels: {
+        colors: KANBAN_LABEL_COLORS,
+      },
     })
     return true
   }
