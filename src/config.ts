@@ -83,6 +83,34 @@ export const SERVICE_ID = env['SERVICE_ID'] ?? MAIN_AGENT_ID
 export const WEB_PORT = parseInt(env['WEB_PORT'] ?? '3420', 10)
 
 export const WEB_HOST = env['WEB_HOST'] ?? '127.0.0.1'
+
+// Kanban card aging visual thresholds (hours since last update) and colours.
+// Override per-install via .env; defaults match the design spec (24/72/168h).
+export const KANBAN_AGING_WARN_H = parseInt(env['KANBAN_AGING_WARN_H'] ?? '24', 10)
+export const KANBAN_AGING_CAUTION_H = parseInt(env['KANBAN_AGING_CAUTION_H'] ?? '72', 10)
+export const KANBAN_AGING_CRITICAL_H = parseInt(env['KANBAN_AGING_CRITICAL_H'] ?? '168', 10)
+export const KANBAN_AGING_WARN_COLOR = env['KANBAN_AGING_WARN_COLOR'] ?? '#c9a000'
+export const KANBAN_AGING_CAUTION_COLOR = env['KANBAN_AGING_CAUTION_COLOR'] ?? '#d46b00'
+export const KANBAN_AGING_CRITICAL_COLOR = env['KANBAN_AGING_CRITICAL_COLOR'] ?? '#c53030'
+// Kanban WIP limits per column (0 = unlimited). Override via .env.
+// NOTE: these constants are frozen at process start (this module reads .env
+// once at import time). The dashboard's Settings page and the /api/marveen
+// kanbanWip payload do NOT read these directly anymore -- they resolve
+// through settings-store.ts (config-overrides.json > .env > registry
+// default) so a value saved in the UI takes effect without a restart. These
+// exports stay as the documented .env-only defaults / for any other code
+// that genuinely wants the boot-time value.
+export const KANBAN_WIP_PLANNED = parseInt(env['KANBAN_WIP_PLANNED'] ?? '0', 10)
+export const KANBAN_WIP_IN_PROGRESS = parseInt(env['KANBAN_WIP_IN_PROGRESS'] ?? '0', 10)
+export const KANBAN_WIP_WAITING = parseInt(env['KANBAN_WIP_WAITING'] ?? '0', 10)
+export const KANBAN_WIP_DONE = parseInt(env['KANBAN_WIP_DONE'] ?? '0', 10)
+// Utilisation % at which the badge turns yellow (default 80)
+export const KANBAN_WIP_WARN_PCT = parseInt(env['KANBAN_WIP_WARN_PCT'] ?? '80', 10)
+// Badge colours for each utilisation tier
+export const KANBAN_WIP_OK_COLOR = env['KANBAN_WIP_OK_COLOR'] ?? '#6b7280'
+export const KANBAN_WIP_WARN_COLOR = env['KANBAN_WIP_WARN_COLOR'] ?? '#c9a000'
+export const KANBAN_WIP_FULL_COLOR = env['KANBAN_WIP_FULL_COLOR'] ?? '#d46b00'
+export const KANBAN_WIP_OVER_COLOR = env['KANBAN_WIP_OVER_COLOR'] ?? '#c53030'
 export const DASHBOARD_PUBLIC_URL = env['DASHBOARD_PUBLIC_URL'] ?? ''
 // Extra browser origins allowed to make state-changing dashboard requests
 // (CORS + CSRF allowlist), comma-separated, e.g. for VPN/LAN addresses that
@@ -90,6 +118,26 @@ export const DASHBOARD_PUBLIC_URL = env['DASHBOARD_PUBLIC_URL'] ?? ''
 // existing installs keep the same allowlist as before.
 export const DASHBOARD_ALLOWED_ORIGINS = env['DASHBOARD_ALLOWED_ORIGINS'] ?? ''
 export const OLLAMA_URL = env['OLLAMA_URL'] ?? 'http://localhost:11434'
+
+// Kanban swimlanes: which field the board groups by on first load. Invalid
+// values silently fall back to 'none' (flat board) rather than breaking the
+// grouping logic on the frontend.
+const rawKanbanSwimlaneDefaultGroup = env['KANBAN_SWIMLANE_DEFAULT_GROUP'] ?? 'none'
+export const KANBAN_SWIMLANE_DEFAULT_GROUP =
+  rawKanbanSwimlaneDefaultGroup === 'assignee' || rawKanbanSwimlaneDefaultGroup === 'priority'
+    ? rawKanbanSwimlaneDefaultGroup
+    : 'none'
+export const KANBAN_SWIMLANE_SEPARATOR_COLOR = env['KANBAN_SWIMLANE_SEPARATOR_COLOR'] ?? ''
+
+// Kanban label colour palette (cold tones by default). The label CRUD UI
+// offers these as swatches instead of a free-text colour input, so every
+// label's colour traces back to this single configurable list rather than
+// a hardcoded per-label mapping in the frontend.
+const rawKanbanLabelColors = (env['KANBAN_LABEL_COLORS'] ?? '#3b82f6,#0ea5e9,#10b981,#14b8a6,#8b5cf6,#64748b')
+  .split(',')
+  .map((c) => c.trim())
+  .filter(Boolean)
+export const KANBAN_LABEL_COLORS = rawKanbanLabelColors.length > 0 ? rawKanbanLabelColors : ['#64748b']
 
 export const CHANNEL_PROVIDER: ChannelProviderType = getProviderType(env['CHANNEL_PROVIDER'])
 export const CHANNEL_TOKEN = getChannelToken(CHANNEL_PROVIDER, env)

@@ -532,6 +532,11 @@ main {
   gap: 12px;
   min-height: calc(100vh - 160px);
 }
+/* Both the flat board and the swimlane board carry .kanban-board; an
+   explicit [hidden] override is required because the unconditional
+   `display: grid` above otherwise wins the cascade over the UA [hidden]
+   default (equal specificity, later source order). */
+.kanban-board[hidden] { display: none; }
 
 .kanban-col {
   background: var(--bg-input);
@@ -565,6 +570,22 @@ main {
   padding: 1px 7px;
   min-width: 20px;
   text-align: center;
+  border: 1px solid transparent;
+  transition: color 0.2s, border-color 0.2s, transform 0.2s;
+}
+
+/* WIP limit badge states — colour applied via inline style from JS */
+.kanban-col-count[data-wip="warn"] { background: color-mix(in oklch, currentColor 10%, var(--bg-card)); }
+.kanban-col-count[data-wip="full"] { background: color-mix(in oklch, currentColor 10%, var(--bg-card)); animation: wip-pulse-mild 2.4s ease-in-out infinite; }
+.kanban-col-count[data-wip="over"] { background: color-mix(in oklch, currentColor 12%, var(--bg-card)); animation: wip-pulse-strong 1.6s ease-in-out infinite; transform: scale(1.1); }
+
+@keyframes wip-pulse-mild {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+@keyframes wip-pulse-strong {
+  0%, 100% { opacity: 1; transform: scale(1.1); }
+  50% { opacity: 0.4; transform: scale(1.1); }
 }
 .kanban-add-btn {
   margin-left: auto;
@@ -755,6 +776,70 @@ main {
 }
 .kanban-card-due.overdue { color: var(--danger); font-weight: 600; }
 
+.kanban-card-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+.kanban-card-label-pill {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 8px;
+  color: var(--label-color);
+  background: color-mix(in srgb, var(--label-color) 16%, transparent);
+  cursor: pointer;
+  line-height: 1.5;
+}
+.kanban-card-label-pill:hover { filter: brightness(1.15); }
+.kanban-card-label-overflow {
+  color: var(--text-muted);
+  background: var(--bg);
+  cursor: default;
+}
+.kanban-card-label-overflow:hover { filter: none; }
+
+.kanban-quick-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  padding: 3px 9px;
+  border-radius: 12px;
+  /* Inactive chips already carry their label's own colour (border + text +
+     faint tint), so the header filter row visually matches the per-card label
+     pills on the board; the active state below fills solid. */
+  border: 1px solid var(--chip-color);
+  color: var(--chip-color);
+  background: color-mix(in srgb, var(--chip-color) 12%, var(--bg-card));
+  cursor: pointer;
+  user-select: none;
+}
+.kanban-quick-filter-chip:hover { border-color: var(--chip-color); }
+.kanban-quick-filter-chip.active {
+  color: white;
+  background: var(--chip-color);
+  border-color: var(--chip-color);
+}
+.kanban-quick-filter-count {
+  font-size: 10px;
+  opacity: 0.85;
+}
+.kanban-quick-filter-clear {
+  margin-left: 2px;
+  font-weight: 700;
+}
+.kanban-quick-filter-clear-all {
+  font-size: 12px;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline;
+  padding: 0;
+}
+
 .priority-bar {
   width: 3px;
   height: 100%;
@@ -772,6 +857,136 @@ main {
 .kanban-card[data-priority="normal"] { border-left: 3px solid transparent; }
 .kanban-card[data-priority="low"] { border-left: 3px solid var(--border); }
 
+/* Card aging: left stripe overrides priority border when card is stale.
+   Colour is set as --card-aging-color via inline style by JS. */
+.kanban-card[data-aging] { border-left: 3px solid var(--card-aging-color); }
+
+/* Aging badge: hourglass + day/hour counter, top-right (left of the ⚡ action) */
+.kanban-card-aging-badge {
+  position: absolute;
+  top: 6px;
+  right: 28px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+@keyframes aging-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+.kanban-card-aging-badge.kanban-card-aging-critical {
+  animation: aging-pulse 2.2s ease-in-out infinite;
+}
+
+/* === Kanban Swimlanes === */
+.kanban-swimlane-board {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.kanban-swimlane {
+  border-bottom: 2px dashed var(--border);
+  padding-bottom: 16px;
+  margin-bottom: 16px;
+}
+.kanban-swimlane:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+  margin-bottom: 0;
+}
+.kanban-swimlane-header {
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 5;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 4px;
+  background: var(--bg);
+}
+.kanban-swimlane-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+  flex-shrink: 0;
+}
+.kanban-swimlane-avatar.owner { background: var(--accent); }
+.kanban-swimlane-avatar.bot { background: var(--info); }
+.kanban-swimlane-avatar.agent { background: var(--success); }
+.kanban-swimlane-avatar.unknown { background: var(--text-muted); }
+.kanban-swimlane-avatar.priority-urgent { background: var(--danger); }
+.kanban-swimlane-avatar.priority-high { background: var(--accent); }
+.kanban-swimlane-avatar.priority-normal { background: var(--text-muted); }
+.kanban-swimlane-avatar.priority-low { background: var(--border); }
+.kanban-swimlane-name {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text);
+  margin-right: auto;
+}
+.kanban-swimlane-count {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--bg-card);
+  border-radius: 10px;
+  padding: 1px 7px;
+  min-width: 20px;
+  text-align: center;
+}
+.kanban-swimlane-toggle {
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--transition);
+}
+.kanban-swimlane-toggle:hover { background: var(--accent-soft); color: var(--accent); }
+.kanban-swimlane-body {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-top: 4px;
+}
+.kanban-swimlane.collapsed .kanban-swimlane-body { display: none; }
+.kanban-swimlane-col {
+  background: var(--bg-input);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  min-height: 60px;
+}
+.kanban-swimlane-col-header {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-muted);
+  padding: 8px 12px 4px;
+}
+.kanban-swimlane-col-body {
+  flex: 1;
+  min-height: 40px;
+}
+
 /* === Card detail === */
 .card-detail-meta {
   display: flex;
@@ -787,6 +1002,54 @@ main {
   white-space: pre-wrap;
 }
 .card-detail-desc:empty { display: none; }
+
+.card-detail-labels { margin-bottom: 20px; }
+.card-detail-labels h4 {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 10px;
+}
+.label-pill-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 22px;
+}
+.label-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--label-color);
+  background: color-mix(in srgb, var(--label-color) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--label-color) 40%, transparent);
+}
+.label-pill-remove {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0;
+  opacity: 0.7;
+}
+.label-pill-remove:hover { opacity: 1; }
+.label-color-swatches { display: flex; gap: 4px; }
+.label-color-swatch {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  cursor: pointer;
+  border: 2px solid transparent;
+}
+.label-color-swatch.selected { border-color: var(--text); }
 
 .card-detail-comments { margin-bottom: 20px; }
 .card-detail-comments h4 {
@@ -2714,6 +2977,27 @@ main.kanban-active { max-width: none; padding-left: 16px; padding-right: 16px; }
   flex-wrap: wrap;
 }
 
+.schedule-section {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 18px 4px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+.schedule-section:first-child { margin-top: 4px; }
+.schedule-section-icon { font-size: 13px; }
+.schedule-section-count {
+  background: var(--bg-input);
+  color: var(--text-muted);
+  border-radius: 10px;
+  padding: 1px 8px;
+  font-size: 11px;
+  font-weight: 600;
+}
 .schedule-row {
   display: flex;
   align-items: center;
@@ -4689,6 +4973,10 @@ main.kanban-active { max-width: none; padding-left: 16px; padding-right: 16px; }
     gap: 16px;
   }
   .kanban-col { min-height: auto; }
+  .kanban-swimlane-body {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
 }
 
 @media (max-width: 640px) {
@@ -4853,6 +5141,87 @@ main.kanban-active { max-width: none; padding-left: 16px; padding-right: 16px; }
   margin-top: 16px;
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* === Settings page === */
+.settings-group { margin-bottom: 28px; }
+.settings-group:last-child { margin-bottom: 0; }
+.settings-group-title {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin: 0 0 10px;
+}
+.settings-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 14px 18px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 8px;
+  transition: border-color var(--transition);
+}
+.settings-row:hover { border-color: var(--accent); }
+.settings-row-info { flex: 1; min-width: 240px; }
+.settings-row-key {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  font-family: var(--font-mono, monospace);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.settings-restart-badge {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--warning, #c9a000);
+  border: 1px solid var(--warning, #c9a000);
+  border-radius: 4px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+.settings-row-desc {
+  font-size: 13px;
+  color: var(--text);
+  margin-top: 4px;
+}
+.settings-row-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+.settings-row-editor {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.settings-row-editor .input {
+  width: 140px;
+  font-size: 13px;
+}
+.settings-color-input {
+  width: 72px;
+  height: 32px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input);
+  cursor: pointer;
+}
+.settings-row-error {
+  font-size: 12px;
+  color: var(--danger);
+  flex-basis: 100%;
 }
 
 /* === connectors.hu cross-promo banner === */
