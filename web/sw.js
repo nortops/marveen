@@ -1,14 +1,10 @@
 // Service worker for PWA installability.
-// Caches only static assets; /api/* requests always go to the network
-// so Bearer-auth and live data are never served stale.
+// Strategy: network-first for app-shell assets (always fresh when online),
+// cache fallback for offline use. /api/* always bypassed (Bearer-auth safety).
 
-const CACHE_NAME = 'marveen-static-v1';
-const STATIC_ASSETS = ['/', '/index.html', '/style.css', '/app.js'];
+const CACHE_NAME = 'marveen-shell-v1';
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(STATIC_ASSETS))
-  );
   self.skipWaiting();
 });
 
@@ -27,7 +23,14 @@ self.addEventListener('fetch', (event) => {
   // Never intercept API calls — they carry Bearer auth and must not be cached.
   if (url.pathname.startsWith('/api/')) return;
 
+  // Network-first: try live fetch, update cache on success, fall back to cache offline.
   event.respondWith(
-    caches.match(event.request).then((cached) => cached || fetch(event.request))
+    fetch(event.request)
+      .then((response) => {
+        const clone = response.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+        return response;
+      })
+      .catch(() => caches.match(event.request))
   );
 });
