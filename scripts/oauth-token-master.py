@@ -16,10 +16,15 @@ HOME = os.path.expanduser("~")
 CRED_PATH = os.path.join(HOME, ".claude/.credentials.json")
 LOCK_PATH = os.path.join(HOME, ".claude/.credentials.lock")
 LOG_PATH = os.path.join(HOME, "Projects/marveen/store/oauth-token-master.log")
+DASHBOARD_TOKEN_PATH = os.path.join(HOME, "Projects/marveen/store/.dashboard-token")
+DASHBOARD_URL = "http://localhost:3420"
 PRE_EXPIRY_MINUTES = 25  # Refresh if T-25 min or less
 OAUTH_ENDPOINT = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 OAUTH_SCOPES = ["user:inference", "user:file_upload", "user:mcp_servers", "user:profile", "user:sessions:claude_code"]
+
+# Ensure log directory exists before configuring logging
+os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -130,10 +135,11 @@ def refresh_token_via_http() -> bool:
                 oauth["expiresAt"] = int((time.time() + expires_in) * 1000)
                 creds["claudeAiOauth"] = oauth
 
-                # Write atomically (temp + rename)
+                # Write atomically (temp + rename), preserve 0600 permissions
                 temp_path = CRED_PATH + ".tmp"
                 with open(temp_path, "w") as f:
                     json.dump(creds, f)
+                os.chmod(temp_path, 0o600)
                 os.replace(temp_path, CRED_PATH)
 
                 logger.info(f"Token refresh succeeded (new expiry in {expires_in}s)")
@@ -175,6 +181,35 @@ def acquire_lock(timeout_sec: int = 10) -> bool:
         return False
 
 
+def notify_atlas(message: str) -> None:
+    """Send an inter-agent message to atlas via the dashboard API."""
+    try:
+        token_file = DASHBOARD_TOKEN_PATH
+        if not os.path.exists(token_file):
+            logger.warning("Dashboard token not found, cannot notify Atlas")
+            return
+        with open(token_file) as f:
+            token = f.read().strip()
+        payload = json.dumps({
+            "from": "oauth-token-master",
+            "to": "atlas",
+            "content": message,
+        }).encode('utf-8')
+        req = urllib.request.Request(
+            f"{DASHBOARD_URL}/api/messages",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            logger.info(f"Atlas notified: {resp.status}")
+    except Exception as e:
+        logger.warning(f"Failed to notify Atlas: {e}")
+
+
 def main():
     if not is_shared_session_enabled():
         logger.debug("Shared session mode is disabled, skipping token refresh check")
@@ -201,6 +236,10 @@ def main():
         logger.info("Token refresh completed successfully")
     else:
         logger.error("Token refresh failed; credentials may stale until manual re-auth")
+        notify_atlas(
+            f"OAUTH TOKEN REFRESH FAILED. Token expires in {secs // 60} minutes. "
+            "Manual re-auth may be required: `claude auth login`"
+        )
 
 
 if __name__ == "__main__":
