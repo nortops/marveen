@@ -9,8 +9,7 @@ same one-time-use refresh token.
 
 Activates only when shared session mode is enabled (dashboard config).
 """
-import fcntl, json, os, time, sys, subprocess, hashlib, logging, urllib.request, urllib.error, urllib.parse
-from datetime import datetime, timedelta
+import fcntl, json, os, time, sys, logging, urllib.request, urllib.error
 
 HOME = os.path.expanduser("~")
 CRED_PATH = os.path.join(HOME, ".claude/.credentials.json")
@@ -113,7 +112,10 @@ def refresh_token_via_http() -> bool:
         req = urllib.request.Request(
             OAUTH_ENDPOINT,
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            },
             method="POST",
         )
 
@@ -191,7 +193,7 @@ def notify_atlas(message: str) -> None:
         with open(token_file) as f:
             token = f.read().strip()
         payload = json.dumps({
-            "from": "oauth-token-master",
+            "from": "daidalosz",
             "to": "atlas",
             "content": message,
         }).encode('utf-8')
