@@ -1,0 +1,11 @@
+[Unit]
+Description=Marveen OAuth Token Master timer (5-min interval)
+Requires=marveen-oauth-token-master.service
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

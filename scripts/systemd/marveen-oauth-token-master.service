@@ -1,0 +1,18 @@
+[Unit]
+Description=Marveen OAuth Token Master (pro-active refresh + fcntl.flock sync)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h
+ExecStart=%h/Projects/marveen/scripts/oauth-token-master.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=oauth-token-master
+
+# Environment: Claude Code paths
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="HOME=%h"
+
+# Restart policy: no restart for oneshot; the timer will reschedule.
+Restart=no
