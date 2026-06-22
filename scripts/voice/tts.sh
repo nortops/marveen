@@ -18,6 +18,6 @@ case "$VOICE_ARG" in
   imre)  ONNX="$DEST/voices/hu_HU-imre-medium.onnx" ;;
   anna)  ONNX="$DEST/voices/hu_HU-anna-medium.onnx" ;;
   /*)    ONNX="$VOICE_ARG" ;;
-  *)     ONNX="$DEST/voices/$VOICE_ARG" ;;
+  *)     echo "Unknown voice alias: $VOICE_ARG (use: imre, anna, or absolute path)" >&2; exit 1 ;;
 esac
 exec "$DEST/venv/bin/python" "$DEST/_vtools.py" speak "$ONNX" "$STATE_DIR" "$CHAT_ID" "$TEXT"

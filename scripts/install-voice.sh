@@ -94,7 +94,7 @@ fi
 
 # --- Step 4: Hungarian voice models ---
 _step "[4/5] Hungarian TTS voice models"
-MIN_ONNX_BYTES=1000000
+MIN_ONNX_BYTES=50000000
 
 for voice_path in "${VOICES[@]}"; do
   name="$(basename "$voice_path")"

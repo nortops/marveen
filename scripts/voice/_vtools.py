@@ -42,31 +42,47 @@ def transcribe(file_id, state_dir):
         f"https://api.telegram.org/bot{token}/getFile?file_id={urllib.parse.quote(file_id)}",
         timeout=20))
     fp = d["result"]["file_path"]
-    out = tempfile.mktemp(suffix=".ogg")
-    urllib.request.urlretrieve(f"https://api.telegram.org/file/bot{token}/{fp}", out)
-    from faster_whisper import WhisperModel
-    m = WhisperModel("small", device="cpu", compute_type="int8")
-    segs, _ = m.transcribe(out, language="hu", beam_size=5)
-    print(" ".join(s.text.strip() for s in segs).strip())
+    fd, out = tempfile.mkstemp(suffix=".ogg")
+    os.close(fd)
+    try:
+        urllib.request.urlretrieve(f"https://api.telegram.org/file/bot{token}/{fp}", out)
+        from faster_whisper import WhisperModel
+        m = WhisperModel("small", device="cpu", compute_type="int8")
+        segs, _ = m.transcribe(out, language="hu", beam_size=5)
+        print(" ".join(s.text.strip() for s in segs).strip())
+    finally:
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
 
 
 def speak(voice_onnx, state_dir, chat_id, text):
     token = _token(state_dir)
-    wav = tempfile.mktemp(suffix=".wav")
-    ogg = tempfile.mktemp(suffix=".ogg")
-    subprocess.run([VENV_PY, "-m", "piper", "-m", voice_onnx, "-f", wav],
-                   input=text.encode(), check=True)
-    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                    "-i", wav, "-c:a", "libopus", "-b:a", "32k", ogg], check=True)
-    b = "----fleetvoice"
-    fd = open(ogg, "rb").read()
-    body = (("--" + b + "\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n" + str(chat_id) + "\r\n").encode()
-            + ("--" + b + "\r\nContent-Disposition: form-data; name=\"voice\"; filename=\"v.ogg\"\r\nContent-Type: audio/ogg\r\n\r\n").encode()
-            + fd + b"\r\n" + ("--" + b + "--\r\n").encode())
-    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendVoice", data=body)
-    req.add_header("Content-Type", "multipart/form-data; boundary=" + b)
-    r = json.load(urllib.request.urlopen(req, timeout=30))
-    print("ok=%s id=%s" % (r.get("ok"), (r.get("result") or {}).get("message_id")))
+    fd_wav, wav = tempfile.mkstemp(suffix=".wav")
+    os.close(fd_wav)
+    fd_ogg, ogg = tempfile.mkstemp(suffix=".ogg")
+    os.close(fd_ogg)
+    try:
+        subprocess.run([VENV_PY, "-m", "piper", "-m", voice_onnx, "-f", wav],
+                       input=text.encode(), check=True)
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-i", wav, "-c:a", "libopus", "-b:a", "32k", ogg], check=True)
+        b = "----fleetvoice"
+        fd = open(ogg, "rb").read()
+        body = (("--" + b + "\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n" + str(chat_id) + "\r\n").encode()
+                + ("--" + b + "\r\nContent-Disposition: form-data; name=\"voice\"; filename=\"v.ogg\"\r\nContent-Type: audio/ogg\r\n\r\n").encode()
+                + fd + b"\r\n" + ("--" + b + "--\r\n").encode())
+        req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendVoice", data=body)
+        req.add_header("Content-Type", "multipart/form-data; boundary=" + b)
+        r = json.load(urllib.request.urlopen(req, timeout=30))
+        print("ok=%s id=%s" % (r.get("ok"), (r.get("result") or {}).get("message_id")))
+    finally:
+        for p in (wav, ogg):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
