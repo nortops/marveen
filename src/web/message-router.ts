@@ -69,8 +69,15 @@ export function shouldAbandon(sessionExists: boolean, ageMs: number, windowMs: n
 
 // Checks for pending messages every 5 seconds and injects them into target
 // agent tmux sessions.
+let _tickRunning = false
+
 export function startMessageRouter(): NodeJS.Timeout {
   return setInterval(async () => {
+    // Re-entrancy guard: STT can hold a tick for up to 65s; skip new ticks
+    // while the previous one is still in flight to prevent double-delivery.
+    if (_tickRunning) return
+    _tickRunning = true
+    try {
     const pending = getPendingMessages()
     const now = Date.now()
     for (const msg of pending) {
@@ -201,6 +208,9 @@ export function startMessageRouter(): NodeJS.Timeout {
         routerLoggedMisses.delete(msg.id)
       }
     }
+    } finally {
+      _tickRunning = false
+    }
   }, 5000)
 }
 
@@ -226,10 +236,10 @@ function injectTranscript(content: string, transcript: string): string {
   let result = content
     .replace(/\s*attachment_kind="voice"/, '')
     .replace(/\s*attachment_file_id="[^"]*"/, '')
-  // Replace the empty body (or "(empty message)") with the transcript
+  // Replace the body with the transcript unconditionally (handles empty, "(empty message)", and caption).
   result = result.replace(
-    /(<channel[^>]*>)\s*(\(empty message\)|)\s*(<\/channel>)/s,
-    `$1\n[Hang átirat]: ${transcript}\n$3`,
+    /(<channel[^>]*>)[\s\S]*?(<\/channel>)/,
+    `$1\n[Hang átirat]: ${transcript}\n$2`,
   )
   return result
 }

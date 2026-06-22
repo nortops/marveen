@@ -36,12 +36,12 @@ if [[ "${SKIP_DOCKER:-}" != "1" ]]; then
     tail -f /dev/null
 
   echo "==> Running acceptance tests inside container..."
+  EXIT_CODE=0
   docker exec \
     -e SKIP_DOCKER=1 \
     -e INSTALL_DIR=/tmp/voice-test \
     "$CONTAINER_NAME" \
-    bash /marveen/scripts/__tests__/test-voice-install.sh 2>&1
-  EXIT_CODE=$?
+    bash /marveen/scripts/__tests__/test-voice-install.sh 2>&1 || EXIT_CODE=$?
 
   echo ""
   if [[ "$EXIT_CODE" -eq 0 ]]; then
