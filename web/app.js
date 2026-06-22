@@ -2305,6 +2305,7 @@ async function openAgentDetail(agentName) {
   )
   renderTeamEditor(currentAgent, agents)
   updateAuthModeUI(currentAgent.authMode || 'shared', currentAgent.hasApiKey || false)
+  loadVoiceConfig(currentAgent.name)
   document.getElementById('editClaudeMd').value = currentAgent.claudeMd || currentAgent.content || ''
   document.getElementById('editSoulMd').value = currentAgent.soulMd || ''
   document.getElementById('editMcpJson').value = currentAgent.mcpJson || ''
@@ -2942,6 +2943,41 @@ document.getElementById('saveAutoRestartBtn').addEventListener('click', async ()
     const body = await res.json()
     if (currentAgent) currentAgent.autoRestart = body.autoRestart
     showToast('Auto-restart beállítás mentve')
+  } catch { showToast('Hiba a mentés során') }
+})
+
+// ---- voice config UI -------------------------------------------------------
+
+async function loadVoiceConfig(agentName) {
+  const voiceModelSel = document.getElementById('editAgentVoiceModel')
+  if (!voiceModelSel) return
+  try {
+    const r = await fetch(`/api/agents/${encodeURIComponent(agentName)}/voice-config`)
+    if (!r.ok) return
+    const cfg = await r.json()
+    // Populate voice model dropdown
+    voiceModelSel.innerHTML = (cfg.availableVoices || []).map(v =>
+      `<option value="${v}"${v === cfg.voiceModel ? ' selected' : ''}>${v}</option>`
+    ).join('')
+    // Set response mode radio
+    const modeInput = document.querySelector(`input[name="voiceResponseMode"][value="${cfg.responseMode || 'text'}"]`)
+    if (modeInput) modeInput.checked = true
+  } catch { /* silent */ }
+}
+
+document.getElementById('saveVoiceConfigBtn').addEventListener('click', async () => {
+  if (!currentAgent) return
+  const modeEl = document.querySelector('input[name="voiceResponseMode"]:checked')
+  const modelEl = document.getElementById('editAgentVoiceModel')
+  if (!modeEl || !modelEl) return
+  try {
+    const r = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/voice-config`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ responseMode: modeEl.value, voiceModel: modelEl.value }),
+    })
+    if (!r.ok) throw new Error()
+    showToast('Hangbeállítás mentve')
   } catch { showToast('Hiba a mentés során') }
 })
 
