@@ -50,6 +50,7 @@ import { tryHandleIdeas } from './web/routes/ideas.js'
 import { tryHandleToolLog } from './web/routes/tool-log.js'
 import { tryHandleSettings } from './web/routes/settings.js'
 import { tryHandleStatic } from './web/routes/static.js'
+import { tryHandleVoice } from './web/routes/voice.js'
 import type { RouteContext } from './web/routes/types.js'
 
 const WEB_DIR = join(PROJECT_ROOT, 'web')
@@ -166,6 +167,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleIdeas(routeCtx)) return
       if (await tryHandleToolLog(routeCtx)) return
       if (await tryHandleSettings(routeCtx)) return
+      if (await tryHandleVoice(routeCtx)) return
       if (await tryHandleStatic(routeCtx, WEB_DIR)) return
 
       res.writeHead(404)
