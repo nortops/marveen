@@ -20,28 +20,46 @@ _fail() { echo "[FAIL] $*" >&2; ((FAIL++)) || true; }
 _section() { echo ""; echo "--- $* ---"; }
 
 # ============================================================
-# DOCKER MODE (default): spin up clean ubuntu:24.04, run self
+# DOCKER MODE (default): spin up persistent ubuntu:24.04, run self
+# Container is kept alive after the test for manual inspection.
 # ============================================================
-if [[ "${SKIP_DOCKER:-}" != "1" ]]; then
-  echo "==> Launching clean ubuntu:24.04 container for isolated test..."
-  TMPDIR_HOST="$(mktemp -d)"
-  trap 'rm -rf "$TMPDIR_HOST"' EXIT
+CONTAINER_NAME="${VOICE_TEST_CONTAINER:-marveen-voice-test}"
 
-  docker run --rm \
+if [[ "${SKIP_DOCKER:-}" != "1" ]]; then
+  # Remove any leftover container from a previous run
+  docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+  echo "==> Starting persistent test container: $CONTAINER_NAME"
+  docker run -d --name "$CONTAINER_NAME" \
     -v "$REPO_ROOT:/marveen:ro" \
-    -v "$TMPDIR_HOST:/testout" \
+    ubuntu:24.04 \
+    tail -f /dev/null
+
+  echo "==> Running acceptance tests inside container..."
+  docker exec \
     -e SKIP_DOCKER=1 \
     -e INSTALL_DIR=/tmp/voice-test \
-    ubuntu:24.04 \
-    bash /marveen/scripts/__tests__/test-voice-install.sh 2>&1 | tee "$TMPDIR_HOST/result.log"
+    "$CONTAINER_NAME" \
+    bash /marveen/scripts/__tests__/test-voice-install.sh 2>&1
+  EXIT_CODE=$?
 
-  EXIT_CODE="${PIPESTATUS[0]}"
   echo ""
   if [[ "$EXIT_CODE" -eq 0 ]]; then
     echo "==> Container test: PASS"
   else
     echo "==> Container test: FAIL (exit $EXIT_CODE)"
   fi
+
+  echo ""
+  echo "==> Container '$CONTAINER_NAME' is still running for manual inspection."
+  echo "    Enter:  docker exec -it $CONTAINER_NAME bash"
+  echo "    Venv:   source /tmp/voice-test/venv/bin/activate"
+  echo "    Voices: ls /tmp/voice-test/voices/"
+  echo "    TTS:    /tmp/voice-test/tts.sh imre <chat_id> 'Helló, ez egy teszt'"
+  echo "    Piper direct: echo 'Helló' | /tmp/voice-test/venv/bin/python -m piper \\"
+  echo "                    -m /tmp/voice-test/voices/hu_HU-imre-medium.onnx -f /tmp/out.wav"
+  echo "    STT:    /tmp/voice-test/venv/bin/python /tmp/voice-test/_vtools.py transcribe <file_id> <state_dir>"
+  echo "    Cleanup: docker rm -f $CONTAINER_NAME"
   exit "$EXIT_CODE"
 fi
 
