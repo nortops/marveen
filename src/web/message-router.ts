@@ -1,3 +1,5 @@
+import { readFileSync, existsSync } from 'node:fs'
+import { join } from 'node:path'
 import { logger } from '../logger.js'
 import { MAIN_AGENT_ID, STORE_DIR } from '../config.js'
 import {
@@ -307,8 +309,6 @@ function buildTtsDirective(opts: {
   voiceModel: string
 }): string | null {
   try {
-    const { join } = require('node:path') as typeof import('node:path')
-    const { readFileSync, existsSync } = require('node:fs') as typeof import('node:fs')
     const tokenPath = join(STORE_DIR, '.dashboard-token')
     if (!existsSync(tokenPath)) return null
     const token = readFileSync(tokenPath, 'utf-8').trim()

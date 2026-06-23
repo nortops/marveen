@@ -101,7 +101,8 @@ export async function tryHandleVoice(ctx: RouteContext): Promise<boolean> {
 
   // POST /api/voice/modality/set
   // Body: { agent_id: string, chat_id: string, modality: 'voice'|'text' }
-  // Called by the channel plugin when a voice message arrives inbound.
+  // TODO: currently unused -- message-router sets modality in-process via setLastInboundModality().
+  // Kept for future use if a channel plugin fork needs to set modality over HTTP.
   if (path === '/api/voice/modality/set' && method === 'POST') {
     const body = await readBody(req)
     let data: { agent_id?: string; chat_id?: string; modality?: string }
