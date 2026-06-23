@@ -1,5 +1,3 @@
-import { readFileSync, existsSync } from 'node:fs'
-import { join } from 'node:path'
 import { logger } from '../logger.js'
 import { MAIN_AGENT_ID, STORE_DIR, WEB_PORT } from '../config.js'
 import { buildTtsDirective } from './voice-directive.js'
