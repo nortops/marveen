@@ -5,6 +5,7 @@
 // TTS: POST /api/voice/tts     -- synthesize text to ogg/opus, send via Telegram sendVoice
 // Config: GET/PUT /api/agents/:id/voice-config  (handled in agents.ts; see there)
 // Modality: GET /api/voice/modality?agent=X&chat=Y
+//           POST /api/voice/modality/set -- set last inbound modality (called by channel plugin)
 //
 // Security:
 //   - voiceModel is whitelisted against KNOWN_VOICE_MODELS (no path traversal)
@@ -18,8 +19,8 @@ import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { logger } from '../../logger.js'
 import { readBody, json } from '../http-helpers.js'
-import { KNOWN_VOICE_MODELS } from '../agent-config.js'
-import { getLastInboundModality } from '../voice-modality.js'
+import { KNOWN_VOICE_MODELS, AGENTS_BASE_DIR } from '../agent-config.js'
+import { getLastInboundModality, setLastInboundModality } from '../voice-modality.js'
 import { PROJECT_ROOT } from '../../config.js'
 import type { RouteContext } from './types.js'
 
@@ -34,10 +35,19 @@ const SAFE_FILE_ID_RE = /^[A-Za-z0-9_\-]{10,200}$/
 // The channel plugin stores its .env (bot token) here.
 const CHANNELS_BASE = join(homedir(), '.claude', 'channels')
 
+// Safe paths: ~/.claude/channels/<provider>/  OR  <AGENTS_BASE_DIR>/<name>/.claude/channels/<provider>/
+// Both must contain a .env file. '..' traversal always rejected.
 function isSafeStateDir(dir: string): boolean {
-  // Must be under ~/.claude/channels/ and must contain a .env file.
   const resolved = dir.replace(/\/$/, '')
-  return resolved.startsWith(CHANNELS_BASE) && !resolved.includes('..') && existsSync(join(resolved, '.env'))
+  if (resolved.includes('..')) return false
+  if (!existsSync(join(resolved, '.env'))) return false
+  if (resolved.startsWith(CHANNELS_BASE + '/') || resolved === CHANNELS_BASE) return true
+  if (resolved.startsWith(AGENTS_BASE_DIR + '/')) {
+    // Must match: <AGENTS_BASE_DIR>/<agentName>/.claude/channels/<provider>
+    const rel = resolved.slice(AGENTS_BASE_DIR.length + 1)
+    return /^[a-zA-Z0-9_-]+\/\.claude\/channels\/[a-zA-Z0-9_-]+$/.test(rel)
+  }
+  return false
 }
 
 function voiceOnnxPath(model: string): string | null {
@@ -86,6 +96,25 @@ export async function tryHandleVoice(ctx: RouteContext): Promise<boolean> {
     if (!agentId || !chatId) { json(res, { error: 'agent and chat required' }, 400); return true }
     const modality = getLastInboundModality(agentId, chatId)
     json(res, { modality })
+    return true
+  }
+
+  // POST /api/voice/modality/set
+  // Body: { agent_id: string, chat_id: string, modality: 'voice'|'text' }
+  // TODO: currently unused -- message-router sets modality in-process via setLastInboundModality().
+  // Kept for future use if a channel plugin fork needs to set modality over HTTP.
+  if (path === '/api/voice/modality/set' && method === 'POST') {
+    const body = await readBody(req)
+    let data: { agent_id?: string; chat_id?: string; modality?: string }
+    try { data = JSON.parse(body.toString()) as typeof data } catch { json(res, { error: 'Invalid JSON' }, 400); return true }
+    const agentId = data.agent_id?.trim() ?? ''
+    const chatId = data.chat_id?.trim() ?? ''
+    const modality = data.modality?.trim() ?? ''
+    if (!agentId || !/^[a-zA-Z0-9_-]+$/.test(agentId)) { json(res, { error: 'Invalid agent_id' }, 400); return true }
+    if (!chatId || !/^\d+$/.test(chatId)) { json(res, { error: 'Invalid chat_id' }, 400); return true }
+    if (modality !== 'voice' && modality !== 'text') { json(res, { error: 'modality must be voice or text' }, 400); return true }
+    setLastInboundModality(agentId, chatId, modality as 'voice' | 'text')
+    json(res, { ok: true })
     return true
   }
 
