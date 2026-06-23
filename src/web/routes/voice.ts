@@ -72,6 +72,9 @@ function runProc(
   })
 }
 
+// Concurrency guard: prevents parallel installs racing on the same venv/DEST.
+let _installInProgress = false
+
 export async function tryHandleVoice(ctx: RouteContext): Promise<boolean> {
   const { req, res, path, method } = ctx
 
@@ -194,16 +197,26 @@ export async function tryHandleVoice(ctx: RouteContext): Promise<boolean> {
       return true
     }
 
-    // Deps present -- fire-and-forget the install (no root needed from here)
+    if (_installInProgress) {
+      json(res, { ok: true, started: true, alreadyRunning: true })
+      return true
+    }
+
+    // Deps present -- fire-and-forget the install (no root needed from here).
+    // detached:true + unref() keeps the child alive even if the dashboard
+    // restarts mid-install (pip + ~126 MB download can take several minutes).
+    _installInProgress = true
     const scriptPath = join(PROJECT_ROOT, 'scripts', 'install-voice.sh')
     const child = spawn('bash', [scriptPath], {
       shell: false,
-      detached: false,
+      detached: true,
       stdio: 'ignore',
       env: { ...process.env, SKIP_SYSTEM_DEPS: '1' },
     })
-    child.on('error', (err) => logger.warn({ err }, '/api/voice/install: spawn error'))
+    child.unref()
+    child.on('error', (err) => { _installInProgress = false; logger.warn({ err }, '/api/voice/install: spawn error') })
     child.on('close', (code) => {
+      _installInProgress = false
       if (code !== 0) logger.warn({ code }, '/api/voice/install: install-voice.sh exited non-zero')
       else logger.info('/api/voice/install: install-voice.sh completed successfully')
     })

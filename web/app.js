@@ -3010,11 +3010,16 @@ document.getElementById('voiceInstallBtn').addEventListener('click', async () =>
       return
     }
 
-    // Install started -- poll /api/voice/status until installed=true
+    // Install started -- poll /api/voice/status until installed=true.
+    // Max 4 minutes (80 × 3s); on timeout show a hint and re-enable the button
+    // so the user can retry (the only failure signal from a fire-and-forget spawn).
     if (progress) progress.hidden = false
     btn.textContent = 'Telepítés...'
     clearInterval(_voiceInstallPollTimer)
+    let _voiceInstallPollCount = 0
+    const VOICE_INSTALL_MAX_POLLS = 80 // 80 × 3s = 4 min
     _voiceInstallPollTimer = setInterval(async () => {
+      _voiceInstallPollCount++
       try {
         const sr = await fetch('/api/voice/status')
         const s = await sr.json()
@@ -3023,8 +3028,20 @@ document.getElementById('voiceInstallBtn').addEventListener('click', async () =>
           _voiceInstallPollTimer = null
           if (progress) progress.hidden = true
           if (currentAgent) loadVoiceConfig(currentAgent.name)
+          return
         }
       } catch { /* keep polling */ }
+      if (_voiceInstallPollCount >= VOICE_INSTALL_MAX_POLLS) {
+        clearInterval(_voiceInstallPollTimer)
+        _voiceInstallPollTimer = null
+        if (progress) progress.hidden = true
+        if (sudoHint) {
+          sudoHint.hidden = false
+          sudoHint.textContent = 'A telepítés tovább tart vagy elakadt. Ellenőrizd a dashboard logjait, majd próbáld újra.'
+        }
+        btn.disabled = false
+        btn.textContent = 'Újrapróbálás'
+      }
     }, 3000)
   } catch {
     btn.disabled = false
