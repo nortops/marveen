@@ -237,9 +237,10 @@ function injectTranscript(content: string, transcript: string): string {
     .replace(/\s*attachment_kind="voice"/, '')
     .replace(/\s*attachment_file_id="[^"]*"/, '')
   // Replace the body with the transcript unconditionally (handles empty, "(empty message)", and caption).
+  // Replacer function avoids $1/$& special-pattern interpretation in the transcript string.
   result = result.replace(
     /(<channel[^>]*>)[\s\S]*?(<\/channel>)/,
-    `$1\n[Hang átirat]: ${transcript}\n$2`,
+    (_m, open: string, close: string) => `${open}\n[Hang átirat]: ${transcript}\n${close}`,
   )
   return result
 }
