@@ -2951,19 +2951,87 @@ document.getElementById('saveAutoRestartBtn').addEventListener('click', async ()
 async function loadVoiceConfig(agentName) {
   const voiceModelSel = document.getElementById('editAgentVoiceModel')
   if (!voiceModelSel) return
+  const banner = document.getElementById('voiceNotInstalledBanner')
+  const controls = document.getElementById('voiceInstalledControls')
   try {
+    // Check toolkit installation first
+    const statusR = await fetch('/api/voice/status')
+    if (!statusR.ok) return
+    const status = await statusR.json()
+
+    if (!status.installed) {
+      if (banner) banner.hidden = false
+      if (controls) controls.hidden = true
+      return
+    }
+    if (banner) banner.hidden = true
+    if (controls) controls.hidden = false
+
     const r = await fetch(`/api/agents/${encodeURIComponent(agentName)}/voice-config`)
     if (!r.ok) return
     const cfg = await r.json()
-    // Populate voice model dropdown
     voiceModelSel.innerHTML = (cfg.availableVoices || []).map(v =>
       `<option value="${v}"${v === cfg.voiceModel ? ' selected' : ''}>${v}</option>`
     ).join('')
-    // Set response mode radio
     const modeInput = document.querySelector(`input[name="voiceResponseMode"][value="${cfg.responseMode || 'text'}"]`)
     if (modeInput) modeInput.checked = true
   } catch { /* silent */ }
 }
+
+let _voiceInstallPollTimer = null
+
+document.getElementById('voiceInstallBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('voiceInstallBtn')
+  const sudoHint = document.getElementById('voiceInstallSudoHint')
+  const progress = document.getElementById('voiceInstallProgress')
+
+  if (sudoHint) sudoHint.hidden = true
+  btn.disabled = true
+  btn.textContent = 'Indítás...'
+
+  try {
+    const r = await fetch('/api/voice/install', { method: 'POST' })
+    if (!r.ok) throw new Error(await r.text())
+    const data = await r.json()
+
+    if (data.needsSudo) {
+      // Show sudo command -- user must run it then click again
+      if (sudoHint) {
+        sudoHint.hidden = false
+        sudoHint.innerHTML = 'A rendszercsomagok telepítéséhez futtasd terminálon:<br><code style="display:block;margin-top:4px;word-break:break-all">' + escapeHtml(data.sudoCommand) + '</code><br>Ezután kattints újra a Telepítés gombra.'
+      }
+      btn.disabled = false
+      btn.textContent = 'Telepítés'
+      return
+    }
+
+    if (data.alreadyInstalled) {
+      if (currentAgent) loadVoiceConfig(currentAgent.name)
+      return
+    }
+
+    // Install started -- poll /api/voice/status until installed=true
+    if (progress) progress.hidden = false
+    btn.textContent = 'Telepítés...'
+    clearInterval(_voiceInstallPollTimer)
+    _voiceInstallPollTimer = setInterval(async () => {
+      try {
+        const sr = await fetch('/api/voice/status')
+        const s = await sr.json()
+        if (s.installed) {
+          clearInterval(_voiceInstallPollTimer)
+          _voiceInstallPollTimer = null
+          if (progress) progress.hidden = true
+          if (currentAgent) loadVoiceConfig(currentAgent.name)
+        }
+      } catch { /* keep polling */ }
+    }, 3000)
+  } catch {
+    btn.disabled = false
+    btn.textContent = 'Telepítés'
+    showToast('Hiba a telepítés során')
+  }
+})
 
 document.getElementById('saveVoiceConfigBtn').addEventListener('click', async () => {
   if (!currentAgent) return

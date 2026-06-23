@@ -20,6 +20,7 @@ import { logger } from '../../logger.js'
 import { readBody, json } from '../http-helpers.js'
 import { KNOWN_VOICE_MODELS } from '../agent-config.js'
 import { getLastInboundModality } from '../voice-modality.js'
+import { PROJECT_ROOT } from '../../config.js'
 import type { RouteContext } from './types.js'
 
 const VOICE_DIR = join(homedir(), '.local', 'share', 'atlas-whisper')
@@ -162,6 +163,52 @@ export async function tryHandleVoice(ctx: RouteContext): Promise<boolean> {
       ok: okMatch?.[1]?.toLowerCase() === 'true',
       message_id: idMatch ? parseInt(idMatch[1], 10) : null,
     })
+    return true
+  }
+
+  // POST /api/voice/install
+  // Checks system dependencies (ffmpeg + python3-venv). If missing: returns
+  // { needsSudo: true, sudoCommand } so the user can run it manually. If deps
+  // are present, spawns install-voice.sh with SKIP_SYSTEM_DEPS=1 (no root
+  // needed) and returns immediately; the client polls /api/voice/status.
+  if (path === '/api/voice/install' && method === 'POST') {
+    if (isVoiceInstalled()) {
+      json(res, { ok: true, alreadyInstalled: true })
+      return true
+    }
+
+    // Check system deps without root
+    const depCheck = await runProc('bash', ['-c',
+      'command -v ffmpeg >/dev/null 2>&1' +
+      ' && ffmpeg -encoders 2>&1 | grep -q libopus' +
+      ' && python3 -m venv --help >/dev/null 2>&1' +
+      ' && echo OK || echo MISSING',
+    ], { timeoutMs: 8000 })
+    const depsMissing = !depCheck.stdout.trim().endsWith('OK')
+
+    if (depsMissing) {
+      json(res, {
+        needsSudo: true,
+        sudoCommand: 'sudo apt-get install -y --no-install-recommends ffmpeg python3-venv python3',
+      })
+      return true
+    }
+
+    // Deps present -- fire-and-forget the install (no root needed from here)
+    const scriptPath = join(PROJECT_ROOT, 'scripts', 'install-voice.sh')
+    const child = spawn('bash', [scriptPath], {
+      shell: false,
+      detached: false,
+      stdio: 'ignore',
+      env: { ...process.env, SKIP_SYSTEM_DEPS: '1' },
+    })
+    child.on('error', (err) => logger.warn({ err }, '/api/voice/install: spawn error'))
+    child.on('close', (code) => {
+      if (code !== 0) logger.warn({ code }, '/api/voice/install: install-voice.sh exited non-zero')
+      else logger.info('/api/voice/install: install-voice.sh completed successfully')
+    })
+
+    json(res, { ok: true, started: true })
     return true
   }
 

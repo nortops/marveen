@@ -51,7 +51,13 @@ _has_python_venv() {
   python3 -m venv --help &>/dev/null 2>&1
 }
 
-if command -v apt-get &>/dev/null; then
+# SKIP_SYSTEM_DEPS=1: skip the apt-get step (used by the dashboard installer
+# which has already verified deps are present and runs without root).
+if [[ "${SKIP_SYSTEM_DEPS:-}" == "1" ]]; then
+  _has_ffmpeg_opus || _fail "ffmpeg + libopus missing -- install manually: sudo apt-get install -y ffmpeg"
+  _has_python_venv || _fail "python3-venv missing -- install manually: sudo apt-get install -y python3-venv python3"
+  _skip "SKIP_SYSTEM_DEPS=1: skipping apt-get step"
+elif command -v apt-get &>/dev/null; then
   PKGS=()
   _has_ffmpeg_opus       || PKGS+=(ffmpeg)
   _has_python_venv       || PKGS+=(python3-venv python3)
