@@ -1,7 +1,8 @@
 import { readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { logger } from '../logger.js'
-import { MAIN_AGENT_ID, STORE_DIR } from '../config.js'
+import { MAIN_AGENT_ID, STORE_DIR, WEB_PORT } from '../config.js'
+import { buildTtsDirective } from './voice-directive.js'
 import {
   getPendingMessages,
   markMessageDelivered,
@@ -285,7 +286,7 @@ async function callVoiceSTT(
     const dashToken = rfs(tokenPath, 'utf-8').trim()
 
     const body = JSON.stringify({ file_id: fileId, state_dir: resolvedDir })
-    const resp = await fetch('http://127.0.0.1:3420/api/voice/stt', {
+    const resp = await fetch(`http://127.0.0.1:${WEB_PORT}/api/voice/stt`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${dashToken}` },
       body,
@@ -301,30 +302,3 @@ async function callVoiceSTT(
   }
 }
 
-// Build a ready-to-run TTS directive block injected after the transcript.
-// Returns null if the dashboard token cannot be read.
-function buildTtsDirective(opts: {
-  chatId: string
-  stateDir: string
-  voiceModel: string
-}): string | null {
-  try {
-    const tokenPath = join(STORE_DIR, '.dashboard-token')
-    if (!existsSync(tokenPath)) return null
-    const token = readFileSync(tokenPath, 'utf-8').trim()
-    const { chatId, stateDir, voiceModel } = opts
-    // Escape for embedding in shell single-quoted string: ' -> '\''
-    const escapedStateDir = stateDir.replace(/'/g, "'\\''")
-    return (
-      `\n\n[Hang válasz direktíva]: A fenti hangüzenetre HANGBAN válaszolj. ` +
-      `Amikor megvan a válaszod szövege, futtasd le ezt a parancsot (a szöveget JSON-escape-elve add meg a --arg-ban):\n` +
-      `\`\`\`bash\n` +
-      `jq -n --arg t "A_VÁLASZOD_SZÖVEGE" '{"text":$t,"chat_id":"${chatId}","state_dir":"${escapedStateDir}","voice_model":"${voiceModel}"}' | ` +
-      `curl -s -X POST http://localhost:3420/api/voice/tts -H "Content-Type: application/json" -H "Authorization: Bearer ${token}" -d @-\n` +
-      `\`\`\`\n` +
-      `Szöveges választ NE küldj -- CSAK a fenti curl-t futtasd le a hangküldéshez.`
-    )
-  } catch {
-    return null
-  }
-}
