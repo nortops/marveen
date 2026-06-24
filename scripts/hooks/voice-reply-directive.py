@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""UserPromptSubmit hook: voice-reply directive injection.
+"""UserPromptSubmit hook: voice-reply directive injection + server-side STT.
 
-When a voice message is delivered to a voice/auto-mode agent, this hook
-appends a ready-to-run TTS curl directive to the prompt so the agent knows
-to reply with voice instead of text.
+When a voice message is delivered to a voice/auto-mode agent, this hook:
+  1. Passes the attachment_file_id to /api/voice/directive so the server
+     transcribes the audio (faster-whisper, no Bash/whisper permission needed).
+  2. Injects "[Hang átirat]: <text>" into the prompt when a transcript is returned.
+  3. Injects the TTS curl directive so the agent knows to reply with voice.
 
 Claude Code delivers stdout from UserPromptSubmit hooks directly into the model
 prompt (no JSON wrapper needed -- plain text is injected as-is). This hook
@@ -16,6 +18,7 @@ import os
 import json
 import re
 import urllib.request
+import urllib.parse
 
 
 def _project_root():
@@ -74,6 +77,10 @@ def main():
         sys.exit(0)
     chat_id = m.group(1)
 
+    # Extract attachment_file_id if present (Telegram voice file reference)
+    m_file = re.search(r'\battachment_file_id="([^"]+)"', prompt)
+    file_id = m_file.group(1) if m_file else None
+
     agent_id = _agent_id(payload.get("cwd"))
     if not agent_id:
         sys.exit(0)
@@ -84,17 +91,24 @@ def main():
 
     port = _web_port()
     url = "http://localhost:%s/api/voice/directive?agent=%s&chat=%s" % (port, agent_id, chat_id)
+    if file_id:
+        url += "&file=" + urllib.parse.quote(file_id, safe="")
+
     try:
         req = urllib.request.Request(url)
         req.add_header("Authorization", "Bearer " + token)
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=55) as r:
             data = json.load(r)
     except Exception:
-        sys.exit(0)  # dashboard unavailable -- fail-safe, no directive injected
+        sys.exit(0)  # dashboard unavailable -- fail-safe, no injection
+
+    transcript = data.get("transcript")
+    if transcript:
+        sys.stdout.write("\n[Hang átirat]: " + transcript + "\n")
+        sys.stdout.flush()
 
     directive = data.get("directive")
     if directive:
-        # Plain text stdout is injected directly into the model prompt by Claude Code.
         sys.stdout.write(directive)
         sys.stdout.flush()
 

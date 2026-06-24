@@ -66,19 +66,38 @@ export function ensureAgentHooks(name: string): boolean {
     try { existing = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { /* overwrite */ }
   }
   const tplHooks = tpl.hooks as Record<string, unknown>
+  type HookEntry = { hooks?: Array<{ command?: string; timeout?: number; [k: string]: unknown }> }
   if (existing.hooks) {
     // Key-level merge: add hook event types that are missing, leave existing ones intact.
     // This handles agents that already have some hooks (e.g. PreCompact) but are missing
     // newly added ones (e.g. UserPromptSubmit).
+    // Additionally, sync the timeout of any command hook whose command matches the template
+    // but whose timeout differs (e.g. 8 -> 60 for voice STT).
     const existingHooks = existing.hooks as Record<string, unknown>
-    let added = false
+    let changed = false
     for (const [event, handlers] of Object.entries(tplHooks)) {
       if (!existingHooks[event]) {
         existingHooks[event] = handlers
-        added = true
+        changed = true
+      } else {
+        const tplEntries = handlers as HookEntry[]
+        const existEntries = existingHooks[event] as HookEntry[]
+        for (const tplEntry of tplEntries) {
+          for (const tplHook of tplEntry.hooks ?? []) {
+            if (!tplHook.command || tplHook.timeout == null) continue
+            for (const existEntry of existEntries) {
+              for (const existHook of existEntry.hooks ?? []) {
+                if (existHook.command === tplHook.command && existHook.timeout !== tplHook.timeout) {
+                  existHook.timeout = tplHook.timeout
+                  changed = true
+                }
+              }
+            }
+          }
+        }
       }
     }
-    if (!added) return false
+    if (!changed) return false
   } else {
     existing.hooks = tplHooks
   }

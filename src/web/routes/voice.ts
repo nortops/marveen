@@ -90,20 +90,34 @@ let _installInProgress = false
 export async function tryHandleVoice(ctx: RouteContext): Promise<boolean> {
   const { req, res, path, method } = ctx
 
-  // GET /api/voice/directive?agent=X&chat=Y
-  // Returns the pre-filled TTS curl directive string for the UserPromptSubmit hook.
-  // Resolves state_dir (sub-agent aware) and voiceModel from the agent's voice-config.
-  // Returns { directive: string|null } -- null if responseMode===text or token missing.
+  // GET /api/voice/directive?agent=X&chat=Y[&file=FILE_ID]
+  // Returns { directive: string|null, transcript: string|null }.
+  // directive: pre-filled TTS curl string for the UserPromptSubmit hook (null if text mode).
+  // transcript: STT result if `file` (Telegram attachment_file_id) is provided and valid.
+  // fail-safe: STT errors set transcript=null; directive is always attempted independently.
   if (path === '/api/voice/directive' && method === 'GET') {
     const agentId = ctx.url.searchParams.get('agent') ?? ''
     const chatId = ctx.url.searchParams.get('chat') ?? ''
+    const fileParam = ctx.url.searchParams.get('file') ?? ''
     if (!agentId || !/^[a-zA-Z0-9_-]+$/.test(agentId)) { json(res, { error: 'Invalid agent' }, 400); return true }
     if (!chatId || !/^\d+$/.test(chatId)) { json(res, { error: 'Invalid chat_id' }, 400); return true }
     const voiceCfg = readAgentVoiceConfig(agentId)
-    if (voiceCfg.responseMode === 'text') { json(res, { directive: null }); return true }
     const stateDir = resolveAgentChannelStateDir(agentId, 'telegram')
-    const directive = buildTtsDirective({ chatId, stateDir, voiceModel: voiceCfg.voiceModel ?? 'hu_HU-imre-medium' })
-    json(res, { directive })
+    const directive = voiceCfg.responseMode === 'text'
+      ? null
+      : buildTtsDirective({ chatId, stateDir, voiceModel: voiceCfg.voiceModel ?? 'hu_HU-imre-medium' })
+
+    let transcript: string | null = null
+    if (fileParam && SAFE_FILE_ID_RE.test(fileParam) && isVoiceInstalled()) {
+      const sttResult = await runProc(VENV_PY, [VTOOLS_PY, 'transcribe', fileParam, stateDir], { timeoutMs: 60_000 })
+      if (sttResult.code === 0) {
+        transcript = sttResult.stdout.trim() || null
+      } else {
+        logger.warn({ fileParam, stderr: sttResult.stderr }, '/api/voice/directive: STT failed (non-fatal)')
+      }
+    }
+
+    json(res, { directive, transcript })
     return true
   }
 
