@@ -67,17 +67,17 @@ def main():
 
     prompt = payload.get("prompt") or ""
 
-    # Only fire for voice inbound messages
-    if 'attachment_kind="voice"' not in prompt:
-        sys.exit(0)
-
-    # Extract chat_id from <channel chat_id="...">
+    # Gate: only fire for channel-inbound messages (has chat_id).
+    # Inter-agent prompts and non-channel input have no chat_id -- skip those.
+    # (voice-mode agents must reply with audio even to plain text input, so we
+    # cannot gate on attachment_kind="voice" here.)
     m = re.search(r'\bchat_id="(\d+)"', prompt)
     if not m:
         sys.exit(0)
     chat_id = m.group(1)
 
-    # Extract attachment_file_id if present (Telegram voice file reference)
+    # Extract attachment_file_id if present (only set for voice attachments).
+    # Passed to the endpoint so STT runs server-side when a voice file is attached.
     m_file = re.search(r'\battachment_file_id="([^"]+)"', prompt)
     file_id = m_file.group(1) if m_file else None
 
