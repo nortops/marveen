@@ -1088,7 +1088,7 @@ export interface KanbanCard {
   seq?: number
   title: string
   description: string | null
-  status: 'planned' | 'in_progress' | 'waiting' | 'done'
+  status: 'planned' | 'in_progress' | 'waiting' | 'testing' | 'done'
   assignee: string | null
   priority: 'low' | 'normal' | 'high' | 'urgent'
   project: string | null

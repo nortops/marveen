@@ -370,8 +370,8 @@ function renderStaticI18n() {
   }
   // Kanban column titles
   const colTitles = document.querySelectorAll('.kanban-col-title')
-  const statusKeys = ['kanban.col.planned', 'kanban.col.in_progress', 'kanban.col.testing', 'kanban.col.waiting', 'kanban.col.done']
-  const statuses = ['planned', 'in_progress', 'testing', 'waiting', 'done']
+  const statusKeys = ['kanban.col.planned', 'kanban.col.in_progress', 'kanban.col.waiting', 'kanban.col.testing', 'kanban.col.done']
+  const statuses = ['planned', 'in_progress', 'waiting', 'testing', 'done']
   colTitles.forEach((el) => {
     const status = el.closest('[data-status]')?.dataset?.status
     if (status) {
@@ -907,7 +907,7 @@ function renderKanban() {
     if (parent.status === card.status) embeddedSubtaskIds.add(card.id)
   }
 
-  const grouped = { planned: [], in_progress: [], testing: [], waiting: [], done: [] }
+  const grouped = { planned: [], in_progress: [], waiting: [], testing: [], done: [] }
   for (const card of kanbanCards) {
     if (embeddedSubtaskIds.has(card.id)) continue
     if (!visibleCardIds.has(card.id)) continue
@@ -955,8 +955,8 @@ function renderKanban() {
 const KANBAN_STATUS_DEFS = [
   { status: 'planned', title: () => t('kanban.col.planned') },
   { status: 'in_progress', title: () => t('kanban.col.in_progress') },
-  { status: 'testing', title: () => t('kanban.col.testing') },
   { status: 'waiting', title: () => t('kanban.col.waiting') },
+  { status: 'testing', title: () => t('kanban.col.testing') },
   { status: 'done', title: () => t('kanban.col.done') },
 ]
 const KANBAN_PRIORITY_LABELS = { urgent: () => t('kanban.priority.urgent'), high: () => t('kanban.priority.high'), normal: () => t('kanban.priority.normal'), low: () => t('kanban.priority.low') }
