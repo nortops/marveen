@@ -370,8 +370,8 @@ function renderStaticI18n() {
   }
   // Kanban column titles
   const colTitles = document.querySelectorAll('.kanban-col-title')
-  const statusKeys = ['kanban.col.planned', 'kanban.col.in_progress', 'kanban.col.waiting', 'kanban.col.done']
-  const statuses = ['planned', 'in_progress', 'waiting', 'done']
+  const statusKeys = ['kanban.col.planned', 'kanban.col.in_progress', 'kanban.col.testing', 'kanban.col.waiting', 'kanban.col.done']
+  const statuses = ['planned', 'in_progress', 'testing', 'waiting', 'done']
   colTitles.forEach((el) => {
     const status = el.closest('[data-status]')?.dataset?.status
     if (status) {
@@ -907,7 +907,7 @@ function renderKanban() {
     if (parent.status === card.status) embeddedSubtaskIds.add(card.id)
   }
 
-  const grouped = { planned: [], in_progress: [], waiting: [], done: [] }
+  const grouped = { planned: [], in_progress: [], testing: [], waiting: [], done: [] }
   for (const card of kanbanCards) {
     if (embeddedSubtaskIds.has(card.id)) continue
     if (!visibleCardIds.has(card.id)) continue
@@ -917,6 +917,7 @@ function renderKanban() {
   // Update counts (embedded subtasks don't count as separate cards)
   document.getElementById('countPlanned').textContent = grouped.planned.length
   document.getElementById('countInProgress').textContent = grouped.in_progress.length
+  document.getElementById('countTesting').textContent = grouped.testing.length
   document.getElementById('countWaiting').textContent = grouped.waiting.length
   document.getElementById('countDone').textContent = grouped.done.length
 
@@ -954,6 +955,7 @@ function renderKanban() {
 const KANBAN_STATUS_DEFS = [
   { status: 'planned', title: () => t('kanban.col.planned') },
   { status: 'in_progress', title: () => t('kanban.col.in_progress') },
+  { status: 'testing', title: () => t('kanban.col.testing') },
   { status: 'waiting', title: () => t('kanban.col.waiting') },
   { status: 'done', title: () => t('kanban.col.done') },
 ]
@@ -1075,6 +1077,7 @@ function renderSwimlaneBoard(grouped, embeddedSubtaskIds) {
 const WIP_COUNT_IDS = {
   planned: 'countPlanned',
   in_progress: 'countInProgress',
+  testing: 'countTesting',
   waiting: 'countWaiting',
   done: 'countDone',
 }
@@ -1532,7 +1535,7 @@ async function showCardDetail(card) {
     : null
   const assigneeDisplay = assignee ? (assignee.displayName || assignee.name) : (rawDetailAssignee || '-- nincs --')
   const priorityLabels = { low: t('kanban.priority.low'), normal: t('kanban.priority.normal'), high: t('kanban.priority.high'), urgent: t('kanban.priority.urgent') }
-  const statusLabels = { planned: t('kanban.status.planned'), in_progress: t('kanban.status.in_progress'), waiting: t('kanban.status.waiting'), done: t('kanban.status.done') }
+  const statusLabels = { planned: t('kanban.status.planned'), in_progress: t('kanban.status.in_progress'), testing: t('kanban.status.testing'), waiting: t('kanban.status.waiting'), done: t('kanban.status.done') }
 
   const meta = document.getElementById('cardDetailMeta')
   const idLabel = (card.seq != null ? `#${card.seq} · ` : '') + card.id
@@ -1624,7 +1627,7 @@ async function showCardDetail(card) {
     parentSelect.innerHTML = `<option value="">${t('kanban.parent.empty')}</option>`
     const availableParents = kanbanCards.filter(c =>
       !c.parent_id && c.id !== card.id && !c.archived_at &&
-      (c.status === 'planned' || c.status === 'in_progress' || c.status === 'waiting')
+      (c.status === 'planned' || c.status === 'in_progress' || c.status === 'testing' || c.status === 'waiting')
     )
     for (const p of availableParents) {
       const opt = document.createElement('option')
@@ -1781,7 +1784,7 @@ async function showCardDetail(card) {
       addSubtaskSection.style.display = 'none'
     }
 
-    const statusLabelsShort = { planned: t('kanban.status.planned'), in_progress: t('kanban.status.in_progress'), waiting: t('kanban.status.waiting_short'), done: t('kanban.status.done') }
+    const statusLabelsShort = { planned: t('kanban.status.planned'), in_progress: t('kanban.status.in_progress'), testing: t('kanban.status.testing'), waiting: t('kanban.status.waiting_short'), done: t('kanban.status.done') }
     if (children.length > 0 || isTask) {
       section.style.display = ''
       list.innerHTML = ''
