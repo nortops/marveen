@@ -20,8 +20,11 @@
       "Bash(curl -s -X PUT http://localhost:3420/api/:*)",
       "Bash(curl -s -m 5 -X PUT http://localhost:3420/api/:*)",
       "Bash(curl -s -m 5 http://localhost:3420/api/:*)",
+      "Bash(${HOME}/.local/share/atlas-whisper/stt.sh:*)",
+      "Bash(${HOME}/.local/share/atlas-whisper/tts.sh:*)",
       "WebFetch(*)",
-      "WebSearch(*)"
+      "WebSearch(*)",
+      "Bash(jq:*)"
     ],
     "deny": [
       "Read(${HOME}/.ssh/**)",

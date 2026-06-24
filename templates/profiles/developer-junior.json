@@ -19,7 +19,8 @@
       "Bash(pwd:*)",
       "Bash(curl:*)",
       "WebFetch(*)",
-      "WebSearch(*)"
+      "WebSearch(*)",
+      "Bash(jq:*)"
     ],
     "deny": [
       "Read(${HOME}/.ssh/**)",
