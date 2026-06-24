@@ -92,8 +92,12 @@ export async function tryHandleVoice(ctx: RouteContext): Promise<boolean> {
 
   // GET /api/voice/directive?agent=X&chat=Y[&file=FILE_ID]
   // Returns { directive: string|null, transcript: string|null }.
-  // directive: pre-filled TTS curl string for the UserPromptSubmit hook (null if text mode).
-  // transcript: STT result if `file` (Telegram attachment_file_id) is provided and valid.
+  // directive semantics by responseMode:
+  //   text  -> null (never speaks)
+  //   voice -> always buildTtsDirective (speaks even for plain-text input)
+  //   auto  -> buildTtsDirective only when a voice file_id is present (speaks only if user sent audio)
+  // transcript: STT result when `file` is provided and valid (mode-independent -- even text-mode
+  //   agents can benefit from knowing what a voice message said).
   // fail-safe: STT errors set transcript=null; directive is always attempted independently.
   if (path === '/api/voice/directive' && method === 'GET') {
     const agentId = ctx.url.searchParams.get('agent') ?? ''
@@ -103,9 +107,12 @@ export async function tryHandleVoice(ctx: RouteContext): Promise<boolean> {
     if (!chatId || !/^\d+$/.test(chatId)) { json(res, { error: 'Invalid chat_id' }, 400); return true }
     const voiceCfg = readAgentVoiceConfig(agentId)
     const stateDir = resolveAgentChannelStateDir(agentId, 'telegram')
-    const directive = voiceCfg.responseMode === 'text'
-      ? null
-      : buildTtsDirective({ chatId, stateDir, voiceModel: voiceCfg.voiceModel ?? 'hu_HU-imre-medium' })
+    const fileIsVoice = !!fileParam && SAFE_FILE_ID_RE.test(fileParam)
+    const ttsParams = { chatId, stateDir, voiceModel: voiceCfg.voiceModel ?? 'hu_HU-imre-medium' }
+    const directive = voiceCfg.responseMode === 'text' ? null
+      : voiceCfg.responseMode === 'voice' ? buildTtsDirective(ttsParams)
+      : fileIsVoice ? buildTtsDirective(ttsParams)  // auto: only when inbound was audio
+      : null
 
     let transcript: string | null = null
     if (fileParam && SAFE_FILE_ID_RE.test(fileParam) && isVoiceInstalled()) {
