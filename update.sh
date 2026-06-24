@@ -6,11 +6,50 @@ set -e
 BOLD='\033[1m'
 GREEN='\033[0;32m'
 RED='\033[0;31m'
+ORANGE='\033[0;33m'
 DIM='\033[2m'
 NC='\033[0m'
 
 INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$INSTALL_DIR"
+# ── Language (saved by installer, falls back to HU) ──────────────────────────
+MARVEEN_LANG="$(cat "${INSTALL_DIR}/.lang" 2>/dev/null || echo hu)"
+export MARVEEN_LANG
+# shellcheck source=install-lang.sh
+source "$(dirname "$0")/install-lang.sh"
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# --- Optional modes (CLI flags or env vars) ---------------------------------
+# The default run is unchanged: it pulls, installs deps, and seeds only the
+# fleet skills/tasks that are MISSING (skip-if-exists), never touching copies
+# the operator already has.
+#
+#   --reseed-fleet  (RESEED_FLEET=1)   Force-refresh the fleet-canonical seeds
+#       (seed-skills/ + seed-scheduled-tasks/) to the repo's current version,
+#       overwriting the already-installed copies. This is how a corrected
+#       canonical seed -- e.g. a security/identity cleanup -- reaches installs
+#       that already seeded the old one. User-authored skills/tasks (anything
+#       NOT present under seed-*) are never touched. Runs even when the code is
+#       already up to date.
+#   --regen-claudemd  (REGEN_CLAUDEMD=1)   Re-render the main CLAUDE.md from
+#       templates/CLAUDE.md.template using this install's .env identity. Opt-in
+#       and backed up first, because the operator may have hand-edited it.
+RESEED_FLEET="${RESEED_FLEET:-0}"
+REGEN_CLAUDEMD="${REGEN_CLAUDEMD:-0}"
+#   --rebuild  (FORCE_REBUILD=1)   Force a rebuild + restart even when the code
+#       is already up to date. Manual escape hatch for the case where the
+#       compiled dist/ is stale relative to the checked-out source (see the
+#       build-marker self-heal in the already-latest branch below). The marker
+#       normally heals this automatically; --rebuild is the explicit override.
+FORCE_REBUILD="${FORCE_REBUILD:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --reseed-fleet|--security-reseed) RESEED_FLEET=1 ;;
+    --regen-claudemd) REGEN_CLAUDEMD=1 ;;
+    --rebuild) FORCE_REBUILD=1 ;;
+  esac
+done
 
 # Pin Node to the version the dashboard service runs on. The global brew node
 # (26.x) cannot compile better-sqlite3 11.x (removed V8 APIs), which corrupts
@@ -93,7 +132,11 @@ fi
 exec > >(tee -a "$UPDATE_LOG") 2>&1
 
 echo ""
-echo -e "${BOLD}Marveen frissites...${NC} [$(date -u +%Y-%m-%dT%H:%M:%SZ)]"
+if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+  echo -e "${BOLD}Marveen update...${NC} [$(date -u +%Y-%m-%dT%H:%M:%SZ)]"
+else
+  echo -e "${BOLD}Marveen frissítés...${NC} [$(date -u +%Y-%m-%dT%H:%M:%SZ)]"
+fi
 echo ""
 
 # Guard 1: derive the release branch from the current checkout and refuse
@@ -108,7 +151,11 @@ echo ""
 # this is defense-in-depth for manual invocations.
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 if [ "$CURRENT_BRANCH" = "HEAD" ] || [ -z "$CURRENT_BRANCH" ]; then
-  echo -e "${RED}HIBA:${NC} A repo detached-HEAD allapotban van."
+  if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+    echo -e "${RED}ERROR:${NC} The repo is in detached-HEAD state."
+  else
+    echo -e "${RED}HIBA:${NC} A repo detached-HEAD állapotban van."
+  fi
   echo "       Allj at egy release branchre, majd indithatod ujra a frissitest, pl.:"
   echo "         git checkout main"
   exit 2
@@ -117,7 +164,11 @@ fi
 # ref to fast-forward to (e.g. a local-only feature branch). Fail early with
 # a clear message instead of letting set -e abort mid-run.
 if ! git ls-remote --exit-code --heads origin "$CURRENT_BRANCH" >/dev/null 2>&1; then
-  echo -e "${RED}HIBA:${NC} A '${CURRENT_BRANCH}' branch nem letezik az origin-on."
+  if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+    echo -e "${RED}ERROR:${NC} Branch '${CURRENT_BRANCH}' does not exist on origin."
+  else
+    echo -e "${RED}HIBA:${NC} A '${CURRENT_BRANCH}' branch nem létezik az origin-on."
+  fi
   echo "       Csak az origin-on is meglevo (kovetett) branchrol lehet frissiteni."
   echo "       Allj at egy release branchre, pl.:"
   echo "         git checkout main"
@@ -145,12 +196,20 @@ if [ -n "$DIRTY" ]; then
   if [ "${AUTO_STASH:-0}" = "1" ]; then
     echo -e "  Lokalis valtozasok stash-elve (auto-stash)..."
     if ! git stash push --keep-index -m "marveen-update-auto-stash $(date +%Y%m%d-%H%M%S)"; then
-      echo -e "${RED}HIBA:${NC} Auto-stash sikertelen. Nezd meg: git status"
+      if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+        echo -e "${RED}ERROR:${NC} Auto-stash failed. Check: git status"
+      else
+        echo -e "${RED}HIBA:${NC} Auto-stash sikertelen. Nézd meg: git status"
+      fi
       exit 3
     fi
     STASHED_AUTO=1
   else
-    echo -e "${RED}HIBA:${NC} A working tree modosult allapotban van."
+    if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+      echo -e "${RED}ERROR:${NC} The working tree has uncommitted changes."
+    else
+      echo -e "${RED}HIBA:${NC} A working tree módosult állapotban van."
+    fi
     echo "       Commitold vagy stasheld a valtozasokat, majd indithatod ujra:"
     echo "         git stash"
     exit 3
@@ -164,10 +223,58 @@ OLD_VERSION=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 echo -e "  Letoltes (origin/${CURRENT_BRANCH})..."
 git pull --ff-only origin "$CURRENT_BRANCH"
 NEW_VERSION=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+# Full SHA for the build-marker (dist/.built-commit). HEAD does not change
+# again in this script (no checkout), so this is the commit any build below
+# produces and the value we compare the marker against.
+NEW_VERSION_FULL=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+BUILT_COMMIT_FILE="$INSTALL_DIR/dist/.built-commit"
 
 if [ "$OLD_VERSION" = "$NEW_VERSION" ]; then
-  echo -e "  ${GREEN}✓${NC} Mar a legfrissebb verzion vagy ($NEW_VERSION)"
-  exit 0
+  # Already on the latest commit -- but "no new commits" does NOT guarantee the
+  # compiled dist/ matches the source. A prior update can pull new source and
+  # then ABORT before building (set -e on a transient build/npm error, run
+  # detached with stdio:'ignore' so the failure is invisible). That leaves
+  # git=NEW + dist=OLD, and because this branch used to `exit 0`, every later
+  # re-run skipped the build too -- the stale dist never self-healed (the
+  # "two updates + a reboot didn't fix it" symptom). We detect it with a
+  # build-marker: dist/.built-commit records the commit dist was built from.
+  # If it is missing or != HEAD (or --rebuild was passed), the dist is stale,
+  # so we fall through to the normal build + restart instead of exiting.
+  BUILT_COMMIT="$(cat "$BUILT_COMMIT_FILE" 2>/dev/null || echo "")"
+  DIST_STALE=0
+  if [ ! -d "$INSTALL_DIR/dist" ] || [ "$BUILT_COMMIT" != "$NEW_VERSION_FULL" ]; then
+    DIST_STALE=1
+  fi
+
+  if [ "$FORCE_REBUILD" = "1" ] || [ "$DIST_STALE" = "1" ]; then
+    # Self-heal (or forced): do NOT exit, do NOT set SKIP_BUILD -- let the
+    # build block below run and the script reach the end-of-run restart.
+    # The dep-install diff (OLD..NEW) is empty here, so npm ci stays skipped;
+    # only the rebuild + restart we actually need will run.
+    if [ "$FORCE_REBUILD" = "1" ]; then
+      echo -e "  ${ORANGE}↻${NC} Mar a legfrissebb verzion ($NEW_VERSION), de --rebuild -> ujraforditas + restart"
+    else
+      echo -e "  ${ORANGE}↻${NC} Mar a legfrissebb verzion ($NEW_VERSION), de a dist elavult (built=${BUILT_COMMIT:-none}) -> ongyogyito ujraforditas + restart"
+    fi
+  elif [ "$RESEED_FLEET" != "1" ] && [ "$REGEN_CLAUDEMD" != "1" ]; then
+    if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+      echo -e "  ${GREEN}✓${NC} Already on the latest version ($NEW_VERSION)"
+    else
+      echo -e "  ${GREEN}✓${NC} Már a legfrissebb verzión vagy ($NEW_VERSION)"
+    fi
+    exit 0
+  else
+    # --reseed-fleet / --regen-claudemd are explicit refresh requests, so they
+    # run even when the code is already current. dist is verified fresh (marker
+    # == HEAD), so skip the dep-install + build below and jump to the
+    # seed/identity refresh.
+    if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+      echo -e "  ${GREEN}✓${NC} Already on the latest version ($NEW_VERSION), continuing due to fleet-reseed/regen flag"
+    else
+      echo -e "  ${GREEN}✓${NC} Már a legfrissebb verzión ($NEW_VERSION), folytatás a kért fleet-reseed/regen miatt"
+    fi
+    SKIP_BUILD=1
+  fi
 fi
 
 # Install deps if package.json OR package-lock.json changed. Use `npm ci`
@@ -194,18 +301,36 @@ if git diff "$OLD_VERSION" "$NEW_VERSION" --name-only | grep -qE "^package(-lock
   # whether to roll back.
   echo -e "  Biztonsagi ellenorzes..."
   if ! npm audit --audit-level=high --omit=dev --silent; then
-    echo -e "  FIGYELEM: npm audit magas-sulyossagu tetelt jelzett."
+    if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+      echo -e "  WARNING: npm audit reported high-severity item(s)."
+    else
+      echo -e "  FIGYELEM: npm audit magas-súlyosságú tételt jelzett."
+    fi
     echo -e "  A frissites folytatodik, de vizsgald meg: npm audit --omit=dev"
   fi
 fi
 
 # Native module rebuild for current Node ABI (critical when Node version changes;
 # better-sqlite3 NODE_MODULE_VERSION must match the running node binary).
-npm rebuild better-sqlite3 --build-from-source --silent
+# Skipped on an already-up-to-date --reseed-fleet/--regen-claudemd run: the
+# compiled tree did not change, only the seeded skills/tasks need refreshing.
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+  npm rebuild better-sqlite3 --build-from-source --silent
 
-# Rebuild
-echo -e "  Forditas..."
-npm run build --silent
+  # Rebuild
+  echo -e "  Forditas..."
+  npm run build --silent
+
+  # Stamp the build-marker AFTER a successful build (set -e means we only
+  # reach this line if the build succeeded). dist/.built-commit records the
+  # commit dist was built from, so the already-latest branch above can detect
+  # a stale dist on a later run and self-heal. `tsc` emits into dist/ without
+  # wiping it, so a marker written here survives subsequent incremental builds;
+  # dist/ is gitignored, so the marker is a pure runtime artifact.
+  if [ -d "$INSTALL_DIR/dist" ]; then
+    echo "$NEW_VERSION_FULL" > "$BUILT_COMMIT_FILE"
+  fi
+fi
 
 # Hook-ok szinkronizálása (~/.claude/hooks/ + ~/.claude/settings.json).
 # Minden scripts/install-*-hook.sh idempotens. Új hook-féle védelmet
@@ -228,28 +353,40 @@ fi
 SKILLS_DIR="$HOME/.claude/skills"
 SCHED_TARGET_DIR="$HOME/.claude/scheduled-tasks"
 
-# Seed skills (no template vars needed, safe without .env)
+# Seed skills (no template vars needed, safe without .env).
+# Default: only seed MISSING skills (skip-if-exists), never clobbering the
+# operator's copies. With --reseed-fleet: force-refresh the canonical copy of
+# every skill that ships under seed-skills/. The loop only ever iterates the
+# seed-skills/ source, so a user-authored skill that has no seed-skills/
+# counterpart is never visited -- it stays untouched either way.
 SEED_SKILLS_DIR="$INSTALL_DIR/seed-skills"
 if [ -d "$SEED_SKILLS_DIR" ]; then
   SEED_NEW=0
   SEED_SKIP=0
+  SEED_FORCED=0
   for skill_dir in "$SEED_SKILLS_DIR"/*/; do
     [ -d "$skill_dir" ] || continue
     skill_name=$(basename "$skill_dir")
     target="$SKILLS_DIR/$skill_name"
+    forced=0
     if [ -d "$target" ]; then
-      SEED_SKIP=$((SEED_SKIP + 1))
-      continue
+      if [ "$RESEED_FLEET" = "1" ]; then
+        rm -rf "$target"
+        forced=1
+      else
+        SEED_SKIP=$((SEED_SKIP + 1))
+        continue
+      fi
     fi
     mkdir -p "$target"
     for f in "$skill_dir"*; do
       [ -f "$f" ] || continue
       cp "$f" "$target/$(basename "$f")"
     done
-    SEED_NEW=$((SEED_NEW + 1))
+    if [ "$forced" = "1" ]; then SEED_FORCED=$((SEED_FORCED + 1)); else SEED_NEW=$((SEED_NEW + 1)); fi
   done
-  if [ "$SEED_NEW" -gt 0 ] || [ "$SEED_SKIP" -gt 0 ]; then
-    echo -e "  ${GREEN}✓${NC} Seed skills: ${SEED_NEW} új, ${SEED_SKIP} kihagyva"
+  if [ "$SEED_NEW" -gt 0 ] || [ "$SEED_SKIP" -gt 0 ] || [ "$SEED_FORCED" -gt 0 ]; then
+    echo -e "  ${GREEN}✓${NC} Seed skills: ${SEED_NEW} új, ${SEED_FORCED} frissítve, ${SEED_SKIP} kihagyva"
   fi
 fi
 
@@ -262,13 +399,24 @@ if [ -d "$SEED_SCHED_DIR" ]; then
     mkdir -p "$SCHED_TARGET_DIR"
     SCHED_NEW=0
     SCHED_SKIP=0
+    SCHED_FORCED=0
+    # Default skip-if-exists; --reseed-fleet force-refreshes the canonical task
+    # content (SKILL.md + task-config.json). Task RUN-STATE lives in store/ (not
+    # in the task dir), so it is preserved across a force-reseed. Tasks the user
+    # authored themselves have no seed-scheduled-tasks/ source -> never visited.
     for tpl in "$SEED_SCHED_DIR"/*/; do
       [ -d "$tpl" ] || continue
       task_name=$(basename "$tpl")
       target="$SCHED_TARGET_DIR/$task_name"
+      forced=0
       if [ -d "$target" ]; then
-        SCHED_SKIP=$((SCHED_SKIP + 1))
-        continue
+        if [ "$RESEED_FLEET" = "1" ]; then
+          rm -rf "$target"
+          forced=1
+        else
+          SCHED_SKIP=$((SCHED_SKIP + 1))
+          continue
+        fi
       fi
       mkdir -p "$target"
       for f in "$tpl"*; do
@@ -279,10 +427,10 @@ if [ -d "$SEED_SCHED_DIR" ]; then
             -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
             "$f" > "$target/$(basename "$f")"
       done
-      SCHED_NEW=$((SCHED_NEW + 1))
+      if [ "$forced" = "1" ]; then SCHED_FORCED=$((SCHED_FORCED + 1)); else SCHED_NEW=$((SCHED_NEW + 1)); fi
     done
-    if [ "$SCHED_NEW" -gt 0 ] || [ "$SCHED_SKIP" -gt 0 ]; then
-      echo -e "  ${GREEN}✓${NC} Seed scheduled tasks: ${SCHED_NEW} új, ${SCHED_SKIP} kihagyva"
+    if [ "$SCHED_NEW" -gt 0 ] || [ "$SCHED_SKIP" -gt 0 ] || [ "$SCHED_FORCED" -gt 0 ]; then
+      echo -e "  ${GREEN}✓${NC} Seed scheduled tasks: ${SCHED_NEW} új, ${SCHED_FORCED} frissítve, ${SCHED_SKIP} kihagyva"
     fi
     # Init state files for new seeded tasks
     if [ "$SCHED_NEW" -gt 0 ]; then
@@ -299,6 +447,52 @@ if [ -d "$SEED_SCHED_DIR" ]; then
       mkdir -p "$BB_TARGET_TI"
       cp "$BB_SEED_TI"/*.json "$BB_TARGET_TI/" 2>/dev/null
       echo -e "  ${GREEN}✓${NC} Bumblebee threat-intel katalógusok telepítve"
+    fi
+  fi
+fi
+
+# --- Main CLAUDE.md identity check / optional regen (fleet-reseed only) ------
+# A stale install can carry hardcoded references to agents that do not exist
+# here (the origin fleet's roster baked into an old template). We never know
+# those names statically -- and must not bake them into the shipped updater --
+# so we detect the SYMPTOM generically: inter-agent delegation targets in the
+# main CLAUDE.md that are neither this install's main agent nor a real local
+# sub-agent under agents/. Warn only; the operator decides (or opts into regen).
+if [ "$RESEED_FLEET" = "1" ] || [ "$REGEN_CLAUDEMD" = "1" ]; then
+  CLAUDE_MD="$INSTALL_DIR/CLAUDE.md"
+  if [ "$REGEN_CLAUDEMD" = "1" ] && [ -f "$INSTALL_DIR/templates/CLAUDE.md.template" ]; then
+    # Opt-in: re-render from the canonical template with this install's identity.
+    # Back up first -- the operator may have hand-edited CLAUDE.md.
+    [ -f "$CLAUDE_MD" ] && cp "$CLAUDE_MD" "$CLAUDE_MD.backup-$(date +%Y%m%d-%H%M%S)"
+    REGEN_CHAT_ID=""
+    [ -f "$INSTALL_DIR/.env" ] && REGEN_CHAT_ID=$(grep '^CHAT_ID=' "$INSTALL_DIR/.env" | cut -d= -f2-)
+    sed -e "s/{{OWNER_NAME}}/$OWNER_NAME/g" \
+        -e "s|{{INSTALL_DIR}}|$INSTALL_DIR|g" \
+        -e "s/{{CHAT_ID}}/$REGEN_CHAT_ID/g" \
+        -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
+        -e "s/{{MAIN_AGENT_ID}}/$MAIN_AGENT_ID/g" \
+        "$INSTALL_DIR/templates/CLAUDE.md.template" > "$CLAUDE_MD"
+    echo -e "  ${GREEN}✓${NC} CLAUDE.md újrarenderelve a sablonból (előző verzió mentve: CLAUDE.md.backup-*)"
+  elif [ -f "$CLAUDE_MD" ]; then
+    KNOWN_IDS=" ${MAIN_AGENT_ID} ${BOT_NAME} "
+    if [ -d "$INSTALL_DIR/agents" ]; then
+      for d in "$INSTALL_DIR"/agents/*/; do
+        [ -d "$d" ] && KNOWN_IDS="${KNOWN_IDS}$(basename "$d") "
+      done
+    fi
+    UNKNOWN=""
+    while IFS= read -r tgt; do
+      [ -z "$tgt" ] && continue
+      case "$tgt" in *[A-Z]*) continue ;; esac           # UPPERCASE placeholder, not an id
+      case "$KNOWN_IDS" in *" $tgt "*) continue ;; esac   # a real local agent
+      case " $UNKNOWN " in *" $tgt "*) continue ;; esac   # dedupe
+      UNKNOWN="$UNKNOWN $tgt"
+    done <<INNER_EOF
+$(grep -oE '"to"[[:space:]]*:[[:space:]]*"[a-z][a-z0-9_-]*"' "$CLAUDE_MD" 2>/dev/null | sed -E 's/.*"([a-z][a-z0-9_-]*)".*/\1/')
+INNER_EOF
+    if [ -n "$UNKNOWN" ]; then
+      echo -e "  ${ORANGE}⚠${NC} A fő CLAUDE.md olyan inter-agent címzett(ek)re hivatkozik ami NEM létezik ezen az installon:${UNKNOWN}"
+      echo -e "     Ez tipikusan egy régi sablon maradéka. Tisztítsd kézzel, vagy futtasd: ./update.sh --regen-claudemd"
     fi
   fi
 fi
@@ -359,7 +553,11 @@ if [ -d "$MARKETPLACE_PLUGIN_DIR" ]; then
       if grep -q 'SLACK_SMOKE_TEST_ALLOWED=true' "$AGENT_ENV" 2>/dev/null; then
         echo -e "  Slack smoke-test futtatasa ($SLACK_AGENT)..."
         if ! bash "$INSTALL_DIR/scripts/smoke-test-slack-channel.sh" "$SLACK_AGENT"; then
-          echo -e "${RED}FIGYELEM:${NC} Slack smoke-test SIKERTELEN. Ellenorizd a plugin integraciot."
+          if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+            echo -e "${RED}WARNING:${NC} Slack smoke-test FAILED. Check the plugin integration."
+          else
+            echo -e "${RED}FIGYELEM:${NC} Slack smoke-test SIKERTELEN. Ellenőrizd a plugin integrációt."
+          fi
         fi
       fi
     fi
@@ -389,7 +587,11 @@ fi
 if [ "$STASHED_AUTO" = "1" ]; then
   echo -e "  Auto-stash visszaallitasa..."
   if ! git stash pop; then
-    echo -e "${RED}FIGYELEM:${NC} Auto-stash pop konfliktusos -- a stash benne marad a 'git stash list'-ben."
+    if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+      echo -e "${RED}WARNING:${NC} Auto-stash pop had conflicts; the stash remains in 'git stash list'."
+    else
+      echo -e "${RED}FIGYELEM:${NC} Auto-stash pop konfliktusos; a stash benne marad a 'git stash list'-ben."
+    fi
     echo -e "          Manualisan kezeld: git stash list / git stash apply / git stash drop"
   fi
 fi
@@ -400,5 +602,9 @@ echo -e "  Szolgaltatasok ujrainditasa..."
 "$INSTALL_DIR/scripts/start.sh"
 
 echo ""
-echo -e "${GREEN}✓ Frissitve: ${OLD_VERSION} -> ${NEW_VERSION}${NC}"
+if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+  echo -e "${GREEN}✓ Updated: ${OLD_VERSION} -> ${NEW_VERSION}${NC}"
+else
+  echo -e "${GREEN}✓ Frissítve: ${OLD_VERSION} -> ${NEW_VERSION}${NC}"
+fi
 echo ""

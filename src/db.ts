@@ -2,6 +2,7 @@ import Database from 'better-sqlite3'
 import { join } from 'node:path'
 import { existsSync, mkdirSync, readFileSync, renameSync, chmodSync, openSync, closeSync } from 'node:fs'
 import { STORE_DIR, DB_FILENAME, ALLOWED_CHAT_ID, OLLAMA_URL } from './config.js'
+import { getEffectiveSettingValue } from './settings-store.js'
 import { logger } from './logger.js'
 
 let db: Database.Database
@@ -29,13 +30,16 @@ function tightenDbPermissions(dbPath: string): void {
   }
 }
 
-// dbPathOverride is for tests: pass ':memory:' (or a temp path) to open an
-// isolated database instead of the real store/claudeclaw.db. The file-precreate
-// (openSync 'wx') and tightenDbPermissions steps are SKIPPED for an override --
-// they only make sense for a real on-disk store file, and ':memory:' has no path
-// to chmod. This keeps tests idempotent and stops them polluting the prod DB.
+// dbPathOverride is for tests: pass ':memory:' (or a temp file path) to open an
+// isolated database instead of the real store/claudeclaw.db. ':memory:' has no
+// path to chmod, so the file-precreate (openSync 'wx') and tightenDbPermissions
+// steps are skipped for it. A real on-disk override path (e.g. a /tmp temp file)
+// STILL gets pre-create + tighten -- this lets the permission tests exercise the
+// tightening logic on a throwaway file instead of touching the prod DB. The
+// STORE_DIR mkdir stays prod-only; a temp-file override owns its own directory.
 export function initDatabase(dbPathOverride?: string): void {
   const useOverride = dbPathOverride !== undefined
+  const isMemory = dbPathOverride === ':memory:'
   if (!useOverride) mkdirSync(STORE_DIR, { recursive: true })
   // Idempotent re-init: close a previous handle before opening a new one
   // so repeated calls (tests, hot-reload, recovery paths) do not leak
@@ -47,8 +51,8 @@ export function initDatabase(dbPathOverride?: string): void {
   // Step 1: close the TOCTOU window on fresh installs. openSync with 'wx'
   // + 0o600 creates the file ONLY if it doesn't exist and sets the strict
   // mode atomically. better-sqlite3 then opens the existing file rather
-  // than creating one at the default umask. Skipped for a test override.
-  if (!useOverride && !existsSync(dbPath)) {
+  // than creating one at the default umask. Skipped only for ':memory:'.
+  if (!isMemory && !existsSync(dbPath)) {
     try {
       closeSync(openSync(dbPath, 'wx', 0o600))
     } catch (err) {
@@ -62,7 +66,7 @@ export function initDatabase(dbPathOverride?: string): void {
   }
   db = new Database(dbPath)
   db.pragma('journal_mode = WAL')
-  if (!useOverride) tightenDbPermissions(dbPath)
+  if (!isMemory) tightenDbPermissions(dbPath)
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions (
@@ -494,6 +498,35 @@ export function initDatabase(dbPathOverride?: string): void {
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_idea_box_status ON idea_box(status)`)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_idea_box_category ON idea_box(category)`)
+  // impact/effort scoring -- added after initial release; safe ALTER on existing DBs
+  try { db.exec('ALTER TABLE idea_box ADD COLUMN impact INTEGER') } catch { /* already exists */ }
+  try { db.exec('ALTER TABLE idea_box ADD COLUMN effort INTEGER') } catch { /* already exists */ }
+
+  // --- Idea Comments ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS idea_comments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      idea_id TEXT NOT NULL,
+      author TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_idea_comments_idea ON idea_comments(idea_id)`)
+
+  // --- Idea Status Log ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS idea_status_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      idea_id TEXT NOT NULL,
+      from_status TEXT,
+      to_status TEXT NOT NULL,
+      actor TEXT NOT NULL DEFAULT 'system',
+      note TEXT,
+      created_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_idea_status_log_idea ON idea_status_log(idea_id, created_at)`)
 
   // --- Tool Call Log (auto-recorder) ---
   db.exec(`
@@ -524,6 +557,26 @@ export function initDatabase(dbPathOverride?: string): void {
     )
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_config_change_log_key ON config_change_log(key, created_at)`)
+
+  // --- Store File Audit (fs-watch events on store/) ---
+  // Records every write/rename in the store/ directory. Content is NEVER
+  // stored -- only path, event type and file size. Sensitive files
+  // (.dashboard-token, vault.json, .vault-key) are flagged so the UI can
+  // render them without leaking values.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS store_file_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rel_path TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      is_sensitive INTEGER NOT NULL DEFAULT 0,
+      file_size INTEGER,
+      agent TEXT,
+      created_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_store_file_audit_ts ON store_file_audit(created_at)`)
+  // Migration: add agent column to installs that created the table before this column existed.
+  try { db.exec(`ALTER TABLE store_file_audit ADD COLUMN agent TEXT`) } catch { /* column already exists */ }
 
   // One-shot migration from the old JSON file (which had a read-modify-write
   // race). Import rows if they exist, then rename the file so we don't keep
@@ -1024,11 +1077,12 @@ export interface KanbanComment {
 }
 
 export function listKanbanCards(): KanbanCard[] {
-  const thirtyDaysAgo = Math.floor(Date.now() / 1000) - 30 * 86400
-  // Auto-archive done cards older than 30 days
+  const archiveDays = Number(getEffectiveSettingValue('KANBAN_ARCHIVE_DONE_DAYS'))
+  const archiveCutoff = Math.floor(Date.now() / 1000) - archiveDays * 86400
+  // Auto-archive done cards older than KANBAN_ARCHIVE_DONE_DAYS days
   db.prepare(
     "UPDATE kanban_cards SET archived_at = ? WHERE status = 'done' AND archived_at IS NULL AND updated_at < ?"
-  ).run(Math.floor(Date.now() / 1000), thirtyDaysAgo)
+  ).run(Math.floor(Date.now() / 1000), archiveCutoff)
   return db
     .prepare('SELECT rowid AS seq, * FROM kanban_cards WHERE archived_at IS NULL ORDER BY sort_order ASC')
     .all() as KanbanCard[]
@@ -1104,6 +1158,57 @@ export function markKanbanCardDispatched(id: string): boolean {
 export function archiveKanbanCard(id: string): boolean {
   const now = Math.floor(Date.now() / 1000)
   return db.prepare('UPDATE kanban_cards SET archived_at=?, updated_at=? WHERE id=?').run(now, now, id).changes > 0
+}
+
+export function unarchiveKanbanCard(id: string): boolean {
+  const now = Math.floor(Date.now() / 1000)
+  return db.prepare('UPDATE kanban_cards SET archived_at=NULL, updated_at=? WHERE id=? AND archived_at IS NOT NULL').run(now, id).changes > 0
+}
+
+export interface ArchivedKanbanCard {
+  id: string
+  title: string
+  status: string
+  project: string | null
+  priority: string
+  assignee: string | null
+  archived_at: number
+  updated_at: number
+}
+
+export function listArchivedKanbanCards(opts: {
+  q?: string
+  project?: string
+  label?: string
+  from?: number
+  to?: number
+  limit: number
+}): ArchivedKanbanCard[] {
+  const { q, project, label, from, to, limit } = opts
+  let sql = `
+    SELECT DISTINCT kc.id, kc.title, kc.status, kc.project, kc.priority, kc.assignee, kc.archived_at, kc.updated_at
+    FROM kanban_cards kc
+  `
+  const params: unknown[] = []
+  if (label) {
+    sql += `
+      JOIN kanban_card_labels kcl ON kcl.card_id = kc.id
+      JOIN labels l ON l.id = kcl.label_id AND l.name = ?
+    `
+    params.push(label)
+  }
+  sql += ' WHERE kc.archived_at IS NOT NULL'
+  if (project) { sql += ' AND kc.project = ?'; params.push(project) }
+  if (from)    { sql += ' AND kc.archived_at >= ?'; params.push(from) }
+  if (to)      { sql += ' AND kc.archived_at <= ?'; params.push(to) }
+  if (q) {
+    sql += ' AND (kc.title LIKE ? OR kc.project LIKE ? OR kc.assignee LIKE ?)'
+    const like = `%${q}%`
+    params.push(like, like, like)
+  }
+  sql += ' ORDER BY kc.archived_at DESC LIMIT ?'
+  params.push(limit)
+  return db.prepare(sql).all(...params) as ArchivedKanbanCard[]
 }
 
 export function listKanbanProjects(): string[] {
@@ -1715,6 +1820,8 @@ export interface IdeaBoxRow {
   status: 'new' | 'reviewed' | 'kanban' | 'rejected'
   source: string
   kanban_id: string | null
+  impact: number | null
+  effort: number | null
   created_at: number
   updated_at: number
 }
@@ -1731,12 +1838,12 @@ export function listIdeas(opts?: { status?: string; category?: string }): IdeaBo
 export function createIdea(idea: Omit<IdeaBoxRow, 'created_at' | 'updated_at'>): void {
   const now = Math.floor(Date.now() / 1000)
   db.prepare(
-    `INSERT INTO idea_box (id, title, description, category, status, source, kanban_id, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(idea.id, idea.title, idea.description ?? null, idea.category, idea.status, idea.source, idea.kanban_id ?? null, now, now)
+    `INSERT INTO idea_box (id, title, description, category, status, source, kanban_id, impact, effort, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(idea.id, idea.title, idea.description ?? null, idea.category, idea.status, idea.source, idea.kanban_id ?? null, idea.impact ?? null, idea.effort ?? null, now, now)
 }
 
-export function updateIdea(id: string, patch: Partial<Pick<IdeaBoxRow, 'title' | 'description' | 'category' | 'status' | 'kanban_id'>>): boolean {
+export function updateIdea(id: string, patch: Partial<Pick<IdeaBoxRow, 'title' | 'description' | 'category' | 'status' | 'kanban_id' | 'impact' | 'effort'>>): boolean {
   const now = Math.floor(Date.now() / 1000)
   const sets: string[] = ['updated_at = ?']
   const params: unknown[] = [now]
@@ -1745,6 +1852,8 @@ export function updateIdea(id: string, patch: Partial<Pick<IdeaBoxRow, 'title' |
   if (patch.category !== undefined) { sets.push('category = ?'); params.push(patch.category) }
   if (patch.status !== undefined) { sets.push('status = ?'); params.push(patch.status) }
   if (patch.kanban_id !== undefined) { sets.push('kanban_id = ?'); params.push(patch.kanban_id) }
+  if (patch.impact !== undefined) { sets.push('impact = ?'); params.push(patch.impact) }
+  if (patch.effort !== undefined) { sets.push('effort = ?'); params.push(patch.effort) }
   params.push(id)
   return db.prepare(`UPDATE idea_box SET ${sets.join(', ')} WHERE id = ?`).run(...params).changes > 0
 }
@@ -1755,6 +1864,69 @@ export function deleteIdea(id: string): boolean {
 
 export function listIdeaCategories(): string[] {
   return (db.prepare('SELECT DISTINCT category FROM idea_box ORDER BY category').all() as { category: string }[]).map(r => r.category)
+}
+
+// --- Idea Comments ---
+
+export interface IdeaComment {
+  id: number
+  idea_id: string
+  author: string
+  content: string
+  created_at: number
+}
+
+export function getIdeaComments(ideaId: string): IdeaComment[] {
+  return db.prepare('SELECT * FROM idea_comments WHERE idea_id = ? ORDER BY created_at ASC').all(ideaId) as IdeaComment[]
+}
+
+export function addIdeaComment(ideaId: string, author: string, content: string): IdeaComment {
+  const now = Math.floor(Date.now() / 1000)
+  const info = db.prepare(
+    'INSERT INTO idea_comments (idea_id, author, content, created_at) VALUES (?, ?, ?, ?)'
+  ).run(ideaId, author, content, now)
+  db.prepare('UPDATE idea_box SET updated_at = ? WHERE id = ?').run(now, ideaId)
+  return { id: Number(info.lastInsertRowid), idea_id: ideaId, author, content, created_at: now }
+}
+
+// --- Idea Status Log ---
+
+export interface IdeaStatusLogRow {
+  id: number
+  idea_id: string
+  from_status: string | null
+  to_status: string
+  actor: string
+  note: string | null
+  created_at: number
+}
+
+export function logIdeaStatusChange(
+  ideaId: string,
+  fromStatus: string | null,
+  toStatus: string,
+  actor: string,
+  note?: string,
+): void {
+  const now = Math.floor(Date.now() / 1000)
+  db.prepare(
+    'INSERT INTO idea_status_log (idea_id, from_status, to_status, actor, note, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+  ).run(ideaId, fromStatus ?? null, toStatus, actor, note ?? null, now)
+}
+
+export function getIdeaStatusLog(ideaId: string): IdeaStatusLogRow[] {
+  return db.prepare('SELECT * FROM idea_status_log WHERE idea_id = ? ORDER BY created_at ASC').all(ideaId) as IdeaStatusLogRow[]
+}
+
+// Revert a promoted idea back to 'reviewed' when its kanban card is deleted or archived.
+// Returns the idea id if a matching idea was found and reverted, null otherwise.
+export function revertIdeaFromKanban(kanbanId: string): string | null {
+  const idea = db.prepare("SELECT id, status FROM idea_box WHERE kanban_id = ? AND status = 'kanban'").get(kanbanId) as { id: string; status: string } | undefined
+  if (!idea) return null
+  const now = Math.floor(Date.now() / 1000)
+  db.prepare("UPDATE idea_box SET status = 'reviewed', kanban_id = NULL, updated_at = ? WHERE id = ?").run(now, idea.id)
+  logIdeaStatusChange(idea.id, 'kanban', 'reviewed', 'system', `Kanban card removed: ${kanbanId}`)
+  return idea.id
 }
 
 // --- Tool Call Log ---
@@ -1861,5 +2033,163 @@ export function getRecentConfigChanges(limit = 200): ConfigChangeLogRow[] {
   // id DESC as a tiebreaker: created_at has 1-second resolution, so two
   // saves in the same second would otherwise sort arbitrarily.
   return db.prepare('SELECT * FROM config_change_log ORDER BY created_at DESC, id DESC LIMIT ?').all(limit) as ConfigChangeLogRow[]
+}
+
+// --- Store File Audit ---
+
+export interface StoreFileAuditRow {
+  id: number
+  rel_path: string
+  event_type: string
+  is_sensitive: number
+  file_size: number | null
+  agent: string | null
+  created_at: number
+}
+
+export function logStoreFileEvent(
+  relPath: string,
+  eventType: string,
+  isSensitive: number,
+  fileSize: number | null,
+  agent: string | null = null,
+): void {
+  const now = Math.floor(Date.now() / 1000)
+  db.prepare(
+    'INSERT INTO store_file_audit (rel_path, event_type, is_sensitive, file_size, agent, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+  ).run(relPath, eventType, isSensitive, fileSize, agent, now)
+}
+
+export function getRecentStoreFileEvents(limit = 200): StoreFileAuditRow[] {
+  return db.prepare('SELECT * FROM store_file_audit ORDER BY created_at DESC, id DESC LIMIT ?').all(limit) as StoreFileAuditRow[]
+}
+
+// --- Unified Audit Log Query ---
+
+export type AuditSource = 'config' | 'idea' | 'store' | 'diary'
+
+export interface AuditLogEntry {
+  id: number
+  source: AuditSource
+  created_at: number
+  actor?: string
+  // config
+  key?: string
+  old_value?: string | null
+  new_value?: string | null
+  // idea
+  idea_id?: string
+  from_status?: string | null
+  to_status?: string
+  note?: string | null
+  // store
+  rel_path?: string
+  event_type?: string
+  is_sensitive?: number
+  file_size?: number | null
+  // diary (daily_logs + memories)
+  agent_id?: string
+  content?: string
+  category?: string
+  keywords?: string
+  entry_type?: 'log' | 'memory'
+}
+
+export function queryAuditLog(opts: {
+  sources: AuditSource[]
+  from?: number
+  to?: number
+  q?: string
+  agent?: string
+  limit: number
+}): AuditLogEntry[] {
+  const { sources, from, to, q, agent, limit } = opts
+  const all: AuditSource[] = ['config', 'idea', 'store', 'diary']
+  const active = sources.length > 0 ? sources : all
+
+  const parts: AuditLogEntry[] = []
+
+  if (active.includes('config')) {
+    let sql = 'SELECT id, key, old_value, new_value, actor, created_at FROM config_change_log WHERE 1=1'
+    const params: unknown[] = []
+    if (from) { sql += ' AND created_at >= ?'; params.push(from) }
+    if (to)   { sql += ' AND created_at <= ?'; params.push(to) }
+    if (q)    { sql += ' AND (key LIKE ? OR old_value LIKE ? OR new_value LIKE ? OR actor LIKE ?)'; const p = `%${q}%`; params.push(p, p, p, p) }
+    sql += ' ORDER BY created_at DESC, id DESC LIMIT ?'; params.push(limit)
+    const rows = db.prepare(sql).all(...params) as ConfigChangeLogRow[]
+    for (const r of rows) parts.push({ ...r, source: 'config' })
+  }
+
+  if (active.includes('idea')) {
+    let sql = 'SELECT id, idea_id, from_status, to_status, actor, note, created_at FROM idea_status_log WHERE 1=1'
+    const params: unknown[] = []
+    if (from) { sql += ' AND created_at >= ?'; params.push(from) }
+    if (to)   { sql += ' AND created_at <= ?'; params.push(to) }
+    if (q)    { sql += ' AND (idea_id LIKE ? OR to_status LIKE ? OR note LIKE ? OR actor LIKE ?)'; const p = `%${q}%`; params.push(p, p, p, p) }
+    sql += ' ORDER BY created_at DESC, id DESC LIMIT ?'; params.push(limit)
+    const rows = db.prepare(sql).all(...params) as Array<{ id: number; idea_id: string; from_status: string | null; to_status: string; actor: string; note: string | null; created_at: number }>
+    for (const r of rows) parts.push({ ...r, source: 'idea' })
+  }
+
+  if (active.includes('store')) {
+    let sql = 'SELECT id, rel_path, event_type, is_sensitive, file_size, agent, created_at FROM store_file_audit WHERE 1=1'
+    const params: unknown[] = []
+    if (from) { sql += ' AND created_at >= ?'; params.push(from) }
+    if (to)   { sql += ' AND created_at <= ?'; params.push(to) }
+    if (agent) { sql += ' AND agent = ?'; params.push(agent) }
+    if (q)    { sql += ' AND (rel_path LIKE ? OR agent LIKE ?)'; const p = `%${q}%`; params.push(p, p) }
+    sql += ' ORDER BY created_at DESC, id DESC LIMIT ?'; params.push(limit)
+    const rows = db.prepare(sql).all(...params) as StoreFileAuditRow[]
+    for (const r of rows) parts.push({ ...r, source: 'store' })
+  }
+
+  if (active.includes('diary')) {
+    // daily_logs
+    let logSql = 'SELECT id, agent_id, content, created_at FROM daily_logs WHERE 1=1'
+    const logParams: unknown[] = []
+    if (from)  { logSql += ' AND created_at >= ?'; logParams.push(from) }
+    if (to)    { logSql += ' AND created_at <= ?'; logParams.push(to) }
+    if (agent) { logSql += ' AND agent_id = ?'; logParams.push(agent) }
+    if (q)     { logSql += ' AND content LIKE ?'; logParams.push(`%${q}%`) }
+    logSql += ' ORDER BY created_at DESC, id DESC LIMIT ?'; logParams.push(limit)
+    const logRows = db.prepare(logSql).all(...logParams) as Array<{ id: number; agent_id: string; content: string; created_at: number }>
+    for (const r of logRows) parts.push({ id: r.id, source: 'diary', created_at: r.created_at, agent_id: r.agent_id, content: r.content, entry_type: 'log' })
+
+    // memories
+    let memSql = 'SELECT id, agent_id, content, category, keywords, created_at FROM memories WHERE 1=1'
+    const memParams: unknown[] = []
+    if (from)  { memSql += ' AND created_at >= ?'; memParams.push(from) }
+    if (to)    { memSql += ' AND created_at <= ?'; memParams.push(to) }
+    if (agent) { memSql += ' AND agent_id = ?'; memParams.push(agent) }
+    if (q)     { memSql += ' AND (content LIKE ? OR keywords LIKE ?)'; memParams.push(`%${q}%`, `%${q}%`) }
+    memSql += ' ORDER BY created_at DESC, id DESC LIMIT ?'; memParams.push(limit)
+    const memRows = db.prepare(memSql).all(...memParams) as Array<{ id: number; agent_id: string; content: string; category: string; keywords: string | null; created_at: number }>
+    for (const r of memRows) parts.push({ id: r.id, source: 'diary', created_at: r.created_at, agent_id: r.agent_id, content: r.content, category: r.category, keywords: r.keywords ?? undefined, entry_type: 'memory' })
+  }
+
+  // Merge and sort by created_at DESC, then id DESC as tiebreaker
+  parts.sort((a, b) => b.created_at - a.created_at || (b.id ?? 0) - (a.id ?? 0))
+  return parts.slice(0, limit)
+}
+
+// Prune all three audit tables to AUDIT_LOG_RETENTION_DAYS. Called from the
+// daily decay sweep so old entries do not accumulate indefinitely.
+export function pruneAuditLogs(): void {
+  const retentionDays = Number(getEffectiveSettingValue('AUDIT_LOG_RETENTION_DAYS'))
+  const cutoff = Math.floor(Date.now() / 1000) - retentionDays * 86400
+  db.prepare('DELETE FROM config_change_log WHERE created_at < ?').run(cutoff)
+  db.prepare('DELETE FROM idea_status_log WHERE created_at < ?').run(cutoff)
+  db.prepare('DELETE FROM store_file_audit WHERE created_at < ?').run(cutoff)
+}
+
+// Prune token_usage rows older than TOKEN_USAGE_RETENTION_DAYS. The table is the
+// main DB-growth driver (one row per inbound token-log event); without this it
+// grows unbounded. Called from the daily decay sweep. `timestamp` is unix
+// SECONDS. Returns the number of rows removed (for logging).
+export function pruneTokenUsage(): number {
+  const retentionDays = Number(getEffectiveSettingValue('TOKEN_USAGE_RETENTION_DAYS'))
+  const cutoff = Math.floor(Date.now() / 1000) - retentionDays * 86400
+  const info = db.prepare('DELETE FROM token_usage WHERE timestamp < ?').run(cutoff)
+  return info.changes
 }
 

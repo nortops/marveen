@@ -7,6 +7,8 @@ import {
   touchMemory,
   saveMemory,
   decayMemories as dbDecay,
+  pruneAuditLogs,
+  pruneTokenUsage,
   getMemoriesForChat,
   listKanbanCardsSummary,
   type Memory,
@@ -152,7 +154,9 @@ export async function saveConversationTurn(
 
 export function runDecaySweep(): void {
   dbDecay()
-  logger.info('Memoria leepulesi sopres vegrehajtva')
+  pruneAuditLogs()
+  const tokenRowsPruned = pruneTokenUsage()
+  logger.info({ tokenRowsPruned }, 'Memoria leepulesi sopres vegrehajtva')
 }
 
 // --- Daily digest ---

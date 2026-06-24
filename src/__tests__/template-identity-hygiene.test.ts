@@ -100,6 +100,34 @@ describe('shipped templates carry no hardcoded identity', () => {
     expect(violations, `Hardcoded identity found in shipped templates:\n${violations.join('\n')}`).toEqual([])
   })
 
+  // web/app.js is the dashboard bundle, shipped verbatim to every install. It
+  // must carry no deployment-specific operator identity: the owner display name
+  // flows from the backend (OWNER_NAME -> /api/marveen -> window._marveen.ownerName,
+  // read via chatOwnerName()), never a hardcoded "Szabolcs"/"Szabi" literal, so a
+  // renamed install labels its real owner. This is the exact regression #369
+  // fixed -- the chat sidebar used to pin/label the owner thread off a
+  // `const CHAT_OWNER_AGENT = 'Szabolcs'` literal. The Marveen product brand and
+  // agent role-names are NOT identity and stay allowed (none match these regexes).
+  it('web/app.js carries no absolute home path, personal email, or default owner-name literal', () => {
+    const violations: string[] = []
+    const file = join(REPO_ROOT, 'web', 'app.js')
+    const text = readText(file)
+    if (text !== null) {
+      text.split('\n').forEach((line, i) => {
+        if (!line.includes('://') && HOME_PATH_RX.test(line)) {
+          violations.push(`web/app.js:${i + 1} absolute home path: ${line.trim().slice(0, 100)}`)
+        }
+        if (PERSONAL_EMAIL_RX.test(line)) {
+          violations.push(`web/app.js:${i + 1} personal email: ${line.trim().slice(0, 100)}`)
+        }
+        if (FOREIGN_DEFAULT_OWNER_RX.test(line)) {
+          violations.push(`web/app.js:${i + 1} default owner name literal (read it from window._marveen.ownerName via chatOwnerName()): ${line.trim().slice(0, 100)}`)
+        }
+      })
+    }
+    expect(violations, `Hardcoded operator identity found in web/app.js:\n${violations.join('\n')}`).toEqual([])
+  })
+
   // scripts/support-mail ships operator tooling that talks to a real mailbox.
   // It must carry no operator identity either: the mailbox address, vault key,
   // owner name and branding flow from config (.env) / {{...}} placeholders, so a
@@ -163,5 +191,27 @@ describe('runtime-seeded placeholders are all substituted', () => {
       unknown,
       `Placeholders used in scheduled-tasks/ that the seed does not substitute: ${unknown.join(', ')}`,
     ).toEqual([])
+  })
+
+  // The distributed updater (update.sh) ships to every install. Its
+  // --reseed-fleet CLAUDE.md identity check detects stale-roster delegation
+  // targets by comparing against the LOCAL agents/ dir at runtime, so the
+  // script itself must never hard-code the origin fleet's roster names (or an
+  // operator's identity) -- otherwise the shipped updater would re-introduce
+  // exactly the leak it is meant to guard against. (The roster list lives here
+  // in the test, never in shipped code.)
+  it('update.sh stays host-agnostic (no hardcoded roster or operator identity)', () => {
+    const updateSh = readFileSync(join(REPO_ROOT, 'update.sh'), 'utf8')
+    for (const name of ['samu', 'zara', 'boni', 'iris', 'deeper', 'slacker']) {
+      expect(
+        new RegExp(`\\b${name}\\b`, 'i').test(updateSh),
+        `update.sh hard-codes fleet roster name "${name}" -- it must compare against agents/ at runtime instead`,
+      ).toBe(false)
+    }
+    for (const line of updateSh.split('\n')) {
+      if (/https?:\/\//.test(line)) continue
+      expect(HOME_PATH_RX.test(line), `update.sh embeds an absolute home path: ${line.trim()}`).toBe(false)
+      expect(PERSONAL_EMAIL_RX.test(line), `update.sh embeds a personal email: ${line.trim()}`).toBe(false)
+    }
   })
 })

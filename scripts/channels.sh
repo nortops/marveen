@@ -196,10 +196,42 @@ $TMUX new-session -d -s "$SESSION" -c "$INSTALL_DIR" \
 #  - "Do you trust the files in this folder?" / "trust" prompts (Y Enter)
 #  - "Welcome to Claude Code" / kezdo vezetes (Enter a folytatashoz)
 # 12 sec timeout ket retry-jal, mert WSL/tmux paint slow lehet first-run-on.
+#
+# EPERM fallback (Claude Code 2.1.183+ regression): launching --channels in a
+# trusted project directory throws EPERM before any dialog appears. Detected
+# below; one auto-restart from /tmp where the trust dialog fires instead.
+_eperm_restarted=0
 for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
   sleep 1
   pane=$($TMUX capture-pane -t "$SESSION" -p 2>/dev/null || true)
   case "$pane" in
+    *"EPERM"*|*"Operation not permitted"*|*"operation not permitted"*)
+      if [ "$_eperm_restarted" = "0" ]; then
+        _eperm_restarted=1
+        $TMUX kill-session -t "$SESSION" 2>/dev/null
+        _CHANNELS_STARTDIR="$(mktemp -d /tmp/marveen-channels-XXXXXX)"
+        # Carry the project CLAUDE.md into the fallback cwd so the session keeps
+        # Marveen's instructions/personality instead of running as a generic,
+        # context-less assistant (the biggest degradation of the /tmp fallback).
+        # Best-effort: a symlink failure degrades to the prior behaviour and
+        # never blocks startup. The trust dialog for the fresh /tmp path still
+        # fires and is handled by the guard below; EPERM is keyed on the
+        # registered project path, not on file presence, so seeding CLAUDE.md
+        # does not re-trigger it.
+        #
+        # NOTE: the project-scoped MCP servers (gmail/calendar) are NOT restored
+        # here. Claude Code keys those by project PATH in ~/.claude.json, not in
+        # the project .mcp.json, so a random /tmp path has no entry and symlinking
+        # files cannot bring them back. Restoring them needs a separate, more
+        # invasive change (a stable fallback dir + a seeded ~/.claude.json project
+        # entry); see the PR description / card 7EB18437.
+        [ -e "$INSTALL_DIR/CLAUDE.md" ] && ln -sf "$INSTALL_DIR/CLAUDE.md" "$_CHANNELS_STARTDIR/CLAUDE.md" 2>/dev/null || true
+        $TMUX new-session -d -s "$SESSION" -c "$_CHANNELS_STARTDIR" \
+          "$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}"
+        unset _CHANNELS_STARTDIR
+      fi
+      continue
+      ;;
     *"Bypass Permissions mode"*"Yes, I accept"*)
       $TMUX send-keys -t "$SESSION" "2" Enter
       sleep 1
@@ -220,6 +252,7 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
       ;;
   esac
 done
+unset _eperm_restarted
 
 # Set agent name once the session is ready. (/remote-control dropped: the operator no
 # longer uses Remote Control.)

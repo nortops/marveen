@@ -15,6 +15,9 @@ NC='\033[0m'
 INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_STEP="init"
 
+# shellcheck source=install-lang.sh
+source "$(dirname "$0")/install-lang.sh"
+
 ok() { echo -e "  ${GREEN}✓${NC} $*"; }
 warn() { echo -e "  ${ORANGE}!${NC} $*"; }
 
@@ -24,17 +27,17 @@ offer_claude_fallback() {
     return
   fi
   echo ""
-  echo -e "${ORANGE}Claude Code elérhető a gépen.${NC}"
+  echo -e "${ORANGE}$(_t macos.claude_available)${NC}"
   local prompt="Marveen installer failed at step \"${step}\". Error: ${err_msg}. Script: install.sh${line_info}. Repo: https://github.com/Szotasz/marveen. OS: macOS $(sw_vers -productVersion 2>/dev/null || echo unknown). Node: $(node -v 2>/dev/null || echo missing). Dir: ${INSTALL_DIR}. Your task: diagnose this Marveen installer failure. The install scripts are install.sh (macOS) and install-linux.sh. Read the relevant section, check for missing dependencies or permission issues, and suggest concrete shell commands to fix."
   if [ -t 0 ]; then
-    read -p "  Megnyissam Claude Code-ot a hiba diagnosztizálásához? (i/n) [n]: " OPEN_CLAUDE
+    read -rp "$(_t prompt_open_claude)" OPEN_CLAUDE
     OPEN_CLAUDE=${OPEN_CLAUDE:-n}
-    if [ "$OPEN_CLAUDE" = "i" ]; then
+    if [[ "$OPEN_CLAUDE" == "i" || "$OPEN_CLAUDE" == "y" ]]; then
       claude --prompt "$prompt"
       return
     fi
   fi
-  echo -e "  ${DIM}Futtasd manuálisan:${NC}"
+  echo -e "  ${DIM}$(_t macos.fallback_manual)${NC}"
   echo -e "  ${DIM}claude --prompt \"$(echo "$prompt" | sed 's/"/\\"/g')\"${NC}"
 }
 
@@ -55,22 +58,30 @@ trap 'on_error $LINENO' ERR
 clear
 echo ""
 echo -e "${BOLD}  ▐▛███▜▌   Marveen${NC}"
-echo -e "${BOLD} ▝▜█████▛▘  AI csapatod, ami fut amig te alszol.${NC}"
+if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+  echo -e "${BOLD} ▝▜█████▛▘  Your AI team, running while you sleep.${NC}"
+else
+  echo -e "${BOLD} ▝▜█████▛▘  $(_t tagline)${NC}"
+fi
 echo -e "${DIM}   ▘▘ ▝▝${NC}"
 echo ""
-echo -e "${DIM}  Telepito wizard - macOS${NC}"
+if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+  echo -e "${DIM}  Setup wizard - macOS${NC}"
+else
+  echo -e "${DIM}$(_t macos.wizard_title)${NC}"
+fi
 echo ""
 
 # Step 1: Check prerequisites
 INSTALL_STEP="prerequisites"
-echo -e "${BOLD}[1/7] Elofeltetelek ellenorzese...${NC}"
+echo -e "${BOLD}$(_t section_1)${NC}"
 
 check_cmd() {
   if command -v "$1" &>/dev/null; then
     echo -e "  ${GREEN}✓${NC} $2"
     return 0
   else
-    echo -e "  ${RED}✗${NC} $2 - hianyzik"
+    echo -e "  ${RED}✗${NC} $2 $(_t macos.missing)"
     return 1
   fi
 }
@@ -92,9 +103,9 @@ fi
 
 if [ "$MISSING" -eq 1 ]; then
   echo ""
-  echo -e "${ORANGE}Hianyzo függőségek telepítése Homebrew-val...${NC}"
+  echo -e "${ORANGE}$(_t macos.install_missing_deps)${NC}"
   if ! command -v brew &>/dev/null; then
-    echo -e "${ORANGE}Homebrew nincs telepítve. Megprobalom most (sudo jelszo kellhet)...${NC}"
+    echo -e "${ORANGE}$(_t macos.installing_homebrew)${NC}"
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
     # Homebrew on Apple Silicon installs to /opt/homebrew; add it to PATH now
     # so subsequent `brew` calls in this script succeed without a shell restart.
@@ -110,20 +121,20 @@ if [ "$MISSING" -eq 1 ]; then
   command -v node &>/dev/null || brew install node@22
   command -v tmux &>/dev/null || brew install tmux
   command -v git &>/dev/null || brew install git
-  echo -e "${GREEN}✓ Függőségek telepítve${NC}"
+  echo -e "${GREEN}$(_t macos.deps_installed)${NC}"
 fi
 
 # Bun (required by Telegram channels plugin)
 export PATH="$HOME/.bun/bin:$PATH"
 if ! command -v bun &>/dev/null; then
-  echo -e "  ${ORANGE}Bun telepítése (Telegram plugin függőség)...${NC}"
+  echo -e "  ${ORANGE}$(_t macos.installing_bun)${NC}"
   curl -fsSL https://bun.sh/install | bash 2>/dev/null
   # Source the profile that bun installer modified
   [ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null
   [ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc" 2>/dev/null
   export PATH="$HOME/.bun/bin:$PATH"
   if ! command -v bun &>/dev/null; then
-    echo -e "  ${RED}✗${NC} Bun telepites sikertelen. Probalj manuálisan: curl -fsSL https://bun.sh/install | bash"
+    echo -e "  ${RED}✗${NC} $(_t macos.bun_install_failed)"
   fi
 fi
 check_cmd "bun" "Bun runtime"
@@ -131,10 +142,10 @@ check_cmd "bun" "Bun runtime"
 # Check Claude Code CLI
 echo ""
 if ! command -v claude &>/dev/null; then
-  echo -e "  ${RED}✗${NC} Claude Code CLI - hianyzik"
-  echo -e "${ORANGE}Telepites: npm install -g @anthropic-ai/claude-code${NC}"
-  read -p "Telepitsem most? (i/n) " INSTALL_CLAUDE
-  if [ "$INSTALL_CLAUDE" = "i" ]; then
+  echo -e "  ${RED}✗${NC} $(_t macos.claude_missing)"
+  echo -e "${ORANGE}$(_t macos.install_claude_hint)${NC}"
+  read -rp "$(_t prompt_install_claude)" INSTALL_CLAUDE
+  if [[ "$INSTALL_CLAUDE" == "i" || "$INSTALL_CLAUDE" == "y" ]]; then
     npm install -g @anthropic-ai/claude-code
   else
     fail "Claude Code CLI szukseges a futtatashoz. Telepitsd: npm install -g @anthropic-ai/claude-code"
@@ -192,22 +203,22 @@ echo -e "  ${GREEN}✓${NC} Claude Code first-run flags pre-set"
 INSTALL_STEP="claude-auth"
 # Step 2b: Claude authentication (kept tolerant -- ha megakad, folytatjuk)
 echo ""
-echo -e "${BOLD}[2/7] Claude bejelentkezes${NC}"
-echo -e "${DIM}  Ha meg nem jelentkeztel be, most megteheted.${NC}"
-echo -e "${DIM}  Ha a browser-os authorize-flow megakad, Ctrl+C-vel kilephetsz${NC}"
-echo -e "${DIM}  -- a telepites folytatodik, kesobb manualisan tudsz belepni.${NC}"
-read -p "  Szeretned most bejelentkezni? (i/n) " DO_AUTH
-if [ "$DO_AUTH" = "i" ]; then
+echo -e "${BOLD}$(_t section_2_macos)${NC}"
+echo -e "${DIM}$(_t macos.auth_hint_1)${NC}"
+echo -e "${DIM}$(_t macos.auth_hint_2)${NC}"
+echo -e "${DIM}$(_t macos.auth_hint_3)${NC}"
+read -rp "$(_t prompt_login)" DO_AUTH
+if [[ "$DO_AUTH" == "i" || "$DO_AUTH" == "y" ]]; then
   set +e
   claude auth login
   AUTH_RC=$?
   set -e
   if [ "$AUTH_RC" -ne 0 ]; then
     echo -e "  ${ORANGE}⚠${NC} Auth login nem fejezodott be sikeresen (exit $AUTH_RC)."
-    echo -e "  ${DIM}A telepites folytatodik. Belepheted kesobb: ${BOLD}claude auth login${NC}"
+    echo -e "  ${DIM}$(_t macos.auth_later)${NC}"
   fi
 fi
-echo -e "  ${GREEN}✓${NC} Claude Code first-run beállítás kész"
+echo -e "  ${GREEN}✓${NC} $(_t macos.firstrun_done)"
 
 # Pre-flight headless probe — Issue #179.
 # `claude auth login` may exit 0 even when the resulting token is unusable for
@@ -215,15 +226,15 @@ echo -e "  ${GREEN}✓${NC} Claude Code first-run beállítás kész"
 # agent-create flow runs `claude --print` under the hood; surface the failure
 # here while the user is still at the install prompt.
 echo ""
-echo -e "  ${DIM}Headless Claude Code teszt...${NC}"
+echo -e "  ${DIM}$(_t macos.headless_test)${NC}"
 set +e
 CLAUDE_PROBE_OUT=$(claude --print "ping" 2>&1 | head -c 200)
 CLAUDE_PROBE_EXIT=$?
 set -e
 if [ "$CLAUDE_PROBE_EXIT" -eq 0 ] && [ -n "$CLAUDE_PROBE_OUT" ]; then
-  echo -e "  ${GREEN}✓${NC} Headless Claude Code futtathato (\`claude --print\` valaszolt)"
+  echo -e "  ${GREEN}✓${NC} $(_t macos.headless_ok)"
 else
-  warn "Headless Claude Code probe SIKERTELEN. Az agent-letrehozas KESOBB EL fog hasalni."
+  warn "$(_t macos.headless_fail)"
   echo -e "    ${DIM}Kimenet: ${CLAUDE_PROBE_OUT:-<ures>}${NC}"
   echo -e "    ${DIM}Tipikus okok: nincs ervenyes auth, halozati problema, regi claude CLI.${NC}"
   echo -e "    ${DIM}Javitas: \`claude --version\` -> \`claude /login\` (vagy ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN beallitas) -> \`claude --print \"ping\"\` ujra.${NC}"
@@ -232,8 +243,8 @@ fi
 INSTALL_STEP="personal-info"
 # Step 3: Personal info
 echo ""
-echo -e "${BOLD}[3/7] Személyes beállítások${NC}"
-read -p "  Mi a neved? " OWNER_NAME
+echo -e "${BOLD}$(_t section_3_macos)${NC}"
+read -rp "$(_t prompt_your_name)" OWNER_NAME
 # Chat ID is NOT asked here -- the user doesn't know it yet.
 # It will be set automatically during the Telegram pairing flow.
 CHAT_ID="0"
@@ -241,12 +252,12 @@ CHAT_ID="0"
 INSTALL_STEP="channel-setup"
 # Step 4: Channel provider setup
 echo ""
-echo -e "${BOLD}[4/7] Csatorna beállítás${NC}"
-echo -e "${DIM}  Melyik csatornan kommunikaljon az AI asszisztensed?${NC}"
-echo -e "  ${BOLD}1.${NC} Telegram (alapertelmezett)"
+echo -e "${BOLD}$(_t section_4_macos)${NC}"
+echo -e "${DIM}$(_t macos.channel_select_hint)${NC}"
+echo -e "  ${BOLD}1.${NC} $(_t macos.channel_option_1)"
 echo -e "  ${BOLD}2.${NC} Slack"
 echo ""
-read -p "  Valassz (1/2) [1]: " PROVIDER_CHOICE
+read -rp "$(_t prompt_channel_select_macos)" PROVIDER_CHOICE
 PROVIDER_CHOICE=${PROVIDER_CHOICE:-1}
 if [ "$PROVIDER_CHOICE" = "2" ]; then
   CHANNEL_PROVIDER="slack"
@@ -267,7 +278,7 @@ if [ "$CHANNEL_PROVIDER" = "telegram" ]; then
   echo -e "${DIM}  3. Adj nevet a botodnak${NC}"
   echo -e "${DIM}  4. Masold ide a kapott tokent:${NC}"
   echo ""
-  read -p "  Telegram bot token (vagy hagyd uresen, kesobb is beallithatod): " BOT_TOKEN
+  read -rp "$(_t prompt_telegram_token)" BOT_TOKEN
 else
   echo ""
   echo -e "${DIM}  Az AI asszisztensed Slack-en kommunikal veled.${NC}"
@@ -281,8 +292,8 @@ else
   echo -e "${DIM}     app_mention, message.channels, message.groups, message.im${NC}"
   echo -e "${DIM}  5. Installald a workspace-be${NC}"
   echo ""
-  read -p "  Bot Token (xoxb-...): " SLACK_BOT_TOKEN
-  read -p "  App-Level Token (xapp-...): " SLACK_APP_TOKEN
+  read -rp "$(_t prompt_slack_bot_token)" SLACK_BOT_TOKEN
+  read -rp "$(_t prompt_slack_app_token)" SLACK_APP_TOKEN
 
   # Managed settings: Claude Code requires allowedChannelPlugins at system level
   MANAGED_DIR="/Library/Application Support/ClaudeCode"
@@ -301,7 +312,7 @@ try:
 except: sys.exit(1)
 " 2>/dev/null && echo "yes" || echo "no")
     if [ "$HAS_SLACK" = "no" ]; then
-      echo -e "  ${ORANGE}⚠${NC} A managed-settings.json frissítése szükséges (sudo)."
+      echo -e "  ${ORANGE}⚠${NC} $(_t macos.managed_update)"
       echo "$REQUIRED_JSON" | sudo python3 -c "
 import json, sys
 new = json.loads(sys.stdin.read())
@@ -315,19 +326,19 @@ for entry in new['allowedChannelPlugins']:
 existing['allowedChannelPlugins'] = plugins
 print(json.dumps(existing, indent=2))
 " | sudo tee "$MANAGED_FILE" > /dev/null
-      echo -e "  ${GREEN}✓${NC} managed-settings.json frissítve"
+      echo -e "  ${GREEN}✓${NC} $(_t macos.managed_updated)"
     else
-      echo -e "  ${GREEN}✓${NC} managed-settings.json mar tartalmazza a Slack plugint"
+      echo -e "  ${GREEN}✓${NC} $(_t macos.managed_has_slack)"
     fi
   else
-    echo -e "  ${ORANGE}⚠${NC} Managed settings létrehozása szükséges (sudo)."
+    echo -e "  ${ORANGE}⚠${NC} $(_t macos.managed_create)"
     sudo mkdir -p "$MANAGED_DIR"
     echo "$REQUIRED_JSON" | python3 -c "import json,sys; print(json.dumps(json.loads(sys.stdin.read()),indent=2))" | sudo tee "$MANAGED_FILE" > /dev/null
-    echo -e "  ${GREEN}✓${NC} managed-settings.json létrehozva"
+    echo -e "  ${GREEN}✓${NC} $(_t macos.managed_created)"
   fi
 fi
 
-read -p "  Mi legyen a botod neve? [Marveen]: " BOT_NAME
+read -rp "$(_t prompt_bot_name)" BOT_NAME
 BOT_NAME=${BOT_NAME:-"Marveen"}
 
 # Derive the ASCII slug the backend uses everywhere (tmux sessions, plist
@@ -342,7 +353,7 @@ print(s or 'marveen')
 PYEOF
 )
 if [ "$MAIN_AGENT_ID" != "marveen" ]; then
-  echo -e "  ${DIM}Ügynök belső azonosító: ${MAIN_AGENT_ID}${NC}"
+  echo -e "  ${DIM}$(_t macos.agent_id_info)${MAIN_AGENT_ID}${NC}"
 fi
 
 # Product / system brand. Per Szabi's decision the installer does NOT prompt for
@@ -357,25 +368,25 @@ SERVICE_ID="$MAIN_AGENT_ID"
 # Step 5: Install dependencies
 INSTALL_STEP="npm-install"
 echo ""
-echo -e "${BOLD}[5/7] Függőségek telepítése...${NC}"
+echo -e "${BOLD}$(_t section_5)${NC}"
 cd "$INSTALL_DIR"
 if ! npm install --loglevel warn || ! npm rebuild better-sqlite3 --build-from-source; then
   fail "npm install sikertelen. Ellenorizd a hibauzeneteket fentebb."
 fi
-ok "npm csomagok telepítve"
+ok "$(_t macos.npm_done)"
 
 # Build TypeScript
 INSTALL_STEP="typescript-build"
-echo -e "  Forditas..."
+echo -e "$(_t macos.building)"
 if ! npm run build --loglevel warn; then
   fail "TypeScript forditas sikertelen. Ellenorizd a hibauzeneteket fentebb."
 fi
-ok "TypeScript leforditva"
+ok "$(_t macos.ts_built)"
 
 INSTALL_STEP="configuration"
 # Step 6: Configuration
 echo ""
-echo -e "${BOLD}[6/7] Konfiguráció létrehozása...${NC}"
+echo -e "${BOLD}$(_t section_6_macos)${NC}"
 
 # Create .env
 (umask 077 && cat > "$INSTALL_DIR/.env" << ENVEOF
@@ -397,12 +408,12 @@ else
   echo "SLACK_APP_TOKEN=${SLACK_APP_TOKEN}" >> "$INSTALL_DIR/.env"
 fi
 chmod 600 "$INSTALL_DIR/.env"
-echo -e "  ${GREEN}✓${NC} .env létrehozva (chmod 600)"
+echo -e "  ${GREEN}✓${NC} $(_t macos.env_created)"
 
 # Create store directory
 mkdir -p "$INSTALL_DIR/store"
 mkdir -p "$INSTALL_DIR/agents"
-echo -e "  ${GREEN}✓${NC} Könyvtárak létrehozva"
+echo -e "  ${GREEN}✓${NC} $(_t macos.dirs_created)"
 
 # Generate CLAUDE.md from template
 if [ -f "$INSTALL_DIR/templates/CLAUDE.md.template" ]; then
@@ -412,7 +423,7 @@ if [ -f "$INSTALL_DIR/templates/CLAUDE.md.template" ]; then
       -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
       -e "s/{{MAIN_AGENT_ID}}/$MAIN_AGENT_ID/g" \
       "$INSTALL_DIR/templates/CLAUDE.md.template" > "$INSTALL_DIR/CLAUDE.md"
-  echo -e "  ${GREEN}✓${NC} CLAUDE.md generalva"
+  echo -e "  ${GREEN}✓${NC} $(_t macos.claude_md_generated)"
 else
   echo -e "  ${ORANGE}⚠${NC} CLAUDE.md.template nem talalhato, CLAUDE.md nem generalhato"
 fi
@@ -424,7 +435,7 @@ if [ -f "$INSTALL_DIR/templates/SOUL.md.template" ] && [ ! -f "$INSTALL_DIR/SOUL
   sed -e "s/{{OWNER_NAME}}/$OWNER_NAME/g" \
       -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
       "$INSTALL_DIR/templates/SOUL.md.template" > "$INSTALL_DIR/SOUL.md"
-  echo -e "  ${GREEN}✓${NC} SOUL.md generalva"
+  echo -e "  ${GREEN}✓${NC} $(_t macos.soul_md_generated)"
 elif [ ! -f "$INSTALL_DIR/templates/SOUL.md.template" ] && [ ! -f "$INSTALL_DIR/SOUL.md" ]; then
   echo -e "  ${ORANGE}⚠${NC} SOUL.md.template nem talalhato, SOUL.md nem generalhato"
 fi
@@ -473,7 +484,7 @@ if [ "$CHANNEL_PROVIDER" = "telegram" ] && [ -n "$BOT_TOKEN" ]; then
   "pending": {}
 }
 ACCESSEOF
-  echo -e "  ${GREEN}✓${NC} Telegram csatorna konfigurálva"
+  echo -e "  ${GREEN}✓${NC} $(_t macos.tg_channel_configured)"
 elif [ "$CHANNEL_PROVIDER" = "slack" ] && [ -n "$SLACK_BOT_TOKEN" ]; then
   (umask 077 && cat > "$CHANNEL_DIR/.env" << SLACKENVEOF
 SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN
@@ -489,7 +500,7 @@ SLACKENVEOF
   "pending": {}
 }
 ACCESSEOF
-  echo -e "  ${GREEN}✓${NC} Slack csatorna konfigurálva"
+  echo -e "  ${GREEN}✓${NC} $(_t macos.slack_channel_configured)"
 fi
 
 # Install channel plugin
@@ -508,13 +519,13 @@ claude plugin marketplace add "$PLUGIN_MARKETPLACE" 2>/dev/null || true
 if claude plugin install "$PLUGIN_ID" 2>/dev/null; then
   ok "${CHANNEL_PROVIDER} plugin telepitve"
 else
-  echo -e "  ${ORANGE}Elso probalkozas sikertelen, ujraprobalok...${NC}"
+  echo -e "  ${ORANGE}$(_t macos.plugin_retry)${NC}"
   sleep 2
   if claude plugin install "$PLUGIN_ID" 2>/dev/null; then
     ok "${CHANNEL_PROVIDER} plugin telepitve (masodik probalkozassal)"
   else
     echo -e "  ${RED}✗${NC} ${CHANNEL_PROVIDER} plugin telepites sikertelen."
-    echo -e "  ${BOLD}Futtasd kesobb kezzel:${NC}"
+    echo -e "  ${BOLD}$(_t macos.plugin_manual_hint)${NC}"
     echo -e "  ${BLUE}claude plugin install ${PLUGIN_ID}${NC}"
     echo ""
   fi
@@ -535,7 +546,7 @@ SKILLS_DIR="$HOME/.claude/skills"
 if [ -d "$INSTALL_DIR/skills/skill-factory" ]; then
   mkdir -p "$SKILLS_DIR/skill-factory"
   cp -r "$INSTALL_DIR/skills/skill-factory/"* "$SKILLS_DIR/skill-factory/"
-  echo -e "  ${GREEN}✓${NC} skill-factory telepítve"
+  echo -e "  ${GREEN}✓${NC} $(_t macos.skill_factory_installed)"
 fi
 
 # Seed skills: fleet-level skills from seed-skills/ into ~/.claude/skills/
@@ -560,7 +571,7 @@ if [ -d "$SEED_SKILLS_DIR" ]; then
     SEED_NEW=$((SEED_NEW + 1))
   done
   if [ "$SEED_NEW" -gt 0 ] || [ "$SEED_SKIP" -gt 0 ]; then
-    echo -e "  ${GREEN}✓${NC} Seed skills: ${SEED_NEW} új, ${SEED_SKIP} kihagyva (már létezik)"
+    echo -e "  ${GREEN}✓${NC} Seed skills: ${SEED_NEW} new, ${SEED_SKIP} skipped"
   fi
 fi
 
@@ -593,14 +604,14 @@ if [ -d "$SEED_SCHED_DIR" ]; then
     SCHED_NEW=$((SCHED_NEW + 1))
   done
   if [ "$SCHED_NEW" -gt 0 ] || [ "$SCHED_SKIP" -gt 0 ]; then
-    echo -e "  ${GREEN}✓${NC} Seed scheduled tasks: ${SCHED_NEW} új, ${SCHED_SKIP} kihagyva"
+    echo -e "  ${GREEN}✓${NC} Seed scheduled tasks: ${SCHED_NEW} new, ${SCHED_SKIP} skipped"
   fi
   # Init state files for seeded tasks
   if [ "$SCHED_NEW" -gt 0 ]; then
     STATE_FILE="$INSTALL_DIR/store/kanban-audit-state.json"
     if [ ! -f "$STATE_FILE" ]; then
       echo '{"last_audit_at":null}' > "$STATE_FILE"
-      echo -e "  ${GREEN}✓${NC} kanban-audit state inicializálva"
+      echo -e "  ${GREEN}✓${NC} $(_t macos.kanban_state_init)"
     fi
   fi
 
@@ -610,7 +621,7 @@ if [ -d "$SEED_SCHED_DIR" ]; then
   if [ -d "$BB_SEED_TI" ] && [ ! -d "$BB_TARGET_TI" ]; then
     mkdir -p "$BB_TARGET_TI"
     cp "$BB_SEED_TI"/*.json "$BB_TARGET_TI/" 2>/dev/null
-    echo -e "  ${GREEN}✓${NC} Bumblebee threat-intel katalógusok telepítve"
+    echo -e "  ${GREEN}✓${NC} $(_t macos.bumblebee_installed)"
   fi
 fi
 
@@ -630,35 +641,35 @@ fi
 
 # Ollama + nomic-embed-text (szemantikus kereséshez)
 echo ""
-echo -e "  Ollama ellenőrzés (szemantikus memória kereséshez)..."
+echo -e "$(_t macos.ollama_check)"
 if command -v ollama &>/dev/null; then
-  echo -e "  ${GREEN}✓${NC} Ollama telepítve"
+  echo -e "  ${GREEN}✓${NC} $(_t macos.ollama_installed)"
 else
-  echo -e "  ${ORANGE}Ollama telepítése...${NC}"
+  echo -e "  ${ORANGE}$(_t macos.ollama_installing)${NC}"
   brew install ollama 2>/dev/null || curl -fsSL https://ollama.com/install.sh | sh
 fi
 
 # Start Ollama if not running
 if ! curl -s http://localhost:11434/api/version &>/dev/null; then
-  echo -e "  Ollama indítás..."
+  echo -e "$(_t macos.ollama_starting)"
   ollama serve &>/dev/null &
   sleep 3
 fi
 
 # Pull nomic-embed-text model
 if ! ollama list 2>/dev/null | grep -q "nomic-embed-text"; then
-  echo -e "  nomic-embed-text modell letöltése (~274 MB)..."
+  echo -e "$(_t macos.nomic_downloading)"
   ollama pull nomic-embed-text
 fi
-echo -e "  ${GREEN}✓${NC} Ollama + nomic-embed-text kész"
+echo -e "$(_t macos.ollama_done)"
 
 # Whisper (speech-to-text for video transcription)
 echo ""
-echo -e "  Whisper telepítés (beszéd -> szöveg leirat)..."
+echo -e "$(_t macos.whisper_installing)"
 if command -v mlx_whisper &>/dev/null || [ -f "$HOME/.local/bin/mlx_whisper" ]; then
-  echo -e "  ${GREEN}✓${NC} mlx-whisper már telepítve (Apple Silicon optimalizált)"
+  echo -e "  ${GREEN}✓${NC} $(_t macos.mlx_whisper_installed)"
 elif command -v whisper &>/dev/null; then
-  echo -e "  ${GREEN}✓${NC} whisper már telepítve"
+  echo -e "  ${GREEN}✓${NC} $(_t macos.whisper_installed)"
   echo -e "  ${DIM}  Tipp: pipx install mlx-whisper gyorsabb Apple Silicon-on${NC}"
 else
   if command -v pipx &>/dev/null; then
@@ -676,15 +687,72 @@ fi
 
 # ffmpeg (audio/video processing)
 if ! command -v ffmpeg &>/dev/null; then
-  echo -e "  ffmpeg telepítés..."
+  echo -e "$(_t macos.ffmpeg_installing)"
   brew install ffmpeg
 fi
-echo -e "  ${GREEN}✓${NC} ffmpeg kész"
+echo -e "$(_t macos.ffmpeg_done)"
+
+INSTALL_STEP="bumblebee"
+# Go + bumblebee (supply-chain scanner)
+echo ""
+echo -e "  Go + bumblebee (supply-chain scanner)..."
+
+_go_version_ok() {
+  command -v go &>/dev/null || return 1
+  local ver major minor
+  ver=$(go version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+  major=$(echo "$ver" | cut -d. -f1)
+  minor=$(echo "$ver" | cut -d. -f2)
+  [ "$major" -gt 1 ] || ( [ "$major" -eq 1 ] && [ "${minor:-0}" -ge 25 ] )
+}
+
+if _go_version_ok; then
+  echo -e "  ${GREEN}✓${NC} $(go version | grep -oE 'go[0-9]+\.[0-9.]+')"
+else
+  echo -e "  ${ORANGE}!${NC} Go >= 1.25 szukseges -- telepites (brew install go)..."
+  if command -v brew &>/dev/null; then
+    # set -e + trap ERR van eletben: brew bukasa NE allitsa le a telepitest,
+    # csak hagyja ki bumblebee-t (a _go_version_ok ujra-ellenoriz lentebb).
+    if brew install go; then
+      # Frissitjuk a PATH-ot az uj Go binary-re
+      export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+    else
+      echo -e "  ${ORANGE}!${NC} Go telepites sikertelen -- bumblebee kihagyva."
+    fi
+  else
+    echo -e "  ${RED}✗${NC} Homebrew nem elerheto; bumblebee nem telepitheto automatikusan."
+    echo -e "  ${DIM}  Kezzel: https://go.dev/dl (>= 1.25)${NC}"
+  fi
+fi
+
+BUMBLEBEE_BIN="$HOME/.local/bin/bumblebee"
+if [ -x "$BUMBLEBEE_BIN" ]; then
+  echo -e "  ${GREEN}✓${NC} bumblebee mar telepitve ($BUMBLEBEE_BIN)"
+elif _go_version_ok; then
+  echo -e "  bumblebee build forrasbol (github.com/perplexityai/bumblebee)..."
+  mkdir -p "$HOME/.local/bin"
+  _BB_TMP=$(mktemp -d)
+  if git clone -q --depth 1 --branch v0.1.2 https://github.com/perplexityai/bumblebee.git "$_BB_TMP" 2>/dev/null; then
+    if (cd "$_BB_TMP" && go build -o "$BUMBLEBEE_BIN" ./cmd/bumblebee 2>/dev/null); then
+      chmod +x "$BUMBLEBEE_BIN"
+      echo -e "  ${GREEN}✓${NC} bumblebee telepitve: $BUMBLEBEE_BIN"
+    else
+      echo -e "  ${ORANGE}!${NC} bumblebee build sikertelen -- a supply-chain scan kihagyja a binart."
+      echo -e "  ${DIM}  Kezzel: cd /tmp/bb && go build -o ~/.local/bin/bumblebee ./cmd/bumblebee${NC}"
+    fi
+  else
+    echo -e "  ${ORANGE}!${NC} bumblebee clone sikertelen (halozat?) -- kihagyva."
+  fi
+  rm -rf "$_BB_TMP"
+else
+  echo -e "  ${ORANGE}!${NC} Go nem elerheto -- bumblebee kihagyva. A supply-chain scan atlepve."
+  echo -e "  ${DIM}  Kezzel: brew install go && git clone https://github.com/perplexityai/bumblebee /tmp/bb && (cd /tmp/bb && go build -o ~/.local/bin/bumblebee ./cmd/bumblebee)${NC}"
+fi
 
 INSTALL_STEP="launchagent"
 # Step 7: LaunchAgent setup
 echo ""
-echo -e "${BOLD}[7/7] Automatikus indítás beállítása...${NC}"
+echo -e "${BOLD}$(_t section_7)${NC}"
 
 PLIST_DIR="$HOME/Library/LaunchAgents"
 mkdir -p "$PLIST_DIR"
@@ -771,7 +839,7 @@ cat > "$PLIST_DIR/${CHANNELS_PLIST}.plist" << PLISTEOF
 </plist>
 PLISTEOF
 
-echo -e "  ${GREEN}✓${NC} LaunchAgent-ek létrehozva"
+echo -e "  ${GREEN}✓${NC} $(_t macos.launchagents_created)"
 
 # Load LaunchAgents
 launchctl load "$PLIST_DIR/${DASHBOARD_PLIST}.plist" 2>/dev/null || true
@@ -781,7 +849,7 @@ echo -e "  ${GREEN}✓${NC} Szolgaltatasok elinditva"
 # Verify channel plugin is working
 sleep 3
 echo ""
-echo -e "${BOLD}Ellenorzes...${NC}"
+echo -e "${BOLD}$(_t section_checks)${NC}"
 if [ "$CHANNEL_PROVIDER" = "telegram" ] && ! command -v bun &>/dev/null; then
   echo -e "  ${RED}✗${NC} Bun nem talalhato. A Telegram plugin nem fog mukodni."
   echo -e "  ${BOLD}Javitas:${NC} curl -fsSL https://bun.sh/install | bash"
@@ -799,14 +867,14 @@ fi
 # Channel pairing flow (Telegram only; Slack uses OAuth / App install)
 if [ "$CHANNEL_PROVIDER" = "telegram" ] && [ -n "$BOT_TOKEN" ]; then
   echo ""
-  echo -e "${BOLD}Telegram parositas${NC}"
-  echo -e "${DIM}  A bot fut, most ossze kell parosítanod vele.${NC}"
+  echo -e "${BOLD}$(_t macos.tg_pairing_title)${NC}"
+  echo -e "${DIM}$(_t macos.tg_pairing_hint)${NC}"
   echo ""
   echo -e "  ${BOLD}1.${NC} Nyisd meg a Telegram appot es irj a botodnak (barmit, pl. \"Szia\")"
   echo -e "  ${BOLD}2.${NC} A bot kuld neked egy parosito kodot"
   echo -e "  ${BOLD}3.${NC} Masold ide a kapott kodot:"
   echo ""
-  read -p "  Parosito kod (vagy hagyd uresen ha kesobb csinalod): " PAIR_CODE
+  read -rp "$(_t prompt_pair_code)" PAIR_CODE
   if [ -n "$PAIR_CODE" ]; then
     ACCESS_FILE="$CHANNEL_DIR/access.json"
     if [ -f "$ACCESS_FILE" ]; then
@@ -848,22 +916,22 @@ with open('$ACCESS_FILE', 'w') as f:
       fi
     fi
   else
-    echo -e "  ${DIM}Rendben, kesobb is parosithatsz.${NC}"
+    echo -e "  ${DIM}$(_t macos.pairing_later)${NC}"
     echo -e "  ${DIM}Futtasd: claude, majd /telegram:access pair AKOD${NC}"
   fi
 fi
 
 # Migration from previous system
 echo ""
-echo -e "${BOLD}Korábbi rendszer költöztetése${NC}"
-echo -e "${DIM}  Ha volt korábbi AI asszisztensed (OpenClaw, egyéni bot), átmigrálhatod a memóriáját.${NC}"
-read -p "  Szeretnéd most futtatni a költöztetést? (i/n) [n]: " DO_MIGRATE
+echo -e "${BOLD}$(_t macos.migration_title)${NC}"
+echo -e "${DIM}$(_t macos.migration_hint)${NC}"
+read -rp "$(_t prompt_migrate)" DO_MIGRATE
 DO_MIGRATE=${DO_MIGRATE:-n}
 if [ "$DO_MIGRATE" = "i" ]; then
   if [ -f "$INSTALL_DIR/scripts/migrate.sh" ]; then
     "$INSTALL_DIR/scripts/migrate.sh"
   else
-    echo -e "  ${ORANGE}A migrate.sh nem található. Használd a dashboardot: http://localhost:3420 -> Költöztetés${NC}"
+    echo -e "  ${ORANGE}$(_t macos.migrate_missing)${NC}"
   fi
 fi
 
@@ -871,7 +939,7 @@ fi
 if [ "$CHANNEL_PROVIDER" = "telegram" ] && [ "$CHAT_ID" = "0" ]; then
   echo ""
   echo -e "${ORANGE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-  echo -e "${RED}  FIGYELEM: Telegram parositas nem tortent meg!${NC}"
+  echo -e "${RED}$(_t warn_pair_missing)${NC}"
   echo -e "${ORANGE}  Az ALLOWED_CHAT_ID=0 marad az .env-ben, ami azt jelenti${NC}"
   echo -e "${ORANGE}  hogy a bot NEM fog valaszolni senkinek.${NC}"
   echo ""
@@ -886,7 +954,7 @@ fi
 echo ""
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-echo -e "${BOLD}${GREEN}  ✓ Marveen sikeresen telepítve!${NC}"
+echo -e "${BOLD}${GREEN}$(_t success_installed)${NC}"
 echo ""
 
 # Read dashboard token for access URL
@@ -896,17 +964,17 @@ if [ -f "$INSTALL_DIR/store/.dashboard-token" ]; then
 fi
 if [ -n "$DASH_TOKEN" ]; then
   echo -e "  ${BOLD}Dashboard:${NC} ${BLUE}http://localhost:3420/?token=${DASH_TOKEN}${NC}"
-  echo -e "  ${DIM}(Nyisd meg egyszer, utana a bongeszo megjegyzi a tokent)${NC}"
+  echo -e "  ${DIM}$(_t dash.token_hint)${NC}"
 else
   echo -e "  ${BOLD}Dashboard:${NC} http://localhost:3420"
-  echo -e "  ${DIM}(A tokenes URL-t a szerver logban talalod)${NC}"
+  echo -e "  ${DIM}$(_t dash.no_token_hint)${NC}"
 fi
-echo -e "  ${BOLD}Telegram:${NC} Irj a botodnak!"
+echo -e "  ${BOLD}Telegram:${NC} $(_t telegram.write_hint)"
 echo ""
-echo -e "  ${DIM}Kovetkezo lepesek:${NC}"
-echo -e "  ${DIM}1. Nyisd meg a dashboardot a fenti URL-lel${NC}"
-echo -e "  ${DIM}2. Irj a botodnak Telegramon -- mar valaszolnia kell${NC}"
-echo -e "  ${DIM}3. A Csapat oldalon hozhatsz letre tobb agenst${NC}"
+echo -e "  ${DIM}$(_t next_steps.title)${NC}"
+echo -e "  ${DIM}$(_t next_steps.1)${NC}"
+echo -e "  ${DIM}$(_t next_steps.2)${NC}"
+echo -e "  ${DIM}$(_t next_steps.3)${NC}"
 echo ""
 echo -e "  ${DIM}Frissites: ./update.sh${NC}"
 echo -e "  ${DIM}Leallitas: ./scripts/stop.sh${NC}"

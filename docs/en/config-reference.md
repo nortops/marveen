@@ -23,26 +23,60 @@ These files are managed by the dashboard and change at runtime. They are not che
 | `store/config-overrides.json` | dashboard UI | Settings-page overrides (plain values only, never contains secrets) |
 | `store/update.pid` | automatic | Update process PID file (concurrency lock) |
 
+### Dashboard language
+
+A `HU / EN` button appears in the bottom-left corner of the sidebar. Clicking it switches the entire interface immediately -- navigation labels, buttons, messages, and the Documentation page all re-render in the newly selected language. The choice persists within the browser session.
+
+To make a particular language the default for every new visit, set `DASHBOARD_LANG` to `hu` or `en` on the Settings page (System module). The sidebar button overrides the server default; if no client-side choice has been stored, `DASHBOARD_LANG` takes effect.
+
+The Documentation page follows the global language setting -- there is no separate docs language selector.
+
+---
+
 ### Settings page
 
 The "Settings" entry in the dashboard's left-hand navigation opens the configuration UI, where env-backed parameters can be viewed and changed directly in the browser -- no `.env` editing or server access required.
 
 **How to change a value**
 
-Settings are grouped by module (e.g. "kanban"). Each row shows:
+Settings are grouped by module (Kanban, System, Heartbeat). Each row shows:
 - the key name and its description,
-- the current value in an editable input (number fields show the valid range; colour fields show a colour picker with a preview swatch),
-- a "Save" button.
+- the current value in an editable input (number fields show the valid range; colour fields show a colour picker with a preview swatch; enum-style keys show a dropdown).
 
-Click "Save" -- the change takes effect immediately, leaving all other settings untouched. The next time you open the Kanban board it will reflect the new values.
+Editing an input marks the row as dirty. A sticky save bar appears at the bottom of the page showing the number of pending changes, with two buttons:
+- **Save** -- saves all dirty rows at once. Rows that fail validation are flagged with an error; the rest are saved.
+- **Reset** -- restores all inputs to their last-loaded values; the save bar disappears.
 
 **What does a validation error mean?**
 
-If you enter an invalid value (e.g. 150 where the maximum is 100, or a colour that isn't in `#rrggbb` format), an error message appears directly below the row after you press Save. Other rows are unaffected. Fix the value and try again.
+If you enter an invalid value (e.g. 150 where the maximum is 100, or a colour that isn't in `#rrggbb` format), an error message appears directly below the row after you press Save. The other rows are saved; only the failing row stays dirty. Fix the value and press Save again.
+
+**Unsaved-change guard**
+
+If you try to leave the Settings page (by clicking another menu entry or closing the browser tab) while there are unsaved changes, the browser shows a confirmation dialog. Dismissing it keeps you on the page with the dirty values intact.
 
 **When is a restart required?**
 
-Some rows carry a "Requires restart" badge -- changes to those settings only take effect after the next server restart. The v1 kanban settings (WIP limits and badge colours) all apply immediately, no restart needed.
+Some rows carry a "Requires restart" badge -- changes to those settings (e.g. `DASHBOARD_PUBLIC_URL`, `OLLAMA_URL`, `HEARTBEAT_AGENT_ENABLED`) only take effect after the next server restart. Kanban and heartbeat window settings (e.g. `KANBAN_WIP_*`, `KANBAN_AGING_*`, `HEARTBEAT_START_HOUR`) apply immediately, no restart needed.
+
+**What can you configure?**
+
+Settings are organised into three modules:
+
+*Kanban* -- how the kanban board behaves:
+- WIP limits and badge colours: how many cards per column before the badge turns yellow or red (available since v1)
+- Card aging: after how many hours a stale-card indicator appears in yellow, orange, or red -- if your team works in longer cycles, raise the default 24h/72h/168h thresholds accordingly
+- Archiving: how many days after a card is closed before it moves to the archive automatically (default: 30 days)
+- Swimlane default: which grouping the kanban board opens in ("none", "by assignee", "by priority")
+
+*System* -- infrastructure parameters:
+- The publicly accessible URL of the dashboard (used by webhooks and external links; restart required)
+- The Ollama embedding server URL (used for memory search; restart required)
+- Default UI language (`DASHBOARD_LANG`): `hu` or `en` -- the sidebar button overrides this per-session, but when no client-side choice is stored this value applies on every new visit (no restart needed)
+
+*Heartbeat* -- the background summary agent:
+- On/off toggle: "1" = active, "0" = stopped (restart required)
+- Active window: which hours of the day the agent is allowed to run (e.g. 9-23 = daytime only)
 
 ---
 
@@ -83,19 +117,49 @@ Every dashboard-editable setting is a registry entry with the following fields:
 | `min` / `max` | number? | Bounds for `int` type |
 | `valueSet` | string[]? | If set: only these values are accepted (select widget in UI) |
 
-**v1 registry (9 kanban WIP keys):**
+**Registry -- Kanban module:**
 
-| Key | Type | Default | Constraint |
-|-----|------|---------|------------|
-| `KANBAN_WIP_PLANNED` | int | 0 (unlimited) | max 100 |
-| `KANBAN_WIP_IN_PROGRESS` | int | 0 | max 100 |
-| `KANBAN_WIP_WAITING` | int | 0 | max 100 |
-| `KANBAN_WIP_DONE` | int | 0 | max 100 |
-| `KANBAN_WIP_WARN_PCT` | int | 80 | min 1, max 100 |
-| `KANBAN_WIP_OK_COLOR` | color | `#6b7280` | #rrggbb |
-| `KANBAN_WIP_WARN_COLOR` | color | `#c9a000` | #rrggbb |
-| `KANBAN_WIP_FULL_COLOR` | color | `#d46b00` | #rrggbb |
-| `KANBAN_WIP_OVER_COLOR` | color | `#c53030` | #rrggbb |
+| Key | Type | Default | Constraint | Restart |
+|-----|------|---------|------------|---------|
+| `KANBAN_WIP_PLANNED` | int | 0 (unlimited) | max 100 | no |
+| `KANBAN_WIP_IN_PROGRESS` | int | 0 | max 100 | no |
+| `KANBAN_WIP_WAITING` | int | 0 | max 100 | no |
+| `KANBAN_WIP_DONE` | int | 0 | max 100 | no |
+| `KANBAN_WIP_WARN_PCT` | int | 80 | min 1, max 100 | no |
+| `KANBAN_WIP_OK_COLOR` | color | `#6b7280` | #rrggbb | no |
+| `KANBAN_WIP_WARN_COLOR` | color | `#c9a000` | #rrggbb | no |
+| `KANBAN_WIP_FULL_COLOR` | color | `#d46b00` | #rrggbb | no |
+| `KANBAN_WIP_OVER_COLOR` | color | `#c53030` | #rrggbb | no |
+| `KANBAN_ARCHIVE_DONE_DAYS` | int | 30 | min 1, max 365 | no |
+| `KANBAN_AGING_WARN_H` | int | 24 | min 1, max 8760 | no |
+| `KANBAN_AGING_CAUTION_H` | int | 72 | min 1, max 8760 | no |
+| `KANBAN_AGING_CRITICAL_H` | int | 168 | min 1, max 8760 | no |
+| `KANBAN_AGING_WARN_COLOR` | color | `#c9a000` | #rrggbb | no |
+| `KANBAN_AGING_CAUTION_COLOR` | color | `#d46b00` | #rrggbb | no |
+| `KANBAN_AGING_CRITICAL_COLOR` | color | `#c53030` | #rrggbb | no |
+| `KANBAN_SWIMLANE_DEFAULT_GROUP` | string | `none` | `none`, `assignee`, `priority` | no |
+| `KANBAN_SWIMLANE_SEPARATOR_COLOR` | color | `#374151` | #rrggbb | no |
+
+**Registry -- System module:**
+
+| Key | Type | Default | Description | Restart |
+|-----|------|---------|-------------|---------|
+| `DASHBOARD_PUBLIC_URL` | string | (empty) | Publicly accessible URL of the dashboard | yes |
+| `OLLAMA_URL` | string | `http://localhost:11434` | Ollama API base URL | yes |
+
+**Registry -- Heartbeat module:**
+
+| Key | Type | Default | Constraint | Restart |
+|-----|------|---------|------------|---------|
+| `HEARTBEAT_START_HOUR` | int | 9 | min 0, max 22 | no |
+| `HEARTBEAT_END_HOUR` | int | 23 | min 1, max 24 | no |
+| `HEARTBEAT_AGENT_ENABLED` | string | `1` | `0` or `1` | yes |
+**Registry -- Idea-box module:**
+
+| Key | Type | Default | Constraint | Restart |
+|-----|------|---------|------------|---------|
+| `IDEA_BREAKDOWN_MAX_SUBTASKS` | int | 10 | min 2, max 20 | no |
+| `IDEA_STALE_DAYS` | int | 7 | min 1, max 365 | no |
 
 **API endpoints:**
 

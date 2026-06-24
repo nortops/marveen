@@ -11,7 +11,7 @@ import {
   shouldClearTruncatedPreamble,
   detectsPastePlaceholder,
 } from '../pane-state.js'
-import { agentDir, readAgentModel, readAgentSecurityProfile, readAgentClaudeConfigDir, readAgentChannelProvider, readAgentAuthMode, readAgentDisplayName, readAgentRemoteConfig, readAgentRemoteHost } from './agent-config.js'
+import { agentDir, readAgentModel, readAgentClaudeConfigDir, readAgentChannelProvider, readAgentAuthMode, readAgentDisplayName, readAgentRemoteConfig, readAgentRemoteHost } from './agent-config.js'
 import {
   buildTmuxInvocation,
   buildSshExec,
@@ -28,6 +28,7 @@ import { parseTelegramToken } from './telegram.js'
 import { getProvider, getProviderType, channelStateDir, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
 import { CHANNEL_PROVIDER, MAIN_AGENT_ID } from '../config.js'
 import { loadProfileTemplate } from './profiles.js'
+import { resolveAgentSecurityProfile } from './agent-team.js'
 import { writeAgentSettingsFromProfile } from './agent-scaffold.js'
 import { getSecret } from './vault.js'
 import { reapChannelOrphans, reapDetachedChannelClaudes } from './channel-poller-reap.js'
@@ -43,6 +44,7 @@ export const CHANNEL_PLUGIN_IDS: Record<string, string> = {
   telegram: 'telegram@claude-plugins-official',
   slack: 'slack-channel@marveen-marketplace',
   discord: 'discord@claude-plugins-official',
+  googlechat: 'googlechat@claude-channel-googlechat',
 }
 
 // Pure: compute the enabledPlugins map for a sub-agent so that exactly its own
@@ -91,7 +93,7 @@ export function ownChannelProviderForScope(
 
 function resolveAgentProvider(name: string): ChannelProviderType {
   const perAgent = readAgentChannelProvider(name)
-  if (perAgent === 'slack' || perAgent === 'telegram' || perAgent === 'discord') return perAgent
+  if (perAgent === 'slack' || perAgent === 'telegram' || perAgent === 'discord' || perAgent === 'googlechat') return perAgent
   return CHANNEL_PROVIDER
 }
 
@@ -321,7 +323,11 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
     // Apply security profile: write allow/deny list into settings.json, and
     // skip the dangerously-skip-permissions flag for strict profiles so
     // Claude Code enforces the list rather than bypassing it.
-    const profile = loadProfileTemplate(readAgentSecurityProfile(name))
+    // Role-derived applier-pool: an explicit non-default profile wins, else a
+    // `leader` (tech-lead) -> 'applier' (Supabase retained), everyone else ->
+    // 'default' (deny-by-default). Keeps a fresh install's tech-lead an applier
+    // without hardcoding agent names.
+    const profile = loadProfileTemplate(resolveAgentSecurityProfile(name))
     writeAgentSettingsFromProfile(name, profile)
     // A sub-agent must load ONLY its own channel plugin. The user-scope
     // enabledPlugins would otherwise make EVERY sub-agent spawn a telegram
@@ -350,11 +356,11 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
         // flag: a real own bot token in this agent's channel .env (token, above).
         // A genuine own-token agent enables its own provider's plugin; a channel-
         // less agent (no own token, only the legacy/global fallback that still
-        // marks hasChannel) yields null -> all three disabled, so it never fights
-        // the main agent over the shared getUpdates slot. Keying on the explicit
-        // channelProvider config field instead (always null for sub-agents) was
-        // the regression that disabled the plugin for every legitimately-channelled
-        // sub-agent after a respawn (truly-unreachable plugin, no bun poller).
+        // marks hasChannel) yields null -> all providers disabled, so it never
+        // fights the main agent over the shared getUpdates slot. Keying on the
+        // explicit channelProvider config field instead (always null for sub-agents)
+        // was the regression that disabled the plugin for every legitimately-
+        // channelled sub-agent after a respawn (truly-unreachable plugin, no poller).
         s.enabledPlugins = scopeChannelPlugins(
           ownChannelProviderForScope(!!token, agentProvider),
           s.enabledPlugins as Record<string, boolean> | undefined,
@@ -386,7 +392,7 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
     // omit --continue so the heavy accumulated context is dropped. Without it
     // we resume the prior session (the 'continue' mode / normal restart).
     const continueFlag = (hasPriorSession && !opts.fresh) ? '--continue ' : ''
-    const stateEnvVar = agentProvider === 'slack' ? 'SLACK_STATE_DIR' : agentProvider === 'discord' ? 'DISCORD_STATE_DIR' : 'TELEGRAM_STATE_DIR'
+    const stateEnvVar = agentProvider === 'slack' ? 'SLACK_STATE_DIR' : agentProvider === 'discord' ? 'DISCORD_STATE_DIR' : agentProvider === 'googlechat' ? 'GOOGLECHAT_STATE_DIR' : 'TELEGRAM_STATE_DIR'
     const unsetTokens = 'unset TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN DISCORD_BOT_TOKEN'
     // Slack plugin is third-party; its "not on approved allowlist" check is
     // bypassed via `allowedChannelPlugins` in /Library/Application Support/ClaudeCode/managed-settings.json.
