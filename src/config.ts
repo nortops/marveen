@@ -178,6 +178,14 @@ export const CHANNEL_PROVIDER: ChannelProviderType = getProviderType(env['CHANNE
 export const CHANNEL_TOKEN = getChannelToken(CHANNEL_PROVIDER, env)
 export const CHANNEL_CHAT_ID = getChannelChatId(CHANNEL_PROVIDER, env)
 
+// When set to '1' or 'true', ensureAgentHooks() also seeds the main agent's
+// user-scope settings (~/.claude/settings.json). Disabled by default so a
+// dev clone or staging deploy never writes into the operator's shared Claude
+// config directory without an explicit opt-in. Production installs that need
+// the main-agent hook (e.g. a voice-reply directive) must set this in .env.
+export const MARVEEN_SEED_MAIN_AGENT_HOOKS =
+  env['MARVEEN_SEED_MAIN_AGENT_HOOKS'] === '1' || env['MARVEEN_SEED_MAIN_AGENT_HOOKS'] === 'true'
+
 // Respawn / keep-alive gate.
 // The in-process channel-plugin monitor (main-agent respawn + sub-agent
 // auto-restart) must run on exactly ONE machine. When the same checkout runs

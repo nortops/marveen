@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, WEB_PORT, OWNER_DRIVE_FOLDER } from '../config.js'
+import { PROJECT_ROOT, OWNER_NAME, MAIN_AGENT_ID, BOT_NAME, CHANNEL_PROVIDER, WEB_PORT, OWNER_DRIVE_FOLDER, MARVEEN_SEED_MAIN_AGENT_HOOKS } from '../config.js'
 import { channelStateDir } from '../channel-provider.js'
 import { runAgent } from '../agent.js'
 import { atomicWriteFileSync } from './atomic-write.js'
@@ -45,12 +45,69 @@ export function resolveTemplatePlaceholders(content: string): string {
   })
 }
 
+// Extract the first absolute-path token from a shell command string, e.g.
+// "python3 /abs/path/script.py" -> "/abs/path/script.py". Returns null when
+// no absolute path token is found (relative commands, built-ins, etc.).
+function extractCommandScriptPath(command: string): string | null {
+  for (const part of command.trim().split(/\s+/)) {
+    if (part.startsWith('/')) return part
+  }
+  return null
+}
+
+// Walk the resolved hooks object and drop any command-type hook whose script
+// path does not exist on disk. Empty hook groups (after filtering) are also
+// dropped. This prevents a template that references an optional feature script
+// (e.g. a voice directive that only ships with a specific profile) from
+// blocking all prompt input when installed on a host that lacks that script.
+function filterMissingScriptHooks(hooks: unknown): Record<string, unknown> {
+  if (!hooks || typeof hooks !== 'object') return {}
+  const result: Record<string, unknown> = {}
+  for (const [eventType, groups] of Object.entries(hooks as Record<string, unknown>)) {
+    if (!Array.isArray(groups)) {
+      result[eventType] = groups
+      continue
+    }
+    const kept = (groups as unknown[])
+      .map((group: unknown) => {
+        if (!group || typeof group !== 'object') return group
+        const g = group as Record<string, unknown>
+        if (!Array.isArray(g.hooks)) return g
+        const filteredHooks = (g.hooks as unknown[]).filter((h: unknown) => {
+          if (!h || typeof h !== 'object') return true
+          const hook = h as Record<string, unknown>
+          if (hook.type !== 'command' || typeof hook.command !== 'string') return true
+          const scriptPath = extractCommandScriptPath(hook.command)
+          return scriptPath === null || existsSync(scriptPath)
+        })
+        if (filteredHooks.length === 0) return null
+        return { ...g, hooks: filteredHooks }
+      })
+      .filter(Boolean)
+    if (kept.length > 0) result[eventType] = kept
+  }
+  return result
+}
+
 // Idempotent migration: every agent's settings.json should carry the
 // PreCompact hook (memory save + skill reflection). Pre-refactor agents
 // were scaffolded before scaffoldAgentDir seeded the template, so their
 // file is permissions-only. Merge the template's hooks block in place.
+//
+// For the main agent (MAIN_AGENT_ID), the target is the user-scope
+// ~/.claude/settings.json, which is shared across all Claude Code sessions on
+// the host. Writing to it is therefore opt-in: set MARVEEN_SEED_MAIN_AGENT_HOOKS=1
+// in .env to enable. A dev clone or staging deploy must NOT set this flag, so
+// it can never accidentally inject a marveen-dev-rooted path into the shared
+// config and block all agents.
 export function ensureAgentHooks(name: string): boolean {
-  const settingsPath = join(agentDir(name), '.claude', 'settings.json')
+  let settingsPath: string
+  if (name === MAIN_AGENT_ID) {
+    if (!MARVEEN_SEED_MAIN_AGENT_HOOKS) return false
+    settingsPath = join(homedir(), '.claude', 'settings.json')
+  } else {
+    settingsPath = join(agentDir(name), '.claude', 'settings.json')
+  }
   const tplPath = join(PROJECT_ROOT, 'templates', 'settings.json.template')
   if (!existsSync(tplPath)) return false
   let tpl: Record<string, unknown>
@@ -61,13 +118,15 @@ export function ensureAgentHooks(name: string): boolean {
     return false
   }
   if (!tpl.hooks) return false
+  const safeHooks = filterMissingScriptHooks(tpl.hooks)
+  if (Object.keys(safeHooks).length === 0) return false
   let existing: Record<string, unknown> = {}
   if (existsSync(settingsPath)) {
     try { existing = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { /* overwrite */ }
   }
   if (existing.hooks) return false  // user already has hooks, leave alone
-  existing.hooks = tpl.hooks
-  mkdirSync(join(agentDir(name), '.claude'), { recursive: true })
+  existing.hooks = safeHooks
+  if (name !== MAIN_AGENT_ID) mkdirSync(join(agentDir(name), '.claude'), { recursive: true })
   atomicWriteFileSync(settingsPath, JSON.stringify(existing, null, 2))
   return true
 }

@@ -2,7 +2,7 @@ import http from 'node:http'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { execSync, execFileSync } from 'node:child_process'
-import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS } from './config.js'
+import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID, MARVEEN_SEED_MAIN_AGENT_HOOKS } from './config.js'
 import { loadOrCreateDashboardToken, checkBearerToken } from './web/dashboard-auth.js'
 import { isBlockedCrossOriginWrite } from './web/csrf-origin.js'
 import { json } from './web/http-helpers.js'
@@ -323,9 +323,14 @@ export function startWebServer(port = 3420): http.Server {
   // Backfill the PreCompact hook into existing agents' settings.json so the
   // auto-skill / auto-memory flow runs on context compaction. No-op if the
   // agent already has its own hooks block.
+  // The main agent's user-scope ~/.claude/settings.json is only seeded when
+  // MARVEEN_SEED_MAIN_AGENT_HOOKS=1 -- see ensureAgentHooks() for the guard.
   try {
     const patched: string[] = []
-    for (const agentName of listAgentNames()) {
+    const agentsToPatch = MARVEEN_SEED_MAIN_AGENT_HOOKS
+      ? [MAIN_AGENT_ID, ...listAgentNames()]
+      : listAgentNames()
+    for (const agentName of agentsToPatch) {
       if (ensureAgentHooks(agentName)) patched.push(agentName)
     }
     if (patched.length) logger.info({ patched }, 'PreCompact hook backfilled into agent settings.json')
