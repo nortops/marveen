@@ -8,7 +8,7 @@ import { isBlockedCrossOriginWrite } from './web/csrf-origin.js'
 import { json } from './web/http-helpers.js'
 import { detectLanIp } from './web/network-info.js'
 import { AGENTS_BASE_DIR, listAgentNames } from './web/agent-config.js'
-import { ensureAgentHooks, ensureDefaultScheduledTasks } from './web/agent-scaffold.js'
+import { ensureAgentHooks, ensureAgentStalenessHook, ensureDefaultScheduledTasks } from './web/agent-scaffold.js'
 import { refreshMarveenBotUsername } from './web/telegram.js'
 import { startMessageRouter } from './web/message-router.js'
 import { startUpdateChecker } from './web/update-checker.js'
@@ -20,6 +20,7 @@ import { startStuckInputWatcher } from './web/stuck-input-watcher.js'
 import { startStuckToolCallWatcher } from './web/stuck-tool-call-watcher.js'
 import { startReauthHealer } from './web/reauth-healer.js'
 import { startAutoRestartRunner } from './web/auto-restart-runner.js'
+import { startModelFallbackRunner } from './web/model-fallback-runner.js'
 import { collectTokenUsage } from './web/token-usage.js'
 import { logger } from './logger.js'
 import { tryHandleProfiles } from './web/routes/profiles.js'
@@ -222,7 +223,9 @@ export function startWebServer(port = 3420): http.Server {
                 try { process.kill(pid, 'SIGKILL') } catch { /* gone */ }
               } catch { /* gone */ }
             }
-            server.listen(port)
+            server.listen(port, WEB_HOST, () => {
+              logger.info({ port }, `Web dashboard: re-listen bound after port reclaim`)
+            })
           }, 1500)
         } else {
           logger.error({ port }, 'Port foglalt de nem talaltunk felszabadithato node processt -- kilepes')
@@ -247,6 +250,33 @@ export function startWebServer(port = 3420): http.Server {
       `\nDashboard access URL (paste into browser, token is stored afterward):\n  ${bootstrapUrl}\n\n`
     )
   })
+
+  // Self-heal a SILENT listener failure. Under launchd, a `kickstart -k` can
+  // race the dying predecessor's lingering socket: the EADDRINUSE reclaim +
+  // re-listen path can leave this process ALIVE but not actually listening, with
+  // no error (observed 2026-06-27 -- the success log above fired yet nothing was
+  // bound, and the background loops started below kept running, so the dashboard
+  // was deaf until a manual restart, which bound cleanly). A clean restart binds
+  // reliably, so if the listener is not up we exit(1) and let launchd restart us
+  // fresh rather than linger un-servable. Runs regardless of WEB_ONLY -- it is
+  // about the HTTP listener, not the background services.
+  //
+  // The grace must comfortably exceed a SLOW-but-valid bind: restarting OVER a
+  // wedged predecessor, the EADDRINUSE reclaim retries every ~1500ms until the
+  // old socket finally releases -- observed up to ~5 MINUTES (2026-06-27). An
+  // 8s grace would exit MID-bind and loop, so wait STARTUP_GRACE first. After
+  // that, poll periodically so a mid-life listener drop is caught too, not just
+  // a startup failure.
+  const STARTUP_GRACE_MS = 7 * 60 * 1000
+  const RELISTEN_POLL_MS = 60 * 1000
+  setTimeout(() => {
+    setInterval(() => {
+      if (!server.listening) {
+        logger.error({ port }, 'Web server not listening -- exiting(1) for a clean launchd restart')
+        process.exit(1)
+      }
+    }, RELISTEN_POLL_MS).unref()
+  }, STARTUP_GRACE_MS).unref()
 
   // WEB_ONLY=true disables all background services (scheduler, pollers, monitors).
   // Used for staging preview instances that must not conflict with the live fleet
@@ -301,6 +331,9 @@ export function startWebServer(port = 3420): http.Server {
   const autoRestartInterval = webOnly ? undefined : startAutoRestartRunner()
   if (!webOnly) logger.info('Auto-restart runner started (60s poll, 40s offset)')
 
+  const modelFallbackInterval = webOnly ? undefined : startModelFallbackRunner()
+  if (!webOnly) logger.info('Model-fallback runner started (60s poll, 50s offset)')
+
   const updateCheckerInterval = webOnly ? undefined : startUpdateChecker()
   if (!webOnly) logger.info('Update checker started (15min poll)')
 
@@ -339,12 +372,15 @@ export function startWebServer(port = 3420): http.Server {
   // agent already has its own hooks block.
   try {
     const patched: string[] = []
+    const stalePatched: string[] = []
     // Include the main agent (MAIN_AGENT_ID) so the voice hook is also seeded
     // into ~/.claude/settings.json alongside existing hooks (e.g. telegram_progress.py).
     for (const agentName of [MAIN_AGENT_ID, ...listAgentNames()]) {
       if (ensureAgentHooks(agentName)) patched.push(agentName)
+      if (ensureAgentStalenessHook(agentName)) stalePatched.push(agentName)
     }
     if (patched.length) logger.info({ patched }, 'PreCompact hook backfilled into agent settings.json')
+    if (stalePatched.length) logger.info({ patched: stalePatched }, 'staleness-guard UserPromptSubmit hook backfilled into agent settings.json')
   } catch (err) {
     logger.warn({ err }, 'Agent hook backfill skipped')
   }
@@ -379,6 +415,7 @@ export function startWebServer(port = 3420): http.Server {
     clearInterval(stuckToolCallInterval)
     if (reauthHealerInterval) clearInterval(reauthHealerInterval)
     clearInterval(autoRestartInterval)
+    clearInterval(modelFallbackInterval)
     clearInterval(updateCheckerInterval)
     clearInterval(tokenCollectInterval)
     return origClose(cb)

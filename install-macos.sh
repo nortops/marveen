@@ -300,18 +300,26 @@ else
   MANAGED_FILE="$MANAGED_DIR/managed-settings.json"
   SLACK_ENTRY='{"plugin":"slack-channel","marketplace":"marveen-marketplace"}'
   TELEGRAM_ENTRY='{"plugin":"telegram","marketplace":"claude-plugins-official"}'
-  REQUIRED_JSON="{\"allowedChannelPlugins\":[$SLACK_ENTRY,$TELEGRAM_ENTRY]}"
+  TEAMS_ENTRY='{"plugin":"teams","marketplace":"marveen-marketplace"}'
+  REQUIRED_JSON="{\"allowedChannelPlugins\":[$SLACK_ENTRY,$TELEGRAM_ENTRY,$TEAMS_ENTRY]}"
 
   if [ -f "$MANAGED_FILE" ]; then
-    HAS_SLACK=$(sudo python3 -c "
+    # Gate on ALL required plugins being present (not just slack) -- otherwise an
+    # install that already has slack/telegram but not teams skips the merge and
+    # the Teams bot is silently dropped (online but never replies). This is the
+    # per-customer sudo-elimination: the installer (already sudo) allows teams
+    # at install time, so no manual managed-settings edit is needed later.
+    HAS_ALL=$(sudo python3 -c "
 import json, sys
+required = [('slack-channel','marveen-marketplace'),('telegram','claude-plugins-official'),('teams','marveen-marketplace')]
 try:
   d = json.load(open('$MANAGED_FILE'))
   plugins = d.get('allowedChannelPlugins', [])
-  sys.exit(0 if any(p.get('plugin')=='slack-channel' and p.get('marketplace')=='marveen-marketplace' for p in plugins) else 1)
+  have = {(p.get('plugin'),p.get('marketplace')) for p in plugins}
+  sys.exit(0 if all(r in have for r in required) else 1)
 except: sys.exit(1)
 " 2>/dev/null && echo "yes" || echo "no")
-    if [ "$HAS_SLACK" = "no" ]; then
+    if [ "$HAS_ALL" = "no" ]; then
       echo -e "  ${ORANGE}⚠${NC} $(_t macos.managed_update)"
       echo "$REQUIRED_JSON" | sudo python3 -c "
 import json, sys
@@ -382,6 +390,19 @@ if ! npm run build --loglevel warn; then
   fail "TypeScript forditas sikertelen. Ellenorizd a hibauzeneteket fentebb."
 fi
 ok "$(_t macos.ts_built)"
+
+# Stamp the build-marker after a successful fresh-install build, mirroring the
+# update.sh self-heal (dist/.built-commit records the commit dist was built
+# from). On a build abort, fail()/the ERR-trap exit 1 BEFORE this line, so the
+# marker is only ever written for a complete dist -- it can never falsely
+# report a stale/partial dist as healthy. Stamping it here also keeps a later
+# update.sh run from a needless first-adoption self-healing rebuild (marker ==
+# HEAD on a fresh install). A failed rev-parse just leaves the marker absent,
+# which the update.sh self-heal then handles exactly as before (no regression).
+if [ -d "$INSTALL_DIR/dist" ]; then
+  _built_commit="$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$_built_commit" ] && printf '%s\n' "$_built_commit" > "$INSTALL_DIR/dist/.built-commit"
+fi
 
 INSTALL_STEP="configuration"
 # Step 6: Configuration
@@ -793,6 +814,16 @@ cat > "$PLIST_DIR/${DASHBOARD_PLIST}.plist" << PLISTEOF
     <string>${HOME}/.local/bin:/opt/homebrew/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key>
     <string>${HOME}</string>
+  </dict>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>16384</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>32768</integer>
   </dict>
 </dict>
 </plist>

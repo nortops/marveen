@@ -4,7 +4,8 @@ import { homedir, platform } from 'node:os'
 import { execSync } from 'node:child_process'
 import { logger } from '../../logger.js'
 import { MAIN_AGENT_ID, BOT_NAME, PROJECT_ROOT } from '../../config.js'
-import { createAgentMessage, listPendingChannelRequests, updateChannelRequestStatus, getDb } from '../../db.js'
+import { createAgentMessage, listPendingChannelRequests, updateChannelRequestStatus, getDb, claimPendingForAgent } from '../../db.js'
+import { classifyAgentMessage, wrapAgentMessageForDelivery } from '../agent-message-wrap.js'
 import { atomicWriteFileSync } from '../atomic-write.js'
 import { getSecret, setSecret, deleteSecret, listSecrets } from '../vault.js'
 import {
@@ -47,6 +48,7 @@ import {
   readAgentTelegramConfig,
   readAgentDiscordConfig,
   readAgentGooglechatConfig,
+  readAgentTeamsConfig,
   readMarveenTelegramConfig,
   sendAvatarChangeMessage,
   sendWelcomeMessage,
@@ -110,7 +112,7 @@ import { suggestForAgent, type AgentSignals } from '../model-suggest.js'
 import { getTokenSummary } from '../token-usage.js'
 import { listScheduledTasks } from '../scheduled-tasks-io.js'
 
-const VALID_PROVIDERS = new Set<ChannelProviderType>(['telegram', 'slack', 'discord', 'googlechat'])
+const VALID_PROVIDERS = new Set<ChannelProviderType>(['telegram', 'slack', 'discord', 'googlechat', 'teams'])
 
 // Short-TTL caches so the synchronous, frequently-polled status endpoints
 // (`/api/agents` on load, `/api/agents/activity` every 3s) don't issue a fresh
@@ -147,7 +149,7 @@ function parseChannelProvider(raw: string): ChannelProviderType | null {
 // Match both new /channels/:provider/ and legacy /telegram/ URL patterns.
 // Returns [agentName, provider] or null. Legacy routes always resolve to 'telegram'.
 function matchChannelRoute(path: string, suffix: string): [string, ChannelProviderType] | null {
-  const newPattern = new RegExp(`^/api/agents/([^/]+)/channels/(telegram|slack|discord|googlechat)${suffix}$`)
+  const newPattern = new RegExp(`^/api/agents/([^/]+)/channels/(telegram|slack|discord|googlechat|teams)${suffix}$`)
   const newMatch = path.match(newPattern)
   if (newMatch) {
     const provider = parseChannelProvider(newMatch[2])
@@ -229,6 +231,7 @@ export function setAgentEnabledPlugins(name: string, provider: ChannelProviderTy
     slack: 'slack-channel@marveen-marketplace',
     discord: 'discord@claude-plugins-official',
     googlechat: 'googlechat@claude-channel-googlechat',
+    teams: 'teams@marveen-marketplace',
   }
   for (const [p, pluginKey] of Object.entries(allPlugins)) {
     plugins[pluginKey] = p === provider
@@ -308,6 +311,7 @@ interface AgentSummary {
   telegramBotUsername?: string
   hasDiscord: boolean
   hasGooglechat: boolean
+  hasTeams: boolean
   status: 'configured' | 'draft'
   running: boolean
   /** Tri-state: 'running' | 'stopped' | 'unreachable' (remote ssh failure). */
@@ -344,6 +348,7 @@ function getAgentSummary(name: string): AgentSummary {
   const tg = readAgentTelegramConfig(name)
   const dc = readAgentDiscordConfig(name)
   const gc = readAgentGooglechatConfig(name)
+  const tc = readAgentTeamsConfig(name)
   const hasClaudeMd = claudeMd.trim().length > 0
   const hasSoulMd = soulMd.trim().length > 0
 
@@ -375,6 +380,7 @@ function getAgentSummary(name: string): AgentSummary {
     telegramBotUsername: tg.botUsername,
     hasDiscord: dc.hasDiscord,
     hasGooglechat: gc.hasGooglechat,
+    hasTeams: tc.hasTeams,
     status: hasClaudeMd && hasSoulMd ? 'configured' : 'draft',
     running,
     runState,
@@ -424,6 +430,11 @@ function getAgentDetail(name: string): AgentDetail {
 function listAgentSummaries(): AgentSummary[] {
   return listAgentNames().map(getAgentSummary)
 }
+
+// Max inter-agent messages a single main-agent inbox drain returns. The rest
+// stay pending (FIFO) for the next turn's drain -- bounds the context a single
+// turn absorbs, mirroring the router's MAX_MESSAGES_PER_TICK.
+const INBOX_DRAIN_CAP = 10
 
 export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promise<boolean> {
   const { req, res, path, method } = ctx
@@ -1419,7 +1430,12 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   if (startMatch && method === 'POST') {
     const name = decodeURIComponent(startMatch[1])
     if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
-    const result = startAgentProcess(name)
+    // Optional { "fresh": true } body -> no `--continue`. Required for channel
+    // agents on Claude Code 2.1.193, where a `--continue` resume does not load
+    // the --channels plugin MCP server (agent comes up deaf).
+    let startFresh = false
+    try { startFresh = JSON.parse((await readBody(req)).toString() || '{}').fresh === true } catch {}
+    const result = startAgentProcess(name, { fresh: startFresh })
     // Record operator intent so the monitor keeps this agent up across shared
     // tmux-server restarts / reboots (see agent-desired-state.ts).
     if (result.ok || result.error === 'Agent is already running') addDesiredAgent(name)
@@ -1439,6 +1455,34 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     return true
   }
 
+  // Main-agent inbox PULL (drain-inbox): atomically CLAIM the main agent's
+  // pending inter-agent messages and return them already WRAPPED (single-source
+  // security framing via agent-message-wrap), for the UserPromptSubmit hook to
+  // print into the agent's context. The router skips main-agent tmux delivery,
+  // so this is the SOLE delivery path for the main agent -- which is why it is
+  // restricted to the main agent (serving a sub-agent here would double-deliver
+  // alongside the router's still-active tmux push). Auth is the global /api
+  // bearer gate. One quick claim+wrap per turn (NOT a hot loop -> not the #498
+  // self-HTTP event-loop hazard).
+  const drainMatch = path.match(/^\/api\/agents\/([^/]+)\/drain-inbox$/)
+  if (drainMatch && method === 'POST') {
+    const name = decodeURIComponent(drainMatch[1])
+    if (name !== MAIN_AGENT_ID) {
+      json(res, { error: 'drain-inbox is main-agent only (sub-agents use the router push path)' }, 400)
+      return true
+    }
+    const claimed = claimPendingForAgent(name, INBOX_DRAIN_CAP)
+    const blocks: string[] = []
+    for (const msg of claimed) {
+      const cls = classifyAgentMessage(msg.from_agent, msg.to_agent)
+      if (!cls) continue // empty/invalid from_agent -> cannot frame safely; drop
+      const { prefix, wrapped } = wrapAgentMessageForDelivery(cls.category, cls.safeFrom, msg.from_agent, msg.content)
+      blocks.push(prefix + wrapped)
+    }
+    json(res, { count: blocks.length, text: blocks.join('\n\n') })
+    return true
+  }
+
   const restartMatch = path.match(/^\/api\/agents\/([^/]+)\/restart$/)
   if (restartMatch && method === 'POST') {
     const name = decodeURIComponent(restartMatch[1])
@@ -1454,7 +1498,10 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       return true
     }
     if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
-    const result = restartAgentProcess(name)
+    // Optional { "fresh": true } body -> no `--continue` (see /start note).
+    let restartFresh = false
+    try { restartFresh = JSON.parse((await readBody(req)).toString() || '{}').fresh === true } catch {}
+    const result = restartAgentProcess(name, { fresh: restartFresh })
     if (result.ok) { json(res, { ok: true }); return true }
     json(res, { error: result.error }, 400)
     return true
