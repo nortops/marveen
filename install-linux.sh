@@ -161,6 +161,20 @@ for pkg in ffmpeg git tmux lsof curl python3 pipx unzip; do
   fi
 done
 
+# C/C++ toolchain a native npm modulok forditasahoz. A better-sqlite3 elobb egy
+# prebuilt binarist probal letolteni (prebuild-install); ha az nem elerheto vagy
+# a letoltes idotullepes miatt elbukik, node-gyp-pel forditja forrasbol, amihez
+# make + gcc/g++ kell. A csomagnev a 'command -v' nevtol elter, ezert kulon
+# ellenorizzuk (make/cc), es managerenkent a megfelelo csomagot adjuk hozza
+# (apt: build-essential -- make/gcc/g++; dnf: make gcc gcc-c++).
+if ! command -v make &>/dev/null || ! command -v cc &>/dev/null; then
+  if [ "$PKG_MANAGER" = "apt" ]; then
+    MISSING_PKGS="$MISSING_PKGS build-essential"
+  else
+    MISSING_PKGS="$MISSING_PKGS make gcc gcc-c++"
+  fi
+fi
+
 # Node.js v20+ ellenorzes
 NODE_OK=false
 if command -v node &>/dev/null; then
@@ -207,6 +221,7 @@ command -v npm &>/dev/null || fail "npm nem talalhato a nodejs csomag utan sem. 
 
 ok "ffmpeg $(ffmpeg -version | awk 'NR==1 {print $3}')"
 ok "git $(git --version | awk '{print $3}')"
+ok "make $(make --version | awk 'NR==1 {print $3}')"
 ok "lsof $(lsof -v 2>&1 | awk '/^    revision:/ {print $2}')"
 ok "node $(node --version)"
 ok "npm $(npm --version)"
@@ -609,6 +624,19 @@ if ! npm run build --loglevel warn; then
   fail "TypeScript forditas sikertelen. Ellenorizd a hibauzeneteket fentebb."
 fi
 ok "TypeScript leforditva"
+
+# Stamp the build-marker after a successful fresh-install build, mirroring the
+# update.sh self-heal (dist/.built-commit records the commit dist was built
+# from). On a build abort, fail()/the ERR-trap exit 1 BEFORE this line, so the
+# marker is only ever written for a complete dist -- it can never falsely
+# report a stale/partial dist as healthy. Stamping it here also keeps a later
+# update.sh run from a needless first-adoption self-healing rebuild (marker ==
+# HEAD on a fresh install). A failed rev-parse just leaves the marker absent,
+# which the update.sh self-heal then handles exactly as before (no regression).
+if [ -d "$INSTALL_DIR/dist" ]; then
+  _built_commit="$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$_built_commit" ] && printf '%s\n' "$_built_commit" > "$INSTALL_DIR/dist/.built-commit"
+fi
 
 mkdir -p "$INSTALL_DIR/store"
 mkdir -p "$INSTALL_DIR/agents"
@@ -1121,6 +1149,11 @@ WorkingDirectory=$INSTALL_DIR
 ExecStart=$NODE_PATH $INSTALL_DIR/dist/index.js
 Restart=on-failure
 RestartSec=5
+# Raise the file-descriptor limit: the dashboard makes many tmux subprocess
+# calls + holds MCP/SSE connections; the default soft limit (often 1024, or 256
+# under launchd on macOS) is exhausted once enough agents are active -> EMFILE,
+# silent HTTP-listener flap + "can't find session" tmux failures (2026-06-27).
+LimitNOFILE=16384
 StandardOutput=append:$INSTALL_DIR/store/dashboard.log
 StandardError=append:$INSTALL_DIR/store/dashboard.error.log
 Environment=PATH=$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin
@@ -1139,6 +1172,13 @@ After=network.target
 
 [Service]
 Type=simple
+# KillMode=process: the first tmux new-session from channels.sh starts the
+# SHARED tmux server in this unit's cgroup, and every sub-agent session lives
+# there too. Default control-group mode would SIGKILL the whole fleet on a
+# stop/restart (only the main agent's own unit). process mode kills only
+# channels.sh; the tmux server and all agents survive. channels.sh kill-sessions
+# its own "\$SESSION" before new-session so the surviving session doesn't collide.
+KillMode=process
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/scripts/channels.sh
 Restart=on-failure

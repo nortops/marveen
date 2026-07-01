@@ -66,8 +66,17 @@ def speak(voice_onnx, state_dir, chat_id, text):
     try:
         subprocess.run([VENV_PY, "-m", "piper", "-m", voice_onnx, "-f", wav],
                        input=text.encode(), check=True)
+        # Optional voice style: deeper + slower (e.g. a melancholic android tone).
+        # asetrate lowers pitch AND slows playback; aresample restores the container
+        # rate (so the lower pitch sticks). Distribution-safe default = 1.0 (off,
+        # natural Piper voice); set VOICE_PITCH in the host env (e.g. dashboard
+        # plist) to style a specific deployment. TODO: per-agent voice-style config.
+        pitch = os.environ.get("VOICE_PITCH", "1.0")
+        af = []
+        if pitch and pitch != "1.0":
+            af = ["-af", "asetrate=22050*%s,aresample=22050" % pitch]
         subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                        "-i", wav, "-c:a", "libopus", "-b:a", "32k", ogg], check=True)
+                        "-i", wav, *af, "-c:a", "libopus", "-b:a", "32k", ogg], check=True)
         b = "----fleetvoice"
         fd = open(ogg, "rb").read()
         body = (("--" + b + "\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n" + str(chat_id) + "\r\n").encode()

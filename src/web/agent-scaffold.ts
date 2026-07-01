@@ -129,6 +129,41 @@ export function ensureAgentHooks(name: string): boolean {
   return true
 }
 
+// Idempotent migration: ensure the staleness-guard UserPromptSubmit hook is
+// present. Unlike ensureAgentHooks (which seeds the WHOLE hooks block only for
+// hook-less agents), this MERGES a single UserPromptSubmit entry into an agent
+// that already has other hooks -- so the guard reaches the existing fleet, not
+// just freshly-scaffolded agents. The guard warns the agent when an inbound
+// <channel ts="..."> message was delivered long after it was sent (a lagged /
+// re-delivered message that may be stale), so it re-confirms before irreversible
+// actions. Re-running is a no-op once the entry exists (matched by command path).
+const STALENESS_HOOK_CMD = `python3 ${join(PROJECT_ROOT, 'scripts', 'hooks', 'staleness-guard.py')}`
+
+export function ensureAgentStalenessHook(name: string): boolean {
+  // agentSettingsPath() maps MAIN_AGENT_ID to ~/.claude/settings.json; using
+  // agentDir() directly here would create a spurious agents/<main> dir and make
+  // the main agent show up as a phantom "down" agent on the dashboard.
+  const settingsPath = agentSettingsPath(name)
+  let settings: Record<string, unknown> = {}
+  if (existsSync(settingsPath)) {
+    try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { return false }
+  }
+  const hooks = (settings.hooks && typeof settings.hooks === 'object')
+    ? settings.hooks as Record<string, unknown>
+    : {}
+  const ups = Array.isArray(hooks.UserPromptSubmit) ? hooks.UserPromptSubmit as unknown[] : []
+  // Idempotency: already wired if any command entry references the guard script.
+  const already = JSON.stringify(ups).includes('staleness-guard.py')
+  if (already) return false
+  ups.push({ hooks: [{ type: 'command', command: STALENESS_HOOK_CMD, timeout: 10 }] })
+  hooks.UserPromptSubmit = ups
+  settings.hooks = hooks
+  // Main agent's ~/.claude already exists; only sub-agent dirs need creating.
+  if (name !== MAIN_AGENT_ID) mkdirSync(join(agentDir(name), '.claude'), { recursive: true })
+  atomicWriteFileSync(settingsPath, JSON.stringify(settings, null, 2))
+  return true
+}
+
 export function writeAgentSettingsFromProfile(name: string, profile: ProfileTemplate): void {
   const agentRoot = agentDir(name)
   const settingsDir = join(agentRoot, '.claude')
@@ -139,11 +174,94 @@ export function writeAgentSettingsFromProfile(name: string, profile: ProfileTemp
     try { existing = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { /* overwrite */ }
   }
   const ctx = { HOME: homedir(), AGENT_DIR: agentRoot }
+  const denyList = profile.filesystem.deny.map(p => resolveProfilePlaceholders(p, ctx))
+  // Self-pace tool-name deny: every sub-agent (NOT the main agent) is denied the
+  // Claude Code runtime self-scheduling tools. A whole-tool-name deny IS enforced
+  // even under --dangerously-skip-permissions (deny is checked BEFORE the bypass
+  // allow), so this is a fail-closed layer; the self-pace-gate hook below covers
+  // the Bash escape routes a name-deny cannot reach. (2026-06-26 autonom-kor fix.)
+  if (agentGetsGovernanceGates(name)) denyList.push(...SELF_PACE_TOOL_DENY)
   existing.permissions = {
     allow: profile.filesystem.allow.map(p => resolveProfilePlaceholders(p, ctx)),
-    deny: profile.filesystem.deny.map(p => resolveProfilePlaceholders(p, ctx)),
+    deny: denyList,
   }
+  // Governance hard-gates: every sub-agent (NOT the main agent) gets PreToolUse
+  // hooks. Re-applied on every spawn (this function regenerates settings.json),
+  // so they survive respawns. (a) email-send block -- outbound email routes
+  // through the main agent. (b) self-pace block -- no ScheduleWakeup/Cron*/Bash
+  // self-injection. The MAIN_AGENT_ID is exempt from both. Merge/deploy is NOT
+  // gated: the operator authorizes those autonomously (so test/deploy runs are
+  // never blocked); the actual incident vector -- an agent answering its OWN
+  // posed question -- is covered by the self-pace block + the #0 CLAUDE.md doctrine.
+  if (agentGetsEmailGate(name)) injectEmailSendGate(existing)
+  if (agentGetsGovernanceGates(name)) injectSelfPaceGate(existing)
   atomicWriteFileSync(settingsPath, JSON.stringify(existing, null, 2))
+}
+
+// Which agents are subject to the email-send hard-gate: every agent EXCEPT the
+// main agent (MAIN_AGENT_ID, e.g. Marveen). Name-agnostic -- keyed on the
+// configured main-agent id, not a hardcoded 'marveen', so a customer install
+// gates its own sub-agents and exempts its own owner (distribution-hardcode
+// rule). Pure + exported so the main-exempt guarantee is unit-testable.
+export function agentGetsEmailGate(name: string): boolean {
+  return name !== MAIN_AGENT_ID
+}
+
+// Idempotently wire the email-send-gate PreToolUse hook into a settings.json
+// object. A deny-list rule alone would NOT enforce this: permissive profiles
+// launch with --dangerously-skip-permissions, which bypasses allow/deny --
+// hooks run regardless of permission mode. Name-agnostic so a customer install
+// gates its own sub-agents (the caller's MAIN_AGENT_ID guard exempts the owner).
+export function injectEmailSendGate(existing: Record<string, unknown>): void {
+  const hooks = (existing.hooks && typeof existing.hooks === 'object'
+    ? existing.hooks
+    : (existing.hooks = {})) as Record<string, unknown>
+  const command = `node ${join(PROJECT_ROOT, 'scripts', 'email-send-gate.mjs')}`
+  const entry = {
+    matcher: 'Bash|send_email',
+    hooks: [{ type: 'command', command, timeout: 10 }],
+  }
+  const prev = Array.isArray(hooks.PreToolUse) ? (hooks.PreToolUse as unknown[]) : []
+  // Drop any prior email-gate entry (respawn re-runs this) before re-adding, so
+  // the hook never accumulates duplicates; other PreToolUse entries are kept.
+  hooks.PreToolUse = [
+    ...prev.filter((e) => !JSON.stringify(e).includes('email-send-gate.mjs')),
+    entry,
+  ]
+}
+
+// Claude Code runtime self-scheduling tool names denied for sub-agents (fail-
+// closed, enforced even under --dangerously-skip-permissions). The Bash escape
+// routes are covered by the self-pace-gate hook, which a name-deny cannot reach.
+const SELF_PACE_TOOL_DENY = ['ScheduleWakeup', 'CronCreate', 'CronDelete', 'CronList', 'RemoteTrigger']
+
+// Which agents are subject to the self-pace gate: every agent EXCEPT the main
+// agent (same name-agnostic main-exempt rule as the email gate). Pure + exported
+// so the main-exempt guarantee is unit-testable.
+export function agentGetsGovernanceGates(name: string): boolean {
+  return name !== MAIN_AGENT_ID
+}
+
+// Idempotently wire the self-pace-gate PreToolUse hook (blocks ScheduleWakeup /
+// Cron* / RemoteTrigger + the Bash self-injection routes). Same shape + dedupe
+// discipline as injectEmailSendGate.
+export function injectSelfPaceGate(existing: Record<string, unknown>): void {
+  const hooks = (existing.hooks && typeof existing.hooks === 'object'
+    ? existing.hooks
+    : (existing.hooks = {})) as Record<string, unknown>
+  const command = `node ${join(PROJECT_ROOT, 'scripts', 'self-pace-gate.mjs')}`
+  const entry = {
+    // Write|Edit|NotebookEdit are included so the gate actually fires on the
+    // native-file route to the self-schedule store (gateDecision blocks a Write
+    // to scheduled_tasks.json); a Bash-only matcher would leave that route open.
+    matcher: 'ScheduleWakeup|CronCreate|CronDelete|CronList|RemoteTrigger|Bash|Write|Edit|NotebookEdit',
+    hooks: [{ type: 'command', command, timeout: 10 }],
+  }
+  const prev = Array.isArray(hooks.PreToolUse) ? (hooks.PreToolUse as unknown[]) : []
+  hooks.PreToolUse = [
+    ...prev.filter((e) => !JSON.stringify(e).includes('self-pace-gate.mjs')),
+    entry,
+  ]
 }
 
 // Copy the repo's `scheduled-tasks/<task>/task-config.json` to the

@@ -13,6 +13,8 @@ import {
   decideStuckInputRecovery,
   parkedChannelInput,
   parkedInputText,
+  parkedInputRowCount,
+  submitLanded,
 } from '../pane-state.js'
 
 // Realistic pane fixtures modelled on actual `tmux capture-pane -p`
@@ -1576,6 +1578,107 @@ describe('parkedInputText', () => {
   })
 })
 
+describe('parked input rendered with a non-breaking space (U+00A0) after ❯', () => {
+  // Live Claude Code panes render a NON-BREAKING SPACE (U+00A0), not an
+  // ASCII space, between the ❯ prompt glyph and parked (delivered-but-not-
+  // yet-submitted) text. Byte-for-byte the prompt line reads
+  //   e2 9d af (❯)  c2 a0 (NBSP)  <text>
+  // The ASCII-space form only shows up in scrollback for already-submitted
+  // lines. The original PARKED_INPUT_RX `/❯[ \t]+\S/` accepted only ASCII
+  // space or tab after the glyph, so an NBSP-rendered parked box fell
+  // through to 'idle'. And because every stuck-input recovery helper
+  // (stuckInputSignature, parkedChannelInput, parkedInputText) gates on
+  // detectPaneState === 'typing', that single miss took the whole recovery
+  // chain down: the delivered message stranded in the box forever, no
+  // recovery Enter was ever sent. Verified live 2026 on real captured panes.
+  const NBSP = '\u00a0'
+  const NBSP_PARKED = [
+    '', SEP,
+    `❯${NBSP}[Uzenet @dev2-tol]: please re-run the merge once CI is green`,
+    SEP,
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+  ].join('\n')
+  // The same message with an ordinary ASCII space, so the fix is proven to
+  // keep the pre-existing form working rather than swap one gap for another.
+  const ASCII_PARKED = [
+    '', SEP,
+    '❯ [Uzenet @dev2-tol]: please re-run the merge once CI is green',
+    SEP,
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+  ].join('\n')
+
+  it('classifies an NBSP-prompted parked box as typing, not idle', () => {
+    expect(detectPaneState(NBSP_PARKED)).toBe('typing')
+  })
+
+  it('still classifies the ASCII-space parked box as typing (no regression)', () => {
+    expect(detectPaneState(ASCII_PARKED)).toBe('typing')
+  })
+
+  it('merges an NBSP-parked box to busy when mergeTypingAsBusy is set', () => {
+    expect(detectPaneState(NBSP_PARKED, { mergeTypingAsBusy: true })).toBe('busy')
+  })
+
+  it('does not report an NBSP-parked pane as ready for a new prompt', () => {
+    expect(isReadyForPrompt(NBSP_PARKED)).toBe(false)
+  })
+
+  it('revives the stuck-input recovery chain (signature is non-null)', () => {
+    expect(stuckInputSignature(NBSP_PARKED)).not.toBe(null)
+  })
+
+  it('recovers the parked text with the ❯ prompt and NBSP stripped', () => {
+    expect(parkedInputText(NBSP_PARKED)).toBe(
+      '[Uzenet @dev2-tol]: please re-run the merge once CI is green',
+    )
+  })
+
+  // The production-critical stranding path: an inbound plugin notification
+  // (Telegram / inter-agent <channel> block) delivered into the box but not
+  // submitted, rendered with the NBSP gap. This is the exact shape that
+  // strands in the wild, so lock that parkedChannelInput recovers it intact.
+  it('recovers an NBSP-prompted parked CHANNEL block with the correct chat_id', () => {
+    const pane = [
+      '', SEP,
+      `❯${NBSP}<channel source="plugin:telegram:telegram" chat_id="1268077055" message_id="999" ts="2026-06-05T10:00:00Z">message body</channel>`,
+      SEP,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n')
+    const r = parkedChannelInput(pane)
+    expect(r).not.toBeNull()
+    expect(r!.complete).toBe(true)
+    expect(r!.chatId).toBe('1268077055')
+  })
+
+  // Real stranded messages are long and the TUI wraps them across input-box
+  // lines. Lock that NBSP + terminal-wrap collapse to one submittable line.
+  it('collapses a terminal-wrapped NBSP-parked message into one submittable line', () => {
+    const pane = [
+      '', SEP,
+      `❯${NBSP}[Uzenet @dev3-tol]: please review the latest changes when you`,
+      '  have a moment and re-run the merge once CI is green',
+      SEP,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n')
+    expect(detectPaneState(pane)).toBe('typing')
+    expect(parkedInputText(pane)).toBe(
+      '[Uzenet @dev3-tol]: please review the latest changes when you have a moment and re-run the merge once CI is green',
+    )
+  })
+
+  // The idle footer has two arms (bypass-permissions and the strict
+  // `? for shortcuts`). Lock NBSP detection under the strict arm too.
+  it('classifies an NBSP-parked box as typing under the strict shortcuts footer', () => {
+    const pane = [
+      '', SEP,
+      `❯${NBSP}[Uzenet @dev2-tol]: ping`,
+      SEP,
+      '  ? for shortcuts',
+    ].join('\n')
+    expect(detectPaneState(pane)).toBe('typing')
+  })
+})
+
 describe('detectsBlockingMenu', () => {
   // The real /mcp "Manage MCP servers" modal that wedged the main channels
   // session for ~6h (2026-06-12). The input box is gone; the footer shows the
@@ -1718,5 +1821,130 @@ describe('detectsPastePlaceholder', () => {
       '  paste again to expand',
     ].join('\n')
     expect(detectsPastePlaceholder(stubInBox)).toBe(true)
+  })
+})
+
+describe('parkedInputRowCount', () => {
+  it('returns 0 for an empty input box (bare prompt)', () => {
+    expect(parkedInputRowCount(IDLE_BYPASS)).toBe(0)
+    expect(parkedInputRowCount(BUSY_FULL_FOOTER)).toBe(0)
+  })
+
+  it('returns 0 when there is no input box at all', () => {
+    expect(parkedInputRowCount('just scrollback text\nno separators here')).toBe(0)
+  })
+
+  it('returns 1 for a single-row parked input', () => {
+    expect(parkedInputRowCount(TYPING_PARKED)).toBe(1)
+    expect(parkedInputRowCount(PENDING_PASTE)).toBe(1)
+  })
+
+  it('counts every visual row of a wrapped multi-row parked input', () => {
+    // A wrapped message occupying 3 box-interior rows; a bare Enter here would
+    // insert a newline instead of submitting.
+    const multiRow = [
+      '',
+      SEP,
+      '❯ first line of a long parked message that wraps across',
+      '  several visual rows inside the input box and would not',
+      '  submit on a bare Enter',
+      SEP,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n')
+    expect(parkedInputRowCount(multiRow)).toBe(3)
+  })
+})
+
+describe('submitLanded', () => {
+  // The exact text parked before the submit attempt.
+  const parkedSig = stuckInputSignature(TYPING_PARKED) as string
+
+  it('captures a non-empty signature from the parked fixture', () => {
+    expect(parkedSig).toBeTruthy()
+  })
+
+  it('is false when the identical signature is still parked', () => {
+    expect(submitLanded(parkedSig, TYPING_PARKED)).toBe(false)
+  })
+
+  it('is true when the box cleared (pane went idle)', () => {
+    expect(submitLanded(parkedSig, IDLE_BYPASS)).toBe(true)
+  })
+
+  it('is true when the agent started processing (pane went busy)', () => {
+    expect(submitLanded(parkedSig, BUSY_FULL_FOOTER)).toBe(true)
+  })
+
+  it('is true when different text is now parked', () => {
+    expect(submitLanded(parkedSig, PENDING_PASTE)).toBe(true)
+  })
+
+  it('is false when there is no after-capture (null)', () => {
+    expect(submitLanded(parkedSig, null)).toBe(false)
+  })
+})
+
+// Fresh-session / welcome-screen layout (Claude Code logo + model line + cwd,
+// the input box framed by two ──── rules, ❯ prefix, NO footer). Modelled on a
+// real captured stuck pane (store/qwen-welcome-stuck-fixture.txt) where a
+// delivered multi-row message parked before any footer rendered, and the whole
+// recovery stack went blind (liveInputBox null -> detectPaneState 'unknown').
+const WELCOME_STUCK = [
+  '',
+  ' ▐▛███▜▌   Claude Code v2.1.170',
+  '▝▜█████▛▘  qwen3.6:27b-192k with high effort · API Usage Billing',
+  '  ▘▘ ▝▝    ~/ClaudeClaw/agents/qwen',
+  '',
+  '',
+  SEP,
+  '❯ kepet: /Users/marvin/workspace/aahe486-screenshot.png',
+  '  Olvasd be a Read tool-lal a kepfajlt, majd mondd meg: (1) mi ez az',
+  '  alkalmazas, (2) a tablazat konkret ertekei. Roviden a vegeredmenyt.',
+  '  </trusted-peer>',
+  SEP,
+  '',
+].join('\n')
+
+describe('footer-less welcome-screen parked input', () => {
+  it('classifies the parked box as typing (not unknown)', () => {
+    expect(detectPaneState(WELCOME_STUCK)).toBe('typing')
+  })
+
+  it('mergeTypingAsBusy folds the footer-less parked box into busy', () => {
+    expect(detectPaneState(WELCOME_STUCK, { mergeTypingAsBusy: true })).toBe('busy')
+  })
+
+  it('stuckInputSignature recovers a non-null signature', () => {
+    const sig = stuckInputSignature(WELCOME_STUCK)
+    expect(sig).not.toBeNull()
+    expect(sig).toContain('kepet')
+  })
+
+  it('parkedInputText returns the collapsed multi-row message (not empty)', () => {
+    const t = parkedInputText(WELCOME_STUCK)
+    expect(t).not.toBeNull()
+    expect(t).not.toBe('')
+    expect(t).toContain('Olvasd be')
+  })
+
+  it('parkedInputRowCount counts every wrapped row (> 1 on a real wedge)', () => {
+    expect(parkedInputRowCount(WELCOME_STUCK)).toBe(4)
+    expect(parkedInputRowCount(WELCOME_STUCK)).toBeGreaterThan(1)
+  })
+
+  it('submitLanded fires once the welcome wedge clears to an idle pane', () => {
+    // Full P1 -> P2 chain on the real wedge: detection sees the footer-less
+    // parked box (sig != null), and after the message submits the pane is no
+    // longer that signature -> submitLanded true. This is what tells the
+    // recovery ladder the resubmit actually landed.
+    const sig = stuckInputSignature(WELCOME_STUCK)
+    expect(sig).not.toBeNull()
+    expect(submitLanded(sig as string, IDLE_BYPASS)).toBe(true)
+  })
+
+  it('does NOT mistake a scrollback ──── pair without a ❯ box for input', () => {
+    const noBox = ['some scrollback line', SEP, 'plain text, no prompt glyph', SEP, ''].join('\n')
+    expect(detectPaneState(noBox)).toBe('unknown')
+    expect(parkedInputRowCount(noBox)).toBe(0)
   })
 })

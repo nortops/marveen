@@ -1280,6 +1280,20 @@ export function getKanbanComments(cardId: string): KanbanComment[] {
   return db.prepare('SELECT * FROM kanban_comments WHERE card_id = ? ORDER BY created_at ASC').all(cardId) as KanbanComment[]
 }
 
+// Lookup a kanban card's `seq` (its sqlite rowid) by the 8-char hex id stored
+// in `kanban_cards.id`. Used by the kanban-ref normalizer to rewrite hex
+// references to the human-facing `#<seq>` form. Returns null when the prefix
+// matches zero rows OR more than one row (ambiguous → leave the message
+// untouched rather than guess). Case-insensitive: breakdown subtask ids are
+// uppercased while createKanbanCard ids stay lowercase.
+export function getKanbanSeqByIdPrefix(prefix: string): number | null {
+  const rows = db.prepare(
+    'SELECT rowid AS seq FROM kanban_cards WHERE id = ? COLLATE NOCASE LIMIT 2'
+  ).all(prefix) as { seq: number }[]
+  if (rows.length !== 1) return null
+  return rows[0].seq
+}
+
 export function addKanbanComment(cardId: string, author: string, content: string): KanbanComment {
   const now = Math.floor(Date.now() / 1000)
   const info = db.prepare(
@@ -1432,6 +1446,30 @@ export function getPendingMessages(toAgent?: string): AgentMessage[] {
 export function markMessageDelivered(id: number): boolean {
   const now = Math.floor(Date.now() / 1000)
   return db.prepare("UPDATE agent_messages SET status = 'delivered', delivered_at = ? WHERE id = ?").run(now, id).changes > 0
+}
+
+// Atomically CLAIM (pending -> delivered) the oldest `limit` pending messages
+// for an agent, returning the claimed rows. A SINGLE `UPDATE ... WHERE
+// status='pending' RETURNING` (NOT a SELECT-then-UPDATE) so two concurrent
+// drains can never double-claim the same message (-> no ghost double-delivery).
+// Backs the main-agent inbox PULL model: the main agent drains its own inbox at
+// each turn (via the drain-inbox endpoint + UserPromptSubmit hook) instead of
+// the router tmux-injecting into its perpetually-busy channel session.
+export function claimPendingForAgent(toAgent: string, limit: number): AgentMessage[] {
+  const now = Math.floor(Date.now() / 1000)
+  const rows = db.prepare(
+    `UPDATE agent_messages SET status = 'delivered', delivered_at = ?
+       WHERE id IN (
+         SELECT id FROM agent_messages
+         WHERE to_agent = ? AND status = 'pending'
+         ORDER BY created_at ASC, id ASC
+         LIMIT ?
+       )
+     RETURNING id, from_agent, to_agent, content, status, result, created_at, delivered_at, completed_at`,
+  ).all(now, toAgent, limit) as AgentMessage[]
+  // RETURNING row order is unspecified; restore FIFO (created_at, then id as the
+  // tiebreaker for same-second inserts) for delivery.
+  return rows.sort((a, b) => (a.created_at - b.created_at) || (a.id - b.id))
 }
 
 export function markMessageDone(id: number, result?: string): boolean {

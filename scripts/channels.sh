@@ -41,6 +41,7 @@ SESSION="${MAIN_AGENT_ID:-marveen}-channels"
 case "$CHANNEL_PROVIDER" in
   slack)    PLUGIN_ID="slack-channel@marveen-marketplace" ;;
   whatsapp) PLUGIN_ID="whatsapp@marveen-marketplace" ;;
+  teams)    PLUGIN_ID="teams@marveen-marketplace" ;;
   discord)  PLUGIN_ID="discord@claude-plugins-official" ;;
   *)        PLUGIN_ID="telegram@claude-plugins-official" ;;
 esac
@@ -85,10 +86,44 @@ export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HO
 # documented sandbox escape hatch. Harmless for non-root (guarded by uid check).
 [ "$(id -u)" = "0" ] && export IS_SANDBOX=1
 
+# Disable Claude Code's "Prompt Suggestions" (the grayed-out/DIM suggested command
+# shown in the input box, picked from git history / conversation). For headless
+# agent sessions it is pure noise AND it caused a false-positive incident: the
+# stuck-input recovery read the dim suggestion as a "parked input" and escalated a
+# phantom to the operator (2026-06-30, "Köszi a halakat."). Killing it at the
+# source removes the phantom entirely. Inherited by every sub-agent via the tmux
+# global env set below.
+export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
+
 CLAUDE="$(command -v claude)"
 TMUX="$(command -v tmux)"
 [ -z "$CLAUDE" ] && echo "ERROR: claude not found on PATH" >&2 && exit 1
 [ -z "$TMUX" ]   && echo "ERROR: tmux not found on PATH" >&2 && exit 1
+
+# MCP startup-batch tuning for the MAIN session (2026-06-26).
+#
+# The --channels telegram plugin registers as a stdio MCP server. Claude Code
+# connects stdio MCP servers in batches of MCP_SERVER_CONNECTION_BATCH_SIZE
+# (default 3) and, by default, blocks on each connection. The main session runs
+# the MOST MCP servers of any agent (filesystem + playwright + chrome + the
+# claude.ai Gmail/Calendar/Drive connectors + the channel plugin), so the slow
+# remote connectors starve the telegram plugin out of the startup batch / push
+# it past MCP_TIMEOUT -- it never registers, no poller spawns, and the main bot
+# goes silent (observed 2026-06-26: ~2h outage, auto-recovery exhausted).
+#
+# startAgentProcess already sets these for every sub-agent (which is why their
+# channels come up); channels.sh did NOT, so the main session never got the
+# mitigation. Set them inline on the launch command -- the tmux SERVER predates
+# this script and does not inherit its environment, so exporting here alone
+# would not reach the new claude. Mirrors the sub-agent launch.
+#
+# CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false also added here: the sub-agent spawn
+# (startAgentProcess) sets it to suppress the DIM ghost-text autocomplete, but
+# the MAIN channels session never got it -- so a dim ghost in the main box was
+# the one place the pane-scrape recovery could still misread it (the v1.15.0
+# dim-strip catches it on the recovery side, but killing it at the SOURCE on MAIN
+# too closes the gap end-to-end). Parity with the sub-agent launch.
+MCP_BATCH_ENV="export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false MCP_SERVER_CONNECTION_BATCH_SIZE=10 MCP_CONNECTION_NONBLOCKING=1 MCP_TIMEOUT=60000 && "
 
 # Read the main agent's default model from .claude/settings.json so we can
 # pass --model explicitly. Without --model claude-code falls back to its
@@ -117,6 +152,7 @@ MAIN_CHAN_DIR="$INSTALL_DIR/.claude/channels/$CHANNEL_PROVIDER"
 case "$CHANNEL_PROVIDER" in
   slack)    STATE_ENV_VAR="SLACK_STATE_DIR" ;;
   whatsapp) STATE_ENV_VAR="WHATSAPP_STATE_DIR" ;;
+  teams)    STATE_ENV_VAR="TEAMS_STATE_DIR" ;;
   discord)  STATE_ENV_VAR="DISCORD_STATE_DIR" ;;
   *)        STATE_ENV_VAR="TELEGRAM_STATE_DIR" ;;
 esac
@@ -172,6 +208,8 @@ fi
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   $TMUX set-environment -g ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY" 2>/dev/null || true
 fi
+# Propagate the prompt-suggestion disable to every sub-agent tmux session.
+$TMUX set-environment -g CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION false 2>/dev/null || true
 
 # Hybrid channel-coordinator model: the native plugin stays the PRIMARY inbound
 # path (it always polls getUpdates here -- never outbound-only). The standalone
@@ -185,8 +223,16 @@ fi
 # the cwd-based project dir may contain the user's own CLI sessions, and
 # resuming one of those loses the --channels activation state, causing
 # "Channel notifications skipped: server not in --channels list" errors.
+#
+# Idempotent launch: the service runs KillMode=process so a `systemctl stop`
+# no longer cgroup-kills the SHARED tmux server (which would tear down every
+# sibling agent session on this host -- the 2026-06-26 fleet-wide outage). The
+# trade-off is that a prior "$SESSION" can survive into this relaunch, so kill
+# just THIS session first -- never the server, never another agent's session --
+# otherwise new-session below fails with "duplicate session".
+$TMUX kill-session -t "$SESSION" 2>/dev/null || true
 $TMUX new-session -d -s "$SESSION" -c "$INSTALL_DIR" \
-  "$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}"
+  "${MCP_BATCH_ENV}$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}"
 
 # Session startup guard: a Claude Code first-run dialogusait auto-accept-eljuk
 # kulonben a headless session orokre parkolna a prompton es a Telegram plugin
@@ -227,7 +273,7 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
         # entry); see the PR description / card 7EB18437.
         [ -e "$INSTALL_DIR/CLAUDE.md" ] && ln -sf "$INSTALL_DIR/CLAUDE.md" "$_CHANNELS_STARTDIR/CLAUDE.md" 2>/dev/null || true
         $TMUX new-session -d -s "$SESSION" -c "$_CHANNELS_STARTDIR" \
-          "$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}"
+          "${MCP_BATCH_ENV}$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}"
         unset _CHANNELS_STARTDIR
       fi
       continue
