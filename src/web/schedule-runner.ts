@@ -15,7 +15,6 @@ import {
   insertPendingTaskRetryIfNew,
   markPendingTaskRetryAlert,
   clearPendingTaskRetryAlert,
-  insertPendingScheduledIfNew,
 } from '../db.js'
 import { toPendingRetryView, classifyTelegramSendError, type PendingRetryView } from '../pending-retries.js'
 import {
@@ -116,81 +115,16 @@ function persistScheduleLastRun(): void {
   }
 }
 
-// Build the full formatted prompt for a scheduled task (PREAMBLE + prefix + wrapped body).
-// Used by both the tmux-inject path (sub-agents) and the PULL inbox path (main agent).
-function buildScheduledTaskFullPrompt(task: ScheduledTask): string {
-  let prefix: string
-  if (task.type === 'heartbeat') {
-    prefix = `[Heartbeat: ${task.name}] `
-  } else {
-    prefix = `[Utemezett feladat: ${task.name}] Az eredmenyt kuldd el Telegramon (chat_id: ${ALLOWED_CHAT_ID}, reply tool). `
-  }
-  return (
-    SCHEDULED_TASK_PREAMBLE + '\n' +
-    prefix.trimEnd() + '\n\n' +
-    wrapScheduledTask(`scheduled-task:${task.name}`, task.prompt)
-  )
-}
-
 // Try to fire a task at a single target agent. Returns the outcome so the
 // caller can decide whether to queue a retry. Splitting this out means the
 // pendingTaskRetries loop and the normal cron loop share one code path.
-function attemptFireTask(task: ScheduledTask, agentName: string, now: number): 'fired' | 'busy' | 'missing' | 'starting' | 'error' | 'queued' {
+function attemptFireTask(task: ScheduledTask, agentName: string, now: number): 'fired' | 'busy' | 'missing' | 'starting' | 'error' {
   const isMainAgent = agentName === MAIN_AGENT_ID
-
-  // PULL + wakeup delivery for the main agent.
-  //
-  // Problem: the channels TUI session (MAIN_CHANNELS_SESSION) shows a different
-  // footer than standard Claude Code ("bypass permissions on..."), so
-  // detectPaneState() returns 'unknown' -> isSessionReadyForPrompt() is always
-  // false -> 444+ "busy or has pending input" retries (observed 2026-07-03).
-  //
-  // Fix -- two-part:
-  //   1. STORE: write the pre-formatted prompt into pending_scheduled_inbox (the
-  //      drain-inbox UserPromptSubmit hook claims it on the next turn start).
-  //   2. WAKE: inject a minimal wakeup via sendPromptToSession with
-  //      waitForIdle:false, bypassing isSessionReadyForPrompt entirely. When
-  //      the channel session is idle, the wakeup triggers an immediate turn;
-  //      when busy, Claude Code queues it and fires at the next turn boundary.
-  //      Either way, the UserPromptSubmit hook picks up pending_scheduled_inbox
-  //      and delivers the full task. If the wakeup injection fails (rare), the
-  //      inbox item persists and drains on the next organic user turn -- no loss.
-  if (isMainAgent) {
-    const fullPrompt = buildScheduledTaskFullPrompt(task)
-    const nowSec = Math.floor(now / 1000)
-    const inserted = insertPendingScheduledIfNew(task.name, agentName, fullPrompt, nowSec)
-    if (inserted) {
-      scheduleLastRun.set(task.name, now)
-      persistScheduleLastRun()
-      appendTaskRun(task.name, agentName, 'queued')
-      logger.info({ task: task.name, agent: agentName }, 'Scheduled task queued in main-agent PULL inbox; sending wakeup')
-      try {
-        // The wakeup is NOT the task itself -- the task arrives via drain-inbox
-        // context prepend. The wakeup just triggers the turn so the hook fires.
-        // waitForIdle:false skips the isSessionReadyForPrompt gate that always
-        // blocks on the channels TUI. If the session is idle, this fires
-        // immediately; if mid-turn, Claude Code queues it for the next boundary.
-        sendPromptToSession(
-          MAIN_CHANNELS_SESSION,
-          `[scheduled-inbox-wakeup: ${task.name}] Utemezett feladat az inboxban -- a drain-inbox hook betolti a context tetejere. Ha mar nincs fent semmi, a feladat egy korabbi turn-ben lefutott.`,
-          null,
-          { waitForIdle: false },
-        )
-        logger.info({ task: task.name }, 'Main-agent schedule wakeup sent')
-      } catch (err) {
-        logger.warn({ err, task: task.name }, 'Main-agent schedule wakeup failed -- inbox item persists, will drain on next user turn')
-      }
-    } else {
-      logger.info({ task: task.name, agent: agentName }, 'Scheduled task already pending in main-agent inbox, duplicate cron tick skipped')
-    }
-    return 'queued'
-  }
-
   // Allow per-task session override via targetSession config field.
   // Falls back to the standard agent session name derivation.
   const session = task.targetSession
     ? task.targetSession
-    : agentSessionName(agentName)
+    : isMainAgent ? MAIN_CHANNELS_SESSION : agentSessionName(agentName)
 
   // A remote sub-agent's session lives on the laptop -- resolve its host so the
   // existence/readiness checks and the send cross the ssh boundary. A custom
@@ -235,9 +169,43 @@ function attemptFireTask(task: ScheduledTask, agentName: string, now: number): '
   }
 
   try {
-    // buildScheduledTaskFullPrompt is single-sourced above; also used by the
-    // main-agent PULL path so the framing is never duplicated.
-    const fullPrompt = buildScheduledTaskFullPrompt(task)
+    let prefix: string
+    if (task.type === 'heartbeat') {
+      // Heartbeat prompts get ONLY a minimal tag. The agent's CLAUDE.md and
+      // the task SKILL.md drive behaviour -- the runner MUST NOT prepend any
+      // operational directive here.
+      //
+      // SECURITY (removed 2026-06-08): the previous `agentName !== 'heartbeat'`
+      // branch injected a coercive "call exactly one local tool before you
+      // write anything, do NOT use Telegram" keep-alive preamble. That text sat
+      // OUTSIDE the wrapUntrusted() envelope, so the receiving agent -- told to
+      // trust everything outside the untrusted tags -- was instructed to perform
+      // a mandatory no-op tool call and to suppress the very channel the user
+      // sees. The runner was poisoning its own trusted channel: a prompt
+      // injection we shipped ourselves. It also contradicted the agent contract
+      // and, if the channel-plugin disable leaked through user-scope settings,
+      // told the leftover Telegram tool to message ALLOWED_CHAT_ID. Removed
+      // entirely; ALL heartbeat agents now get the clean tag. Channel liveness
+      // is handled separately by the channels TUI keepalive
+      // (channel-coordinator/liveness.ts), never by injecting instructions into
+      // heartbeat prompts.
+      prefix = `[Heartbeat: ${task.name}] `
+    } else {
+      prefix = `[Utemezett feladat: ${task.name}] Az eredmenyt kuldd el Telegramon (chat_id: ${ALLOWED_CHAT_ID}, reply tool). `
+    }
+    // A scheduled task body is the agent's OWN task, authored by the operator
+    // (SKILL.md on disk, or the bearer-gated /api/schedules editor -- both
+    // inside the local trust boundary). Framing it with UNTRUSTED_PREAMBLE +
+    // wrapUntrusted was self-defeating: that preamble tells the agent to IGNORE
+    // instructions inside <untrusted> tags, so a security-correct agent refused
+    // to run its own heartbeat/audit and every scheduled task silently no-opped.
+    // Use the scheduled-task framing instead: tags are still scrubbed (so a
+    // poisoned body cannot smuggle a fake security tag) but the preamble marks
+    // it as a task-to-execute with the standard escalate-if-dangerous guard.
+    const fullPrompt =
+      SCHEDULED_TASK_PREAMBLE + '\n' +
+      prefix.trimEnd() + '\n\n' +
+      wrapScheduledTask(`scheduled-task:${task.name}`, task.prompt)
     // forceSend skips the busy-state check above; it must also skip the
     // pre-flight wait-until-idle gate inside sendPromptToSession, otherwise a
     // task aimed at a long-busy session would block on the 12s idle wait every
@@ -322,7 +290,6 @@ export function runScheduledTaskNow(taskName: string): { ok: boolean; result?: s
     // busy session both get a queued retry that lands once the session is
     // ready. We deliberately do NOT consult skipIfBusy here -- that flag trims
     // redundant cron ticks, but an explicit run-now must not be dropped.
-    // 'queued': main-agent task was written to PULL inbox -- no retry needed.
     if (result === 'starting' || result === 'busy') {
       insertPendingTaskRetryIfNew(task.name, agentName, now, result)
     }
@@ -440,10 +407,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
 
       const view = toPendingRetryView(row, now)
       const result = attemptFireTask(taskDef, row.agent_name, now)
-      // 'queued': main-agent task was written to PULL inbox -- treat as
-      // delivered and remove the legacy pending_task_retries row so the
-      // old tmux-retry path does not keep firing alongside the new one.
-      if (result === 'fired' || result === 'missing' || result === 'queued') {
+      if (result === 'fired' || result === 'missing') {
         deletePendingTaskRetry(row.task_name, row.agent_name)
         continue
       }

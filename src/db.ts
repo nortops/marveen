@@ -463,27 +463,6 @@ export function initDatabase(dbPathOverride?: string): void {
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_pending_retries_first_attempt ON pending_task_retries(first_attempt)`)
 
-  // --- Pending Scheduled Inbox (PULL delivery for main agent) ---
-  // The main agent's channel session is always busy; tmux injection fails with
-  // 444+ "busy or has pending input" retries (observed 2026-07-03). Instead,
-  // the schedule-runner writes the pre-formatted prompt here and the
-  // drain-inbox UserPromptSubmit hook claims it on the next main-agent turn.
-  // insertPendingScheduledIfNew uses WHERE NOT EXISTS so only ONE pending row
-  // per task+agent exists at a time (duplicate cron ticks are no-ops until the
-  // hook drains the previous one).
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS pending_scheduled_inbox (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      task_name TEXT NOT NULL,
-      agent_name TEXT NOT NULL,
-      full_prompt TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','delivered')),
-      created_at INTEGER NOT NULL,
-      delivered_at INTEGER
-    )
-  `)
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_pending_scheduled_status ON pending_scheduled_inbox(status, agent_name)`)
-
   db.exec(`
     CREATE TABLE IF NOT EXISTS background_tasks (
       id TEXT PRIMARY KEY,
@@ -2286,51 +2265,5 @@ export function pruneTokenUsage(): number {
   const cutoff = Math.floor(Date.now() / 1000) - retentionDays * 86400
   const info = db.prepare('DELETE FROM token_usage WHERE timestamp < ?').run(cutoff)
   return info.changes
-}
-
-// --- Pending Scheduled Inbox: PULL delivery for the main agent ---
-
-export interface PendingScheduledInboxRow {
-  id: number
-  task_name: string
-  agent_name: string
-  full_prompt: string
-  status: string
-  created_at: number
-  delivered_at: number | null
-}
-
-// Insert a scheduled-task prompt into the PULL inbox ONLY if no pending row
-// already exists for this task+agent. Returns true when a row was inserted
-// (first delivery), false when a pending row was already present (idempotent
-// duplicate cron tick -- caller should skip or treat as already-queued).
-export function insertPendingScheduledIfNew(taskName: string, agentName: string, fullPrompt: string, nowSec: number): boolean {
-  const info = db.prepare(
-    `INSERT INTO pending_scheduled_inbox (task_name, agent_name, full_prompt, status, created_at)
-     SELECT ?, ?, ?, 'pending', ?
-     WHERE NOT EXISTS (
-       SELECT 1 FROM pending_scheduled_inbox
-       WHERE task_name = ? AND agent_name = ? AND status = 'pending'
-     )`
-  ).run(taskName, agentName, fullPrompt, nowSec, taskName, agentName)
-  return info.changes > 0
-}
-
-// Atomically CLAIM (pending -> delivered) the oldest `limit` pending scheduled
-// tasks for an agent and return them. Single UPDATE ... RETURNING prevents
-// double-claims on concurrent drains (same guarantee as claimPendingForAgent).
-export function claimPendingScheduledForAgent(agentName: string, limit: number): PendingScheduledInboxRow[] {
-  const nowSec = Math.floor(Date.now() / 1000)
-  const rows = db.prepare(
-    `UPDATE pending_scheduled_inbox SET status = 'delivered', delivered_at = ?
-       WHERE id IN (
-         SELECT id FROM pending_scheduled_inbox
-         WHERE agent_name = ? AND status = 'pending'
-         ORDER BY created_at ASC, id ASC
-         LIMIT ?
-       )
-     RETURNING id, task_name, agent_name, full_prompt, status, created_at, delivered_at`
-  ).all(nowSec, agentName, limit) as PendingScheduledInboxRow[]
-  return rows.sort((a, b) => (a.created_at - b.created_at) || (a.id - b.id))
 }
 
