@@ -4,7 +4,7 @@ import { homedir, platform } from 'node:os'
 import { execSync } from 'node:child_process'
 import { logger } from '../../logger.js'
 import { MAIN_AGENT_ID, BOT_NAME, PROJECT_ROOT } from '../../config.js'
-import { createAgentMessage, listPendingChannelRequests, updateChannelRequestStatus, getDb, claimPendingForAgent, claimPendingScheduledForAgent } from '../../db.js'
+import { createAgentMessage, listPendingChannelRequests, updateChannelRequestStatus, getDb, claimPendingForAgent } from '../../db.js'
 import { classifyAgentMessage, wrapAgentMessageForDelivery } from '../agent-message-wrap.js'
 import { atomicWriteFileSync } from '../atomic-write.js'
 import { getSecret, setSecret, deleteSecret, listSecrets } from '../vault.js'
@@ -1482,17 +1482,6 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       // PUT /api/messages/:id for tasks it receives through the PULL path.
       const prefix = isChannelInbound ? basePrefix : basePrefix.replace(']: ', `, msg_id:${msg.id}]: `)
       blocks.push(prefix + wrapped)
-    }
-    // Also drain the scheduled-task PULL inbox. The schedule-runner writes
-    // pre-formatted prompts here for the main agent instead of tmux-injecting,
-    // bypassing the always-busy isSessionReadyForPrompt check that caused 444+
-    // "busy or has pending input" retries (regression since v1.18.5). The
-    // full_prompt is already formatted with SCHEDULED_TASK_PREAMBLE +
-    // wrapScheduledTask (single-sourced in buildScheduledTaskFullPrompt), so
-    // include it verbatim -- no additional wrapping needed.
-    const scheduledClaimed = claimPendingScheduledForAgent(name, INBOX_DRAIN_CAP)
-    for (const row of scheduledClaimed) {
-      blocks.push(row.full_prompt)
     }
     json(res, { count: blocks.length, text: blocks.join('\n\n') })
     return true
