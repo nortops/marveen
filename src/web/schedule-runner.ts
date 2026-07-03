@@ -164,12 +164,23 @@ function buildScheduledTaskFullPrompt(task: ScheduledTask): string {
 function attemptFireTask(task: ScheduledTask, agentName: string, now: number): 'fired' | 'busy' | 'missing' | 'starting' | 'error' | 'queued' {
   const isMainAgent = agentName === MAIN_AGENT_ID
 
-  // PULL delivery for the main agent: the channel session is always-busy, so
-  // tmux injection would stall in the pending_task_retries queue for hours
-  // (444+ "busy or has pending input" retries observed 2026-07-03). Instead,
-  // write the pre-formatted prompt into pending_scheduled_inbox; the
-  // drain-inbox UserPromptSubmit hook claims it on the next turn. This bypasses
-  // isSessionReadyForPrompt entirely and does NOT need pending_task_retries.
+  // PULL + wakeup delivery for the main agent.
+  //
+  // Problem: the channels TUI session (MAIN_CHANNELS_SESSION) shows a different
+  // footer than standard Claude Code ("bypass permissions on..."), so
+  // detectPaneState() returns 'unknown' -> isSessionReadyForPrompt() is always
+  // false -> 444+ "busy or has pending input" retries (observed 2026-07-03).
+  //
+  // Fix -- two-part:
+  //   1. STORE: write the pre-formatted prompt into pending_scheduled_inbox (the
+  //      drain-inbox UserPromptSubmit hook claims it on the next turn start).
+  //   2. WAKE: inject a minimal wakeup via sendPromptToSession with
+  //      waitForIdle:false, bypassing isSessionReadyForPrompt entirely. When
+  //      the channel session is idle, the wakeup triggers an immediate turn;
+  //      when busy, Claude Code queues it and fires at the next turn boundary.
+  //      Either way, the UserPromptSubmit hook picks up pending_scheduled_inbox
+  //      and delivers the full task. If the wakeup injection fails (rare), the
+  //      inbox item persists and drains on the next organic user turn -- no loss.
   if (isMainAgent) {
     const fullPrompt = buildScheduledTaskFullPrompt(task)
     const nowSec = Math.floor(now / 1000)
@@ -178,7 +189,23 @@ function attemptFireTask(task: ScheduledTask, agentName: string, now: number): '
       scheduleLastRun.set(task.name, now)
       persistScheduleLastRun()
       appendTaskRun(task.name, agentName, 'queued')
-      logger.info({ task: task.name, agent: agentName }, 'Scheduled task queued in main-agent PULL inbox')
+      logger.info({ task: task.name, agent: agentName }, 'Scheduled task queued in main-agent PULL inbox; sending wakeup')
+      try {
+        // The wakeup is NOT the task itself -- the task arrives via drain-inbox
+        // context prepend. The wakeup just triggers the turn so the hook fires.
+        // waitForIdle:false skips the isSessionReadyForPrompt gate that always
+        // blocks on the channels TUI. If the session is idle, this fires
+        // immediately; if mid-turn, Claude Code queues it for the next boundary.
+        sendPromptToSession(
+          MAIN_CHANNELS_SESSION,
+          `[scheduled-inbox-wakeup: ${task.name}] Utemezett feladat az inboxban -- a drain-inbox hook betolti a context tetejere. Ha mar nincs fent semmi, a feladat egy korabbi turn-ben lefutott.`,
+          null,
+          { waitForIdle: false },
+        )
+        logger.info({ task: task.name }, 'Main-agent schedule wakeup sent')
+      } catch (err) {
+        logger.warn({ err, task: task.name }, 'Main-agent schedule wakeup failed -- inbox item persists, will drain on next user turn')
+      }
     } else {
       logger.info({ task: task.name, agent: agentName }, 'Scheduled task already pending in main-agent inbox, duplicate cron tick skipped')
     }

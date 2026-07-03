@@ -20,7 +20,7 @@ import {
 
 beforeAll(() => { initDatabase(':memory:') })
 
-const AGENT = 'atlas'
+const AGENT = 'agent-main'
 const TASK = 'test-scheduled-task-pull-' + Date.now()
 const NOW = Math.floor(Date.now() / 1000)
 
@@ -106,16 +106,38 @@ describe('schedule-runner: main-agent tasks use PULL delivery', () => {
     expect(fnBody).toMatch(/isMainAgent/)
   })
 
-  it('PULL path returns "queued" without touching sendPromptToSession for main agent', () => {
+  it('PULL path uses waitForIdle:false wakeup -- bypasses isSessionReadyForPrompt for main agent', () => {
     const fnIdx = SRC.indexOf('function attemptFireTask')
     const nextFnIdx = SRC.indexOf('\nfunction ', fnIdx + 1)
     const fnBody = SRC.slice(fnIdx, nextFnIdx)
-    // The isMainAgent early-return must come BEFORE the session/idle checks
+    // The isMainAgent block must use sendPromptToSession with waitForIdle:false
+    const wakeupIdx = fnBody.indexOf('waitForIdle: false')
+    expect(wakeupIdx).toBeGreaterThan(0)
+    // The FUNCTIONAL isSessionReadyForPrompt call (not the comment mention)
+    // must come AFTER the main-agent early return ('return \'queued\'')
     const pullReturnIdx = fnBody.indexOf("return 'queued'")
-    const sessionCheckIdx = fnBody.indexOf('isSessionReadyForPrompt(')
+    // Use '!isSessionReadyForPrompt(' to skip comment references
+    const sessionCheckIdx = fnBody.indexOf('!isSessionReadyForPrompt(')
     expect(pullReturnIdx).toBeGreaterThan(0)
     expect(sessionCheckIdx).toBeGreaterThan(0)
     expect(pullReturnIdx).toBeLessThan(sessionCheckIdx)
+  })
+
+  it('wakeup targets MAIN_CHANNELS_SESSION inside the isMainAgent block', () => {
+    const fnIdx = SRC.indexOf('function attemptFireTask')
+    const nextFnIdx = SRC.indexOf('\nfunction ', fnIdx + 1)
+    const fnBody = SRC.slice(fnIdx, nextFnIdx)
+    const isMainAgentBlockIdx = fnBody.indexOf('if (isMainAgent)')
+    expect(isMainAgentBlockIdx).toBeGreaterThan(0)
+    // Search for MAIN_CHANNELS_SESSION AFTER the if (isMainAgent) statement
+    const afterBlock = fnBody.slice(isMainAgentBlockIdx)
+    expect(afterBlock).toMatch(/MAIN_CHANNELS_SESSION/)
+    // And it must appear in the same block as sendPromptToSession
+    const sendPromptIdx = afterBlock.indexOf('sendPromptToSession(')
+    const channelSessionIdx = afterBlock.indexOf('MAIN_CHANNELS_SESSION')
+    expect(sendPromptIdx).toBeGreaterThan(0)
+    // MAIN_CHANNELS_SESSION is the first arg to sendPromptToSession -- appears after the call start
+    expect(Math.abs(channelSessionIdx - sendPromptIdx)).toBeLessThan(100)
   })
 
   it('pending-retry loop deletes the retry row when result is "queued"', () => {
