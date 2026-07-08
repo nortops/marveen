@@ -217,8 +217,10 @@
 
       <!-- Board-specific filter row (hidden when gantt active) -->
       <div id="kanbanBoardFilters" style="margin-bottom:12px;display:flex;align-items:center;gap:8px;">
-        <span id="kanbanProjectChipsLabel" style="font-size:13px;color:var(--muted);white-space:nowrap;">Projekt:</span>
-        <div id="kanbanProjectChips" style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;"></div>
+        <label for="kanbanProjectFilter" style="font-size:13px;color:var(--muted);white-space:nowrap;">Projekt:</label>
+        <select id="kanbanProjectFilter" style="font-size:13px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);min-width:140px;">
+          <option value="">Mind</option>
+        </select>
         <label for="kanbanGroupBy" style="font-size:13px;color:var(--muted);white-space:nowrap;margin-left:8px;" data-i18n="kanban.filter.group_label">Csoportosítás:</label>
         <select id="kanbanGroupBy" style="font-size:13px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);min-width:140px;">
           <option value="none" data-i18n="kanban.filter.group_none">Nincs</option>

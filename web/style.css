@@ -945,33 +945,6 @@ main {
   padding: 0;
 }
 
-.kanban-project-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 12px;
-  padding: 3px 9px;
-  border-radius: 12px;
-  border: 1px solid var(--accent);
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 10%, var(--bg-card));
-  cursor: pointer;
-  user-select: none;
-  transition: opacity 0.15s;
-}
-.kanban-project-chip:hover { opacity: 0.8; }
-.kanban-project-chip.hidden {
-  border-color: var(--border);
-  color: var(--muted);
-  background: var(--bg);
-  text-decoration: line-through;
-  opacity: 0.6;
-}
-.kanban-project-chip-count {
-  font-size: 10px;
-  opacity: 0.8;
-}
-
 .priority-bar {
   width: 3px;
   height: 100%;
