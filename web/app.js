@@ -433,14 +433,10 @@ function renderStaticI18n() {
   if (overviewAgentMeta) overviewAgentMeta.textContent = t('overview.meta.messages')
 
   // Kanban filter labels
-  const kanbanProjectLabel = document.querySelector('label[for="kanbanProjectFilter"]')
-  if (kanbanProjectLabel) kanbanProjectLabel.textContent = t('kanban.filter.project_label')
+  const kanbanProjectChipsLabel = document.getElementById('kanbanProjectChipsLabel')
+  if (kanbanProjectChipsLabel) kanbanProjectChipsLabel.textContent = t('kanban.filter.project_label')
   const kanbanGroupLabel = document.querySelector('label[for="kanbanGroupBy"]')
   if (kanbanGroupLabel) kanbanGroupLabel.textContent = t('kanban.filter.group_label')
-
-  // Kanban project filter "Mind" option (first option)
-  const kanbanProjectFilter = document.getElementById('kanbanProjectFilter')
-  if (kanbanProjectFilter?.options[0]) kanbanProjectFilter.options[0].text = t('kanban.filter.all_projects')
 
   // Kanban group-by options
   const kanbanGroupBy = document.getElementById('kanbanGroupBy')
@@ -618,7 +614,9 @@ let kanbanAllLabels = []
 // AND-combined with the existing project/assignee filters. Persisted in
 // localStorage alongside the swimlane groupBy choice.
 let kanbanLabelFilter = new Set()
-let kanbanProjectFilter = ''
+// Set of project keys (card.project || '') that are currently HIDDEN.
+// Empty = show all projects. Persisted in localStorage.
+let kanbanHiddenProjects = new Set()
 // Assignee filter for the kanban board. '' = show all. Set via the
 // assignee dropdown / "Csak Gábor" toggle injected by setupAssigneeFilter().
 // Matched case-insensitively against card.assignee so a casing mismatch
@@ -688,6 +686,10 @@ async function loadKanban() {
         const storedLabels = JSON.parse(localStorage.getItem('marveen.kanbanLabelFilter') || '[]')
         if (Array.isArray(storedLabels)) kanbanLabelFilter = new Set(storedLabels)
       } catch { /* ignore malformed storage */ }
+      try {
+        const storedHidden = JSON.parse(localStorage.getItem('marveen.kanbanHiddenProjects') || '[]')
+        if (Array.isArray(storedHidden)) kanbanHiddenProjects = new Set(storedHidden)
+      } catch { /* ignore malformed storage */ }
     }
     const [cardsRes, assigneesRes, projectsRes, labelsRes] = await Promise.all([
       fetch('/api/kanban'),
@@ -699,7 +701,7 @@ async function loadKanban() {
     kanbanAssignees = await assigneesRes.json()
     kanbanProjects = await projectsRes.json()
     kanbanAllLabels = await labelsRes.json()
-    populateProjectFilter()
+    renderKanbanProjectChips()
     populateProjectSuggestions()
     setupAssigneeFilter()
     renderKanban()
@@ -714,18 +716,29 @@ document.getElementById('kanbanGroupBy').addEventListener('change', (e) => {
   renderKanban()
 })
 
-function populateProjectFilter() {
-  const sel = document.getElementById('kanbanProjectFilter')
-  const prev = sel.value
-  sel.innerHTML = '<option value="">Mind</option>'
-  for (const p of kanbanProjects) {
-    const opt = document.createElement('option')
-    opt.value = p
-    opt.textContent = p
-    if (p === prev) opt.selected = true
-    sel.appendChild(opt)
+function renderKanbanProjectChips() {
+  const container = document.getElementById('kanbanProjectChips')
+  if (!container) return
+  container.innerHTML = ''
+  // Include '' as the key for cards with no project assigned
+  const allKeys = ['', ...kanbanProjects]
+  for (const key of allKeys) {
+    const count = kanbanCards.filter(c => (c.project || '') === key).length
+    if (count === 0) continue
+    const label = key || t('kanban.filter.no_project')
+    const hidden = kanbanHiddenProjects.has(key)
+    const chip = document.createElement('span')
+    chip.className = 'kanban-project-chip' + (hidden ? ' hidden' : '')
+    chip.title = hidden ? t('kanban.filter.project_show') : t('kanban.filter.project_hide')
+    chip.innerHTML = `${escapeHtml(label)} <span class="kanban-project-chip-count">${count}</span>`
+    chip.addEventListener('click', () => {
+      if (kanbanHiddenProjects.has(key)) kanbanHiddenProjects.delete(key)
+      else kanbanHiddenProjects.add(key)
+      persistKanbanFilters()
+      renderKanban()
+    })
+    container.appendChild(chip)
   }
-  if (prev && !kanbanProjects.includes(prev)) kanbanProjectFilter = ''
 }
 
 function populateProjectSuggestions() {
@@ -738,11 +751,6 @@ function populateProjectSuggestions() {
     dl.appendChild(opt)
   }
 }
-
-document.getElementById('kanbanProjectFilter').addEventListener('change', (e) => {
-  kanbanProjectFilter = e.target.value
-  renderKanban()
-})
 
 // The kanban "owner" is the assignee whose type is 'owner' -- the person the
 // board is primarily run for, on any deployment. Identified by type, never by
@@ -773,9 +781,8 @@ function syncOwnerFilterBtn() {
 // the toolbar stays self-contained. Idempotent: the controls are created once;
 // later calls only refresh the <option>s from the current assignee list.
 function setupAssigneeFilter() {
-  const projectSel = document.getElementById('kanbanProjectFilter')
-  if (!projectSel) return
-  const toolbar = projectSel.parentElement
+  const toolbar = document.getElementById('kanbanBoardFilters')
+  if (!toolbar) return
   let sel = document.getElementById('kanbanAssigneeFilter')
   if (!sel) {
     const label = document.createElement('label')
@@ -837,7 +844,7 @@ function setupAssigneeFilter() {
 // currently active, so a chip's count stays meaningful whether it's the one
 // being toggled or not.
 function kanbanCardMatchesBaseFilters(card) {
-  if (kanbanProjectFilter && (card.project || '') !== kanbanProjectFilter) return false
+  if (kanbanHiddenProjects.size > 0 && kanbanHiddenProjects.has(card.project || '')) return false
   const assigneeFilter = kanbanAssigneeFilter.toLowerCase()
   if (assigneeFilter && String(card.assignee || '').trim().toLowerCase() !== assigneeFilter) return false
   return true
@@ -869,6 +876,7 @@ function clearKanbanQuickFilters() {
 
 function persistKanbanFilters() {
   localStorage.setItem('marveen.kanbanLabelFilter', JSON.stringify([...kanbanLabelFilter]))
+  localStorage.setItem('marveen.kanbanHiddenProjects', JSON.stringify([...kanbanHiddenProjects]))
 }
 
 // Quick-filter chip row: one chip per defined label (not per priority), tinted
@@ -903,6 +911,7 @@ function renderKanbanQuickFilters() {
 function renderKanban() {
   const cardById = new Map(kanbanCards.map(c => [c.id, c]))
 
+  renderKanbanProjectChips()
   renderKanbanQuickFilters()
 
   // Determine which top-level cards are visible under current filters.
