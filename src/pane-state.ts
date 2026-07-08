@@ -1413,3 +1413,25 @@ export function decideStuckToolCallRecovery(
     next: { ...prev, lastSeconds: sig.seconds, stagnantPolls: nextStagnant, stagnantSince: nextStagnantSince, attempts: 1 },
   }
 }
+
+// --- Context-saturation predicate -------------------------------------------
+// Claude Code prints "100% context used" (and a few equivalent phrasings) in
+// its footer when a pane can no longer accept useful work, yet the pane can
+// still otherwise present as perfectly idle -- empty prompt, ready-looking
+// footer. paneLooksIdle() therefore returns true for a saturated session, and
+// a caller that only checks idleness will happily dispatch new work into a
+// pane that cannot act on it. paneShowsContextSaturation() closes that gap.
+//
+// The banner renders one row ABOVE the bypass-mode footer, so the window is a
+// little wider than LIVE_FOOTER_REGION_LINES (which anchors on the footer line
+// itself); still tail-scoped, so a scrollback quote of the same phrase does
+// not trip it.
+const CTX_SAT_FOOTER_REGION_LINES = 8
+const CTX_SAT_RX = /100% context used|context (?:is |limit reached|window )?full\b|context limit|auto-?compact required/i
+
+export function paneShowsContextSaturation(capture: string): boolean {
+  if (!capture || !capture.trim()) return false
+  const lines = capture.split('\n')
+  const footerRegion = lines.slice(-CTX_SAT_FOOTER_REGION_LINES).join('\n')
+  return CTX_SAT_RX.test(footerRegion)
+}
