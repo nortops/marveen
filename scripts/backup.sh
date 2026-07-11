@@ -1,167 +1,304 @@
 #!/usr/bin/env bash
-# Marveen backup.
+# backup.sh — one-command encrypted backup of the full Atlas fleet.
 #
-# The archive has two top-level groups so a restore is unambiguous about
-# where each file belongs (see docs/MIGRATION.md):
+# Usage:
+#   ./scripts/backup.sh [--dry-run] [--output-dir DIR]
 #
-#   repo/   -> extract under the project root (this repo)
-#     store/claudeclaw.db (+ -shm/-wal; WAL-checkpointed before copy)
-#     store/.dashboard-token   (dashboard bearer)
-#     .env                     (project root secrets)
-#     scheduled-tasks.json     (legacy, if present)
-#     assets/meetings/**       (meeting transcripts/memos)
-#     agents/*/CLAUDE.md, SOUL.md, .mcp.json
-#     agents/*/.claude/channels/{telegram,slack,discord}/.env, access.json
+# Output: marveen-backup-<TIMESTAMP>.tar.gz.age  (current dir, or --output-dir)
 #
-#   home/   -> extract under $HOME
-#     .claude/skills/**            (the self-built skill library)
-#     .claude/scheduled-tasks/**   (file-based scheduled tasks: SKILL.md + config)
-#     .claude/channels/*/.env      (MAIN orchestrator channel token)
-#     .claude/channels/*/access.json, invites.json, approved/**  (pairing state)
-#     Library/LaunchAgents/com.<MAIN_AGENT_ID>.*.plist (launchd jobs)
+# What gets packed (tar root = /home/northber):
+#   .claude/              (excluding cache/, sessions/, tmp/, daemon/, daemon.lock, daemon.log)
+#   .config/systemd/user/
+#   Projects/marveen/store/<snapshot + vault + state files>
+#   Projects/marveen/.env-for-backup   (CLAUDE_CODE_OAUTH_TOKEN row excluded)
+#   Projects/marveen/homeserver.tail*.crt / .key
+#   Projects/marveen/fleet.bundle      (git bundle for offline restore)
+#   Projects/marveen/manifest.json     (pinned_sha, checksums, node_version, ...)
 #
-# Output: backups/claudeclaw-YYYYmmdd-HHMMSS.tar.gz
-# Retention: keeps the most recent 14 archives, prunes the rest.
+# Restore: extract, then run scripts/install.sh on the target machine.
 #
-# Restore (preserve modes so the 0600 token files stay private):
-#   tar -xpzf <archive> -C /tmp/restore        # inspect first
-#   then copy repo/* into the project root and home/* into $HOME.
-# Full runbook: docs/MIGRATION.md.
+# SECURITY: the archive contains vault keys and bot tokens. Keep it off cloud sync.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BACKUP_DIR="${REPO_ROOT}/backups"
-STAMP="$(date +%Y%m%d-%H%M%S)"
-ARCHIVE="${BACKUP_DIR}/claudeclaw-${STAMP}.tar.gz"
-KEEP=14
+HOME_DIR="/home/northber"
+STORE_DIR="${REPO_ROOT}/store"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+DRY_RUN=false
+OUTPUT_DIR="$(pwd)"
 
-mkdir -p "${BACKUP_DIR}"
-cd "${REPO_ROOT}"
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run)          DRY_RUN=true ;;
+    --output-dir=*)     OUTPUT_DIR="${arg#--output-dir=}" ;;
+    --output-dir)       shift; OUTPUT_DIR="$1" ;;
+    *)                  echo "Unknown argument: $arg" >&2; exit 1 ;;
+  esac
+done
 
-# Checkpoint WAL into the main DB file so the snapshot is self-contained.
-# Tolerate a missing sqlite3 CLI -- just fall back to copying the files as-is.
-if [[ -f store/claudeclaw.db ]] && command -v sqlite3 >/dev/null 2>&1; then
-  sqlite3 store/claudeclaw.db 'PRAGMA wal_checkpoint(TRUNCATE);' >/dev/null || true
+# ---------------------------------------------------------------------------
+# Prereq check (dry-run only needs git + node for pinned_sha + size display)
+# ---------------------------------------------------------------------------
+MISSING=()
+if $DRY_RUN; then
+  for cmd in git node; do
+    command -v "$cmd" >/dev/null 2>&1 || MISSING+=("$cmd")
+  done
+else
+  for cmd in sqlite3 age git node tar; do
+    command -v "$cmd" >/dev/null 2>&1 || MISSING+=("$cmd")
+  done
+fi
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+  echo "ERROR: missing tools: ${MISSING[*]}" >&2
+  echo "Install them and retry." >&2
+  exit 1
 fi
 
-# --- Build the two path lists (each relative to its own base). -------------
-# tar refuses missing entries, which would fail the whole backup on a fresh
-# machine (no agents yet) -- so we only list paths that actually exist.
-REPOLIST="$(mktemp -t claudeclaw-repo.XXXXXX)"
-HOMELIST="$(mktemp -t claudeclaw-home.XXXXXX)"
-MANIFEST="$(mktemp -t claudeclaw-manifest.XXXXXX)"
-STAGE="$(mktemp -d -t claudeclaw-stage.XXXXXX)"
-trap 'rm -f "${REPOLIST}" "${HOMELIST}" "${MANIFEST}"; rm -rf "${STAGE}"' EXIT
+echo "=== Atlas Fleet Backup ==="
+echo "Timestamp : $TIMESTAMP"
+echo "Repo      : $REPO_ROOT"
+$DRY_RUN && echo "(DRY-RUN: no archive will be created)"
+echo
 
-# add_if <listfile> <base> <relpath>  -- append relpath when <base>/<relpath> exists.
-add_if() {
-  local list="$1" base="$2" rel="$3"
-  if [[ -e "${base}/${rel}" ]]; then echo "${rel}" >> "${list}"; fi
+# ---------------------------------------------------------------------------
+# Step 1 — DB snapshot (WAL checkpoint + VACUUM INTO + integrity_check)
+# ---------------------------------------------------------------------------
+SNAPSHOT_TMP="/tmp/claudeclaw-snapshot-${TIMESTAMP}.db"
+SNAPSHOT_IN_STORE="${STORE_DIR}/claudeclaw-snapshot.db"
+cleanup_temps() {
+  rm -f "${SNAPSHOT_TMP}" "${SNAPSHOT_IN_STORE}" \
+        "/tmp/fleet-${TIMESTAMP}.bundle" \
+        "${REPO_ROOT}/fleet.bundle" \
+        "${REPO_ROOT}/manifest.json" \
+        "${REPO_ROOT}/.env-for-backup"
 }
 
-# repo/ group (relative to REPO_ROOT)
-add_if "${REPOLIST}" "${REPO_ROOT}" store/claudeclaw.db
-add_if "${REPOLIST}" "${REPO_ROOT}" store/claudeclaw.db-shm
-add_if "${REPOLIST}" "${REPO_ROOT}" store/claudeclaw.db-wal
-add_if "${REPOLIST}" "${REPO_ROOT}" store/.dashboard-token
-add_if "${REPOLIST}" "${REPO_ROOT}" store/config-overrides.json
-add_if "${REPOLIST}" "${REPO_ROOT}" .env
-add_if "${REPOLIST}" "${REPO_ROOT}" scheduled-tasks.json
-add_if "${REPOLIST}" "${REPO_ROOT}" assets/meetings
-# Per-agent identity + channel secrets (glob; missing dir is not an error).
-if [[ -d agents ]]; then
-  find agents -type f \
-    \( -name 'CLAUDE.md' -o -name 'SOUL.md' -o -name '.mcp.json' \
-       -o -name 'access.json' -o -name '.env' \) \
-    -print >> "${REPOLIST}"
-fi
+if $DRY_RUN; then
+  PINNED_SHA="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+  echo "[DRY-RUN] DB: WAL checkpoint + VACUUM INTO + integrity_check"
+  echo "[DRY-RUN] git bundle create --branches main_atlas HEAD (pinned_sha=${PINNED_SHA:0:12}...)"
+  echo "[DRY-RUN] grep -v CLAUDE_CODE_OAUTH_TOKEN .env > .env-for-backup"
+  echo
+  echo "Files that would be included (from ${HOME_DIR}):"
+  printf "  %-62s  %s\n" "PATH" "SIZE"
+  printf "  %-62s  %s\n" "$(printf '%.0s-' {1..62})" "------"
 
-# home/ group (relative to $HOME)
-add_if "${HOMELIST}" "${HOME}" .claude/skills
-add_if "${HOMELIST}" "${HOME}" .claude/scheduled-tasks
-# MAIN orchestrator channel tokens + pairing state, per provider. bot.pid and
-# inbox/ are runtime/transient and intentionally excluded.
-if [[ -d "${HOME}/.claude/channels" ]]; then
-  ( cd "${HOME}" && find .claude/channels -maxdepth 2 \
-      \( -name '.env' -o -name 'access.json' -o -name 'invites.json' \) \
-      -print ) >> "${HOMELIST}"
-  ( cd "${HOME}" && find .claude/channels -maxdepth 2 -type d -name 'approved' -print ) >> "${HOMELIST}"
-fi
-# launchd jobs for this fleet. The job labels are com.<MAIN_AGENT_ID>.<service>
-# (see src/web/main-agent.ts), so resolve MAIN_AGENT_ID the way the app does
-# (src/env.ts: read from .env, default "marveen" when unset) instead of
-# hardcoding one deployment's prefix. Parsing mirrors env.ts: last definition
-# wins, surrounding matching quotes stripped.
-MAIN_AGENT_ID="marveen"
-if [[ -f "${REPO_ROOT}/.env" ]]; then
-  # `|| true`: with `set -o pipefail`, a no-match grep would otherwise fail the
-  # whole substitution (and, under `set -e`, abort the backup) on any install
-  # that leaves MAIN_AGENT_ID unset and relies on the "marveen" default.
-  _mid="$(grep -E '^[[:space:]]*MAIN_AGENT_ID[[:space:]]*=' "${REPO_ROOT}/.env" | tail -1 \
-    | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*$//; s/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/' || true)"
-  [[ -n "${_mid}" ]] && MAIN_AGENT_ID="${_mid}"
-fi
-if [[ -d "${HOME}/Library/LaunchAgents" ]]; then
-  ( cd "${HOME}" && find Library/LaunchAgents -maxdepth 1 -name "com.${MAIN_AGENT_ID}.*.plist" -print ) >> "${HOMELIST}"
-fi
+  _show() {
+    local p="$1"
+    local full="${HOME_DIR}/${p}"
+    if [[ -e "$full" ]]; then
+      local sz
+      sz=$(du -sh "$full" 2>/dev/null | cut -f1)
+      printf "  %-62s  %s\n" "$p" "$sz"
+    fi
+  }
 
-if [[ ! -s "${REPOLIST}" && ! -s "${HOMELIST}" ]]; then
-  echo "backup: nothing to archive" >&2
+  _show "Projects/marveen/store/claudeclaw-snapshot.db"
+  printf "  %-62s  %s\n" "Projects/marveen/store/claudeclaw-snapshot.db" "(generated)"
+  _show "Projects/marveen/store/vault.json"
+  _show "Projects/marveen/store/.vault-key"
+  _show "Projects/marveen/store/vault-bindings.json"
+  _show "Projects/marveen/store/.dashboard-token"
+  _show "Projects/marveen/store/agents-desired.json"
+  _show "Projects/marveen/store/autonomy-config.json"
+  _show "Projects/marveen/store/auto-restart.json"
+  _show "Projects/marveen/store/norbert-personal.json"
+  _show "Projects/marveen/store/schedule-last-run.json"
+  _show "Projects/marveen/store/terminal-input.json"
+  _show "Projects/marveen/store/kanban-audit-state.json"
+  [[ -d "${STORE_DIR}/agent-taskstate" ]] && _show "Projects/marveen/store/agent-taskstate"
+  [[ -d "${STORE_DIR}/patches" ]] && _show "Projects/marveen/store/patches"
+  printf "  %-62s  %s\n" "Projects/marveen/.env-for-backup" "(generated)"
+  for f in "${REPO_ROOT}"/homeserver.tail*.crt "${REPO_ROOT}"/homeserver.tail*.key; do
+    [[ -f "$f" ]] && _show "Projects/marveen/${f##*/}"
+  done
+  printf "  %-62s  %s\n" "Projects/marveen/fleet.bundle" "(generated)"
+  printf "  %-62s  %s\n" "Projects/marveen/manifest.json" "(generated)"
+  if [[ -d "${HOME_DIR}/.claude" ]]; then
+    SZ=$(du -sh \
+      --exclude="${HOME_DIR}/.claude/cache" \
+      --exclude="${HOME_DIR}/.claude/sessions" \
+      --exclude="${HOME_DIR}/.claude/tmp" \
+      --exclude="${HOME_DIR}/.claude/daemon" \
+      "${HOME_DIR}/.claude" 2>/dev/null | tail -1 | cut -f1)
+    printf "  %-62s  ~%s\n" ".claude/ (excl. cache/sessions/tmp/daemon)" "${SZ}"
+  fi
+  _show ".config/systemd/user"
+  echo
+  echo "[DRY-RUN] No archive created."
   exit 0
 fi
 
-# --- Manifest (stored at the archive root for self-description). -----------
-{
-  echo "Marveen backup ${STAMP}"
-  echo "host: $(hostname 2>/dev/null || echo '?')   user: ${USER:-?}   home: ${HOME}"
-  echo "repo root: ${REPO_ROOT}"
-  echo "Restore: tar -xpzf <archive> -C <tmp>; copy repo/* -> project root, home/* -> \$HOME."
-  echo "See docs/MIGRATION.md for the full runbook (TCC, launchd paths, one-bot-one-poller, venv rebuild)."
-  echo "--- repo/ ---"; sed 's,^,repo/,' "${REPOLIST}" 2>/dev/null || true
-  echo "--- home/ ---"; sed 's,^,home/,' "${HOMELIST}" 2>/dev/null || true
-} > "${MANIFEST}"
+# From here on: real run. Clean up temp files on exit (success or failure).
+trap cleanup_temps EXIT
 
-# --- Assemble the archive via a staging dir, then one plain tar. -----------
-# The repo/ and home/ groups are produced by copying into a staging tree, NOT
-# by tar name-substitution: bsdtar's `-s` and GNU tar's `--transform` are
-# mutually incompatible (on GNU tar, `-s` is `--same-order` and takes no
-# argument), so a substitution-based build is not portable. Staging + a single
-# `tar -czf -C "${STAGE}" .` works identically on macOS (bsdtar) and Linux
-# (GNU tar). Everything backed up is small (a few MB), so the copy is cheap;
-# `cp -pR` preserves modes so the 0600 token files stay private.
-cp "${MANIFEST}" "${STAGE}/MANIFEST.txt"
+echo "[1/7] DB snapshot..."
+sqlite3 "${STORE_DIR}/claudeclaw.db" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null
+sqlite3 "${STORE_DIR}/claudeclaw.db" "VACUUM INTO '${SNAPSHOT_TMP}';"
+INTCK="$(sqlite3 "${SNAPSHOT_TMP}" "PRAGMA integrity_check;")"
+if [[ "$INTCK" != "ok" ]]; then
+  echo "ERROR: DB integrity_check failed: ${INTCK}" >&2
+  exit 1
+fi
+echo "    snapshot OK (integrity: ok)"
+cp "${SNAPSHOT_TMP}" "${SNAPSHOT_IN_STORE}"
 
-stage_group() {  # stage_group <listfile> <base> <group>
-  local list="$1" base="$2" group="$3" rel parent
-  [[ -s "${list}" ]] || return 0
-  while IFS= read -r rel; do
-    [[ -z "${rel}" ]] && continue
-    parent="$(dirname "${rel}")"
-    mkdir -p "${STAGE}/${group}/${parent}"
-    cp -pR "${base}/${rel}" "${STAGE}/${group}/${parent}/"
-  done < "${list}"
+# ---------------------------------------------------------------------------
+# Step 2 — git bundle
+# ---------------------------------------------------------------------------
+echo "[2/7] Git bundle..."
+BUNDLE_TMP="/tmp/fleet-${TIMESTAMP}.bundle"
+git -C "${REPO_ROOT}" bundle create "${BUNDLE_TMP}" --branches main_atlas HEAD
+PINNED_SHA="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+cp "${BUNDLE_TMP}" "${REPO_ROOT}/fleet.bundle"
+echo "    bundle OK, pinned_sha: ${PINNED_SHA}"
+
+# ---------------------------------------------------------------------------
+# Step 3 — .env-for-backup (OAuth token row excluded)
+# ---------------------------------------------------------------------------
+echo "[3/7] Preparing .env-for-backup..."
+grep -v 'CLAUDE_CODE_OAUTH_TOKEN' "${REPO_ROOT}/.env" > "${REPO_ROOT}/.env-for-backup" || true
+echo "    .env-for-backup written (CLAUDE_CODE_OAUTH_TOKEN excluded)"
+
+# ---------------------------------------------------------------------------
+# Step 4 — manifest.json
+# ---------------------------------------------------------------------------
+echo "[4/7] Writing manifest.json..."
+ORIGINAL_USER="${HOME_DIR##*/}"
+NODE_VERSION="$(node --version)"
+HOSTNAME_VAL="$(hostname)"
+MANIFEST_PATH="${REPO_ROOT}/manifest.json"
+
+REPO_ROOT="${REPO_ROOT}" \
+PINNED_SHA="${PINNED_SHA}" \
+NODE_VERSION="${NODE_VERSION}" \
+TIMESTAMP="${TIMESTAMP}" \
+HOME_DIR="${HOME_DIR}" \
+ORIGINAL_USER="${ORIGINAL_USER}" \
+HOSTNAME_VAL="${HOSTNAME_VAL}" \
+node -e "
+const { createHash } = require('crypto');
+const { readFileSync, existsSync } = require('fs');
+const path = require('path');
+
+const repoRoot = process.env.REPO_ROOT;
+const KEY_FILES = [
+  'store/vault.json',
+  'store/.vault-key',
+  'store/vault-bindings.json',
+  'store/.dashboard-token',
+  'store/claudeclaw-snapshot.db',
+  '.env-for-backup'
+];
+const checksums = {};
+for (const f of KEY_FILES) {
+  const full = path.join(repoRoot, f);
+  checksums[f] = existsSync(full)
+    ? createHash('sha256').update(readFileSync(full)).digest('hex')
+    : 'missing';
 }
+const manifest = {
+  pinned_sha: process.env.PINNED_SHA,
+  branch: 'main_atlas',
+  node_version: process.env.NODE_VERSION,
+  timestamp: process.env.TIMESTAMP,
+  original_home: process.env.HOME_DIR,
+  original_user: process.env.ORIGINAL_USER,
+  hostname: process.env.HOSTNAME_VAL,
+  checksums
+};
+process.stdout.write(JSON.stringify(manifest, null, 2) + '\n');
+" > "${MANIFEST_PATH}"
+echo "    manifest.json written"
 
-stage_group "${REPOLIST}" "${REPO_ROOT}" repo
-stage_group "${HOMELIST}" "${HOME}" home
+# ---------------------------------------------------------------------------
+# Step 5 — build tar file list (explicit includes, minimal excludes)
+# ---------------------------------------------------------------------------
+echo "[5/7] Building tar archive..."
 
-# Archive only the top-level entries that exist (a group dir is absent when
-# its list was empty), so tar never errors on a missing entry and the names
-# stay clean (no leading "./").
-( cd "${STAGE}" && tar -czf "${ARCHIVE}" MANIFEST.txt \
-    $( [[ -d repo ]] && echo repo ) $( [[ -d home ]] && echo home ) )
-echo "backup: wrote ${ARCHIVE} ($(wc -c < "${ARCHIVE}" | awk '{print $1}') bytes)"
+INCLUDE=()
 
-# The archive contains sensitive tokens (dashboard bearer, channel bot tokens,
-# project .env secrets). Do not auto-sync ${BACKUP_DIR} to iCloud, Dropbox,
-# Google Drive, or any other cloud-backup folder. Keep it local.
-echo "backup: WARNING -- archive contains sensitive tokens; keep ${BACKUP_DIR} out of cloud-sync folders (iCloud / Dropbox / Google Drive)." >&2
-
-# Keep the newest ${KEEP} archives, drop the rest. while-read (not mapfile)
-# for macOS bash 3.2 compatibility.
-ls -1t "${BACKUP_DIR}"/claudeclaw-*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)) | while IFS= read -r f; do
-  [[ -z "${f}" ]] && continue
-  rm -f "${f}"
-  echo "backup: pruned $(basename "${f}")"
+# Store: explicit files only (skip logs, pid, etc.)
+for rel in \
+  "Projects/marveen/store/claudeclaw-snapshot.db" \
+  "Projects/marveen/store/vault.json" \
+  "Projects/marveen/store/.vault-key" \
+  "Projects/marveen/store/vault-bindings.json" \
+  "Projects/marveen/store/.dashboard-token" \
+  "Projects/marveen/store/agents-desired.json" \
+  "Projects/marveen/store/autonomy-config.json" \
+  "Projects/marveen/store/auto-restart.json" \
+  "Projects/marveen/store/norbert-personal.json" \
+  "Projects/marveen/store/schedule-last-run.json" \
+  "Projects/marveen/store/terminal-input.json" \
+  "Projects/marveen/store/kanban-audit-state.json"
+do
+  [[ -e "${HOME_DIR}/${rel}" ]] && INCLUDE+=("$rel")
 done
+
+# Optional dirs
+[[ -d "${STORE_DIR}/agent-taskstate" ]] && INCLUDE+=("Projects/marveen/store/agent-taskstate")
+[[ -d "${STORE_DIR}/patches" ]]         && INCLUDE+=("Projects/marveen/store/patches")
+
+# .env-for-backup + certs
+INCLUDE+=("Projects/marveen/.env-for-backup")
+for f in "${REPO_ROOT}"/homeserver.tail*.crt "${REPO_ROOT}"/homeserver.tail*.key; do
+  [[ -f "$f" ]] && INCLUDE+=("Projects/marveen/${f##*/}")
+done
+
+# Git artifacts + manifest
+INCLUDE+=("Projects/marveen/fleet.bundle" "Projects/marveen/manifest.json")
+
+# .claude/ and systemd units are included as whole trees with exclusions applied below
+INCLUDE+=(".claude" ".config/systemd/user")
+
+TAR_TMP="/tmp/marveen-backup-${TIMESTAMP}.tar.gz"
+ARCHIVE_FINAL="${OUTPUT_DIR}/marveen-backup-${TIMESTAMP}.tar.gz.age"
+
+# Exclusion list: paths relative to HOME_DIR, leading ./ omitted (tar matches both)
+EXCLUDES=(
+  # .claude internals
+  ".claude/cache"
+  ".claude/sessions"
+  ".claude/tmp"
+  ".claude/daemon"
+  ".claude/daemon.lock"
+  ".claude/daemon.log"
+  # repo build artifacts (rebuilt by npm ci + npm run build)
+  "Projects/marveen/node_modules"
+  "Projects/marveen/dist"
+  # transient / sensitive non-backup items
+  ".local/share/claude"
+  ".env.save"
+)
+
+EXCLUDE_ARGS=()
+for ex in "${EXCLUDES[@]}"; do
+  EXCLUDE_ARGS+=("--exclude=${ex}")
+done
+
+cd "${HOME_DIR}"
+tar -czpf "${TAR_TMP}" "${EXCLUDE_ARGS[@]}" "${INCLUDE[@]}"
+echo "    tar: ${TAR_TMP} ($(du -sh "${TAR_TMP}" | cut -f1))"
+
+# ---------------------------------------------------------------------------
+# Step 6 — age passphrase encryption
+# ---------------------------------------------------------------------------
+echo "[6/7] Encrypting with age..."
+echo "(Enter a passphrase for the archive. You will need it to restore.)"
+age -p "${TAR_TMP}" > "${ARCHIVE_FINAL}"
+rm -f "${TAR_TMP}"
+echo "    Encrypted: ${ARCHIVE_FINAL} ($(du -sh "${ARCHIVE_FINAL}" | cut -f1))"
+
+# Temp files cleaned by trap EXIT
+
+echo
+echo "[7/7] Cleanup done (temp files removed)."
+echo
+echo "=== BACKUP COMPLETE ==="
+echo "Archive : ${ARCHIVE_FINAL}"
+echo "Transfer to new machine + run: ./install.sh"
+echo
+echo "WARNING: archive contains vault keys and bot tokens — keep it off cloud-sync folders."
