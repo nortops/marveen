@@ -1,61 +1,61 @@
-# Backup & Restore
+# Backup & Visszaállítás
 
-## Quick start
+## Gyors indítás
 
-### Create a backup
+### Backup létrehozása
 
 ```bash
 ./scripts/backup.sh
 ```
 
-Produces `marveen-backup-<TIMESTAMP>.tar.gz.enc` in the current directory.
-Use `--dry-run` to preview what would be included without creating an archive.
-Use `--output-dir=/path/to/dir` to write the archive elsewhere.
+Létrehoz egy `marveen-backup-<TIMESTAMP>.tar.gz.enc` fájlt az aktuális könyvtárban.
+A `--dry-run` kapcsolóval megtekinthető, mi kerülne az archívumba, anélkül hogy ténylegesen létrehozná.
+A `--output-dir=/path/to/dir` kapcsolóval megadható a célkönyvtár.
 
-You will be prompted for a passphrase. Remember it — without it, restore is impossible.
+A script jelszót kér. Jegyezd meg, nélküle a visszaállítás lehetetlen.
 
-### Restore on a new machine
+### Visszaállítás új gépre
 
-1. Install prerequisites: `git`, `node` (>=18), `npm`, `openssl`, `tmux`, `systemd --user`, and the `claude` CLI (`npm i -g @anthropic-ai/claude-code`).
-2. Copy `marveen-backup-*.tar.gz.enc` and `scripts/install.sh` to the new machine.
-3. Run:
+1. Telepítsd az előfeltételeket: `git`, `node` (>=18), `npm`, `openssl`, `tmux`, `systemd --user`, és a `claude` CLI (`npm i -g @anthropic-ai/claude-code`).
+2. Másold a `marveen-backup-*.tar.gz.enc` fájlt és a `scripts/install.sh` scriptet az új gépre.
+3. Futtasd:
 
 ```bash
 bash install.sh
 ```
 
-The script decrypts the archive, rebuilds from the embedded git bundle, injects the vault-resolved OAuth token, starts systemd services, and prints a post-install checklist.
+A script visszafejti az archívumot, újraépíti a beágyazott git bundle-ból, beinjektálja a vault-feloldott OAuth tokent, elindítja a systemd szolgáltatásokat, és kiír egy telepítés utáni ellenőrzőlistát.
 
 ---
 
-## What gets backed up
+## Mi kerül mentésbe
 
-Everything is extracted relative to `/home/northber` on the target machine.
+Minden az `/home/northber` könyvtárhoz képest relatív elérési úttal kerül a célgépre.
 
-| Content | Path in archive |
+| Tartalom | Elérési út az archívumban |
 |---|---|
-| DB snapshot (VACUUM INTO, not live WAL) | `Projects/marveen/store/claudeclaw-snapshot.db` |
-| Vault + auth | `Projects/marveen/store/vault.json`, `.vault-key`, `vault-bindings.json`, `.dashboard-token` |
-| Agent state | `store/agents-desired.json`, `autonomy-config.json`, `auto-restart.json`, etc. |
-| .env (OAuth token row excluded) | `Projects/marveen/.env-for-backup` |
-| Homeserver certs | `Projects/marveen/homeserver.tail*.crt / .key` |
-| Claude config | `.claude/` (excl. `cache/`, `sessions/`, `tmp/`, `daemon/`) |
-| systemd units | `.config/systemd/user/` |
-| Git bundle | `Projects/marveen/fleet.bundle` (offline clone; pinned to HEAD) |
-| Manifest | `Projects/marveen/manifest.json` (SHA256, pinned_sha, versions) |
+| DB pillanatkép (VACUUM INTO, nem élő WAL) | `Projects/marveen/store/claudeclaw-snapshot.db` |
+| Vault + hitelesítés | `Projects/marveen/store/vault.json`, `.vault-key`, `vault-bindings.json`, `.dashboard-token` |
+| Ágens állapot | `store/agents-desired.json`, `autonomy-config.json`, `auto-restart.json`, stb. |
+| .env (OAuth token sor kizárva) | `Projects/marveen/.env-for-backup` |
+| Homeserver tanúsítványok | `Projects/marveen/homeserver.tail*.crt / .key` |
+| Claude konfig | `.claude/` (kivéve: `cache/`, `sessions/`, `tmp/`, `daemon/`) |
+| systemd unitok | `.config/systemd/user/` |
+| Git bundle | `Projects/marveen/fleet.bundle` (offline klón, HEAD-re rögzítve) |
+| Manifest | `Projects/marveen/manifest.json` (SHA256, pinned_sha, verziók) |
 
-**Not backed up** (rebuilt or excluded): `node_modules/`, `dist/`, `claudeclaw.db` (live file, replaced by snapshot), `CLAUDE_CODE_OAUTH_TOKEN` (re-injected from vault on restore), `~/.local/share/claude` (managed Claude binary), `.claude/cache`, `.claude/sessions`, `.claude/projects` (transient session data).
+**Nem kerül mentésbe** (újraépül vagy kizárva): `node_modules/`, `dist/`, `claudeclaw.db` (élő fájl, a pillanatképpel helyettesítve), `CLAUDE_CODE_OAUTH_TOKEN` (visszaállításkor vault-ból injektálva), `~/.local/share/claude` (Claude bináris, kezelten), `.claude/cache`, `.claude/sessions`, `.claude/projects` (átmeneti session adatok).
 
-**Note:** scheduled tasks (`~/.claude/scheduled-tasks/`) are restored but **disabled** (`enabled: false`). Re-enable them manually in the dashboard after verifying the install.
+**Megjegyzés:** az ütemezett feladatok (`~/.claude/scheduled-tasks/`) visszaállítódnak, de **letiltva** (`enabled: false`). A telepítés ellenőrzése után manuálisan engedélyezd őket a dashboardon.
 
 ---
 
-## Docker test harness
+## Docker tesztállomás
 
-To verify a backup is valid in a clean environment without touching the host:
+Egy backup érvényességének ellenőrzéséhez tiszta környezetben, anélkül hogy az éles gépet érintenéd:
 
 ```bash
-# Copy backup archive next to Dockerfile
+# Másold a backup archívumot a Dockerfile mellé
 cp marveen-backup-*.tar.gz.enc ./marveen-backup.tar.gz.enc
 
 echo "your-passphrase" > passphrase.txt
@@ -65,10 +65,10 @@ rm passphrase.txt
 docker run -d -p 3420:3420 --name marveen-fleet marveen-fleet
 ```
 
-Wait ~3 minutes for the agent stagger, then verify:
+Várj ~3 percet az ágensek sorba indulására, majd ellenőrizd:
 
 ```bash
-# L1: DB (uses better-sqlite3 already in node_modules)
+# L1: DB (better-sqlite3 már megvan a node_modules-ban)
 docker exec marveen-fleet node -e \
   "const d=require('/home/northber/Projects/marveen/node_modules/better-sqlite3'); \
    const db=d('/home/northber/Projects/marveen/store/claudeclaw.db',{readonly:true}); \
@@ -82,10 +82,10 @@ TOKEN=$(docker exec marveen-fleet cat /home/northber/Projects/marveen/store/.das
 curl -H "Authorization: Bearer $TOKEN" "http://localhost:3420/api/memories?agent=atlas&q=test"
 ```
 
-Clean up after the test:
+Takarítás a teszt után:
 
 ```bash
 docker rm -f marveen-fleet && docker rmi marveen-fleet
 ```
 
-**Security:** the Docker image contains decrypted secrets in its layers. Never push it to any registry.
+**Biztonság:** a Docker image visszafejtett titkokat tartalmaz a rétegeiben. Soha ne töltsd fel semmilyen registry-be.

@@ -1,4 +1,4 @@
-# Dockerfile — Atlas fleet test harness (secondary restore path).
+# Dockerfile — Marveen fleet test harness (secondary restore path).
 #
 # PURPOSE: Verify that a backup archive is complete and the full fleet
 # can boot in a clean environment. NOT for production use.

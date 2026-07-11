@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — interactive native restore for the Atlas fleet.
+# install.sh — interactive native restore for the Marveen fleet.
 #
 # Usage: bash install.sh
 #
@@ -26,7 +26,7 @@ PROJECT_DIR="${TARGET_HOME}/Projects/marveen"
 # ---------------------------------------------------------------------------
 # Step 0 — prerequisite check
 # ---------------------------------------------------------------------------
-echo "=== Atlas Fleet Restore ==="
+echo "=== Marveen fleet restore ==="
 echo "Target user : ${TARGET_USER}"
 echo "Target home : ${TARGET_HOME}"
 echo

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# backup.sh — one-command encrypted backup of the full Atlas fleet.
+# backup.sh — one-command encrypted backup of the full Marveen fleet.
 #
 # Usage:
 #   ./scripts/backup.sh [--dry-run] [--output-dir DIR]
@@ -57,7 +57,7 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
   exit 1
 fi
 
-echo "=== Atlas Fleet Backup ==="
+echo "=== Marveen fleet backup ==="
 echo "Timestamp : $TIMESTAMP"
 echo "Repo      : $REPO_ROOT"
 $DRY_RUN && echo "(DRY-RUN: no archive will be created)"
