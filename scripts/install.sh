@@ -210,6 +210,15 @@ if [[ "${TARGET_USER}" != "${ORIGINAL_USER}" ]]; then
   done
   _rewrite_file "${TARGET_HOME}/.claude/settings.json"
 
+  # Rewrite absolute symlinks inside agents/ that point to the old home path
+  while IFS= read -r -d '' lnk; do
+    old_target="$(readlink "$lnk")"
+    if [[ "$old_target" == *"/home/${ORIGINAL_USER}"* ]]; then
+      new_target="${old_target/\/home\/${ORIGINAL_USER}/\/home\/${TARGET_USER}}"
+      ln -sf "$new_target" "$lnk"
+    fi
+  done < <(find "${PROJECT_DIR}/agents" -type l -print0 2>/dev/null)
+
   echo "    Path rewrite done"
 else
   echo "[5/8] Path rewrite: same username (${TARGET_USER}), skipped"

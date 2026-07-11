@@ -121,6 +121,17 @@ if $DRY_RUN; then
   done
   printf "  %-62s  %s\n" "Projects/marveen/fleet.bundle" "(generated)"
   printf "  %-62s  %s\n" "Projects/marveen/manifest.json" "(generated)"
+  [[ -f "${REPO_ROOT}/agent-config.json" ]] && _show "Projects/marveen/agent-config.json"
+  if [[ -d "${REPO_ROOT}/agents" ]]; then
+    SZ=$(du -sh \
+      --exclude="${HOME_DIR}/Projects/marveen/agents/*/.claude/cache" \
+      --exclude="${HOME_DIR}/Projects/marveen/agents/*/.claude/sessions" \
+      --exclude="${HOME_DIR}/Projects/marveen/agents/*/.claude/tmp" \
+      --exclude="${HOME_DIR}/Projects/marveen/agents/*/.claude/projects" \
+      --exclude="${HOME_DIR}/Projects/marveen/agents/*/.claude/daemon" \
+      "${REPO_ROOT}/agents" 2>/dev/null | tail -1 | cut -f1)
+    printf "  %-62s  ~%s\n" "Projects/marveen/agents/ (excl. .claude/cache/sessions/tmp/projects/daemon)" "${SZ}"
+  fi
   if [[ -d "${HOME_DIR}/.claude" ]]; then
     SZ=$(du -sh \
       --exclude="${HOME_DIR}/.claude/cache" \
@@ -266,17 +277,28 @@ done
 # Git artifacts + manifest
 INCLUDE+=("Projects/marveen/fleet.bundle" "Projects/marveen/manifest.json")
 
+# Atlas root-level voice/runtime config (gitignored, fleet-essential)
+[[ -f "${REPO_ROOT}/agent-config.json" ]] && INCLUDE+=("Projects/marveen/agent-config.json")
+
+# Sub-agent directories: config, persona, Telegram channel, memory, MCP
+# (.claude/cache, sessions, tmp, daemon, projects match via suffix and are excluded below)
+[[ -d "${REPO_ROOT}/agents" ]] && INCLUDE+=("Projects/marveen/agents")
+
 # .claude/ and systemd units are included as whole trees with exclusions applied below
 INCLUDE+=(".claude" ".config/systemd/user")
 
-# Exclusion list: paths relative to HOME_DIR
+# Exclusion list: paths relative to HOME_DIR.
+# GNU tar suffix-matches patterns containing a slash, so these cover both
+# the top-level .claude/ and any nested agents/*/.claude/ directories.
 EXCLUDES=(
   ".claude/cache"
   ".claude/sessions"
   ".claude/tmp"
+  ".claude/projects"
   ".claude/daemon"
   ".claude/daemon.lock"
   ".claude/daemon.log"
+  ".claude-config"
   "Projects/marveen/node_modules"
   "Projects/marveen/dist"
   ".local/share/claude"
