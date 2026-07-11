@@ -124,7 +124,21 @@ if $DRY_RUN; then
   done
   printf "  %-62s  %s\n" "Projects/marveen/fleet.bundle" "(generated)"
   printf "  %-62s  %s\n" "Projects/marveen/manifest.json" "(generated)"
-  [[ -f "${REPO_ROOT}/agent-config.json" ]] && _show "Projects/marveen/agent-config.json"
+  # Fleet-specific gitignored root files (dynamic scan, same skip-list as real run)
+  _DR_SKIP=(
+    "store" "agents" "backups" "dist" "node_modules"
+    ".playwright-mcp" "DREAM.md" ".env" ".env.save"
+    "scripts" ".gitnexus" "workspace" "reports" "mcp-servers"
+  )
+  while IFS= read -r _ig; do
+    _ig="${_ig%/}"; [[ -z "${_ig}" ]] && continue
+    _sk=false
+    for _s in "${_DR_SKIP[@]}"; do
+      [[ "${_ig}" == "${_s}" || "${_ig}" == "${_s}/"* ]] && { _sk=true; break; }
+    done
+    ${_sk} && continue
+    [[ -e "${HOME_DIR}/Projects/marveen/${_ig}" ]] && _show "Projects/marveen/${_ig}"
+  done < <(git -C "${REPO_ROOT}" status --ignored --short 2>/dev/null | awk '/^!! /{print substr($0,4)}')
   if [[ -d "${REPO_ROOT}/agents" ]]; then
     SZ=$(du -sh \
       --exclude="${HOME_DIR}/Projects/marveen/agents/*/.claude/cache" \
@@ -285,12 +299,31 @@ done
 # Git artifacts + manifest
 INCLUDE+=("Projects/marveen/fleet.bundle" "Projects/marveen/manifest.json")
 
-# Atlas root-level voice/runtime config (gitignored, fleet-essential)
-[[ -f "${REPO_ROOT}/agent-config.json" ]] && INCLUDE+=("Projects/marveen/agent-config.json")
-
 # Sub-agent directories: config, persona, Telegram channel, memory, MCP
 # (.claude/cache, sessions, tmp, daemon, projects match via suffix and are excluded below)
 [[ -d "${REPO_ROOT}/agents" ]] && INCLUDE+=("Projects/marveen/agents")
+
+# Fleet-specific gitignored files at repo root (CLAUDE.md, SOUL.md, agent-config.json, etc.)
+# Derived dynamically so future additions are picked up without modifying this script.
+# Items already handled above (store/, agents/, certs, .env) are skipped.
+_IGNORE_SKIP=(
+  "store" "agents" "backups" "dist" "node_modules"
+  ".playwright-mcp" "DREAM.md" ".env" ".env.save"
+  "scripts" ".gitnexus" "workspace" "reports"
+  "mcp-servers"
+)
+while IFS= read -r _ig; do
+  _ig="${_ig%/}"   # strip trailing slash
+  [[ -z "${_ig}" ]] && continue
+  _skip=false
+  for _s in "${_IGNORE_SKIP[@]}"; do
+    if [[ "${_ig}" == "${_s}" || "${_ig}" == "${_s}/"* ]]; then
+      _skip=true; break
+    fi
+  done
+  ${_skip} && continue
+  [[ -e "${HOME_DIR}/Projects/marveen/${_ig}" ]] && INCLUDE+=("Projects/marveen/${_ig}")
+done < <(git -C "${REPO_ROOT}" status --ignored --short 2>/dev/null | awk '/^!! /{print substr($0,4)}')
 
 # .claude/ and systemd units are included as whole trees with exclusions applied below
 INCLUDE+=(".claude" ".config/systemd/user")
