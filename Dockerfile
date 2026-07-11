@@ -41,12 +41,14 @@ COPY marveen-backup.tar.gz.age /home/northber/
 
 # Decrypt + extract as root (secret mount is root-only by default; chown after).
 # age reads passphrase from /dev/tty; `script -q -c` provides the PTY while
-# printf pipes the passphrase through it. util-linux (script) is present in
-# debian:bookworm-slim by default.
+# printf pipes the passphrase through it. Flags:
+#   -e / --return  propagate the child's exit code (otherwise script returns its own)
+#   bash -c 'set -o pipefail; ...' ensures age failure is not masked by tar's exit code
+# Result: wrong passphrase or corrupt archive fails the build with non-zero exit.
 RUN --mount=type=secret,id=age_passphrase \
     PASS="$(cat /run/secrets/age_passphrase)" \
  && printf '%s\n' "${PASS}" \
-    | script -q -c "age -d /home/northber/marveen-backup.tar.gz.age | tar -xzpC /home/northber" /dev/null \
+    | script -q -e -c "bash -c 'set -o pipefail; age -d /home/northber/marveen-backup.tar.gz.age | tar -xzpC /home/northber'" /dev/null \
  && chown -R northber:northber /home/northber \
  && unset PASS
 
