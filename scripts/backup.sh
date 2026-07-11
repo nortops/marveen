@@ -115,6 +115,9 @@ if $DRY_RUN; then
   _show "Projects/marveen/store/kanban-audit-state.json"
   [[ -d "${STORE_DIR}/agent-taskstate" ]] && _show "Projects/marveen/store/agent-taskstate"
   [[ -d "${STORE_DIR}/patches" ]] && _show "Projects/marveen/store/patches"
+  for f in "${STORE_DIR}"/marveen-avatar.*; do
+    [[ -f "$f" ]] && _show "Projects/marveen/store/${f##*/}"
+  done
   printf "  %-62s  %s\n" "Projects/marveen/.env-for-backup" "(generated)"
   for f in "${REPO_ROOT}"/homeserver.tail*.crt "${REPO_ROOT}"/homeserver.tail*.key; do
     [[ -f "$f" ]] && _show "Projects/marveen/${f##*/}"
@@ -267,6 +270,11 @@ done
 # Optional dirs
 [[ -d "${STORE_DIR}/agent-taskstate" ]] && INCLUDE+=("Projects/marveen/store/agent-taskstate")
 [[ -d "${STORE_DIR}/patches" ]]         && INCLUDE+=("Projects/marveen/store/patches")
+
+# Main agent avatar (gitignored; all extensions, e.g. .png / .jpg)
+for f in "${STORE_DIR}"/marveen-avatar.*; do
+  [[ -f "$f" ]] && INCLUDE+=("Projects/marveen/store/${f##*/}")
+done
 
 # .env-for-backup + certs (existence guard)
 [[ -f "${REPO_ROOT}/.env-for-backup" ]] && INCLUDE+=("Projects/marveen/.env-for-backup")

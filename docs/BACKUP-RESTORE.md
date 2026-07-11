@@ -44,7 +44,9 @@ Everything is extracted relative to `/home/northber` on the target machine.
 | Git bundle | `Projects/marveen/fleet.bundle` (offline clone; pinned to HEAD) |
 | Manifest | `Projects/marveen/manifest.json` (SHA256, pinned_sha, versions) |
 
-**Not backed up** (rebuilt or excluded): `node_modules/`, `dist/`, `claudeclaw.db` (live file, replaced by snapshot), `CLAUDE_CODE_OAUTH_TOKEN` (re-injected from vault on restore), `~/.local/share/claude` (managed Claude binary).
+**Not backed up** (rebuilt or excluded): `node_modules/`, `dist/`, `claudeclaw.db` (live file, replaced by snapshot), `CLAUDE_CODE_OAUTH_TOKEN` (re-injected from vault on restore), `~/.local/share/claude` (managed Claude binary), `.claude/cache`, `.claude/sessions`, `.claude/projects` (transient session data).
+
+**Note:** scheduled tasks (`~/.claude/scheduled-tasks/`) are restored but **disabled** (`enabled: false`). Re-enable them manually in the dashboard after verifying the install.
 
 ---
 

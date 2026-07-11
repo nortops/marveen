@@ -108,6 +108,26 @@ unset PASS
 
 echo "    Extracted to ${TARGET_HOME}"
 
+# Disable all scheduled tasks restored from backup so they don't fire on a
+# new machine before the operator explicitly re-enables them.
+SCHED_DIR="${TARGET_HOME}/.claude/scheduled-tasks"
+DISABLED_COUNT=0
+for cfg in "${SCHED_DIR}"/*/task-config.json; do
+  [[ -f "$cfg" ]] || continue
+  node -e "
+    const fs = require('fs');
+    const p = process.argv[1];
+    try {
+      const d = JSON.parse(fs.readFileSync(p, 'utf8'));
+      d.enabled = false;
+      fs.writeFileSync(p, JSON.stringify(d, null, 2) + '\n');
+    } catch(e) { process.stderr.write('WARNING: could not disable ' + p + ': ' + e.message + '\n'); }
+  " "$cfg"
+  DISABLED_COUNT=$(( DISABLED_COUNT + 1 ))
+done
+[[ $DISABLED_COUNT -gt 0 ]] && echo "    Scheduled tasks disabled (${DISABLED_COUNT}): re-enable manually after verifying the install." \
+  || echo "    No scheduled tasks found."
+
 # ---------------------------------------------------------------------------
 # Step 4 — parse pinned_sha from manifest, git clone bundle, checkout
 # ---------------------------------------------------------------------------

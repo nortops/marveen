@@ -81,6 +81,15 @@ RUN mv /home/northber/Projects/marveen/store/claudeclaw-snapshot.db \
        /home/northber/Projects/marveen/store/claudeclaw.db \
  && rm -f /home/northber/Projects/marveen/fleet.bundle
 
+# Disable all restored scheduled tasks so they don't fire in the test container.
+RUN for cfg in /home/northber/.claude/scheduled-tasks/*/task-config.json; do \
+      [ -f "$cfg" ] || continue; \
+      node -e " \
+        const fs=require('fs'),p=process.argv[1]; \
+        try{const d=JSON.parse(fs.readFileSync(p,'utf8'));d.enabled=false;fs.writeFileSync(p,JSON.stringify(d,null,2)+'\n');}catch(e){} \
+      " "$cfg"; \
+    done
+
 EXPOSE 3420
 
 # In direct-launch mode, start.sh backgrounds both dashboard and channels via
