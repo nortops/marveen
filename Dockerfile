@@ -5,15 +5,17 @@
 #
 # Build:
 #   echo "your-passphrase" > passphrase.txt
-#   docker build --secret id=age_passphrase,src=./passphrase.txt -t marveen-fleet .
+#   docker build --secret id=passphrase,src=./passphrase.txt -t marveen-fleet .
 #   rm passphrase.txt
 #
 # Run:
 #   docker run -d -p 3420:3420 --name marveen-fleet marveen-fleet
 #
 # Verify (wait ~3 min for agent stagger):
-#   docker exec marveen-fleet sqlite3 /home/northber/Projects/marveen/store/claudeclaw.db \
-#       "PRAGMA integrity_check;"
+#   docker exec marveen-fleet node -e \
+#     "const d=require('/home/northber/Projects/marveen/node_modules/better-sqlite3'); \
+#      const db=d('/home/northber/Projects/marveen/store/claudeclaw.db',{readonly:true}); \
+#      console.log(db.pragma('integrity_check',{simple:true})); db.close()"
 #   curl -s -o /dev/null -w "%{http_code}" http://localhost:3420         # expect 200
 #   TOKEN=$(docker exec marveen-fleet cat /home/northber/Projects/marveen/store/.dashboard-token)
 #   curl -H "Authorization: Bearer $TOKEN" "http://localhost:3420/api/memories?agent=atlas&q=test"
@@ -29,28 +31,27 @@ FROM node:22-bookworm-slim
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      git sqlite3 age tmux curl procps \
+      git tmux curl procps openssl \
  && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g @anthropic-ai/claude-code
 
 RUN useradd -m -s /bin/bash northber
 
-# Copy backup archive (must be named marveen-backup.tar.gz.age, placed next to Dockerfile)
-COPY marveen-backup.tar.gz.age /home/northber/
+# Copy backup archive (must be named marveen-backup.tar.gz.enc, placed next to Dockerfile)
+COPY marveen-backup.tar.gz.enc /home/northber/
 
 # Decrypt + extract as root (secret mount is root-only by default; chown after).
-# age reads passphrase from /dev/tty; `script -q -c` provides the PTY while
-# printf pipes the passphrase through it. Flags:
-#   -e / --return  propagate the child's exit code (otherwise script returns its own)
-#   bash -c 'set -o pipefail; ...' ensures age failure is not masked by tar's exit code
-# Result: wrong passphrase or corrupt archive fails the build with non-zero exit.
-RUN --mount=type=secret,id=age_passphrase \
-    PASS="$(cat /run/secrets/age_passphrase)" \
- && printf '%s\n' "${PASS}" \
-    | script -q -e -c "bash -c 'set -o pipefail; age -d /home/northber/marveen-backup.tar.gz.age | tar -xzpC /home/northber'" /dev/null \
+# openssl reads passphrase from the BuildKit secret file directly -- no TTY needed.
+# pipefail ensures a wrong passphrase (openssl non-zero exit) fails the build.
+RUN --mount=type=secret,id=passphrase \
+    bash -c 'set -o pipefail; \
+      openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+        -in /home/northber/marveen-backup.tar.gz.enc \
+        -pass file:/run/secrets/passphrase \
+      | tar -xzpC /home/northber' \
  && chown -R northber:northber /home/northber \
- && unset PASS
+ && rm /home/northber/marveen-backup.tar.gz.enc
 
 USER northber
 WORKDIR /home/northber

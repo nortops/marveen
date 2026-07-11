@@ -8,16 +8,16 @@
 ./scripts/backup.sh
 ```
 
-Produces `marveen-backup-<TIMESTAMP>.tar.gz.age` in the current directory.
+Produces `marveen-backup-<TIMESTAMP>.tar.gz.enc` in the current directory.
 Use `--dry-run` to preview what would be included without creating an archive.
 Use `--output-dir=/path/to/dir` to write the archive elsewhere.
 
-You will be prompted for an age passphrase. Remember it — without it, restore is impossible.
+You will be prompted for a passphrase. Remember it — without it, restore is impossible.
 
 ### Restore on a new machine
 
-1. Install prerequisites: `git`, `node` (>=18), `npm`, `sqlite3`, `age`, `tmux`, `systemd --user`, and the `claude` CLI (`npm i -g @anthropic-ai/claude-code`).
-2. Copy `marveen-backup-*.tar.gz.age` and `scripts/install.sh` to the new machine.
+1. Install prerequisites: `git`, `node` (>=18), `npm`, `openssl`, `tmux`, `systemd --user`, and the `claude` CLI (`npm i -g @anthropic-ai/claude-code`).
+2. Copy `marveen-backup-*.tar.gz.enc` and `scripts/install.sh` to the new machine.
 3. Run:
 
 ```bash
@@ -54,10 +54,10 @@ To verify a backup is valid in a clean environment without touching the host:
 
 ```bash
 # Copy backup archive next to Dockerfile
-cp marveen-backup-*.tar.gz.age ./marveen-backup.tar.gz.age
+cp marveen-backup-*.tar.gz.enc ./marveen-backup.tar.gz.enc
 
 echo "your-passphrase" > passphrase.txt
-docker build --secret id=age_passphrase,src=./passphrase.txt -t marveen-fleet .
+docker build --secret id=passphrase,src=./passphrase.txt -t marveen-fleet .
 rm passphrase.txt
 
 docker run -d -p 3420:3420 --name marveen-fleet marveen-fleet
@@ -66,9 +66,11 @@ docker run -d -p 3420:3420 --name marveen-fleet marveen-fleet
 Wait ~3 minutes for the agent stagger, then verify:
 
 ```bash
-# L1: DB
-docker exec marveen-fleet sqlite3 \
-  /home/northber/Projects/marveen/store/claudeclaw.db "PRAGMA integrity_check;"
+# L1: DB (uses better-sqlite3 already in node_modules)
+docker exec marveen-fleet node -e \
+  "const d=require('/home/northber/Projects/marveen/node_modules/better-sqlite3'); \
+   const db=d('/home/northber/Projects/marveen/store/claudeclaw.db',{readonly:true}); \
+   console.log(db.pragma('integrity_check',{simple:true})); db.close()"
 
 # L2: dashboard
 curl -s -o /dev/null -w "%{http_code}" http://localhost:3420

@@ -4,7 +4,7 @@
 # Usage:
 #   ./scripts/backup.sh [--dry-run] [--output-dir DIR]
 #
-# Output: marveen-backup-<TIMESTAMP>.tar.gz.age  (current dir, or --output-dir)
+# Output: marveen-backup-<TIMESTAMP>.tar.gz.enc  (current dir, or --output-dir)
 #
 # What gets packed (tar root = /home/northber):
 #   .claude/              (excluding cache/, sessions/, tmp/, daemon/, daemon.lock, daemon.log)
@@ -46,7 +46,7 @@ if $DRY_RUN; then
     command -v "$cmd" >/dev/null 2>&1 || MISSING+=("$cmd")
   done
 else
-  for cmd in sqlite3 age git node tar; do
+  for cmd in openssl git node tar; do
     command -v "$cmd" >/dev/null 2>&1 || MISSING+=("$cmd")
   done
 fi
@@ -64,20 +64,25 @@ echo
 
 # ---------------------------------------------------------------------------
 # Step 1 — DB snapshot (WAL checkpoint + VACUUM INTO + integrity_check)
+#          Uses better-sqlite3 (already in node_modules; no sqlite3 CLI needed)
 # ---------------------------------------------------------------------------
 SNAPSHOT_TMP="/tmp/claudeclaw-snapshot-${TIMESTAMP}.db"
 SNAPSHOT_IN_STORE="${STORE_DIR}/claudeclaw-snapshot.db"
+TAR_TMP="/tmp/marveen-backup-${TIMESTAMP}.tar.gz"
+ARCHIVE_FINAL="${OUTPUT_DIR}/marveen-backup-${TIMESTAMP}.tar.gz.enc"
+
 cleanup_temps() {
   rm -f "${SNAPSHOT_TMP}" "${SNAPSHOT_IN_STORE}" \
         "/tmp/fleet-${TIMESTAMP}.bundle" \
         "${REPO_ROOT}/fleet.bundle" \
         "${REPO_ROOT}/manifest.json" \
-        "${REPO_ROOT}/.env-for-backup"
+        "${REPO_ROOT}/.env-for-backup" \
+        "${TAR_TMP}"
 }
 
 if $DRY_RUN; then
   PINNED_SHA="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
-  echo "[DRY-RUN] DB: WAL checkpoint + VACUUM INTO + integrity_check"
+  echo "[DRY-RUN] DB: WAL checkpoint + VACUUM INTO + integrity_check (via better-sqlite3)"
   echo "[DRY-RUN] git bundle create --branches main_atlas HEAD (pinned_sha=${PINNED_SHA:0:12}...)"
   echo "[DRY-RUN] grep -v CLAUDE_CODE_OAUTH_TOKEN .env > .env-for-backup"
   echo
@@ -95,7 +100,6 @@ if $DRY_RUN; then
     fi
   }
 
-  _show "Projects/marveen/store/claudeclaw-snapshot.db"
   printf "  %-62s  %s\n" "Projects/marveen/store/claudeclaw-snapshot.db" "(generated)"
   _show "Projects/marveen/store/vault.json"
   _show "Projects/marveen/store/.vault-key"
@@ -135,14 +139,24 @@ fi
 trap cleanup_temps EXIT
 
 echo "[1/7] DB snapshot..."
-sqlite3 "${STORE_DIR}/claudeclaw.db" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null
-sqlite3 "${STORE_DIR}/claudeclaw.db" "VACUUM INTO '${SNAPSHOT_TMP}';"
-INTCK="$(sqlite3 "${SNAPSHOT_TMP}" "PRAGMA integrity_check;")"
-if [[ "$INTCK" != "ok" ]]; then
-  echo "ERROR: DB integrity_check failed: ${INTCK}" >&2
-  exit 1
-fi
-echo "    snapshot OK (integrity: ok)"
+REPO_ROOT="${REPO_ROOT}" \
+STORE_DIR="${STORE_DIR}" \
+SNAPSHOT_TMP="${SNAPSHOT_TMP}" \
+node - << 'NODESCRIPT'
+  const Database = require(process.env.REPO_ROOT + "/node_modules/better-sqlite3");
+  const db = new Database(process.env.STORE_DIR + "/claudeclaw.db");
+  db.pragma("wal_checkpoint(TRUNCATE)");
+  db.exec("VACUUM INTO '" + process.env.SNAPSHOT_TMP.replace(/'/g, "''") + "'");
+  db.close();
+  const snap = new Database(process.env.SNAPSHOT_TMP, {readonly: true});
+  const intck = snap.pragma("integrity_check", {simple: true});
+  snap.close();
+  if (intck !== "ok") {
+    process.stderr.write("ERROR: DB integrity_check failed: " + intck + "\n");
+    process.exit(1);
+  }
+  process.stdout.write("    snapshot OK (integrity: ok)\n");
+NODESCRIPT
 cp "${SNAPSHOT_TMP}" "${SNAPSHOT_IN_STORE}"
 
 # ---------------------------------------------------------------------------
@@ -242,7 +256,7 @@ done
 [[ -d "${STORE_DIR}/agent-taskstate" ]] && INCLUDE+=("Projects/marveen/store/agent-taskstate")
 [[ -d "${STORE_DIR}/patches" ]]         && INCLUDE+=("Projects/marveen/store/patches")
 
-# .env-for-backup + certs (existence guard: .env-for-backup was just created in step 3)
+# .env-for-backup + certs (existence guard)
 [[ -f "${REPO_ROOT}/.env-for-backup" ]] && INCLUDE+=("Projects/marveen/.env-for-backup")
 for f in "${REPO_ROOT}"/homeserver.tail*.crt "${REPO_ROOT}"/homeserver.tail*.key; do
   [[ -f "$f" ]] && INCLUDE+=("Projects/marveen/${f##*/}")
@@ -254,22 +268,16 @@ INCLUDE+=("Projects/marveen/fleet.bundle" "Projects/marveen/manifest.json")
 # .claude/ and systemd units are included as whole trees with exclusions applied below
 INCLUDE+=(".claude" ".config/systemd/user")
 
-TAR_TMP="/tmp/marveen-backup-${TIMESTAMP}.tar.gz"
-ARCHIVE_FINAL="${OUTPUT_DIR}/marveen-backup-${TIMESTAMP}.tar.gz.age"
-
-# Exclusion list: paths relative to HOME_DIR, leading ./ omitted (tar matches both)
+# Exclusion list: paths relative to HOME_DIR
 EXCLUDES=(
-  # .claude internals
   ".claude/cache"
   ".claude/sessions"
   ".claude/tmp"
   ".claude/daemon"
   ".claude/daemon.lock"
   ".claude/daemon.log"
-  # repo build artifacts (rebuilt by npm ci + npm run build)
   "Projects/marveen/node_modules"
   "Projects/marveen/dist"
-  # transient / sensitive non-backup items
   ".local/share/claude"
   ".env.save"
 )
@@ -284,11 +292,25 @@ tar -czpf "${TAR_TMP}" "${EXCLUDE_ARGS[@]}" "${INCLUDE[@]}"
 echo "    tar: ${TAR_TMP} ($(du -sh "${TAR_TMP}" | cut -f1))"
 
 # ---------------------------------------------------------------------------
-# Step 6 — age passphrase encryption
+# Step 6 — openssl AES-256-CBC encryption (passphrase from stdin)
 # ---------------------------------------------------------------------------
-echo "[6/7] Encrypting with age..."
+echo "[6/7] Encrypting with openssl (AES-256-CBC, PBKDF2, 200 000 iterations)..."
 echo "(Enter a passphrase for the archive. You will need it to restore.)"
-age -p "${TAR_TMP}" > "${ARCHIVE_FINAL}"
+read -rsp "Passphrase: " PASS
+echo
+read -rsp "Confirm:    " PASS2
+echo
+if [[ "${PASS}" != "${PASS2}" ]]; then
+  echo "ERROR: passphrases do not match" >&2
+  unset PASS PASS2
+  exit 1
+fi
+unset PASS2
+
+printf '%s\n' "${PASS}" \
+  | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+      -in "${TAR_TMP}" -out "${ARCHIVE_FINAL}" -pass stdin
+unset PASS
 rm -f "${TAR_TMP}"
 echo "    Encrypted: ${ARCHIVE_FINAL} ($(du -sh "${ARCHIVE_FINAL}" | cut -f1))"
 
@@ -299,6 +321,6 @@ echo "[7/7] Cleanup done (temp files removed)."
 echo
 echo "=== BACKUP COMPLETE ==="
 echo "Archive : ${ARCHIVE_FINAL}"
-echo "Transfer to new machine + run: ./install.sh"
+echo "Transfer to new machine + run: bash install.sh"
 echo
-echo "WARNING: archive contains vault keys and bot tokens — keep it off cloud-sync folders."
+echo "WARNING: archive contains vault keys and bot tokens -- keep it off cloud-sync folders."

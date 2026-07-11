@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # install.sh — interactive native restore for the Atlas fleet.
 #
-# Usage: ./install.sh
+# Usage: bash install.sh
 #
 # Prerequisites (must be installed BEFORE running):
-#   git, node (>=18), npm, sqlite3, age, tmux, systemd --user, claude (Claude Code CLI)
+#   git, node (>=18), npm, openssl, tmux, systemd --user, claude (Claude Code CLI)
 #
-# The script restores from a .tar.gz.age backup created by scripts/backup.sh:
+# The script restores from a .tar.gz.enc backup created by scripts/backup.sh:
 #   1. Select backup file
 #   2. Decrypt + extract to ~/
 #   3. Git clone from embedded bundle, build source
@@ -32,7 +32,7 @@ echo "Target home : ${TARGET_HOME}"
 echo
 
 MISSING=()
-for cmd in git npm sqlite3 age tmux; do
+for cmd in git npm openssl tmux; do
   command -v "$cmd" >/dev/null 2>&1 || MISSING+=("$cmd")
 done
 
@@ -53,7 +53,7 @@ fi
 
 # claude CLI
 if ! command -v claude >/dev/null 2>&1; then
-  MISSING+=("claude (Claude Code CLI — install with: npm i -g @anthropic-ai/claude-code)")
+  MISSING+=("claude (Claude Code CLI -- install with: npm i -g @anthropic-ai/claude-code)")
 fi
 
 if [[ ${#MISSING[@]} -gt 0 ]]; then
@@ -72,7 +72,7 @@ echo
 # ---------------------------------------------------------------------------
 select_backup_file() {
   local path
-  read -rp "Backup file path (.tar.gz.age): " path
+  read -rp "Backup file path (.tar.gz.enc): " path
   path="${path/#\~/${HOME}}"   # expand leading ~
   if [[ ! -f "$path" ]]; then
     echo "ERROR: file not found: $path" >&2
@@ -86,18 +86,25 @@ echo "Using: ${BACKUP_FILE}"
 echo
 
 # ---------------------------------------------------------------------------
-# Step 2+3 — decrypt + extract (age prompts for passphrase from /dev/tty)
+# Step 2+3 — decrypt + extract
+#   openssl reads passphrase from stdin; tar reads decrypted stream from pipe.
 # ---------------------------------------------------------------------------
 echo "[1/8] Decrypting and extracting..."
-echo "(age will prompt for the archive passphrase)"
-echo
 
 mkdir -p "${TARGET_HOME}/Projects"
 
-if ! age -d "${BACKUP_FILE}" | tar -xzpC "${TARGET_HOME}"; then
+read -rsp "Archive passphrase: " PASS
+echo
+
+if ! printf '%s\n' "${PASS}" \
+    | openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+        -in "${BACKUP_FILE}" -pass stdin \
+    | tar -xzpC "${TARGET_HOME}"; then
+  unset PASS
   echo "ERROR: Decryption or extraction failed (wrong passphrase or corrupt archive)." >&2
   exit 1
 fi
+unset PASS
 
 echo "    Extracted to ${TARGET_HOME}"
 
@@ -120,7 +127,6 @@ fi
 
 PINNED_SHA="$(node -e "process.stdout.write(require('${MANIFEST_PATH}').pinned_sha)")"
 ORIGINAL_USER="$(node -e "process.stdout.write(require('${MANIFEST_PATH}').original_user)")"
-ORIGINAL_HOME="$(node -e "process.stdout.write(require('${MANIFEST_PATH}').original_home)")"
 
 if [[ -z "${PINNED_SHA}" ]]; then
   echo "ERROR: could not read pinned_sha from manifest.json" >&2
@@ -163,12 +169,11 @@ fi
 
 mv "${ENV_BACKUP}" "${ENV_FILE}"
 
-# Append OAuth token resolved from vault
 if echo "CLAUDE_CODE_OAUTH_TOKEN=CLAUDE_CODE_OAUTH_TOKEN" \
     | node "${PROJECT_DIR}/scripts/vault-resolve.mjs" >> "${ENV_FILE}"; then
   echo "    OAuth token resolved from vault and appended to .env"
 else
-  echo "WARNING: vault-resolve failed for CLAUDE_CODE_OAUTH_TOKEN — token may be missing" >&2
+  echo "WARNING: vault-resolve failed for CLAUDE_CODE_OAUTH_TOKEN -- token may be missing" >&2
 fi
 
 # ---------------------------------------------------------------------------
@@ -197,17 +202,12 @@ if [[ "${TARGET_USER}" != "${ORIGINAL_USER}" ]]; then
     [[ -f "$f" ]] && sed -i "s|/home/${ORIGINAL_USER}|/home/${TARGET_USER}|g" "$f"
   }
 
-  # systemd units
   for f in "${TARGET_HOME}/.config/systemd/user"/*.service; do
     _rewrite_file "$f"
   done
-
-  # scheduled-task configs
   for f in "${TARGET_HOME}/.claude/scheduled-tasks"/*/task-config.json; do
     _rewrite_file "$f"
   done
-
-  # claude settings
   _rewrite_file "${TARGET_HOME}/.claude/settings.json"
 
   echo "    Path rewrite done"
@@ -243,8 +243,14 @@ echo "[7/8] Verification..."
 
 FAIL=0
 
-# L1: DB integrity
-if sqlite3 "${LIVE_DB}" "PRAGMA integrity_check;" 2>/dev/null | grep -q '^ok$'; then
+# L1: DB integrity via better-sqlite3 (no sqlite3 CLI required)
+if PROJECT_DIR="${PROJECT_DIR}" LIVE_DB="${LIVE_DB}" node -e '
+  const Database = require(process.env.PROJECT_DIR + "/node_modules/better-sqlite3");
+  const db = new Database(process.env.LIVE_DB, {readonly: true});
+  const r = db.pragma("integrity_check", {simple: true});
+  db.close();
+  process.exit(r === "ok" ? 0 : 1);
+' 2>/dev/null; then
   echo "    L1 DB integrity_check: OK"
 else
   echo "    L1 DB integrity_check: FAIL" >&2
@@ -273,11 +279,11 @@ fi
 # Agent sessions (informational)
 echo
 echo "Active tmux sessions:"
-tmux ls 2>/dev/null || echo "  (none yet — agents start ~15s after dashboard)"
+tmux ls 2>/dev/null || echo "  (none yet -- agents start ~15s after dashboard)"
 
 if [[ $FAIL -ne 0 ]]; then
   echo
-  echo "WARNING: verification checks failed — inspect journalctl and logs before assuming failure." >&2
+  echo "WARNING: verification checks failed -- inspect journalctl and logs before assuming failure." >&2
 fi
 
 # ---------------------------------------------------------------------------
@@ -296,7 +302,7 @@ echo "3. Re-authenticate Google Drive MCP:"
 echo "   Run the relevant MCP auth flow"
 echo
 echo "4. Test Telegram bot:"
-echo "   Send a message to your bot — it should respond within ~30s (15s stagger)"
+echo "   Send a message to your bot -- it should respond within ~30s (15s stagger)"
 echo
 echo "5. Open dashboard: http://localhost:3420"
 echo
@@ -306,5 +312,5 @@ echo
 if [[ $FAIL -eq 0 ]]; then
   echo "=== RESTORE COMPLETE ==="
 else
-  echo "=== RESTORE FINISHED WITH WARNINGS — review output above ==="
+  echo "=== RESTORE FINISHED WITH WARNINGS -- review output above ==="
 fi
