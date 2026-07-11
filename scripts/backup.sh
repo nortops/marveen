@@ -242,8 +242,8 @@ done
 [[ -d "${STORE_DIR}/agent-taskstate" ]] && INCLUDE+=("Projects/marveen/store/agent-taskstate")
 [[ -d "${STORE_DIR}/patches" ]]         && INCLUDE+=("Projects/marveen/store/patches")
 
-# .env-for-backup + certs
-INCLUDE+=("Projects/marveen/.env-for-backup")
+# .env-for-backup + certs (existence guard: .env-for-backup was just created in step 3)
+[[ -f "${REPO_ROOT}/.env-for-backup" ]] && INCLUDE+=("Projects/marveen/.env-for-backup")
 for f in "${REPO_ROOT}"/homeserver.tail*.crt "${REPO_ROOT}"/homeserver.tail*.key; do
   [[ -f "$f" ]] && INCLUDE+=("Projects/marveen/${f##*/}")
 done

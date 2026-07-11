@@ -86,30 +86,18 @@ echo "Using: ${BACKUP_FILE}"
 echo
 
 # ---------------------------------------------------------------------------
-# Step 2 — age passphrase (silent read)
-# ---------------------------------------------------------------------------
-read -rsp "Age passphrase: " AGE_PASS
-echo   # newline after silent prompt
-echo
-
-# ---------------------------------------------------------------------------
-# Step 3 — decrypt + extract
+# Step 2+3 — decrypt + extract (age prompts for passphrase from /dev/tty)
 # ---------------------------------------------------------------------------
 echo "[1/8] Decrypting and extracting..."
-
-PASS_FILE="$(mktemp /tmp/age-pass.XXXXXX)"
-chmod 600 "${PASS_FILE}"
-printf '%s\n' "${AGE_PASS}" > "${PASS_FILE}"
-AGE_PASS=""  # clear from memory asap
+echo "(age will prompt for the archive passphrase)"
+echo
 
 mkdir -p "${TARGET_HOME}/Projects"
 
-if ! age -d --passphrase-file "${PASS_FILE}" "${BACKUP_FILE}" | tar -xzpC "${TARGET_HOME}"; then
-  rm -f "${PASS_FILE}"
+if ! age -d "${BACKUP_FILE}" | tar -xzpC "${TARGET_HOME}"; then
   echo "ERROR: Decryption or extraction failed (wrong passphrase or corrupt archive)." >&2
   exit 1
 fi
-rm -f "${PASS_FILE}"
 
 echo "    Extracted to ${TARGET_HOME}"
 
@@ -245,8 +233,8 @@ done
 loginctl enable-linger "${TARGET_USER}" 2>/dev/null || \
   echo "  NOTE: loginctl enable-linger failed (may need sudo or already enabled)"
 
-echo "    Services started. Waiting 15s for dashboard to come up..."
-sleep 15
+echo "    Services started. Waiting 30s for dashboard to come up..."
+sleep 30
 
 # ---------------------------------------------------------------------------
 # Step 10 — three-level verification

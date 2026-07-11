@@ -41,10 +41,15 @@ WORKDIR /home/northber
 # Copy backup archive (must be named marveen-backup.tar.gz.age, placed next to Dockerfile)
 COPY --chown=northber:northber marveen-backup.tar.gz.age .
 
-# Decrypt + extract using BuildKit secret mount (passphrase never written to a layer)
+# Decrypt + extract using BuildKit secret mount (passphrase never written to a layer).
+# age reads passphrase from /dev/tty; `script -q -c` provides the PTY while the
+# printf pipe feeds the passphrase through it. util-linux (which provides `script`)
+# is present in debian:bookworm-slim by default.
 RUN --mount=type=secret,id=age_passphrase \
-    age --decrypt --passphrase-file /run/secrets/age_passphrase \
-        marveen-backup.tar.gz.age | tar -xzpC /home/northber
+    PASS="$(cat /run/secrets/age_passphrase)" \
+ && printf '%s\n' "${PASS}" \
+    | script -q -c "age -d marveen-backup.tar.gz.age | tar -xzpC /home/northber" /dev/null \
+ && unset PASS
 
 # Clone repo from embedded bundle; pinned_sha parsed with node (not python3)
 RUN git clone /home/northber/Projects/marveen/fleet.bundle /tmp/marveen-src \
