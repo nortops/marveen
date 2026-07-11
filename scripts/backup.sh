@@ -28,13 +28,14 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 DRY_RUN=false
 OUTPUT_DIR="$(pwd)"
 
-for arg in "$@"; do
-  case "$arg" in
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     --dry-run)          DRY_RUN=true ;;
-    --output-dir=*)     OUTPUT_DIR="${arg#--output-dir=}" ;;
-    --output-dir)       shift; OUTPUT_DIR="$1" ;;
-    *)                  echo "Unknown argument: $arg" >&2; exit 1 ;;
+    --output-dir=*)     OUTPUT_DIR="${1#--output-dir=}" ;;
+    --output-dir)       shift; OUTPUT_DIR="${1:?--output-dir requires a value}" ;;
+    *)                  echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
+  shift
 done
 
 # ---------------------------------------------------------------------------
