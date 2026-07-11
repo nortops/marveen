@@ -159,6 +159,8 @@ if $DRY_RUN; then
     printf "  %-62s  ~%s\n" ".claude/ (excl. cache/sessions/tmp/daemon)" "${SZ}"
   fi
   _show ".config/systemd/user"
+  [[ -f "${HOME_DIR}/.claude.json" ]] && _show ".claude.json"
+  [[ -f "${HOME_DIR}/.bashrc" ]]      && _show ".bashrc"
   echo
   echo "[DRY-RUN] No archive created."
   exit 0
@@ -324,6 +326,13 @@ while IFS= read -r _ig; do
   ${_skip} && continue
   [[ -e "${HOME_DIR}/Projects/marveen/${_ig}" ]] && INCLUDE+=("Projects/marveen/${_ig}")
 done < <(git -C "${REPO_ROOT}" status --ignored --short 2>/dev/null | awk '/^!! /{print substr($0,4)}')
+
+# HOME-level fleet-essential files (siblings of .claude/, not inside the repo).
+# .claude.json  — user-scope MCP servers (github/gmail/notion/...) + oauthAccount login state.
+# .bashrc       — vault-resolve block that exports CLAUDE_CODE_OAUTH_TOKEN on every shell start.
+# Exclude .claude.json.bak-* and .claude.json.tmp.* (transient, not added explicitly).
+[[ -f "${HOME_DIR}/.claude.json" ]] && INCLUDE+=(".claude.json")
+[[ -f "${HOME_DIR}/.bashrc" ]]      && INCLUDE+=(".bashrc")
 
 # .claude/ and systemd units are included as whole trees with exclusions applied below
 INCLUDE+=(".claude" ".config/systemd/user")

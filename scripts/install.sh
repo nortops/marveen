@@ -229,6 +229,10 @@ if [[ "${TARGET_USER}" != "${ORIGINAL_USER}" ]]; then
     _rewrite_file "$f"
   done
   _rewrite_file "${TARGET_HOME}/.claude/settings.json"
+  # .claude.json: projects dict keys + mcpServers paths contain /home/<user>
+  _rewrite_file "${TARGET_HOME}/.claude.json"
+  # .bashrc: vault-resolve path references /home/<user>/Projects/marveen/...
+  _rewrite_file "${TARGET_HOME}/.bashrc"
 
   # Rewrite absolute symlinks inside agents/ that point to the old home path
   while IFS= read -r -d '' lnk; do
