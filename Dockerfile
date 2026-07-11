@@ -35,21 +35,23 @@ RUN apt-get update \
 RUN npm install -g @anthropic-ai/claude-code
 
 RUN useradd -m -s /bin/bash northber
-USER northber
-WORKDIR /home/northber
 
 # Copy backup archive (must be named marveen-backup.tar.gz.age, placed next to Dockerfile)
-COPY --chown=northber:northber marveen-backup.tar.gz.age .
+COPY marveen-backup.tar.gz.age /home/northber/
 
-# Decrypt + extract using BuildKit secret mount (passphrase never written to a layer).
-# age reads passphrase from /dev/tty; `script -q -c` provides the PTY while the
-# printf pipe feeds the passphrase through it. util-linux (which provides `script`)
-# is present in debian:bookworm-slim by default.
+# Decrypt + extract as root (secret mount is root-only by default; chown after).
+# age reads passphrase from /dev/tty; `script -q -c` provides the PTY while
+# printf pipes the passphrase through it. util-linux (script) is present in
+# debian:bookworm-slim by default.
 RUN --mount=type=secret,id=age_passphrase \
     PASS="$(cat /run/secrets/age_passphrase)" \
  && printf '%s\n' "${PASS}" \
-    | script -q -c "age -d marveen-backup.tar.gz.age | tar -xzpC /home/northber" /dev/null \
+    | script -q -c "age -d /home/northber/marveen-backup.tar.gz.age | tar -xzpC /home/northber" /dev/null \
+ && chown -R northber:northber /home/northber \
  && unset PASS
+
+USER northber
+WORKDIR /home/northber
 
 # Clone repo from embedded bundle; pinned_sha parsed with node (not python3)
 RUN git clone /home/northber/Projects/marveen/fleet.bundle /tmp/marveen-src \
@@ -78,5 +80,11 @@ RUN mv /home/northber/Projects/marveen/store/claudeclaw-snapshot.db \
 
 EXPOSE 3420
 
-# start.sh detects missing systemd and falls back to direct-launch mode
-ENTRYPOINT ["/home/northber/Projects/marveen/scripts/start.sh"]
+# In direct-launch mode, start.sh backgrounds both dashboard and channels via
+# nohup and then exits -- so the container would die immediately without a
+# keepalive. This wrapper starts the fleet and then waits on the dashboard pid.
+RUN printf '#!/bin/bash\nset -e\n/home/northber/Projects/marveen/scripts/start.sh\nsleep 2\nexec tail -f /home/northber/Projects/marveen/store/dashboard.log 2>/dev/null || exec tail -f /dev/null\n' \
+    > /home/northber/docker-entrypoint.sh \
+ && chmod +x /home/northber/docker-entrypoint.sh
+
+ENTRYPOINT ["/home/northber/docker-entrypoint.sh"]
