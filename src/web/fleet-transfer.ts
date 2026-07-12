@@ -185,7 +185,7 @@ const GCM_TAG_LEN = 16
 // Packed format: [version:1][N_log2:1][r:1][p:1][salt:32][iv:12][tag:16][ciphertext:...]
 function encryptWithPassword(plaintext: string, password: string): string {
   const salt = randomBytes(KDF_SALT_LEN)
-  const key = scryptSync(password, salt, KDF_KEYLEN, { N: 2 ** KDF_N_LOG2, r: KDF_R, p: KDF_P })
+  const key = scryptSync(password, salt, KDF_KEYLEN, { N: 2 ** KDF_N_LOG2, r: KDF_R, p: KDF_P, maxmem: 256 * 1024 * 1024 })
   const iv = randomBytes(GCM_IV_LEN)
   const cipher = createCipheriv('aes-256-gcm', key, iv)
   const enc = Buffer.concat([cipher.update(plaintext, 'utf-8'), cipher.final()])
@@ -205,7 +205,7 @@ function decryptWithPassword(packed: string, password: string): string {
   const iv = buf.subarray(off + KDF_SALT_LEN, off + KDF_SALT_LEN + GCM_IV_LEN)
   const tag = buf.subarray(off + KDF_SALT_LEN + GCM_IV_LEN, off + KDF_SALT_LEN + GCM_IV_LEN + GCM_TAG_LEN)
   const ciphertext = buf.subarray(off + KDF_SALT_LEN + GCM_IV_LEN + GCM_TAG_LEN)
-  const key = scryptSync(password, salt, KDF_KEYLEN, { N: 2 ** nLog2, r, p })
+  const key = scryptSync(password, salt, KDF_KEYLEN, { N: 2 ** nLog2, r, p, maxmem: 256 * 1024 * 1024 })
   const decipher = createDecipheriv('aes-256-gcm', key, iv)
   decipher.setAuthTag(tag)
   // Buffer.concat avoids multi-byte UTF-8 split corruption at chunk boundary
@@ -218,8 +218,9 @@ export const MIN_VAULT_PASSWORD_LEN = 8
 // Path normalization (H4: applied to the entire serialized FleetJson)
 // ---------------------------------------------------------------------------
 
-const PROJECT_ROOT_PLACEHOLDER = '{{PROJECT_ROOT}}'
-const HOME_PLACEHOLDER = '{{HOME}}'
+// Collision-resistant sentinels: namespaced so memory/skill content can't accidentally contain them
+const PROJECT_ROOT_PLACEHOLDER = '{{FLEET:PROJECT_ROOT}}'
+const HOME_PLACEHOLDER = '{{FLEET:HOME}}'
 
 function normalizePaths(text: string): string {
   // Replace PROJECT_ROOT before HOME: on typical installs HOME is a prefix of PROJECT_ROOT.
@@ -247,13 +248,38 @@ const NON_SECRET_VALUE_RE = [
   /^\$\{/,
   /^vault:/,
   /^\{\{VAULT:/,
-  /\s/,  // human-readable multi-word strings are not secrets
+  // Note: no /\s/ exemption -- "Bearer sk-live-..." contains whitespace but IS a secret
 ]
 
 function looksLikeSecret(value: string): boolean {
   if (value.length < 16) return false
   for (const re of NON_SECRET_VALUE_RE) {
     if (re.test(value)) return false
+  }
+  return true
+}
+
+// Auth scheme prefixes to strip before entropy check on header values
+const HEADER_AUTH_SCHEME_RE = /^(?:Bearer|Basic|Token|Digest)\s+/i
+// Header keys that always carry secrets (unless already vault-bound)
+const ALWAYS_SECRET_HEADER_KEY_RE = /^(authorization|x-api-key|x-auth-token|.*-token|.*-key)$/i
+// Non-secret patterns for header values -- note: no URL exemption (https://user:cred@host IS a secret)
+const NON_SECRET_HEADER_VALUE_RE = [
+  /^(true|false)$/i,
+  /^\d+$/,
+  /^\//,
+  /^\$\{/,
+  /^vault:/,
+  /^\{\{VAULT:/,
+]
+
+function looksLikeHeaderSecret(key: string, value: string): boolean {
+  if (ALWAYS_SECRET_HEADER_KEY_RE.test(key)) return true
+  // Strip auth scheme prefix ("Bearer ", "Basic "…) then check the credential part
+  const stripped = value.replace(HEADER_AUTH_SCHEME_RE, '')
+  if (stripped.length < 16) return false
+  for (const re of NON_SECRET_HEADER_VALUE_RE) {
+    if (re.test(stripped)) return false
   }
   return true
 }
@@ -289,6 +315,7 @@ function placeholderMcp(
     const c = cfg as Record<string, unknown>
     const byEnv = byServer?.get(serverName)
 
+    const blockingFields: string[] = []
     for (const field of ['env', 'headers'] as const) {
       const dict = c[field] as Record<string, string> | undefined
       if (!dict) continue
@@ -298,14 +325,20 @@ function placeholderMcp(
           dict[key] = `{{VAULT:${val.slice(6)}}}`
         } else if (byEnv?.has(key)) {
           dict[key] = `{{VAULT:${byEnv.get(key)!}}}`
-        } else if (looksLikeSecret(val)) {
-          // Unbound high-entropy literal -- hard-fail rather than silently leak (B2)
-          throw new Error(
-            `Titkosítatlan secret az .mcp.json-ban: szerver="${serverName}", mező="${field}", kulcs="${key}". ` +
-            `Kösd be a vault-ba a dashboard Vault oldalán, majd próbáld újra az exportot.`
-          )
+        } else {
+          const isSecret = field === 'headers' ? looksLikeHeaderSecret(key, val) : looksLikeSecret(val)
+          if (isSecret) {
+            // Collect all blocking fields before throwing so the user can fix them in one pass (B2 tors)
+            blockingFields.push(`mező="${field}", kulcs="${key}"`)
+          }
         }
       }
+    }
+    if (blockingFields.length > 0) {
+      throw new Error(
+        `Titkosítatlan secret az .mcp.json-ban: szerver="${serverName}": ${blockingFields.join('; ')}. ` +
+        `Kösd be a vault-ba a dashboard Vault oldalán, majd próbáld újra az exportot.`
+      )
     }
   }
   return result
@@ -679,8 +712,13 @@ function buildDiffReport(fleet: FleetJson): DiffReport {
 // Apply helpers -- tracked writes for partial cleanup (H3)
 // ---------------------------------------------------------------------------
 
+interface WriteEntry {
+  path: string
+  preexisted: boolean
+}
+
 interface WriteTracker {
-  files: string[]
+  files: WriteEntry[]
   dirs: string[]
 }
 
@@ -692,13 +730,18 @@ function trackedMkdir(path: string, tracker: WriteTracker): void {
 }
 
 function trackedWrite(path: string, content: string | Buffer, tracker: WriteTracker, opts?: { mode?: number }): void {
+  const preexisted = existsSync(path)
   atomicWriteFileSync(path, content as string, opts)
-  tracker.files.push(path)
+  tracker.files.push({ path, preexisted })
 }
 
 function cleanupTracked(tracker: WriteTracker): void {
-  for (const f of tracker.files) {
-    try { unlinkSync(f) } catch { /* best effort */ }
+  // Only delete files that did not exist before the import started; pre-existing overwritten files
+  // cannot be restored (no backup), so we leave them rather than delete them (H3).
+  for (const { path, preexisted } of tracker.files) {
+    if (!preexisted) {
+      try { unlinkSync(path) } catch { /* best effort */ }
+    }
   }
   // Remove dirs in reverse order (deepest first), only if empty
   for (const d of [...tracker.dirs].reverse()) {
@@ -807,7 +850,7 @@ export function importFleet(
 
     // 3. Scheduled tasks (all paused: enabled=false already set at export time)
     if (existsSync(SCHEDULED_TASKS_DIR) || fleet.scheduledTasks?.length) {
-      mkdirSync(SCHEDULED_TASKS_DIR, { recursive: true })
+      trackedMkdir(SCHEDULED_TASKS_DIR, tracker)
     }
     for (const task of fleet.scheduledTasks ?? []) {
       const dir = safeJoin(SCHEDULED_TASKS_DIR, task.dirName)
