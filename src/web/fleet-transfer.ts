@@ -8,23 +8,38 @@
 // NOT included -- those come from a normal `npm ci && npm run build` install.
 
 import {
-  existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync,
+  existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync,
 } from 'node:fs'
-import { join, basename } from 'node:path'
+import { join, extname } from 'node:path'
 import { homedir, hostname } from 'node:os'
-import { createHash, randomBytes, createCipheriv, createDecipheriv, scryptSync } from 'node:crypto'
+import {
+  randomBytes, createCipheriv, createDecipheriv, scryptSync,
+} from 'node:crypto'
 import { PROJECT_ROOT, STORE_DIR } from '../config.js'
 import { atomicWriteFileSync } from './atomic-write.js'
-import { AGENTS_BASE_DIR, listAgentNames, readFileOr } from './agent-config.js'
-import { SCHEDULED_TASKS_DIR, listScheduledTasks, writeScheduledTask } from './scheduled-tasks-io.js'
+import { AGENTS_BASE_DIR, listAgentNames } from './agent-config.js'
+import { safeJoin } from './sanitize.js'
+import { SCHEDULED_TASKS_DIR } from './scheduled-tasks-io.js'
 import { getBindings } from './vault-bindings.js'
-import { getDb } from '../db.js'
+import { getDb, backfillEmbeddings } from '../db.js'
 import { logger } from '../logger.js'
 
 // ---------------------------------------------------------------------------
 // Schema version -- bump when the JSON shape changes incompatibly.
 // ---------------------------------------------------------------------------
 export const FLEET_SCHEMA_VERSION = 1
+
+// ---------------------------------------------------------------------------
+// Name validation (used to guard all import-side path joins -- B1)
+// ---------------------------------------------------------------------------
+const SAFE_NAME_RE = /^[a-z0-9][a-z0-9_-]*$/
+
+function assertSafeName(value: unknown, field: string): string {
+  if (typeof value !== 'string' || !SAFE_NAME_RE.test(value)) {
+    throw new Error(`Érvénytelen ${field} érték: "${String(value).slice(0, 60)}" -- csak [a-z0-9_-] megengedett.`)
+  }
+  return value
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -51,7 +66,8 @@ export interface AgentExport {
   mcp: Record<string, unknown>
   settings: Record<string, unknown>
   channelsAccess: Record<string, unknown>
-  avatar: string | null  // base64 PNG
+  avatar: string | null  // base64
+  avatarExt: string      // 'png' or 'jpg'
   agentSkills: SkillExport[]
   memories: MemoryRow[]
   dailyLogs: DailyLogRow[]
@@ -109,20 +125,17 @@ export interface DailyLogRow {
 }
 
 export interface VaultExport {
-  // The .vault-key (base64 string) re-encrypted with the user-supplied password.
-  // Format: base64(scrypt-salt[32] || iv[16] || gcm-tag[16] || ciphertext)
+  // Packed format: version[1] + N_log2[1] + r[1] + p[1] + salt[32] + iv[12] + gcm-tag[16] + ciphertext
+  // All base64-encoded. The .vault-key content (base64 string) is the plaintext.
   encryptedKey: string
-  // Vault entries unchanged -- already AES-256-GCM encrypted with the vault-key.
   entries: Record<string, unknown>[]
-  // vault-bindings.json verbatim.
   bindings: Record<string, unknown>[]
-  // Channel .env files (bot tokens) encrypted with the same password+scrypt.
   channelEnvs: EncryptedChannelEnv[]
 }
 
 export interface EncryptedChannelEnv {
   provider: string
-  encrypted: string  // base64(scrypt-salt[32] || iv[16] || gcm-tag[16] || ciphertext)
+  encrypted: string  // same packed format as encryptedKey
 }
 
 export interface DiffReport {
@@ -157,44 +170,59 @@ export interface ImportResult {
 }
 
 // ---------------------------------------------------------------------------
-// Crypto helpers (scrypt + AES-256-GCM, same algorithm as vault.ts)
+// Crypto helpers -- M7: versioned packed blob, scrypt N=2^17
 // ---------------------------------------------------------------------------
 
-const SCRYPT_SALT_LEN = 32
-const AES_IV_LEN = 16
-const AES_TAG_LEN = 16
+const KDF_VERSION = 1
+const KDF_N_LOG2 = 17   // N = 2^17 = 131072 (appropriate for user-chosen password on portable file)
+const KDF_R = 8
+const KDF_P = 1
+const KDF_KEYLEN = 32
+const KDF_SALT_LEN = 32
+const GCM_IV_LEN = 12   // GCM standard is 12 bytes
+const GCM_TAG_LEN = 16
 
+// Packed format: [version:1][N_log2:1][r:1][p:1][salt:32][iv:12][tag:16][ciphertext:...]
 function encryptWithPassword(plaintext: string, password: string): string {
-  const salt = randomBytes(SCRYPT_SALT_LEN)
-  const key = scryptSync(password, salt, 32)
-  const iv = randomBytes(AES_IV_LEN)
+  const salt = randomBytes(KDF_SALT_LEN)
+  const key = scryptSync(password, salt, KDF_KEYLEN, { N: 2 ** KDF_N_LOG2, r: KDF_R, p: KDF_P })
+  const iv = randomBytes(GCM_IV_LEN)
   const cipher = createCipheriv('aes-256-gcm', key, iv)
   const enc = Buffer.concat([cipher.update(plaintext, 'utf-8'), cipher.final()])
   const tag = cipher.getAuthTag()
-  return Buffer.concat([salt, iv, tag, enc]).toString('base64')
+  const header = Buffer.from([KDF_VERSION, KDF_N_LOG2, KDF_R, KDF_P])
+  return Buffer.concat([header, salt, iv, tag, enc]).toString('base64')
 }
 
 function decryptWithPassword(packed: string, password: string): string {
   const buf = Buffer.from(packed, 'base64')
-  const salt = buf.subarray(0, SCRYPT_SALT_LEN)
-  const iv = buf.subarray(SCRYPT_SALT_LEN, SCRYPT_SALT_LEN + AES_IV_LEN)
-  const tag = buf.subarray(SCRYPT_SALT_LEN + AES_IV_LEN, SCRYPT_SALT_LEN + AES_IV_LEN + AES_TAG_LEN)
-  const ciphertext = buf.subarray(SCRYPT_SALT_LEN + AES_IV_LEN + AES_TAG_LEN)
-  const key = scryptSync(password, salt, 32)
+  // version byte (offset 0) reserved for future format changes; currently always 1
+  const nLog2 = buf[1]
+  const r = buf[2]
+  const p = buf[3]
+  const off = 4
+  const salt = buf.subarray(off, off + KDF_SALT_LEN)
+  const iv = buf.subarray(off + KDF_SALT_LEN, off + KDF_SALT_LEN + GCM_IV_LEN)
+  const tag = buf.subarray(off + KDF_SALT_LEN + GCM_IV_LEN, off + KDF_SALT_LEN + GCM_IV_LEN + GCM_TAG_LEN)
+  const ciphertext = buf.subarray(off + KDF_SALT_LEN + GCM_IV_LEN + GCM_TAG_LEN)
+  const key = scryptSync(password, salt, KDF_KEYLEN, { N: 2 ** nLog2, r, p })
   const decipher = createDecipheriv('aes-256-gcm', key, iv)
   decipher.setAuthTag(tag)
-  return decipher.update(ciphertext) + decipher.final('utf-8')
+  // Buffer.concat avoids multi-byte UTF-8 split corruption at chunk boundary
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf-8')
 }
 
+export const MIN_VAULT_PASSWORD_LEN = 8
+
 // ---------------------------------------------------------------------------
-// Path normalization (export: absolute -> placeholders, import: reverse)
+// Path normalization (H4: applied to the entire serialized FleetJson)
 // ---------------------------------------------------------------------------
 
 const PROJECT_ROOT_PLACEHOLDER = '{{PROJECT_ROOT}}'
 const HOME_PLACEHOLDER = '{{HOME}}'
 
 function normalizePaths(text: string): string {
-  // Replace longer path first to avoid partial replacement (HOME is a prefix of PROJECT_ROOT on typical installs).
+  // Replace PROJECT_ROOT before HOME: on typical installs HOME is a prefix of PROJECT_ROOT.
   return text
     .replaceAll(PROJECT_ROOT, PROJECT_ROOT_PLACEHOLDER)
     .replaceAll(homedir(), HOME_PLACEHOLDER)
@@ -207,10 +235,30 @@ function denormalizePaths(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// .mcp.json placeholder handling
+// .mcp.json placeholder handling (B2: scan env AND headers, entropy hard-fail)
 // ---------------------------------------------------------------------------
 
-// Build a lookup: mcpFilePath -> serverName -> envVar -> vaultSecretId
+// Patterns that suggest a value is NOT a secret (safe to export plaintext).
+const NON_SECRET_VALUE_RE = [
+  /^(true|false)$/i,
+  /^https?:\/\//,
+  /^\d+$/,
+  /^\//,
+  /^\$\{/,
+  /^vault:/,
+  /^\{\{VAULT:/,
+  /\s/,  // human-readable multi-word strings are not secrets
+]
+
+function looksLikeSecret(value: string): boolean {
+  if (value.length < 16) return false
+  for (const re of NON_SECRET_VALUE_RE) {
+    if (re.test(value)) return false
+  }
+  return true
+}
+
+// Build lookup: mcpFilePath -> serverName -> envVar -> vaultSecretId
 function buildBindingLookup(): Map<string, Map<string, Map<string, string>>> {
   const lookup = new Map<string, Map<string, Map<string, string>>>()
   for (const binding of getBindings()) {
@@ -224,9 +272,8 @@ function buildBindingLookup(): Map<string, Map<string, Map<string, string>>> {
   return lookup
 }
 
-// Replace literal env values with {{VAULT:<id>}} placeholders for export.
-// vault:<id> references (already synced) are also normalized to {{VAULT:<id>}}
-// so import always sees the same format.
+// Scan env AND headers for secrets; convert known vault refs to {{VAULT:id}};
+// hard-fail on unbound high-entropy literals (B2).
 function placeholderMcp(
   mcpObj: Record<string, unknown>,
   mcpFilePath: string,
@@ -236,20 +283,29 @@ function placeholderMcp(
   const byServer = lookup.get(mcpFilePath)
   const servers = result.mcpServers as Record<string, Record<string, unknown>> | undefined
   if (!servers) return result
+
   for (const [serverName, cfg] of Object.entries(servers)) {
     if (!cfg || typeof cfg !== 'object') continue
-    const env = (cfg as Record<string, unknown>).env as Record<string, string> | undefined
-    if (!env) continue
+    const c = cfg as Record<string, unknown>
     const byEnv = byServer?.get(serverName)
-    for (const [envVar, envVal] of Object.entries(env)) {
-      if (typeof envVal !== 'string') continue
-      if (envVal.startsWith('vault:')) {
-        env[envVar] = `{{VAULT:${envVal.slice(6)}}}`
-      } else if (byEnv?.has(envVar)) {
-        env[envVar] = `{{VAULT:${byEnv.get(envVar)!}}}`
+
+    for (const field of ['env', 'headers'] as const) {
+      const dict = c[field] as Record<string, string> | undefined
+      if (!dict) continue
+      for (const [key, val] of Object.entries(dict)) {
+        if (typeof val !== 'string') continue
+        if (val.startsWith('vault:')) {
+          dict[key] = `{{VAULT:${val.slice(6)}}}`
+        } else if (byEnv?.has(key)) {
+          dict[key] = `{{VAULT:${byEnv.get(key)!}}}`
+        } else if (looksLikeSecret(val)) {
+          // Unbound high-entropy literal -- hard-fail rather than silently leak (B2)
+          throw new Error(
+            `Titkosítatlan secret az .mcp.json-ban: szerver="${serverName}", mező="${field}", kulcs="${key}". ` +
+            `Kösd be a vault-ba a dashboard Vault oldalán, majd próbáld újra az exportot.`
+          )
+        }
       }
-      // Non-bound literals pass through without warning -- they may be non-secret
-      // config values. The scanMcpConfigs() route already surfaces unbound secrets.
     }
   }
   return result
@@ -262,11 +318,14 @@ function deplaceholderMcp(mcpObj: Record<string, unknown>): Record<string, unkno
   if (!servers) return result
   for (const [, cfg] of Object.entries(servers)) {
     if (!cfg || typeof cfg !== 'object') continue
-    const env = (cfg as Record<string, unknown>).env as Record<string, string> | undefined
-    if (!env) continue
-    for (const [envVar, envVal] of Object.entries(env)) {
-      if (typeof envVal === 'string' && envVal.startsWith('{{VAULT:') && envVal.endsWith('}}')) {
-        env[envVar] = `vault:${envVal.slice(8, -2)}`
+    const c = cfg as Record<string, unknown>
+    for (const field of ['env', 'headers'] as const) {
+      const dict = c[field] as Record<string, string> | undefined
+      if (!dict) continue
+      for (const [k, v] of Object.entries(dict)) {
+        if (typeof v === 'string' && v.startsWith('{{VAULT:') && v.endsWith('}}')) {
+          dict[k] = `vault:${v.slice(8, -2)}`
+        }
       }
     }
   }
@@ -312,21 +371,17 @@ function exportAgent(
 ): AgentExport {
   const dir = join(AGENTS_BASE_DIR, name)
   const claudeDir = join(dir, '.claude')
-
-  const configPath = join(dir, 'agent-config.json')
   const mcpPath = join(dir, '.mcp.json')
   const settingsPath = join(claudeDir, 'settings.json')
 
   const rawMcp = safeReadJson(mcpPath)
-  const mcpNormalized = placeholderMcp(rawMcp, mcpPath, bindingLookup)
-  // Path-normalize the mcp JSON (vault-env-wrapper.sh path etc.)
-  const mcpStr = normalizePaths(JSON.stringify(mcpNormalized))
-  const mcp = JSON.parse(mcpStr) as Record<string, unknown>
+  // placeholder .mcp.json (may throw on unbound secrets -- propagates to exportFleet)
+  const mcpPlaceholdered = placeholderMcp(rawMcp, mcpPath, bindingLookup)
 
   const settingsRaw = safeReadText(settingsPath)
-  const settingsNormalized = settingsRaw ? JSON.parse(normalizePaths(settingsRaw)) : {}
+  const settings = settingsRaw ? JSON.parse(settingsRaw) as Record<string, unknown> : {}
 
-  // channels/access.json per provider (not .env -- that's vault-gated)
+  // channels/access.json per provider (not .env -- vault-gated)
   const channelsDir = join(claudeDir, 'channels')
   const channelsAccess: Record<string, unknown> = {}
   if (existsSync(channelsDir)) {
@@ -338,34 +393,41 @@ function exportAgent(
     }
   }
 
-  // avatar
-  const avatar = safeReadBase64(join(dir, 'avatar.png'))
-    ?? safeReadBase64(join(dir, 'avatar.jpg'))
+  // avatar -- preserve actual extension (M NIT: don't coerce jpg -> png)
+  let avatar: string | null = null
+  let avatarExt = 'png'
+  const pngPath = join(dir, 'avatar.png')
+  const jpgPath = join(dir, 'avatar.jpg')
+  if (existsSync(pngPath)) {
+    avatar = safeReadBase64(pngPath)
+    avatarExt = 'png'
+  } else if (existsSync(jpgPath)) {
+    avatar = safeReadBase64(jpgPath)
+    avatarExt = 'jpg'
+  }
 
-  // agent-local skills
   const agentSkills = listSkillsInDir(join(claudeDir, 'skills'))
 
-  // memories (no embedding column)
   const memories = db.prepare(
     `SELECT agent_id, content, sector, salience, created_at, accessed_at,
             category, auto_generated, keywords
      FROM memories WHERE agent_id = ? ORDER BY created_at ASC`
   ).all(name) as MemoryRow[]
 
-  // daily logs
   const dailyLogs = db.prepare(
     'SELECT agent_id, date, content, created_at FROM daily_logs WHERE agent_id = ? ORDER BY date ASC'
   ).all(name) as DailyLogRow[]
 
   return {
     name,
-    config: safeReadJson(configPath),
+    config: safeReadJson(join(dir, 'agent-config.json')),
     claudeMd: safeReadText(join(dir, 'CLAUDE.md')),
     soulMd: safeReadText(join(dir, 'SOUL.md')),
-    mcp,
-    settings: settingsNormalized as Record<string, unknown>,
+    mcp: mcpPlaceholdered,
+    settings,
     channelsAccess,
     avatar,
+    avatarExt,
     agentSkills,
     memories,
     dailyLogs,
@@ -377,14 +439,10 @@ function exportScheduledTasks(): ScheduledTaskExport[] {
   const result: ScheduledTaskExport[] = []
   for (const dirName of readdirSync(SCHEDULED_TASKS_DIR)) {
     const dir = join(SCHEDULED_TASKS_DIR, dirName)
-    try {
-      if (!statSync(dir).isDirectory()) continue
-    } catch { continue }
+    try { if (!statSync(dir).isDirectory()) continue } catch { continue }
     const skillMd = safeReadText(join(dir, 'SKILL.md'))
     const configRaw = safeReadJson(join(dir, 'task-config.json'))
-    // Force enabled=false on export so tasks don't fire on fresh import
-    const config = { ...configRaw, enabled: false }
-    result.push({ dirName, skillMd, config })
+    result.push({ dirName, skillMd, config: { ...configRaw, enabled: false } })
   }
   return result
 }
@@ -402,16 +460,25 @@ function exportDashboardSettings(): DashboardSettingsExport {
 function exportVault(password: string): VaultExport | null {
   const vaultPath = join(STORE_DIR, 'vault.json')
   const vaultKeyPath = join(STORE_DIR, '.vault-key')
+  const vaultKeyMigratedPath = join(STORE_DIR, '.vault-key.migrated')
   const bindingsPath = join(STORE_DIR, 'vault-bindings.json')
 
-  if (!existsSync(vaultKeyPath)) return null
+  if (!existsSync(vaultKeyPath)) {
+    // M8: macOS Keychain migration -- vault-key.migrated means key is in Keychain
+    if (existsSync(vaultKeyMigratedPath)) {
+      throw new Error(
+        'A vault kulcs macOS Keychain-be lett migrálva (.vault-key.migrated megtalálható). ' +
+        'A vault szekció exportja ebben a konfigurációban nem támogatott -- hagyd ki a vault_password-öt.'
+      )
+    }
+    return null
+  }
 
   const vaultKeyBase64 = readFileSync(vaultKeyPath, 'utf-8').trim()
   const encryptedKey = encryptWithPassword(vaultKeyBase64, password)
 
   const vaultStore = safeReadJson(vaultPath)
   const entries = (vaultStore.entries as Record<string, unknown>[]) ?? []
-
   const bindingsStore = safeReadJson(bindingsPath)
   const bindings = (bindingsStore.bindings as Record<string, unknown>[]) ?? []
 
@@ -422,8 +489,10 @@ function exportVault(password: string): VaultExport | null {
     for (const provider of readdirSync(channelsBase)) {
       const envPath = join(channelsBase, provider, '.env')
       if (existsSync(envPath)) {
-        const envContent = readFileSync(envPath, 'utf-8')
-        channelEnvs.push({ provider, encrypted: encryptWithPassword(envContent, password) })
+        channelEnvs.push({
+          provider,
+          encrypted: encryptWithPassword(readFileSync(envPath, 'utf-8'), password),
+        })
       }
     }
   }
@@ -432,17 +501,17 @@ function exportVault(password: string): VaultExport | null {
 }
 
 export function exportFleet(options: { vaultPassword?: string } = {}): FleetJson {
+  if (options.vaultPassword !== undefined && options.vaultPassword.length < MIN_VAULT_PASSWORD_LEN) {
+    throw new Error(`A vault jelszó legalább ${MIN_VAULT_PASSWORD_LEN} karakter kell legyen.`)
+  }
+
   const db = getDb()
   const bindingLookup = buildBindingLookup()
 
   const agents = listAgentNames().map(name => exportAgent(name, bindingLookup, db))
-
-  const globalSkillsDir = join(homedir(), '.claude', 'skills')
-  const skills = listSkillsInDir(globalSkillsDir)
-
+  const skills = listSkillsInDir(join(homedir(), '.claude', 'skills'))
   const scheduledTasks = exportScheduledTasks()
 
-  // DB export
   const kanban: KanbanExport = {
     cards: db.prepare('SELECT * FROM kanban_cards').all() as Record<string, unknown>[],
     comments: db.prepare('SELECT * FROM kanban_comments').all() as Record<string, unknown>[],
@@ -457,11 +526,9 @@ export function exportFleet(options: { vaultPassword?: string } = {}): FleetJson
     statusLog: db.prepare('SELECT * FROM idea_status_log').all() as Record<string, unknown>[],
   }
 
-  const dashboardSettings = exportDashboardSettings()
-
   const vault = options.vaultPassword ? exportVault(options.vaultPassword) : undefined
 
-  return {
+  const fleet: FleetJson = {
     schemaVersion: 1,
     exportedAt: new Date().toISOString(),
     sourceHost: hostname(),
@@ -470,18 +537,17 @@ export function exportFleet(options: { vaultPassword?: string } = {}): FleetJson
     scheduledTasks,
     kanban,
     ideaBox,
-    dashboardSettings,
+    dashboardSettings: exportDashboardSettings(),
     ...(vault ? { vault } : {}),
   }
+
+  // H4: normalize ALL absolute paths in the entire JSON in one pass
+  return JSON.parse(normalizePaths(JSON.stringify(fleet))) as FleetJson
 }
 
 // ---------------------------------------------------------------------------
-// Import -- dry-run (validate + diff) and apply
+// Import -- validate, dry-run, and apply
 // ---------------------------------------------------------------------------
-
-function contentHash(content: string): string {
-  return createHash('sha256').update(content).digest('hex').slice(0, 16)
-}
 
 function validateSchema(fleet: unknown): string[] {
   const errors: string[] = []
@@ -495,9 +561,10 @@ function validateSchema(fleet: unknown): string[] {
     return errors
   }
   if (f.schemaVersion !== FLEET_SCHEMA_VERSION) {
+    const v = f.schemaVersion
     errors.push(
-      `Az export schema v${f.schemaVersion}, a telepített dashboard v${FLEET_SCHEMA_VERSION}-t támogat. ` +
-      (Number(f.schemaVersion) > FLEET_SCHEMA_VERSION
+      `Az export schema v${v}, a telepített dashboard v${FLEET_SCHEMA_VERSION}-t támogat. ` +
+      (Number(v) > FLEET_SCHEMA_VERSION
         ? 'Frissítsd a dashboardot az import előtt.'
         : 'Az export túl régi.')
     )
@@ -507,48 +574,83 @@ function validateSchema(fleet: unknown): string[] {
   return errors
 }
 
+// B1: validate all untrusted names before any file operation
+function validateNames(fleet: FleetJson): string[] {
+  const errors: string[] = []
+  for (const agent of fleet.agents ?? []) {
+    if (!SAFE_NAME_RE.test(String(agent.name ?? ''))) {
+      errors.push(`Érvénytelen agent.name: "${String(agent.name).slice(0, 60)}"`)
+    }
+    for (const skill of agent.agentSkills ?? []) {
+      if (!SAFE_NAME_RE.test(String(skill.name ?? ''))) {
+        errors.push(`Érvénytelen skill.name (agent ${agent.name}): "${String(skill.name).slice(0, 60)}"`)
+      }
+    }
+    for (const provider of Object.keys(agent.channelsAccess ?? {})) {
+      if (!SAFE_NAME_RE.test(provider)) {
+        errors.push(`Érvénytelen channel provider (agent ${agent.name}): "${provider.slice(0, 60)}"`)
+      }
+    }
+  }
+  for (const skill of fleet.skills ?? []) {
+    if (!SAFE_NAME_RE.test(String(skill.name ?? ''))) {
+      errors.push(`Érvénytelen global skill.name: "${String(skill.name).slice(0, 60)}"`)
+    }
+  }
+  for (const task of fleet.scheduledTasks ?? []) {
+    if (!SAFE_NAME_RE.test(String(task.dirName ?? ''))) {
+      errors.push(`Érvénytelen scheduledTask.dirName: "${String(task.dirName).slice(0, 60)}"`)
+    }
+  }
+  if (fleet.vault) {
+    for (const { provider } of fleet.vault.channelEnvs ?? []) {
+      if (!SAFE_NAME_RE.test(String(provider ?? ''))) {
+        errors.push(`Érvénytelen vault channelEnv provider: "${String(provider).slice(0, 60)}"`)
+      }
+    }
+  }
+  return errors
+}
+
 function buildDiffReport(fleet: FleetJson): DiffReport {
   const db = getDb()
   const warnings: string[] = []
 
-  // Count what would be created
   const existingAgents = new Set(listAgentNames())
   const newAgents = (fleet.agents ?? []).map(a => a.name).filter(n => !existingAgents.has(n))
 
-  // memories -- count non-duplicate rows (full content equality check)
   let newMemories = 0
   for (const agent of fleet.agents ?? []) {
     for (const mem of agent.memories ?? []) {
-      const exists = db.prepare(
-        'SELECT 1 FROM memories WHERE agent_id = ? AND content = ?'
-      ).get(mem.agent_id, mem.content)
+      const exists = db.prepare('SELECT 1 FROM memories WHERE agent_id = ? AND content = ?')
+        .get(mem.agent_id, mem.content)
       if (!exists) newMemories++
     }
   }
 
-  // kanban cards
   let newCards = 0
   for (const card of fleet.kanban?.cards ?? []) {
-    const exists = db.prepare('SELECT 1 FROM kanban_cards WHERE id = ?').get((card as any).id)
-    if (!exists) newCards++
+    if (!db.prepare('SELECT 1 FROM kanban_cards WHERE id = ?').get((card as any).id)) newCards++
   }
 
-  // labels
   let newLabels = 0
   for (const label of fleet.kanban?.labels ?? []) {
-    const exists = db.prepare('SELECT 1 FROM labels WHERE id = ?').get((label as any).id)
-    if (!exists) newLabels++
+    if (!db.prepare('SELECT 1 FROM labels WHERE id = ?').get((label as any).id)) newLabels++
   }
 
-  // daily logs (rough count)
   let newDailyLogs = 0
   for (const agent of fleet.agents ?? []) {
     for (const log of agent.dailyLogs ?? []) {
-      const exists = db.prepare(
-        'SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ?'
-      ).get(log.agent_id, log.date)
-      if (!exists) newDailyLogs++
+      if (!db.prepare('SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ?').get(log.agent_id, log.date)) {
+        newDailyLogs++
+      }
     }
+  }
+
+  let newComments = 0
+  for (const c of fleet.kanban?.comments ?? []) {
+    if (!db.prepare('SELECT 1 FROM kanban_comments WHERE card_id = ? AND content = ?')
+      .get((c as any).card_id, (c as any).content)) newComments++
   }
 
   if (!fleet.vault) {
@@ -563,7 +665,7 @@ function buildDiffReport(fleet: FleetJson): DiffReport {
       scheduledTasks: (fleet.scheduledTasks ?? []).length,
       memories: newMemories,
       kanbanCards: newCards,
-      kanbanComments: (fleet.kanban?.comments ?? []).length,
+      kanbanComments: newComments,
       labels: newLabels,
       dailyLogs: newDailyLogs,
       ideaBox: (fleet.ideaBox?.ideas ?? []).length,
@@ -573,155 +675,171 @@ function buildDiffReport(fleet: FleetJson): DiffReport {
   }
 }
 
-function writeAgentFiles(
-  agent: AgentExport,
-  globalSkillsDir: string,
-): void {
-  const dir = join(AGENTS_BASE_DIR, agent.name)
-  const claudeDir = join(dir, '.claude')
-  mkdirSync(claudeDir, { recursive: true })
+// ---------------------------------------------------------------------------
+// Apply helpers -- tracked writes for partial cleanup (H3)
+// ---------------------------------------------------------------------------
 
-  atomicWriteFileSync(join(dir, 'agent-config.json'), JSON.stringify(agent.config, null, 2))
-  if (agent.claudeMd) atomicWriteFileSync(join(dir, 'CLAUDE.md'), agent.claudeMd)
-  if (agent.soulMd) atomicWriteFileSync(join(dir, 'SOUL.md'), agent.soulMd)
+interface WriteTracker {
+  files: string[]
+  dirs: string[]
+}
 
-  // .mcp.json -- de-placeholder vault refs, then path-denormalize
-  const mcpDeplaceholdered = deplaceholderMcp(agent.mcp)
-  const mcpStr = denormalizePaths(JSON.stringify(mcpDeplaceholdered, null, 2))
-  atomicWriteFileSync(join(dir, '.mcp.json'), mcpStr)
-
-  // settings.json -- path-denormalize hooks
-  const settingsStr = denormalizePaths(JSON.stringify(agent.settings, null, 2))
-  mkdirSync(join(claudeDir), { recursive: true })
-  atomicWriteFileSync(join(claudeDir, 'settings.json'), settingsStr)
-
-  // channels/access.json per provider
-  for (const [provider, access] of Object.entries(agent.channelsAccess ?? {})) {
-    const provDir = join(claudeDir, 'channels', provider)
-    mkdirSync(provDir, { recursive: true })
-    atomicWriteFileSync(join(provDir, 'access.json'), JSON.stringify(access, null, 2))
-  }
-
-  // avatar
-  if (agent.avatar) {
-    const avatarBuf = Buffer.from(agent.avatar, 'base64')
-    atomicWriteFileSync(join(dir, 'avatar.png'), avatarBuf as unknown as string)
-  }
-
-  // agent-local skills
-  for (const skill of agent.agentSkills ?? []) {
-    const skillDir = join(claudeDir, 'skills', skill.name)
-    mkdirSync(skillDir, { recursive: true })
-    atomicWriteFileSync(join(skillDir, 'SKILL.md'), skill.skillMd)
+function trackedMkdir(path: string, tracker: WriteTracker): void {
+  if (!existsSync(path)) {
+    mkdirSync(path, { recursive: true })
+    tracker.dirs.push(path)
   }
 }
 
-function importVault(vault: VaultExport, password: string): void {
-  // Decrypt and restore .vault-key
+function trackedWrite(path: string, content: string | Buffer, tracker: WriteTracker, opts?: { mode?: number }): void {
+  atomicWriteFileSync(path, content as string, opts)
+  tracker.files.push(path)
+}
+
+function cleanupTracked(tracker: WriteTracker): void {
+  for (const f of tracker.files) {
+    try { unlinkSync(f) } catch { /* best effort */ }
+  }
+  // Remove dirs in reverse order (deepest first), only if empty
+  for (const d of [...tracker.dirs].reverse()) {
+    try { rmSync(d, { recursive: true, force: true }) } catch { /* best effort */ }
+  }
+}
+
+function writeAgentFiles(agent: AgentExport, tracker: WriteTracker): void {
+  // B1: names already validated by validateNames() before this is called
+  const dir = safeJoin(AGENTS_BASE_DIR, agent.name)
+  const claudeDir = safeJoin(dir, '.claude')
+  trackedMkdir(claudeDir, tracker)
+
+  trackedWrite(join(dir, 'agent-config.json'), JSON.stringify(agent.config, null, 2), tracker)
+  if (agent.claudeMd) trackedWrite(join(dir, 'CLAUDE.md'), agent.claudeMd, tracker)
+  if (agent.soulMd) trackedWrite(join(dir, 'SOUL.md'), agent.soulMd, tracker)
+
+  // .mcp.json: de-placeholder vault refs (path denormalization happens at fleet level)
+  trackedWrite(join(dir, '.mcp.json'), JSON.stringify(deplaceholderMcp(agent.mcp), null, 2), tracker)
+
+  trackedWrite(join(claudeDir, 'settings.json'), JSON.stringify(agent.settings, null, 2), tracker)
+
+  for (const [provider, access] of Object.entries(agent.channelsAccess ?? {})) {
+    const provDir = safeJoin(claudeDir, 'channels', provider)
+    trackedMkdir(provDir, tracker)
+    trackedWrite(join(provDir, 'access.json'), JSON.stringify(access, null, 2), tracker)
+  }
+
+  if (agent.avatar) {
+    const ext = agent.avatarExt || 'png'
+    trackedWrite(join(dir, `avatar.${ext}`), Buffer.from(agent.avatar, 'base64'), tracker)
+  }
+
+  for (const skill of agent.agentSkills ?? []) {
+    const skillDir = safeJoin(claudeDir, 'skills', skill.name)
+    trackedMkdir(skillDir, tracker)
+    trackedWrite(join(skillDir, 'SKILL.md'), skill.skillMd, tracker)
+  }
+}
+
+function importVaultSection(vault: VaultExport, password: string, tracker: WriteTracker): void {
   const vaultKeyBase64 = decryptWithPassword(vault.encryptedKey, password)
-  atomicWriteFileSync(join(STORE_DIR, '.vault-key'), vaultKeyBase64, { mode: 0o600 })
+  trackedWrite(join(STORE_DIR, '.vault-key'), vaultKeyBase64, tracker, { mode: 0o600 })
+  trackedWrite(join(STORE_DIR, 'vault.json'), JSON.stringify({ entries: vault.entries }, null, 2), tracker, { mode: 0o600 })
+  trackedWrite(join(STORE_DIR, 'vault-bindings.json'), JSON.stringify({ bindings: vault.bindings }, null, 2), tracker)
 
-  // vault.json entries (already encrypted with vault-key)
-  atomicWriteFileSync(
-    join(STORE_DIR, 'vault.json'),
-    JSON.stringify({ entries: vault.entries }, null, 2),
-    { mode: 0o600 },
-  )
-
-  // vault-bindings.json
-  atomicWriteFileSync(
-    join(STORE_DIR, 'vault-bindings.json'),
-    JSON.stringify({ bindings: vault.bindings }, null, 2),
-  )
-
-  // Channel .env files (bot tokens)
   const channelsBase = join(homedir(), '.claude', 'channels')
   for (const { provider, encrypted } of vault.channelEnvs ?? []) {
     const envContent = decryptWithPassword(encrypted, password)
-    const provDir = join(channelsBase, provider)
-    mkdirSync(provDir, { recursive: true })
-    atomicWriteFileSync(join(provDir, '.env'), envContent, { mode: 0o600 })
+    const provDir = safeJoin(channelsBase, provider)
+    trackedMkdir(provDir, tracker)
+    trackedWrite(join(provDir, '.env'), envContent, tracker, { mode: 0o600 })
   }
 }
 
 export function importFleet(
-  fleet: FleetJson,
+  rawBody: string,
   options: { vaultPassword?: string; apply: boolean },
 ): DiffReport | ImportResult {
-  const validationErrors = validateSchema(fleet)
-  if (validationErrors.length > 0) {
-    const report: DiffReport = {
+  // H4: denormalize paths in the entire JSON before any processing
+  const fleet = JSON.parse(denormalizePaths(rawBody)) as FleetJson
+
+  const schemaErrors = validateSchema(fleet)
+  if (schemaErrors.length > 0) {
+    return {
       dryRun: true,
       wouldCreate: { agents: [], globalSkills: 0, scheduledTasks: 0, memories: 0, kanbanCards: 0, kanbanComments: 0, labels: 0, dailyLogs: 0, ideaBox: 0 },
       warnings: [],
-      errors: validationErrors,
+      errors: schemaErrors,
     }
-    return report
   }
 
-  if (!options.apply) {
-    return buildDiffReport(fleet)
+  // B1: validate all names before dry-run or apply
+  const nameErrors = validateNames(fleet)
+  if (nameErrors.length > 0) {
+    return {
+      dryRun: true,
+      wouldCreate: { agents: [], globalSkills: 0, scheduledTasks: 0, memories: 0, kanbanCards: 0, kanbanComments: 0, labels: 0, dailyLogs: 0, ideaBox: 0 },
+      warnings: [],
+      errors: nameErrors,
+    }
   }
+
+  if (!options.apply) return buildDiffReport(fleet)
 
   // -------------------------------------------------------------------------
-  // Apply phase
+  // Apply phase -- H3: track ALL writes, cleanup on any failure
   // -------------------------------------------------------------------------
   const db = getDb()
+  const tracker: WriteTracker = { files: [], dirs: [] }
   const globalSkillsDir = join(homedir(), '.claude', 'skills')
-  const createdAgentDirs: string[] = []
 
   try {
-    // 1. Write agent files
+    // 1. Agent files
     for (const agent of fleet.agents ?? []) {
-      const dir = join(AGENTS_BASE_DIR, agent.name)
-      const isNew = !existsSync(dir)
-      writeAgentFiles(agent, globalSkillsDir)
-      if (isNew) createdAgentDirs.push(dir)
+      writeAgentFiles(agent, tracker)
     }
 
     // 2. Global skills
-    let globalSkillCount = 0
+    trackedMkdir(globalSkillsDir, tracker)
     for (const skill of fleet.skills ?? []) {
-      const skillDir = join(globalSkillsDir, skill.name)
-      mkdirSync(skillDir, { recursive: true })
-      atomicWriteFileSync(join(skillDir, 'SKILL.md'), skill.skillMd)
-      globalSkillCount++
+      const skillDir = safeJoin(globalSkillsDir, skill.name)
+      trackedMkdir(skillDir, tracker)
+      trackedWrite(join(skillDir, 'SKILL.md'), skill.skillMd, tracker)
     }
 
-    // 3. Scheduled tasks (all paused -- enabled=false already set at export time)
+    // 3. Scheduled tasks (all paused: enabled=false already set at export time)
+    if (existsSync(SCHEDULED_TASKS_DIR) || fleet.scheduledTasks?.length) {
+      mkdirSync(SCHEDULED_TASKS_DIR, { recursive: true })
+    }
     for (const task of fleet.scheduledTasks ?? []) {
-      const dir = join(SCHEDULED_TASKS_DIR, task.dirName)
-      mkdirSync(dir, { recursive: true })
-      if (task.skillMd) atomicWriteFileSync(join(dir, 'SKILL.md'), task.skillMd)
-      atomicWriteFileSync(join(dir, 'task-config.json'), JSON.stringify({ ...task.config, enabled: false }, null, 2))
+      const dir = safeJoin(SCHEDULED_TASKS_DIR, task.dirName)
+      trackedMkdir(dir, tracker)
+      if (task.skillMd) trackedWrite(join(dir, 'SKILL.md'), task.skillMd, tracker)
+      trackedWrite(
+        join(dir, 'task-config.json'),
+        JSON.stringify({ ...task.config, enabled: false }, null, 2),
+        tracker,
+      )
     }
 
     // 4. Dashboard settings
     const s = fleet.dashboardSettings ?? {}
     if (s.autonomy && Object.keys(s.autonomy).length)
-      atomicWriteFileSync(join(STORE_DIR, 'autonomy-config.json'), JSON.stringify(s.autonomy, null, 2))
+      trackedWrite(join(STORE_DIR, 'autonomy-config.json'), JSON.stringify(s.autonomy, null, 2), tracker)
     if (s.autoRestart && Object.keys(s.autoRestart).length)
-      atomicWriteFileSync(join(STORE_DIR, 'auto-restart.json'), JSON.stringify(s.autoRestart, null, 2))
+      trackedWrite(join(STORE_DIR, 'auto-restart.json'), JSON.stringify(s.autoRestart, null, 2), tracker)
     if (s.agentsDesired && Object.keys(s.agentsDesired).length)
-      atomicWriteFileSync(join(STORE_DIR, 'agents-desired.json'), JSON.stringify(s.agentsDesired, null, 2))
+      trackedWrite(join(STORE_DIR, 'agents-desired.json'), JSON.stringify(s.agentsDesired, null, 2), tracker)
     if (s.norbertPersonal && Object.keys(s.norbertPersonal).length)
-      atomicWriteFileSync(join(STORE_DIR, 'norbert-personal.json'), JSON.stringify(s.norbertPersonal, null, 2))
+      trackedWrite(join(STORE_DIR, 'norbert-personal.json'), JSON.stringify(s.norbertPersonal, null, 2), tracker)
 
-    // 5. Vault (optional)
-    if (fleet.vault && options.vaultPassword) {
-      importVault(fleet.vault, options.vaultPassword)
-    }
-
-    // 6. DB -- single transaction for all-or-nothing
+    // 5. DB -- single transaction (H3: before vault so vault is last and cleanup is cleaner)
     const importTx = db.transaction(() => {
-      // labels first (kanban_card_labels FK)
+      // labels first (FK dep for kanban_card_labels)
       for (const label of fleet.kanban?.labels ?? []) {
-        db.prepare(
-          'INSERT OR IGNORE INTO labels (id, name, color, created_at) VALUES (?, ?, ?, ?)'
-        ).run((label as any).id, (label as any).name, (label as any).color, (label as any).created_at)
+        const l = label as any
+        db.prepare('INSERT OR IGNORE INTO labels (id, name, color, created_at) VALUES (?, ?, ?, ?)')
+          .run(l.id, l.name, l.color, l.created_at)
       }
 
-      // kanban cards
       for (const card of fleet.kanban?.cards ?? []) {
         const c = card as any
         db.prepare(
@@ -734,44 +852,36 @@ export function importFleet(
           c.created_at, c.updated_at, c.archived_at ?? null, c.parent_id ?? null, c.dispatched_at ?? null)
       }
 
-      // kanban comments (idempotent: skip if card_id + content already present)
+      // kanban comments (idempotent: card_id + content)
       for (const comment of fleet.kanban?.comments ?? []) {
         const c = comment as any
-        const exists = db.prepare(
-          'SELECT 1 FROM kanban_comments WHERE card_id = ? AND content = ?'
-        ).get(c.card_id, c.content)
-        if (!exists) {
-          db.prepare(
-            'INSERT INTO kanban_comments (card_id, author, content, created_at) VALUES (?, ?, ?, ?)'
-          ).run(c.card_id, c.author, c.content, c.created_at)
+        if (!db.prepare('SELECT 1 FROM kanban_comments WHERE card_id = ? AND content = ?').get(c.card_id, c.content)) {
+          db.prepare('INSERT INTO kanban_comments (card_id, author, content, created_at) VALUES (?, ?, ?, ?)')
+            .run(c.card_id, c.author, c.content, c.created_at)
         }
       }
 
-      // kanban card events (INTEGER PK autoincrement -- no idempotency key, insert all)
+      // kanban card events -- M5: idempotent on (card_id, created_at, to_status)
       for (const ev of fleet.kanban?.cardEvents ?? []) {
         const e = ev as any
-        db.prepare(
-          `INSERT INTO kanban_card_events (card_id, from_status, to_status, actor, created_at)
-           VALUES (?, ?, ?, ?, ?)`
-        ).run(e.card_id, e.from_status ?? null, e.to_status, e.actor, e.created_at)
+        if (!db.prepare('SELECT 1 FROM kanban_card_events WHERE card_id = ? AND created_at = ? AND to_status = ?')
+          .get(e.card_id, e.created_at, e.to_status)) {
+          db.prepare('INSERT INTO kanban_card_events (card_id, from_status, to_status, actor, created_at) VALUES (?, ?, ?, ?, ?)')
+            .run(e.card_id, e.from_status ?? null, e.to_status, e.actor, e.created_at)
+        }
       }
 
-      // kanban card labels
       for (const cl of fleet.kanban?.cardLabels ?? []) {
         const c = cl as any
-        db.prepare(
-          'INSERT OR IGNORE INTO kanban_card_labels (card_id, label_id, created_at) VALUES (?, ?, ?)'
-        ).run(c.card_id, c.label_id, c.created_at)
+        db.prepare('INSERT OR IGNORE INTO kanban_card_labels (card_id, label_id, created_at) VALUES (?, ?, ?)')
+          .run(c.card_id, c.label_id, c.created_at)
       }
 
-      // memories (idempotent: agent_id + content)
+      // memories -- idempotent on (agent_id, content)
       const now = Math.floor(Date.now() / 1000)
       for (const agent of fleet.agents ?? []) {
         for (const mem of agent.memories ?? []) {
-          const exists = db.prepare(
-            'SELECT 1 FROM memories WHERE agent_id = ? AND content = ?'
-          ).get(mem.agent_id, mem.content)
-          if (!exists) {
+          if (!db.prepare('SELECT 1 FROM memories WHERE agent_id = ? AND content = ?').get(mem.agent_id, mem.content)) {
             db.prepare(
               `INSERT INTO memories
                (chat_id, topic_key, content, sector, salience, created_at, accessed_at,
@@ -783,23 +893,17 @@ export function importFleet(
         }
       }
 
-      // daily logs (idempotent: agent_id + date)
-      let logCount = 0
+      // daily logs -- idempotent on (agent_id, date)
       for (const agent of fleet.agents ?? []) {
         for (const log of agent.dailyLogs ?? []) {
-          const exists = db.prepare(
-            'SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ?'
-          ).get(log.agent_id, log.date)
-          if (!exists) {
-            db.prepare(
-              'INSERT INTO daily_logs (agent_id, date, content, created_at) VALUES (?, ?, ?, ?)'
-            ).run(log.agent_id, log.date, log.content, log.created_at)
-            logCount++
+          if (!db.prepare('SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ?').get(log.agent_id, log.date)) {
+            db.prepare('INSERT INTO daily_logs (agent_id, date, content, created_at) VALUES (?, ?, ?, ?)')
+              .run(log.agent_id, log.date, log.content, log.created_at)
           }
         }
       }
 
-      // idea_box
+      // idea_box -- idempotent on id
       for (const idea of fleet.ideaBox?.ideas ?? []) {
         const i = idea as any
         db.prepare(
@@ -810,20 +914,25 @@ export function importFleet(
           i.kanban_id ?? null, i.impact ?? null, i.effort ?? null, i.created_at, i.updated_at)
       }
 
+      // idea_comments -- M5: idempotent on (idea_id, created_at, content)
       for (const comment of fleet.ideaBox?.comments ?? []) {
         const c = comment as any
-        db.prepare(
-          'INSERT OR IGNORE INTO idea_comments (idea_id, author, content, created_at) VALUES (?, ?, ?, ?)'
-        ).run(c.idea_id, c.author, c.content, c.created_at)
+        if (!db.prepare('SELECT 1 FROM idea_comments WHERE idea_id = ? AND created_at = ? AND content = ?')
+          .get(c.idea_id, c.created_at, c.content)) {
+          db.prepare('INSERT INTO idea_comments (idea_id, author, content, created_at) VALUES (?, ?, ?, ?)')
+            .run(c.idea_id, c.author, c.content, c.created_at)
+        }
       }
 
+      // idea_status_log -- M5: idempotent on (idea_id, created_at, to_status)
       for (const log of fleet.ideaBox?.statusLog ?? []) {
         const l = log as any
-        db.prepare(
-          `INSERT OR IGNORE INTO idea_status_log
-           (idea_id, from_status, to_status, actor, note, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`
-        ).run(l.idea_id, l.from_status ?? null, l.to_status, l.actor, l.note ?? null, l.created_at)
+        if (!db.prepare('SELECT 1 FROM idea_status_log WHERE idea_id = ? AND created_at = ? AND to_status = ?')
+          .get(l.idea_id, l.created_at, l.to_status)) {
+          db.prepare(
+            'INSERT INTO idea_status_log (idea_id, from_status, to_status, actor, note, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+          ).run(l.idea_id, l.from_status ?? null, l.to_status, l.actor, l.note ?? null, l.created_at)
+        }
       }
 
       // FTS rebuild after all memory inserts
@@ -832,13 +941,21 @@ export function importFleet(
 
     importTx()
 
+    // 6. Vault -- LAST: after DB tx committed (H3: vault written last so DB rollback is clean)
+    if (fleet.vault && options.vaultPassword) {
+      importVaultSection(fleet.vault, options.vaultPassword, tracker)
+    }
+
+    // M3: fire-and-forget re-embed imported memories (embedding was stripped at export)
+    backfillEmbeddings().catch(err => logger.warn({ err: err?.message }, 'Fleet import: embedding backfill failed'))
+
     logger.info({ agents: (fleet.agents ?? []).map(a => a.name) }, 'Fleet import completed')
 
     return {
       ok: true,
       imported: {
         agents: (fleet.agents ?? []).map(a => a.name),
-        globalSkills: globalSkillCount,
+        globalSkills: (fleet.skills ?? []).length,
         scheduledTasks: (fleet.scheduledTasks ?? []).length,
         memories: (fleet.agents ?? []).reduce((s, a) => s + (a.memories?.length ?? 0), 0),
         kanbanCards: (fleet.kanban?.cards ?? []).length,
@@ -848,11 +965,8 @@ export function importFleet(
       },
     }
   } catch (err: any) {
-    // Partial cleanup: remove agent directories that were freshly created
-    for (const dir of createdAgentDirs) {
-      try { rmSync(dir, { recursive: true, force: true }) } catch { /* best effort */ }
-    }
-    logger.error({ err: err.message }, 'Fleet import failed, partial state cleaned up')
+    cleanupTracked(tracker)
+    logger.error({ err: err.message }, 'Fleet import failed, tracked writes cleaned up')
     throw err
   }
 }
