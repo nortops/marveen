@@ -190,6 +190,7 @@ export interface ImportResult {
     dailyLogs: number
     ideaBox: number
   }
+  warnings?: string[]
 }
 
 // ---------------------------------------------------------------------------
@@ -819,6 +820,14 @@ function buildDiffReport(fleet: FleetJson): DiffReport {
     warnings.push('Csatornák: újra-párosítás szükséges a célgépen (bot token újboli megadása).')
   }
 
+  // Identity takeover preview
+  const sourceAgentId = fleet.mainAgent?.agentId
+  if (sourceAgentId && typeof sourceAgentId === 'string') {
+    warnings.push(
+      `Fő-agent identitás átvéve: ${sourceAgentId}. Apply után újraindítás szükséges hogy a dashboard ${sourceAgentId}-ként induljon.`
+    )
+  }
+
   return {
     dryRun: true,
     wouldCreate: {
@@ -1114,32 +1123,25 @@ export function importFleet(
       }
 
       // memories -- idempotent on (agent_id, content); covers ALL agent_ids
-      // Remap: source main agent_id -> target MAIN_AGENT_ID (backward-compat: skip if no agentId)
-      const sourceMainAgentId = fleet.mainAgent?.agentId
+      // agent_id-k pontosan a forrásból kerülnek át (a cél átveszi a forrás főagent identitását)
       const now = Math.floor(Date.now() / 1000)
       for (const mem of fleet.memories ?? []) {
-        const targetAgentId = (sourceMainAgentId && mem.agent_id === sourceMainAgentId && sourceMainAgentId !== MAIN_AGENT_ID)
-          ? MAIN_AGENT_ID
-          : mem.agent_id
-        if (!db.prepare('SELECT 1 FROM memories WHERE agent_id = ? AND content = ?').get(targetAgentId, mem.content)) {
+        if (!db.prepare('SELECT 1 FROM memories WHERE agent_id = ? AND content = ?').get(mem.agent_id, mem.content)) {
           db.prepare(
             `INSERT INTO memories
              (chat_id, topic_key, content, sector, salience, created_at, accessed_at,
               agent_id, category, auto_generated, keywords)
              VALUES ('', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).run(mem.content, mem.sector, mem.salience, mem.created_at, mem.accessed_at ?? now,
-            targetAgentId, mem.category, mem.auto_generated ?? 0, mem.keywords ?? null)
+            mem.agent_id, mem.category, mem.auto_generated ?? 0, mem.keywords ?? null)
         }
       }
 
       // daily logs -- idempotent on (agent_id, date, content); multiple rows per date are preserved
       for (const log of fleet.dailyLogs ?? []) {
-        const targetAgentId = (sourceMainAgentId && log.agent_id === sourceMainAgentId && sourceMainAgentId !== MAIN_AGENT_ID)
-          ? MAIN_AGENT_ID
-          : log.agent_id
-        if (!db.prepare('SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ? AND content = ?').get(targetAgentId, log.date, log.content)) {
+        if (!db.prepare('SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ? AND content = ?').get(log.agent_id, log.date, log.content)) {
           db.prepare('INSERT INTO daily_logs (agent_id, date, content, created_at) VALUES (?, ?, ?, ?)')
-            .run(targetAgentId, log.date, log.content, log.created_at)
+            .run(log.agent_id, log.date, log.content, log.created_at)
         }
       }
 
@@ -1189,6 +1191,26 @@ export function importFleet(
     // M3: fire-and-forget re-embed imported memories (embedding was stripped at export)
     backfillEmbeddings().catch(err => logger.warn({ err: err?.message }, 'Fleet import: embedding backfill failed'))
 
+    // Identity takeover: write source mainAgent.agentId into config-overrides.json so the
+    // target install adopts the source identity on next restart.
+    // Backward-compat: if export has no agentId (old export), skip (leave target identity unchanged).
+    const applyWarnings: string[] = []
+    const sourceAgentId = fleet.mainAgent?.agentId
+    if (sourceAgentId && typeof sourceAgentId === 'string') {
+      const overridesPath = join(STORE_DIR, 'config-overrides.json')
+      let overrides: Record<string, unknown> = {}
+      try {
+        if (existsSync(overridesPath)) {
+          overrides = JSON.parse(readFileSync(overridesPath, 'utf-8')) as Record<string, unknown>
+        }
+      } catch { /* start fresh if file is corrupt */ }
+      overrides['MAIN_AGENT_ID'] = sourceAgentId
+      atomicWriteFileSync(overridesPath, JSON.stringify(overrides, null, 2))
+      applyWarnings.push(
+        `Fő-agent identitás átvéve: ${sourceAgentId}. Újraindítás kell hogy a dashboard ${sourceAgentId}-ként induljon.`
+      )
+    }
+
     logger.info({ agents: (fleet.agents ?? []).map(a => a.name) }, 'Fleet import completed')
 
     return {
@@ -1204,6 +1226,7 @@ export function importFleet(
         dailyLogs: (fleet.dailyLogs ?? []).length,
         ideaBox: (fleet.ideaBox?.ideas ?? []).length,
       },
+      ...(applyWarnings.length > 0 ? { warnings: applyWarnings } : {}),
     }
   } catch (err: any) {
     cleanupTracked(tracker)
