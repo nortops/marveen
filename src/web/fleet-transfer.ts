@@ -54,6 +54,7 @@ export interface FleetJson {
   skills: SkillExport[]
   scheduledTasks: ScheduledTaskExport[]
   memories: MemoryRow[]      // ALL agent_ids (atlas, marveen, sub-agents)
+  dailyLogs: DailyLogRow[]   // ALL agent_ids
   kanban: KanbanExport
   ideaBox: IdeaBoxExport
   dashboardSettings: DashboardSettingsExport
@@ -127,6 +128,13 @@ export interface MemoryRow {
   keywords: string | null
 }
 
+export interface DailyLogRow {
+  agent_id: string
+  date: string
+  content: string
+  created_at: number
+}
+
 export interface VaultExport {
   // Packed format: version[1] + N_log2[1] + r[1] + p[1] + salt[32] + iv[12] + gcm-tag[16] + ciphertext
   // All base64-encoded. The .vault-key content (base64 string) is the plaintext.
@@ -152,6 +160,7 @@ export interface DiffReport {
     kanbanCards: number
     kanbanComments: number
     labels: number
+    dailyLogs: number
     ideaBox: number
   }
   warnings: string[]
@@ -168,6 +177,7 @@ export interface ImportResult {
     memories: number
     kanbanCards: number
     labels: number
+    dailyLogs: number
     ideaBox: number
   }
 }
@@ -568,12 +578,16 @@ export function exportFleet(options: { vaultPassword?: string } = {}): FleetJson
   const skills = listSkillsInDir(join(homedir(), '.claude', 'skills'))
   const scheduledTasks = exportScheduledTasks()
 
-  // Export ALL memories across every agent_id (atlas, marveen, sub-agents)
+  // Export ALL memories and daily_logs across every agent_id (atlas, marveen, sub-agents)
   const memories = db.prepare(
     `SELECT agent_id, content, sector, salience, created_at, accessed_at,
             category, auto_generated, keywords
      FROM memories ORDER BY agent_id ASC, created_at ASC`
   ).all() as MemoryRow[]
+
+  const dailyLogs = db.prepare(
+    'SELECT agent_id, date, content, created_at FROM daily_logs ORDER BY agent_id ASC, date ASC'
+  ).all() as DailyLogRow[]
 
   const kanban: KanbanExport = {
     cards: db.prepare('SELECT * FROM kanban_cards').all() as Record<string, unknown>[],
@@ -600,6 +614,7 @@ export function exportFleet(options: { vaultPassword?: string } = {}): FleetJson
     skills,
     scheduledTasks,
     memories,
+    dailyLogs,
     kanban,
     ideaBox,
     dashboardSettings: exportDashboardSettings(),
@@ -709,6 +724,13 @@ function buildDiffReport(fleet: FleetJson): DiffReport {
     if (!db.prepare('SELECT 1 FROM labels WHERE id = ?').get((label as any).id)) newLabels++
   }
 
+  let newDailyLogs = 0
+  for (const log of fleet.dailyLogs ?? []) {
+    if (!db.prepare('SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ? AND content = ?').get(log.agent_id, log.date, log.content)) {
+      newDailyLogs++
+    }
+  }
+
   let newComments = 0
   for (const c of fleet.kanban?.comments ?? []) {
     if (!db.prepare('SELECT 1 FROM kanban_comments WHERE card_id = ? AND content = ?')
@@ -730,6 +752,7 @@ function buildDiffReport(fleet: FleetJson): DiffReport {
       kanbanCards: newCards,
       kanbanComments: newComments,
       labels: newLabels,
+      dailyLogs: newDailyLogs,
       ideaBox: (fleet.ideaBox?.ideas ?? []).length,
     },
     warnings,
@@ -858,7 +881,7 @@ export function importFleet(
   if (schemaErrors.length > 0) {
     return {
       dryRun: true,
-      wouldCreate: { mainAgent: false, agents: [], globalSkills: 0, scheduledTasks: 0, memories: 0, kanbanCards: 0, kanbanComments: 0, labels: 0, ideaBox: 0 },
+      wouldCreate: { mainAgent: false, agents: [], globalSkills: 0, scheduledTasks: 0, memories: 0, kanbanCards: 0, kanbanComments: 0, labels: 0, dailyLogs: 0, ideaBox: 0 },
       warnings: [],
       errors: schemaErrors,
     }
@@ -869,7 +892,7 @@ export function importFleet(
   if (nameErrors.length > 0) {
     return {
       dryRun: true,
-      wouldCreate: { mainAgent: false, agents: [], globalSkills: 0, scheduledTasks: 0, memories: 0, kanbanCards: 0, kanbanComments: 0, labels: 0, ideaBox: 0 },
+      wouldCreate: { mainAgent: false, agents: [], globalSkills: 0, scheduledTasks: 0, memories: 0, kanbanCards: 0, kanbanComments: 0, labels: 0, dailyLogs: 0, ideaBox: 0 },
       warnings: [],
       errors: nameErrors,
     }
@@ -989,6 +1012,14 @@ export function importFleet(
         }
       }
 
+      // daily logs -- idempotent on (agent_id, date, content); multiple rows per date are preserved
+      for (const log of fleet.dailyLogs ?? []) {
+        if (!db.prepare('SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ? AND content = ?').get(log.agent_id, log.date, log.content)) {
+          db.prepare('INSERT INTO daily_logs (agent_id, date, content, created_at) VALUES (?, ?, ?, ?)')
+            .run(log.agent_id, log.date, log.content, log.created_at)
+        }
+      }
+
       // idea_box -- idempotent on id
       for (const idea of fleet.ideaBox?.ideas ?? []) {
         const i = idea as any
@@ -1047,6 +1078,7 @@ export function importFleet(
         memories: (fleet.memories ?? []).length,
         kanbanCards: (fleet.kanban?.cards ?? []).length,
         labels: (fleet.kanban?.labels ?? []).length,
+        dailyLogs: (fleet.dailyLogs ?? []).length,
         ideaBox: (fleet.ideaBox?.ideas ?? []).length,
       },
     }
