@@ -15,7 +15,7 @@ import { homedir, hostname } from 'node:os'
 import {
   randomBytes, createCipheriv, createDecipheriv, scryptSync,
 } from 'node:crypto'
-import { PROJECT_ROOT, STORE_DIR, MAIN_AGENT_ID } from '../config.js'
+import { PROJECT_ROOT, STORE_DIR, MAIN_AGENT_ID, BOT_NAME, BRAND_NAME, OWNER_NAME, CHANNEL_PROVIDER } from '../config.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { AGENTS_BASE_DIR, listAgentNames } from './agent-config.js'
 import { safeJoin } from './sanitize.js'
@@ -71,9 +71,19 @@ export interface FleetJson {
   vault?: VaultExport
 }
 
+// Identity set transferred with the fleet so the target becomes an exact copy of the source.
+export interface FleetIdentity {
+  MAIN_AGENT_ID: string
+  BOT_NAME: string
+  BRAND_NAME: string
+  OWNER_NAME: string
+  CHANNEL_PROVIDER: string
+}
+
 // Main agent lives at PROJECT_ROOT (not under agents/), so it needs its own export section.
 export interface MainAgentExport {
-  agentId: string  // source MAIN_AGENT_ID -- used to remap memories/logs to target MAIN_AGENT_ID on import
+  agentId: string  // source MAIN_AGENT_ID -- kept for backward-compat; identity supersedes this
+  identity?: FleetIdentity  // full identity set; absent in exports from older versions
   claudeMd: string
   soulMd: string
   config: Record<string, unknown>
@@ -499,6 +509,13 @@ function exportMainAgent(
 
   return {
     agentId: MAIN_AGENT_ID,
+    identity: {
+      MAIN_AGENT_ID,
+      BOT_NAME,
+      BRAND_NAME,
+      OWNER_NAME,
+      CHANNEL_PROVIDER,
+    },
     claudeMd: safeReadText(join(PROJECT_ROOT, 'CLAUDE.md')),
     soulMd: safeReadText(join(PROJECT_ROOT, 'SOUL.md')),
     config: safeReadJson(join(PROJECT_ROOT, 'agent-config.json')),
@@ -821,10 +838,10 @@ function buildDiffReport(fleet: FleetJson): DiffReport {
   }
 
   // Identity takeover preview
-  const sourceAgentId = fleet.mainAgent?.agentId
-  if (sourceAgentId && typeof sourceAgentId === 'string') {
+  const drySourceId = fleet.mainAgent?.identity?.MAIN_AGENT_ID ?? fleet.mainAgent?.agentId
+  if (drySourceId && typeof drySourceId === 'string') {
     warnings.push(
-      `Fő-agent identitás átvéve: ${sourceAgentId}. Apply után újraindítás szükséges hogy a dashboard ${sourceAgentId}-ként induljon.`
+      `Fő-agent identitás átvéve: ${drySourceId}. Apply után újraindítás szükséges hogy a dashboard ${drySourceId}-ként induljon.`
     )
   }
 
@@ -1191,11 +1208,13 @@ export function importFleet(
     // M3: fire-and-forget re-embed imported memories (embedding was stripped at export)
     backfillEmbeddings().catch(err => logger.warn({ err: err?.message }, 'Fleet import: embedding backfill failed'))
 
-    // Identity takeover: write source mainAgent.agentId into config-overrides.json so the
-    // target install adopts the source identity on next restart.
-    // Backward-compat: if export has no agentId (old export), skip (leave target identity unchanged).
+    // Identity takeover: write the source identity set into config-overrides.json so the
+    // target install adopts the source persona (name, brand, owner) on next restart.
+    // Preference: use identity object (full set) if present; fall back to agentId-only for
+    // exports produced before the identity field was added.
     const applyWarnings: string[] = []
-    const sourceAgentId = fleet.mainAgent?.agentId
+    const sourceIdentity = fleet.mainAgent?.identity
+    const sourceAgentId = sourceIdentity?.MAIN_AGENT_ID ?? fleet.mainAgent?.agentId
     if (sourceAgentId && typeof sourceAgentId === 'string') {
       const overridesPath = join(STORE_DIR, 'config-overrides.json')
       let overrides: Record<string, unknown> = {}
@@ -1204,7 +1223,17 @@ export function importFleet(
           overrides = JSON.parse(readFileSync(overridesPath, 'utf-8')) as Record<string, unknown>
         }
       } catch { /* start fresh if file is corrupt */ }
-      overrides['MAIN_AGENT_ID'] = sourceAgentId
+      if (sourceIdentity && typeof sourceIdentity === 'object') {
+        // Full identity takeover: iterate all keys generically (no hardcoded names)
+        for (const [key, val] of Object.entries(sourceIdentity)) {
+          if (typeof val === 'string' && val.length > 0) {
+            overrides[key] = val
+          }
+        }
+      } else {
+        // Backward-compat: old export without identity -- only set MAIN_AGENT_ID
+        overrides['MAIN_AGENT_ID'] = sourceAgentId
+      }
       atomicWriteFileSync(overridesPath, JSON.stringify(overrides, null, 2))
       applyWarnings.push(
         `Fő-agent identitás átvéve: ${sourceAgentId}. Újraindítás kell hogy a dashboard ${sourceAgentId}-ként induljon.`

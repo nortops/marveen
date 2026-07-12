@@ -47,13 +47,13 @@ export const SLACK_BOT_TOKEN = env['SLACK_BOT_TOKEN'] ?? ''
 export const SLACK_APP_TOKEN = env['SLACK_APP_TOKEN'] ?? ''
 export const SLACK_CHANNEL_ID = env['SLACK_CHANNEL_ID'] ?? ''
 
-export const OWNER_NAME = env['OWNER_NAME'] ?? 'Szabolcs'
+export const OWNER_NAME = cfg('OWNER_NAME') ?? 'Szabolcs'
 // Shared Google Drive folder ID the fleet writes deliverables into. Empty by
 // default (distribution-safe: no owner-specific folder is baked into a fresh
 // install's generated agent CLAUDE.md); set OWNER_DRIVE_FOLDER in .env to wire
 // the default shared drive for this install.
 export const OWNER_DRIVE_FOLDER = env['OWNER_DRIVE_FOLDER'] ?? ''
-export const BOT_NAME = env['BOT_NAME'] ?? 'Marveen'
+export const BOT_NAME = cfg('BOT_NAME') ?? 'Marveen'
 
 // Product / system brand shown in the dashboard chrome (browser tab title,
 // mobile topbar, sidebar, updates page). Kept SEPARATE from BOT_NAME so an
@@ -61,7 +61,7 @@ export const BOT_NAME = env['BOT_NAME'] ?? 'Marveen'
 // another (BOT_NAME, the agent's display name). Defaults to BOT_NAME -- which
 // itself defaults to 'Marveen' -- so an install that sets neither, or only
 // BOT_NAME, behaves exactly as before.
-export const BRAND_NAME = env['BRAND_NAME'] ?? BOT_NAME
+export const BRAND_NAME = cfg('BRAND_NAME') ?? BOT_NAME
 
 // Pure resolution rule for BRAND_NAME, so the default (brandEnv unset =>
 // botName) is provable without a live .env. brandEnv is the raw env value
@@ -217,7 +217,7 @@ const rawKanbanLabelColors = (env['KANBAN_LABEL_COLORS'] ?? '#3b82f6,#0ea5e9,#10
   .filter(Boolean)
 export const KANBAN_LABEL_COLORS = rawKanbanLabelColors.length > 0 ? rawKanbanLabelColors : ['#64748b']
 
-export const CHANNEL_PROVIDER: ChannelProviderType = getProviderType(env['CHANNEL_PROVIDER'])
+export const CHANNEL_PROVIDER: ChannelProviderType = getProviderType(cfg('CHANNEL_PROVIDER'))
 export const CHANNEL_TOKEN = getChannelToken(CHANNEL_PROVIDER, env)
 export const CHANNEL_CHAT_ID = getChannelChatId(CHANNEL_PROVIDER, env)
 
