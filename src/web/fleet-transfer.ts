@@ -53,7 +53,7 @@ export interface FleetJson {
   agents: AgentExport[]
   skills: SkillExport[]
   scheduledTasks: ScheduledTaskExport[]
-  memories: MemoryRow[]      // ALL agent_ids (atlas, marveen, sub-agents)
+  memories: MemoryRow[]      // ALL agent_ids (main + sub-agents)
   dailyLogs: DailyLogRow[]   // ALL agent_ids
   kanban: KanbanExport
   ideaBox: IdeaBoxExport
@@ -136,17 +136,10 @@ export interface DailyLogRow {
 }
 
 export interface VaultExport {
-  // Packed format: version[1] + N_log2[1] + r[1] + p[1] + salt[32] + iv[12] + gcm-tag[16] + ciphertext
-  // All base64-encoded. The .vault-key content (base64 string) is the plaintext.
-  encryptedKey: string
+  vaultKey: string  // raw base64 content of .vault-key (safe: whole JSON is encrypted when password given)
   entries: Record<string, unknown>[]
   bindings: Record<string, unknown>[]
-  channelEnvs: EncryptedChannelEnv[]
-}
-
-export interface EncryptedChannelEnv {
-  provider: string
-  encrypted: string  // same packed format as encryptedKey
+  channelEnvs: { provider: string; content: string }[]  // plaintext .env file content
 }
 
 export interface DiffReport {
@@ -207,8 +200,20 @@ function encryptWithPassword(plaintext: string, password: string): string {
   return Buffer.concat([header, salt, iv, tag, enc]).toString('base64')
 }
 
+// Exported for unit testing (crypto round-trip verification)
+export function _encryptForTest(plaintext: string, password: string): string {
+  return encryptWithPassword(plaintext, password)
+}
+export function _decryptForTest(packed: string, password: string): string {
+  return decryptWithPassword(packed, password)
+}
+
 function decryptWithPassword(packed: string, password: string): string {
   const buf = Buffer.from(packed, 'base64')
+  const MIN_PACKED_LEN = 4 + KDF_SALT_LEN + GCM_IV_LEN + GCM_TAG_LEN
+  if (buf.length < MIN_PACKED_LEN) {
+    throw new Error(`Érvénytelen titkosított blob: várt legalább ${MIN_PACKED_LEN} byte, kapott ${buf.length}.`)
+  }
   // version byte (offset 0) reserved for future format changes; currently always 1
   const nLog2 = buf[1]
   const r = buf[2]
@@ -344,12 +349,29 @@ function placeholderMcp(
         } else {
           const isSecret = field === 'headers' ? looksLikeHeaderSecret(key, val) : looksLikeSecret(val)
           if (isSecret) {
-            // Collect all blocking fields before throwing so the user can fix them in one pass (B2 tors)
             blockingFields.push(`mező="${field}", kulcs="${key}"`)
           }
         }
       }
     }
+
+    // H1: also scan args (string[]) and url/command (string) for embedded secrets
+    const args = c.args
+    if (Array.isArray(args)) {
+      for (let i = 0; i < args.length; i++) {
+        const arg = args[i]
+        if (typeof arg === 'string' && looksLikeSecret(arg)) {
+          blockingFields.push(`mező="args[${i}]"`)
+        }
+      }
+    }
+    for (const fld of ['url', 'command'] as const) {
+      const val = c[fld]
+      if (typeof val === 'string' && looksLikeSecret(val)) {
+        blockingFields.push(`mező="${fld}"`)
+      }
+    }
+
     if (blockingFields.length > 0) {
       throw new Error(
         `Titkosítatlan secret az .mcp.json-ban: szerver="${serverName}": ${blockingFields.join('; ')}. ` +
@@ -429,16 +451,30 @@ function exportChannelsAccess(channelsDir: string): Record<string, unknown> {
 // Main agent lives at PROJECT_ROOT -- exported separately since it's not under agents/.
 function exportMainAgent(
   bindingLookup: Map<string, Map<string, Map<string, string>>>,
+  withSecrets: boolean,
 ): MainAgentExport {
   const claudeDir = join(PROJECT_ROOT, '.claude')
   const mcpPath = join(PROJECT_ROOT, '.mcp.json')
   const settingsPath = join(claudeDir, 'settings.json')
 
   const rawMcp = safeReadJson(mcpPath)
-  const mcpPlaceholdered = placeholderMcp(rawMcp, mcpPath, bindingLookup)
+  // withSecrets: whole JSON will be encrypted -- skip placeholder/hard-fail
+  const mcp = withSecrets ? rawMcp : placeholderMcp(rawMcp, mcpPath, bindingLookup)
 
   const settingsRaw = safeReadText(settingsPath)
   const settings = settingsRaw ? JSON.parse(settingsRaw) as Record<string, unknown> : {}
+
+  // M4: in plaintext export, hard-fail if settings.env contains secrets
+  if (!withSecrets && typeof settings.env === 'object' && settings.env !== null) {
+    for (const [key, val] of Object.entries(settings.env as Record<string, unknown>)) {
+      if (typeof val === 'string' && looksLikeSecret(val)) {
+        throw new Error(
+          `Titkosítatlan secret a settings.json env blokkjában: kulcs="${key}". ` +
+          `Adj meg vault jelszót az exporthoz, vagy távolítsd el a titkot a settings.json-ból.`
+        )
+      }
+    }
+  }
 
   // Main agent channel access lives at ~/.claude/channels/<provider>/access.json
   const channelsAccess = exportChannelsAccess(join(homedir(), '.claude', 'channels'))
@@ -447,7 +483,7 @@ function exportMainAgent(
     claudeMd: safeReadText(join(PROJECT_ROOT, 'CLAUDE.md')),
     soulMd: safeReadText(join(PROJECT_ROOT, 'SOUL.md')),
     config: safeReadJson(join(PROJECT_ROOT, 'agent-config.json')),
-    mcp: mcpPlaceholdered,
+    mcp,
     settings,
     channelsAccess,
   }
@@ -456,6 +492,7 @@ function exportMainAgent(
 function exportAgent(
   name: string,
   bindingLookup: Map<string, Map<string, Map<string, string>>>,
+  withSecrets: boolean,
 ): AgentExport {
   const dir = join(AGENTS_BASE_DIR, name)
   const claudeDir = join(dir, '.claude')
@@ -463,11 +500,23 @@ function exportAgent(
   const settingsPath = join(claudeDir, 'settings.json')
 
   const rawMcp = safeReadJson(mcpPath)
-  // placeholder .mcp.json (may throw on unbound secrets -- propagates to exportFleet)
-  const mcpPlaceholdered = placeholderMcp(rawMcp, mcpPath, bindingLookup)
+  // withSecrets: whole JSON will be encrypted -- skip placeholder/hard-fail
+  const mcp = withSecrets ? rawMcp : placeholderMcp(rawMcp, mcpPath, bindingLookup)
 
   const settingsRaw = safeReadText(settingsPath)
   const settings = settingsRaw ? JSON.parse(settingsRaw) as Record<string, unknown> : {}
+
+  // M4: in plaintext export, hard-fail if settings.env contains secrets
+  if (!withSecrets && typeof settings.env === 'object' && settings.env !== null) {
+    for (const [key, val] of Object.entries(settings.env as Record<string, unknown>)) {
+      if (typeof val === 'string' && looksLikeSecret(val)) {
+        throw new Error(
+          `Titkosítatlan secret az agent "${name}" settings.json env blokkjában: kulcs="${key}". ` +
+          `Adj meg vault jelszót az exporthoz, vagy távolítsd el a titkot a settings.json-ból.`
+        )
+      }
+    }
+  }
 
   // channels/access.json per provider (not .env -- vault-gated)
   const channelsAccess = exportChannelsAccess(join(claudeDir, 'channels'))
@@ -490,7 +539,7 @@ function exportAgent(
     config: safeReadJson(join(dir, 'agent-config.json')),
     claudeMd: safeReadText(join(dir, 'CLAUDE.md')),
     soulMd: safeReadText(join(dir, 'SOUL.md')),
-    mcp: mcpPlaceholdered,
+    mcp,
     settings,
     channelsAccess,
     avatar,
@@ -522,63 +571,65 @@ function exportDashboardSettings(): DashboardSettingsExport {
   }
 }
 
-function exportVault(password: string): VaultExport | null {
-  const vaultPath = join(STORE_DIR, 'vault.json')
+function exportVault(): VaultExport | null {
   const vaultKeyPath = join(STORE_DIR, '.vault-key')
   const vaultKeyMigratedPath = join(STORE_DIR, '.vault-key.migrated')
+  const vaultPath = join(STORE_DIR, 'vault.json')
   const bindingsPath = join(STORE_DIR, 'vault-bindings.json')
 
   if (!existsSync(vaultKeyPath)) {
-    // M8: macOS Keychain migration -- vault-key.migrated means key is in Keychain
+    // macOS Keychain migration -- vault-key.migrated means key is in Keychain
     if (existsSync(vaultKeyMigratedPath)) {
       throw new Error(
         'A vault kulcs macOS Keychain-be lett migrálva (.vault-key.migrated megtalálható). ' +
-        'A vault szekció exportja ebben a konfigurációban nem támogatott -- hagyd ki a vault_password-öt.'
+        'A vault szekció exportja ebben a konfigurációban nem támogatott -- adj meg vault jelszót.'
       )
     }
     return null
   }
 
-  const vaultKeyBase64 = readFileSync(vaultKeyPath, 'utf-8').trim()
-  const encryptedKey = encryptWithPassword(vaultKeyBase64, password)
-
+  // Raw export: the entire FleetJson will be encrypted, so vault data is safe as plaintext here.
+  const vaultKey = readFileSync(vaultKeyPath, 'utf-8').trim()
   const vaultStore = safeReadJson(vaultPath)
   const entries = (vaultStore.entries as Record<string, unknown>[]) ?? []
   const bindingsStore = safeReadJson(bindingsPath)
   const bindings = (bindingsStore.bindings as Record<string, unknown>[]) ?? []
 
-  // Channel .env files (bot tokens)
-  const channelEnvs: EncryptedChannelEnv[] = []
+  const channelEnvs: { provider: string; content: string }[] = []
   const channelsBase = join(homedir(), '.claude', 'channels')
   if (existsSync(channelsBase)) {
     for (const provider of readdirSync(channelsBase)) {
       const envPath = join(channelsBase, provider, '.env')
       if (existsSync(envPath)) {
-        channelEnvs.push({
-          provider,
-          encrypted: encryptWithPassword(readFileSync(envPath, 'utf-8'), password),
-        })
+        channelEnvs.push({ provider, content: readFileSync(envPath, 'utf-8') })
       }
     }
   }
 
-  return { encryptedKey, entries, bindings, channelEnvs }
+  return { vaultKey, entries, bindings, channelEnvs }
 }
 
-export function exportFleet(options: { vaultPassword?: string } = {}): FleetJson {
+// Encrypted export wrapper: {"enc":1,"blob":"<base64-of-encrypted-fleet-json>"}
+// The enc field signals the import side to decrypt before parsing.
+export const ENCRYPTED_FLEET_VERSION = 1
+
+export type ExportedFleet = { data: string; exportedAt: string }
+
+export function exportFleet(options: { vaultPassword?: string } = {}): ExportedFleet {
   if (options.vaultPassword !== undefined && options.vaultPassword.length < MIN_VAULT_PASSWORD_LEN) {
     throw new Error(`A vault jelszó legalább ${MIN_VAULT_PASSWORD_LEN} karakter kell legyen.`)
   }
 
+  const withSecrets = !!options.vaultPassword
   const db = getDb()
-  const bindingLookup = buildBindingLookup()
+  const bindingLookup = withSecrets ? new Map() : buildBindingLookup()
 
-  const mainAgent = exportMainAgent(bindingLookup)
-  const agents = listAgentNames().map(name => exportAgent(name, bindingLookup))
+  const mainAgent = exportMainAgent(bindingLookup, withSecrets)
+  const agents = listAgentNames().map(name => exportAgent(name, bindingLookup, withSecrets))
   const skills = listSkillsInDir(join(homedir(), '.claude', 'skills'))
   const scheduledTasks = exportScheduledTasks()
 
-  // Export ALL memories and daily_logs across every agent_id (atlas, marveen, sub-agents)
+  // Export ALL memories and daily_logs across every agent_id
   const memories = db.prepare(
     `SELECT agent_id, content, sector, salience, created_at, accessed_at,
             category, auto_generated, keywords
@@ -603,7 +654,8 @@ export function exportFleet(options: { vaultPassword?: string } = {}): FleetJson
     statusLog: db.prepare('SELECT * FROM idea_status_log').all() as Record<string, unknown>[],
   }
 
-  const vault = options.vaultPassword ? exportVault(options.vaultPassword) : undefined
+  // Vault section is only included in encrypted exports (whole-JSON encryption makes it safe)
+  const vault = withSecrets ? exportVault() : undefined
 
   const fleet: FleetJson = {
     schemaVersion: 1,
@@ -621,8 +673,17 @@ export function exportFleet(options: { vaultPassword?: string } = {}): FleetJson
     ...(vault ? { vault } : {}),
   }
 
-  // H4: normalize ALL absolute paths in the entire JSON in one pass
-  return JSON.parse(normalizePaths(JSON.stringify(fleet))) as FleetJson
+  // Normalize ALL absolute paths in the entire JSON in one pass
+  const normalized = normalizePaths(JSON.stringify(fleet))
+
+  if (withSecrets) {
+    // Encrypt the entire JSON -- vault secrets, MCP tokens, settings.env all protected as a unit
+    const blob = encryptWithPassword(normalized, options.vaultPassword!)
+    const data = JSON.stringify({ enc: ENCRYPTED_FLEET_VERSION, blob })
+    return { data, exportedAt: fleet.exportedAt }
+  }
+
+  return { data: normalized, exportedAt: fleet.exportedAt }
 }
 
 // ---------------------------------------------------------------------------
@@ -668,6 +729,11 @@ function validateNames(fleet: FleetJson): string[] {
   for (const agent of fleet.agents ?? []) {
     if (!SAFE_NAME_RE.test(String(agent.name ?? ''))) {
       errors.push(`Érvénytelen agent.name: "${String(agent.name).slice(0, 60)}"`)
+    }
+    // B1: avatarExt defense-in-depth guard (primary enforcement in writeAgentFiles)
+    if (agent.avatar && agent.avatarExt !== undefined &&
+        !/^(png|jpe?g|webp)$/i.test(String(agent.avatarExt))) {
+      errors.push(`Érvénytelen avatarExt (agent ${agent.name}): "${String(agent.avatarExt).slice(0, 20)}"`)
     }
     for (const skill of agent.agentSkills ?? []) {
       if (!SAFE_NAME_RE.test(String(skill.name ?? ''))) {
@@ -739,6 +805,15 @@ function buildDiffReport(fleet: FleetJson): DiffReport {
 
   if (!fleet.vault) {
     warnings.push('vault szekció hiányzik -- az MCP szerverek token nélkül indulnak el, manuális re-auth szükséges.')
+  }
+
+  // H3: warn about existing agents and main agent files that would be overwritten
+  const existingAgentsToOverwrite = (fleet.agents ?? []).map(a => a.name).filter(n => existingAgents.has(n))
+  if (existingAgentsToOverwrite.length > 0) {
+    warnings.push(`Meglévő ügynökök fájljai FELÜLÍRÓDNAK (FIGYELMEZTETÉS): ${existingAgentsToOverwrite.join(', ')}`)
+  }
+  if (fleet.mainAgent && existsSync(join(PROJECT_ROOT, 'CLAUDE.md'))) {
+    warnings.push('A fő-agent fájljai (CLAUDE.md, .mcp.json, settings.json, agent-config.json) FELÜLÍRÓDNAK.')
   }
 
   return {
@@ -844,8 +919,9 @@ function writeAgentFiles(agent: AgentExport, tracker: WriteTracker): void {
   }
 
   if (agent.avatar) {
-    const ext = agent.avatarExt || 'png'
-    trackedWrite(join(dir, `avatar.${ext}`), Buffer.from(agent.avatar, 'base64'), tracker)
+    // B1: whitelist extension to prevent path traversal via malicious avatarExt
+    const ext = /^(png|jpe?g|webp)$/i.test(String(agent.avatarExt || '')) ? String(agent.avatarExt) : 'png'
+    trackedWrite(safeJoin(dir, `avatar.${ext}`), Buffer.from(agent.avatar, 'base64'), tracker)
   }
 
   for (const skill of agent.agentSkills ?? []) {
@@ -855,50 +931,79 @@ function writeAgentFiles(agent: AgentExport, tracker: WriteTracker): void {
   }
 }
 
-function importVaultSection(vault: VaultExport, password: string, tracker: WriteTracker): void {
-  const vaultKeyBase64 = decryptWithPassword(vault.encryptedKey, password)
-  trackedWrite(join(STORE_DIR, '.vault-key'), vaultKeyBase64, tracker, { mode: 0o600 })
+function importVaultSection(vault: VaultExport, tracker: WriteTracker): void {
+  // vault.vaultKey is plaintext -- the caller already decrypted the whole JSON with the user password
+  trackedWrite(join(STORE_DIR, '.vault-key'), vault.vaultKey, tracker, { mode: 0o600 })
   trackedWrite(join(STORE_DIR, 'vault.json'), JSON.stringify({ entries: vault.entries }, null, 2), tracker, { mode: 0o600 })
   trackedWrite(join(STORE_DIR, 'vault-bindings.json'), JSON.stringify({ bindings: vault.bindings }, null, 2), tracker)
 
   const channelsBase = join(homedir(), '.claude', 'channels')
-  for (const { provider, encrypted } of vault.channelEnvs ?? []) {
-    const envContent = decryptWithPassword(encrypted, password)
+  for (const { provider, content } of vault.channelEnvs ?? []) {
     const provDir = safeJoin(channelsBase, provider)
     trackedMkdir(provDir, tracker)
-    trackedWrite(join(provDir, '.env'), envContent, tracker, { mode: 0o600 })
+    trackedWrite(join(provDir, '.env'), content, tracker, { mode: 0o600 })
   }
+}
+
+const EMPTY_DIFF: DiffReport = {
+  dryRun: true,
+  wouldCreate: { mainAgent: false, agents: [], globalSkills: 0, scheduledTasks: 0, memories: 0, kanbanCards: 0, kanbanComments: 0, labels: 0, dailyLogs: 0, ideaBox: 0 },
+  warnings: [],
+  errors: [],
 }
 
 export function importFleet(
   rawBody: string,
   options: { vaultPassword?: string; apply: boolean },
 ): DiffReport | ImportResult {
-  // H4: denormalize paths in the entire JSON before any processing
-  const fleet = JSON.parse(denormalizePaths(rawBody)) as FleetJson
+  // Auto-detect encrypted export: {"enc":1,"blob":"..."}
+  // H2/M2: decrypt FIRST, before any file writes or DB commits (fail-fast on wrong password)
+  let jsonBody: string
+  try {
+    const parsed = JSON.parse(rawBody)
+    if (parsed && typeof parsed === 'object' && parsed.enc === ENCRYPTED_FLEET_VERSION && typeof parsed.blob === 'string') {
+      // Encrypted fleet -- password required
+      if (!options.vaultPassword) {
+        return { ...EMPTY_DIFF, errors: ['A fájl titkosítva van -- add meg a vault jelszót az importhoz.'] }
+      }
+      if (options.vaultPassword.length < MIN_VAULT_PASSWORD_LEN) {
+        return { ...EMPTY_DIFF, errors: [`A vault jelszó legalább ${MIN_VAULT_PASSWORD_LEN} karakter kell legyen.`] }
+      }
+      try {
+        jsonBody = decryptWithPassword(parsed.blob, options.vaultPassword)
+      } catch {
+        return { ...EMPTY_DIFF, errors: ['Helytelen vault jelszó -- a titkosított fájl nem dekódolható.'] }
+      }
+    } else {
+      // Plaintext fleet JSON
+      jsonBody = rawBody
+    }
+  } catch (err: any) {
+    return { ...EMPTY_DIFF, errors: [`Érvénytelen JSON: ${err.message}`] }
+  }
+
+  // Denormalize paths in the entire JSON before any processing
+  const fleet = JSON.parse(denormalizePaths(jsonBody)) as FleetJson
 
   const schemaErrors = validateSchema(fleet)
   if (schemaErrors.length > 0) {
-    return {
-      dryRun: true,
-      wouldCreate: { mainAgent: false, agents: [], globalSkills: 0, scheduledTasks: 0, memories: 0, kanbanCards: 0, kanbanComments: 0, labels: 0, dailyLogs: 0, ideaBox: 0 },
-      warnings: [],
-      errors: schemaErrors,
-    }
+    return { ...EMPTY_DIFF, errors: schemaErrors }
   }
 
   // B1: validate all names before dry-run or apply
   const nameErrors = validateNames(fleet)
   if (nameErrors.length > 0) {
-    return {
-      dryRun: true,
-      wouldCreate: { mainAgent: false, agents: [], globalSkills: 0, scheduledTasks: 0, memories: 0, kanbanCards: 0, kanbanComments: 0, labels: 0, dailyLogs: 0, ideaBox: 0 },
-      warnings: [],
-      errors: nameErrors,
-    }
+    return { ...EMPTY_DIFF, errors: nameErrors }
   }
 
-  if (!options.apply) return buildDiffReport(fleet)
+  if (!options.apply) {
+    const report = buildDiffReport(fleet)
+    // M1: vault present in export but no password at import -> warning (apply would skip vault)
+    if (fleet.vault && !options.vaultPassword) {
+      report.warnings.push('vault szekció jelen van, de nem adtál meg jelszót -- a vault-titkok kihagyásra kerülnek.')
+    }
+    return report
+  }
 
   // -------------------------------------------------------------------------
   // Apply phase -- H3: track ALL writes, cleanup on any failure
@@ -908,7 +1013,7 @@ export function importFleet(
   const globalSkillsDir = join(homedir(), '.claude', 'skills')
 
   try {
-    // 0. Main agent files (PROJECT_ROOT level -- atlas persona, settings, channel pairing)
+    // 0. Main agent files (PROJECT_ROOT level -- main agent persona, settings, channel pairing)
     if (fleet.mainAgent) {
       writeMainAgentFiles(fleet.mainAgent, tracker)
     }
@@ -955,14 +1060,19 @@ export function importFleet(
     // 5. DB -- single transaction (H3: before vault so vault is last and cleanup is cleaner)
     const importTx = db.transaction(() => {
       // labels first (FK dep for kanban_card_labels)
+      // M3: skip rows with missing required fields to avoid SQLite constraint errors -> 500
       for (const label of fleet.kanban?.labels ?? []) {
         const l = label as any
+        if (!l.id || !l.name) { logger.warn({ id: l.id }, 'Fleet import: skipping label with missing required fields'); continue }
         db.prepare('INSERT OR IGNORE INTO labels (id, name, color, created_at) VALUES (?, ?, ?, ?)')
           .run(l.id, l.name, l.color, l.created_at)
       }
 
       for (const card of fleet.kanban?.cards ?? []) {
         const c = card as any
+        if (!c.id || !c.title || !c.status || !c.priority || c.sort_order == null) {
+          logger.warn({ id: c.id }, 'Fleet import: skipping kanban card with missing required fields'); continue
+        }
         db.prepare(
           `INSERT OR IGNORE INTO kanban_cards
            (id, title, description, status, assignee, priority, project,
@@ -976,15 +1086,17 @@ export function importFleet(
       // kanban comments (idempotent: card_id + content)
       for (const comment of fleet.kanban?.comments ?? []) {
         const c = comment as any
+        if (!c.card_id || !c.content) continue
         if (!db.prepare('SELECT 1 FROM kanban_comments WHERE card_id = ? AND content = ?').get(c.card_id, c.content)) {
           db.prepare('INSERT INTO kanban_comments (card_id, author, content, created_at) VALUES (?, ?, ?, ?)')
             .run(c.card_id, c.author, c.content, c.created_at)
         }
       }
 
-      // kanban card events -- M5: idempotent on (card_id, created_at, to_status)
+      // kanban card events -- idempotent on (card_id, created_at, to_status)
       for (const ev of fleet.kanban?.cardEvents ?? []) {
         const e = ev as any
+        if (!e.card_id || !e.to_status) continue
         if (!db.prepare('SELECT 1 FROM kanban_card_events WHERE card_id = ? AND created_at = ? AND to_status = ?')
           .get(e.card_id, e.created_at, e.to_status)) {
           db.prepare('INSERT INTO kanban_card_events (card_id, from_status, to_status, actor, created_at) VALUES (?, ?, ?, ?, ?)')
@@ -994,11 +1106,12 @@ export function importFleet(
 
       for (const cl of fleet.kanban?.cardLabels ?? []) {
         const c = cl as any
+        if (!c.card_id || !c.label_id) continue
         db.prepare('INSERT OR IGNORE INTO kanban_card_labels (card_id, label_id, created_at) VALUES (?, ?, ?)')
           .run(c.card_id, c.label_id, c.created_at)
       }
 
-      // memories -- idempotent on (agent_id, content); covers ALL agent_ids (atlas, marveen, sub-agents)
+      // memories -- idempotent on (agent_id, content); covers ALL agent_ids
       const now = Math.floor(Date.now() / 1000)
       for (const mem of fleet.memories ?? []) {
         if (!db.prepare('SELECT 1 FROM memories WHERE agent_id = ? AND content = ?').get(mem.agent_id, mem.content)) {
@@ -1058,9 +1171,9 @@ export function importFleet(
 
     importTx()
 
-    // 6. Vault -- LAST: after DB tx committed (H3: vault written last so DB rollback is clean)
-    if (fleet.vault && options.vaultPassword) {
-      importVaultSection(fleet.vault, options.vaultPassword, tracker)
+    // 6. Vault -- LAST: vault data is plaintext (decrypted at the top of importFleet)
+    if (fleet.vault) {
+      importVaultSection(fleet.vault, tracker)
     }
 
     // M3: fire-and-forget re-embed imported memories (embedding was stripped at export)

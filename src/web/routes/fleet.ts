@@ -1,6 +1,6 @@
 import { logger } from '../../logger.js'
 import { readBody, json } from '../http-helpers.js'
-import { exportFleet, importFleet, MIN_VAULT_PASSWORD_LEN } from '../fleet-transfer.js'
+import { exportFleet, importFleet, MIN_VAULT_PASSWORD_LEN, type ExportedFleet } from '../fleet-transfer.js'
 import type { RouteContext } from './types.js'
 
 export async function tryHandleFleet(ctx: RouteContext): Promise<boolean> {
@@ -17,14 +17,14 @@ export async function tryHandleFleet(ctx: RouteContext): Promise<boolean> {
       return true
     }
     try {
-      const fleet = exportFleet({ vaultPassword: vaultPassword || undefined })
-      const body = JSON.stringify(fleet)
+      const exported: ExportedFleet = exportFleet({ vaultPassword: vaultPassword || undefined })
+      const buf = Buffer.from(exported.data)
       res.writeHead(200, {
         'Content-Type': 'application/json',
-        'Content-Disposition': `attachment; filename="fleet-export-${fleet.exportedAt.slice(0, 10)}.json"`,
-        'Content-Length': Buffer.byteLength(body),
+        'Content-Disposition': `attachment; filename="fleet-export-${exported.exportedAt.slice(0, 10)}.json"`,
+        'Content-Length': buf.byteLength,
       })
-      res.end(body)
+      res.end(buf)
     } catch (err: any) {
       logger.error({ err: err.message }, 'Fleet export failed')
       json(res, { error: `Export hiba: ${err.message}` }, 500)
@@ -35,6 +35,12 @@ export async function tryHandleFleet(ctx: RouteContext): Promise<boolean> {
   if (path === '/api/fleet/import' && method === 'POST') {
     const apply = ctx.url.searchParams.get('apply') === 'true'
 
+    // M1: check vault password length for import side too
+    if (vaultPassword !== undefined && vaultPassword.length < MIN_VAULT_PASSWORD_LEN) {
+      json(res, { error: `X-Vault-Password must be at least ${MIN_VAULT_PASSWORD_LEN} characters.` }, 400)
+      return true
+    }
+
     let rawBody: string
     try {
       const buf = await readBody(req)
@@ -44,14 +50,7 @@ export async function tryHandleFleet(ctx: RouteContext): Promise<boolean> {
       return true
     }
 
-    // Basic JSON parse check before handing to importFleet (which does denormalize + parse internally)
-    try {
-      JSON.parse(rawBody)
-    } catch (err: any) {
-      json(res, { error: `Érvénytelen JSON: ${err.message}` }, 400)
-      return true
-    }
-
+    // importFleet handles JSON parse (and encrypted blob detection) internally
     try {
       const result = importFleet(rawBody, { vaultPassword: vaultPassword || undefined, apply })
       if ('dryRun' in result && result.errors.length > 0) {

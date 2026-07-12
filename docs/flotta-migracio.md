@@ -12,7 +12,7 @@ Egyetlen hordozható JSON-t készít a teljes flottáról, amit egy friss telep�
 
 - Fő ügynök persona: CLAUDE.md, SOUL.md, agent-config.json, beállítások, csatorna-párosítás
 - Al-ügynökök: teljes konfiguráció, személyiség, csatornák, képek
-- Memóriák: az összes ügynök memóriabejegyzése (atlas, marveen, al-ügynökök)
+- Memóriák: az összes ügynök memóriabejegyzése (fő ügynök és al-ügynökök)
 - Napi napló bejegyzések
 - Skillek: globális és ügynök-szintű
 - Ütemezett feladatok (szüneteltetve: enabled=false érkeznek)

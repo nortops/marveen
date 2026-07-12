@@ -1408,6 +1408,7 @@ window._i18n.en = {
   'fleet.warning':                'Import is for empty/fresh installations only, not merge. Google/Gmail OAuth and dashboard-token are not included: re-auth required on the target machine.',
   'fleet.vault_password_label':   'Vault password (optional)',
   'fleet.vault_password_ph':      'Leave empty to export without secrets',
+  'fleet.import_vault_password_ph': 'Leave empty to import without secrets',
 
   'fleet.export.title':           'Export',
   'fleet.export.desc':            'Full fleet in one JSON. Supply a password to include vault secrets (encrypted).',

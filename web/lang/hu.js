@@ -1405,6 +1405,7 @@ window._i18n.hu = {
   'fleet.warning':                'Az import kizárólag üres/friss telepítésre való, nem merge-re. Google/Gmail OAuth és a dashboard-token nem utazik: a célgépen re-auth szükséges.',
   'fleet.vault_password_label':   'Vault jelszó (opcionális)',
   'fleet.vault_password_ph':      'Ha üresen hagyod, titkok nélkül exportál',
+  'fleet.import_vault_password_ph': 'Ha üresen hagyod, titkok nélkül importál',
 
   'fleet.export.title':           'Export',
   'fleet.export.desc':            'A teljes flotta egy JSON-ban. Jelszó megadásával a vault-titkok is (titkosítva).',
