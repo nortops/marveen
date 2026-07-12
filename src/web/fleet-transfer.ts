@@ -726,7 +726,7 @@ function buildDiffReport(fleet: FleetJson): DiffReport {
 
   let newDailyLogs = 0
   for (const log of fleet.dailyLogs ?? []) {
-    if (!db.prepare('SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ?').get(log.agent_id, log.date)) {
+    if (!db.prepare('SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ? AND content = ?').get(log.agent_id, log.date, log.content)) {
       newDailyLogs++
     }
   }
@@ -1012,9 +1012,9 @@ export function importFleet(
         }
       }
 
-      // daily logs -- idempotent on (agent_id, date); covers ALL agent_ids
+      // daily logs -- idempotent on (agent_id, date, content); multiple rows per date are preserved
       for (const log of fleet.dailyLogs ?? []) {
-        if (!db.prepare('SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ?').get(log.agent_id, log.date)) {
+        if (!db.prepare('SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ? AND content = ?').get(log.agent_id, log.date, log.content)) {
           db.prepare('INSERT INTO daily_logs (agent_id, date, content, created_at) VALUES (?, ?, ?, ?)')
             .run(log.agent_id, log.date, log.content, log.created_at)
         }
