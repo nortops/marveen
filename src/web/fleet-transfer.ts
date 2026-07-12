@@ -49,13 +49,26 @@ export interface FleetJson {
   schemaVersion: 1
   exportedAt: string
   sourceHost: string
+  mainAgent?: MainAgentExport
   agents: AgentExport[]
   skills: SkillExport[]
   scheduledTasks: ScheduledTaskExport[]
+  memories: MemoryRow[]      // ALL agent_ids (atlas, marveen, sub-agents)
+  dailyLogs: DailyLogRow[]   // ALL agent_ids
   kanban: KanbanExport
   ideaBox: IdeaBoxExport
   dashboardSettings: DashboardSettingsExport
   vault?: VaultExport
+}
+
+// Main agent lives at PROJECT_ROOT (not under agents/), so it needs its own export section.
+export interface MainAgentExport {
+  claudeMd: string
+  soulMd: string
+  config: Record<string, unknown>
+  mcp: Record<string, unknown>
+  settings: Record<string, unknown>
+  channelsAccess: Record<string, unknown>  // provider -> access.json content
 }
 
 export interface AgentExport {
@@ -69,8 +82,6 @@ export interface AgentExport {
   avatar: string | null  // base64
   avatarExt: string      // 'png' or 'jpg'
   agentSkills: SkillExport[]
-  memories: MemoryRow[]
-  dailyLogs: DailyLogRow[]
 }
 
 export interface SkillExport {
@@ -141,6 +152,7 @@ export interface EncryptedChannelEnv {
 export interface DiffReport {
   dryRun: true
   wouldCreate: {
+    mainAgent: boolean
     agents: string[]
     globalSkills: number
     scheduledTasks: number
@@ -158,6 +170,7 @@ export interface DiffReport {
 export interface ImportResult {
   ok: true
   imported: {
+    mainAgent: boolean
     agents: string[]
     globalSkills: number
     scheduledTasks: number
@@ -263,6 +276,8 @@ function looksLikeSecret(value: string): boolean {
 const HEADER_AUTH_SCHEME_RE = /^(?:Bearer|Basic|Token|Digest)\s+/i
 // Header keys that always carry secrets (unless already vault-bound)
 const ALWAYS_SECRET_HEADER_KEY_RE = /^(authorization|x-api-key|x-auth-token|.*-token|.*-key)$/i
+// Well-known non-secret header keys: content/transport metadata, never credentials
+const NON_SECRET_HEADER_KEY_RE = /^(content-type|accept|accept-encoding|accept-language|content-length|user-agent|connection|host|origin|referer|cache-control|if-modified-since|if-none-match|pragma|transfer-encoding|upgrade)$/i
 // Non-secret patterns for header values -- note: no URL exemption (https://user:cred@host IS a secret)
 const NON_SECRET_HEADER_VALUE_RE = [
   /^(true|false)$/i,
@@ -274,6 +289,7 @@ const NON_SECRET_HEADER_VALUE_RE = [
 ]
 
 function looksLikeHeaderSecret(key: string, value: string): boolean {
+  if (NON_SECRET_HEADER_KEY_RE.test(key)) return false
   if (ALWAYS_SECRET_HEADER_KEY_RE.test(key)) return true
   // Strip auth scheme prefix ("Bearer ", "Basic "…) then check the credential part
   const stripped = value.replace(HEADER_AUTH_SCHEME_RE, '')
@@ -397,10 +413,49 @@ function listSkillsInDir(dir: string): SkillExport[] {
 // Export
 // ---------------------------------------------------------------------------
 
+function exportChannelsAccess(channelsDir: string): Record<string, unknown> {
+  const channelsAccess: Record<string, unknown> = {}
+  if (existsSync(channelsDir)) {
+    for (const provider of readdirSync(channelsDir)) {
+      const accessPath = join(channelsDir, provider, 'access.json')
+      if (existsSync(accessPath)) {
+        channelsAccess[provider] = safeReadJson(accessPath)
+      }
+    }
+  }
+  return channelsAccess
+}
+
+// Main agent lives at PROJECT_ROOT -- exported separately since it's not under agents/.
+function exportMainAgent(
+  bindingLookup: Map<string, Map<string, Map<string, string>>>,
+): MainAgentExport {
+  const claudeDir = join(PROJECT_ROOT, '.claude')
+  const mcpPath = join(PROJECT_ROOT, '.mcp.json')
+  const settingsPath = join(claudeDir, 'settings.json')
+
+  const rawMcp = safeReadJson(mcpPath)
+  const mcpPlaceholdered = placeholderMcp(rawMcp, mcpPath, bindingLookup)
+
+  const settingsRaw = safeReadText(settingsPath)
+  const settings = settingsRaw ? JSON.parse(settingsRaw) as Record<string, unknown> : {}
+
+  // Main agent channel access lives at ~/.claude/channels/<provider>/access.json
+  const channelsAccess = exportChannelsAccess(join(homedir(), '.claude', 'channels'))
+
+  return {
+    claudeMd: safeReadText(join(PROJECT_ROOT, 'CLAUDE.md')),
+    soulMd: safeReadText(join(PROJECT_ROOT, 'SOUL.md')),
+    config: safeReadJson(join(PROJECT_ROOT, 'agent-config.json')),
+    mcp: mcpPlaceholdered,
+    settings,
+    channelsAccess,
+  }
+}
+
 function exportAgent(
   name: string,
   bindingLookup: Map<string, Map<string, Map<string, string>>>,
-  db: ReturnType<typeof getDb>,
 ): AgentExport {
   const dir = join(AGENTS_BASE_DIR, name)
   const claudeDir = join(dir, '.claude')
@@ -415,18 +470,9 @@ function exportAgent(
   const settings = settingsRaw ? JSON.parse(settingsRaw) as Record<string, unknown> : {}
 
   // channels/access.json per provider (not .env -- vault-gated)
-  const channelsDir = join(claudeDir, 'channels')
-  const channelsAccess: Record<string, unknown> = {}
-  if (existsSync(channelsDir)) {
-    for (const provider of readdirSync(channelsDir)) {
-      const accessPath = join(channelsDir, provider, 'access.json')
-      if (existsSync(accessPath)) {
-        channelsAccess[provider] = safeReadJson(accessPath)
-      }
-    }
-  }
+  const channelsAccess = exportChannelsAccess(join(claudeDir, 'channels'))
 
-  // avatar -- preserve actual extension (M NIT: don't coerce jpg -> png)
+  // avatar -- preserve actual extension
   let avatar: string | null = null
   let avatarExt = 'png'
   const pngPath = join(dir, 'avatar.png')
@@ -439,18 +485,6 @@ function exportAgent(
     avatarExt = 'jpg'
   }
 
-  const agentSkills = listSkillsInDir(join(claudeDir, 'skills'))
-
-  const memories = db.prepare(
-    `SELECT agent_id, content, sector, salience, created_at, accessed_at,
-            category, auto_generated, keywords
-     FROM memories WHERE agent_id = ? ORDER BY created_at ASC`
-  ).all(name) as MemoryRow[]
-
-  const dailyLogs = db.prepare(
-    'SELECT agent_id, date, content, created_at FROM daily_logs WHERE agent_id = ? ORDER BY date ASC'
-  ).all(name) as DailyLogRow[]
-
   return {
     name,
     config: safeReadJson(join(dir, 'agent-config.json')),
@@ -461,9 +495,7 @@ function exportAgent(
     channelsAccess,
     avatar,
     avatarExt,
-    agentSkills,
-    memories,
-    dailyLogs,
+    agentSkills: listSkillsInDir(join(claudeDir, 'skills')),
   }
 }
 
@@ -541,9 +573,21 @@ export function exportFleet(options: { vaultPassword?: string } = {}): FleetJson
   const db = getDb()
   const bindingLookup = buildBindingLookup()
 
-  const agents = listAgentNames().map(name => exportAgent(name, bindingLookup, db))
+  const mainAgent = exportMainAgent(bindingLookup)
+  const agents = listAgentNames().map(name => exportAgent(name, bindingLookup))
   const skills = listSkillsInDir(join(homedir(), '.claude', 'skills'))
   const scheduledTasks = exportScheduledTasks()
+
+  // Export ALL memories and daily_logs across every agent_id (atlas, marveen, sub-agents)
+  const memories = db.prepare(
+    `SELECT agent_id, content, sector, salience, created_at, accessed_at,
+            category, auto_generated, keywords
+     FROM memories ORDER BY agent_id ASC, created_at ASC`
+  ).all() as MemoryRow[]
+
+  const dailyLogs = db.prepare(
+    'SELECT agent_id, date, content, created_at FROM daily_logs ORDER BY agent_id ASC, date ASC'
+  ).all() as DailyLogRow[]
 
   const kanban: KanbanExport = {
     cards: db.prepare('SELECT * FROM kanban_cards').all() as Record<string, unknown>[],
@@ -565,9 +609,12 @@ export function exportFleet(options: { vaultPassword?: string } = {}): FleetJson
     schemaVersion: 1,
     exportedAt: new Date().toISOString(),
     sourceHost: hostname(),
+    mainAgent,
     agents,
     skills,
     scheduledTasks,
+    memories,
+    dailyLogs,
     kanban,
     ideaBox,
     dashboardSettings: exportDashboardSettings(),
@@ -610,6 +657,14 @@ function validateSchema(fleet: unknown): string[] {
 // B1: validate all untrusted names before any file operation
 function validateNames(fleet: FleetJson): string[] {
   const errors: string[] = []
+
+  // mainAgent channel providers (written to ~/.claude/channels/<provider>/)
+  for (const provider of Object.keys(fleet.mainAgent?.channelsAccess ?? {})) {
+    if (!SAFE_NAME_RE.test(provider)) {
+      errors.push(`Érvénytelen mainAgent channel provider: "${provider.slice(0, 60)}"`)
+    }
+  }
+
   for (const agent of fleet.agents ?? []) {
     if (!SAFE_NAME_RE.test(String(agent.name ?? ''))) {
       errors.push(`Érvénytelen agent.name: "${String(agent.name).slice(0, 60)}"`)
@@ -653,11 +708,9 @@ function buildDiffReport(fleet: FleetJson): DiffReport {
   const newAgents = (fleet.agents ?? []).map(a => a.name).filter(n => !existingAgents.has(n))
 
   let newMemories = 0
-  for (const agent of fleet.agents ?? []) {
-    for (const mem of agent.memories ?? []) {
-      const exists = db.prepare('SELECT 1 FROM memories WHERE agent_id = ? AND content = ?')
-        .get(mem.agent_id, mem.content)
-      if (!exists) newMemories++
+  for (const mem of fleet.memories ?? []) {
+    if (!db.prepare('SELECT 1 FROM memories WHERE agent_id = ? AND content = ?').get(mem.agent_id, mem.content)) {
+      newMemories++
     }
   }
 
@@ -672,11 +725,9 @@ function buildDiffReport(fleet: FleetJson): DiffReport {
   }
 
   let newDailyLogs = 0
-  for (const agent of fleet.agents ?? []) {
-    for (const log of agent.dailyLogs ?? []) {
-      if (!db.prepare('SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ?').get(log.agent_id, log.date)) {
-        newDailyLogs++
-      }
+  for (const log of fleet.dailyLogs ?? []) {
+    if (!db.prepare('SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ?').get(log.agent_id, log.date)) {
+      newDailyLogs++
     }
   }
 
@@ -693,6 +744,7 @@ function buildDiffReport(fleet: FleetJson): DiffReport {
   return {
     dryRun: true,
     wouldCreate: {
+      mainAgent: !!fleet.mainAgent,
       agents: newAgents,
       globalSkills: (fleet.skills ?? []).length,
       scheduledTasks: (fleet.scheduledTasks ?? []).length,
@@ -746,6 +798,27 @@ function cleanupTracked(tracker: WriteTracker): void {
   // Remove dirs in reverse order (deepest first), only if empty
   for (const d of [...tracker.dirs].reverse()) {
     try { rmSync(d, { recursive: true, force: true }) } catch { /* best effort */ }
+  }
+}
+
+function writeMainAgentFiles(ma: MainAgentExport, tracker: WriteTracker): void {
+  const claudeDir = join(PROJECT_ROOT, '.claude')
+  trackedMkdir(claudeDir, tracker)
+
+  if (ma.claudeMd) trackedWrite(join(PROJECT_ROOT, 'CLAUDE.md'), ma.claudeMd, tracker)
+  if (ma.soulMd) trackedWrite(join(PROJECT_ROOT, 'SOUL.md'), ma.soulMd, tracker)
+  if (ma.config && Object.keys(ma.config).length)
+    trackedWrite(join(PROJECT_ROOT, 'agent-config.json'), JSON.stringify(ma.config, null, 2), tracker)
+  trackedWrite(join(PROJECT_ROOT, '.mcp.json'), JSON.stringify(deplaceholderMcp(ma.mcp), null, 2), tracker)
+  trackedWrite(join(claudeDir, 'settings.json'), JSON.stringify(ma.settings, null, 2), tracker)
+
+  // Main agent channel access: ~/.claude/channels/<provider>/access.json
+  // B1: provider names validated by validateNames() before this is called
+  const channelsBase = join(homedir(), '.claude', 'channels')
+  for (const [provider, access] of Object.entries(ma.channelsAccess ?? {})) {
+    const provDir = safeJoin(channelsBase, provider)
+    trackedMkdir(provDir, tracker)
+    trackedWrite(join(provDir, 'access.json'), JSON.stringify(access, null, 2), tracker)
   }
 }
 
@@ -808,7 +881,7 @@ export function importFleet(
   if (schemaErrors.length > 0) {
     return {
       dryRun: true,
-      wouldCreate: { agents: [], globalSkills: 0, scheduledTasks: 0, memories: 0, kanbanCards: 0, kanbanComments: 0, labels: 0, dailyLogs: 0, ideaBox: 0 },
+      wouldCreate: { mainAgent: false, agents: [], globalSkills: 0, scheduledTasks: 0, memories: 0, kanbanCards: 0, kanbanComments: 0, labels: 0, dailyLogs: 0, ideaBox: 0 },
       warnings: [],
       errors: schemaErrors,
     }
@@ -819,7 +892,7 @@ export function importFleet(
   if (nameErrors.length > 0) {
     return {
       dryRun: true,
-      wouldCreate: { agents: [], globalSkills: 0, scheduledTasks: 0, memories: 0, kanbanCards: 0, kanbanComments: 0, labels: 0, dailyLogs: 0, ideaBox: 0 },
+      wouldCreate: { mainAgent: false, agents: [], globalSkills: 0, scheduledTasks: 0, memories: 0, kanbanCards: 0, kanbanComments: 0, labels: 0, dailyLogs: 0, ideaBox: 0 },
       warnings: [],
       errors: nameErrors,
     }
@@ -835,7 +908,12 @@ export function importFleet(
   const globalSkillsDir = join(homedir(), '.claude', 'skills')
 
   try {
-    // 1. Agent files
+    // 0. Main agent files (PROJECT_ROOT level -- atlas persona, settings, channel pairing)
+    if (fleet.mainAgent) {
+      writeMainAgentFiles(fleet.mainAgent, tracker)
+    }
+
+    // 1. Sub-agent files
     for (const agent of fleet.agents ?? []) {
       writeAgentFiles(agent, tracker)
     }
@@ -920,29 +998,25 @@ export function importFleet(
           .run(c.card_id, c.label_id, c.created_at)
       }
 
-      // memories -- idempotent on (agent_id, content)
+      // memories -- idempotent on (agent_id, content); covers ALL agent_ids (atlas, marveen, sub-agents)
       const now = Math.floor(Date.now() / 1000)
-      for (const agent of fleet.agents ?? []) {
-        for (const mem of agent.memories ?? []) {
-          if (!db.prepare('SELECT 1 FROM memories WHERE agent_id = ? AND content = ?').get(mem.agent_id, mem.content)) {
-            db.prepare(
-              `INSERT INTO memories
-               (chat_id, topic_key, content, sector, salience, created_at, accessed_at,
-                agent_id, category, auto_generated, keywords)
-               VALUES ('', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-            ).run(mem.content, mem.sector, mem.salience, mem.created_at, mem.accessed_at ?? now,
-              mem.agent_id, mem.category, mem.auto_generated ?? 0, mem.keywords ?? null)
-          }
+      for (const mem of fleet.memories ?? []) {
+        if (!db.prepare('SELECT 1 FROM memories WHERE agent_id = ? AND content = ?').get(mem.agent_id, mem.content)) {
+          db.prepare(
+            `INSERT INTO memories
+             (chat_id, topic_key, content, sector, salience, created_at, accessed_at,
+              agent_id, category, auto_generated, keywords)
+             VALUES ('', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).run(mem.content, mem.sector, mem.salience, mem.created_at, mem.accessed_at ?? now,
+            mem.agent_id, mem.category, mem.auto_generated ?? 0, mem.keywords ?? null)
         }
       }
 
-      // daily logs -- idempotent on (agent_id, date)
-      for (const agent of fleet.agents ?? []) {
-        for (const log of agent.dailyLogs ?? []) {
-          if (!db.prepare('SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ?').get(log.agent_id, log.date)) {
-            db.prepare('INSERT INTO daily_logs (agent_id, date, content, created_at) VALUES (?, ?, ?, ?)')
-              .run(log.agent_id, log.date, log.content, log.created_at)
-          }
+      // daily logs -- idempotent on (agent_id, date); covers ALL agent_ids
+      for (const log of fleet.dailyLogs ?? []) {
+        if (!db.prepare('SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ?').get(log.agent_id, log.date)) {
+          db.prepare('INSERT INTO daily_logs (agent_id, date, content, created_at) VALUES (?, ?, ?, ?)')
+            .run(log.agent_id, log.date, log.content, log.created_at)
         }
       }
 
@@ -997,13 +1071,14 @@ export function importFleet(
     return {
       ok: true,
       imported: {
+        mainAgent: !!fleet.mainAgent,
         agents: (fleet.agents ?? []).map(a => a.name),
         globalSkills: (fleet.skills ?? []).length,
         scheduledTasks: (fleet.scheduledTasks ?? []).length,
-        memories: (fleet.agents ?? []).reduce((s, a) => s + (a.memories?.length ?? 0), 0),
+        memories: (fleet.memories ?? []).length,
         kanbanCards: (fleet.kanban?.cards ?? []).length,
         labels: (fleet.kanban?.labels ?? []).length,
-        dailyLogs: (fleet.agents ?? []).reduce((s, a) => s + (a.dailyLogs?.length ?? 0), 0),
+        dailyLogs: (fleet.dailyLogs ?? []).length,
         ideaBox: (fleet.ideaBox?.ideas ?? []).length,
       },
     }
