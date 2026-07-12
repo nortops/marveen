@@ -88,6 +88,11 @@ vi.mock('../web/scheduled-tasks-io.js', () => ({
 vi.mock('../config.js', () => ({
   PROJECT_ROOT: '/mock/project',
   STORE_DIR: '/mock/store',
+  MAIN_AGENT_ID: 'marveen',
+  BOT_NAME: 'Marveen',
+  BRAND_NAME: 'Marveen',
+  OWNER_NAME: 'Szabolcs',
+  CHANNEL_PROVIDER: 'telegram',
 }))
 
 vi.mock('../web/vault-bindings.js', () => ({
@@ -237,6 +242,13 @@ const FLEET_WITH_SOURCE_ID = JSON.stringify({
   sourceHost: 'source',
   mainAgent: {
     agentId: 'atlas',
+    identity: {
+      MAIN_AGENT_ID: 'atlas',
+      BOT_NAME: 'Atlas',
+      BRAND_NAME: 'Atlas',
+      OWNER_NAME: 'Norbert',
+      CHANNEL_PROVIDER: 'telegram',
+    },
     claudeMd: '', soulMd: '', config: {}, mcp: {}, settings: {}, channelsAccess: {},
   },
   memories: [
@@ -264,7 +276,7 @@ describe('importFleet: identity takeover', () => {
     expect((result as any).wouldCreate.memories).toBe(2)
   })
 
-  it('apply writes MAIN_AGENT_ID to config-overrides.json and returns warning', async () => {
+  it('apply writes all identity keys to config-overrides.json and returns warning', async () => {
     const { importFleet } = await import('../web/fleet-transfer.js')
     const { atomicWriteFileSync } = await import('../web/atomic-write.js')
 
@@ -272,12 +284,16 @@ describe('importFleet: identity takeover', () => {
     // ImportResult (not DiffReport)
     expect('ok' in result).toBe(true)
     const ir = result as any
-    // config-overrides.json written with atlas as MAIN_AGENT_ID
+    // config-overrides.json written with full identity set
     const configOverrideCalls = (atomicWriteFileSync as any).mock.calls
       .filter((c: string[]) => c[0]?.includes('config-overrides.json'))
     expect(configOverrideCalls.length).toBeGreaterThan(0)
     const written = JSON.parse(configOverrideCalls[configOverrideCalls.length - 1][1])
     expect(written['MAIN_AGENT_ID']).toBe('atlas')
+    expect(written['BOT_NAME']).toBe('Atlas')
+    expect(written['BRAND_NAME']).toBe('Atlas')
+    expect(written['OWNER_NAME']).toBe('Norbert')
+    expect(written['CHANNEL_PROVIDER']).toBe('telegram')
     // Warning present in ImportResult
     expect(ir.warnings).toBeDefined()
     expect(ir.warnings.some((w: string) => w.includes('atlas'))).toBe(true)
