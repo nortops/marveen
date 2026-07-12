@@ -1439,5 +1439,6 @@ window._i18n.en = {
   'fleet.stat.skills':            'Global skills',
   'fleet.stat.tasks':             'Scheduled tasks',
   'fleet.stat.agent_names':       'Agents',
+  'fleet.stat.overwrite_agents':  'Will overwrite',
 
 }

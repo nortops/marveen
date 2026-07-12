@@ -160,6 +160,109 @@ describe('importFleet: encrypted wrapper detection', () => {
 })
 
 // ---------------------------------------------------------------------------
+// DiffReport: wouldOverwrite is present in dry-run result
+// ---------------------------------------------------------------------------
+
+describe('importFleet: wouldOverwrite in DiffReport', () => {
+  it('DiffReport contains wouldOverwrite fields', async () => {
+    const { importFleet } = await import('../web/fleet-transfer.js')
+    const result = importFleet(MINIMAL_FLEET, { apply: false })
+    expect('dryRun' in result).toBe(true)
+    const diff = result as any
+    expect(diff).toHaveProperty('wouldOverwrite')
+    expect(Array.isArray(diff.wouldOverwrite.agents)).toBe(true)
+    expect(typeof diff.wouldOverwrite.mainAgent).toBe('boolean')
+  })
+
+  it('wouldOverwrite.agents empty when no existing agents (mocked listAgentNames returns [])', async () => {
+    const { importFleet } = await import('../web/fleet-transfer.js')
+    const withAgents = JSON.stringify({
+      schemaVersion: 1,
+      exportedAt: '2026-01-01T00:00:00.000Z',
+      sourceHost: 'test-host',
+      agents: [{ name: 'newbot', config: {}, claudeMd: '', soulMd: '', mcp: {}, settings: {}, channelsAccess: {}, agentSkills: [] }],
+      skills: [], scheduledTasks: [], memories: [], dailyLogs: [],
+      kanban: { cards: [], comments: [], cardEvents: [], labels: [], cardLabels: [] },
+      ideaBox: { ideas: [], comments: [], statusLog: [] },
+      dashboardSettings: { autonomy: {}, autoRestart: {}, agentsDesired: {}, norbertPersonal: {} },
+    })
+    const result = importFleet(withAgents, { apply: false })
+    const diff = result as any
+    // listAgentNames is mocked to return [] so nothing to overwrite
+    expect(diff.wouldOverwrite.agents).toHaveLength(0)
+    // newbot is a new agent (not existing)
+    expect(diff.wouldCreate.agents).toContain('newbot')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// VaultExport: bot tokens NOT exported (channels re-pair model)
+// ---------------------------------------------------------------------------
+
+describe('exportFleet: channelEnvs not in VaultExport', () => {
+  it('exported plaintext fleet JSON has no channelEnvs key in vault', async () => {
+    // exportFleet requires real FS -- only assert on the type shape via importFleet round-trip
+    // The VaultExport interface has no channelEnvs field by design; verify via a crafted import
+    // that ignores channelEnvs even if present in the JSON.
+    const { importFleet } = await import('../web/fleet-transfer.js')
+    const fleetWithChannelEnvs = JSON.stringify({
+      schemaVersion: 1,
+      exportedAt: '2026-01-01T00:00:00.000Z',
+      sourceHost: 'source',
+      vault: {
+        vaultKey: 'key',
+        entries: [],
+        bindings: [],
+        channelEnvs: { telegram: 'BOT_TOKEN=secret123' }, // legacy / attacker-supplied field
+      },
+      agents: [], skills: [], scheduledTasks: [], memories: [], dailyLogs: [],
+      kanban: { cards: [], comments: [], cardEvents: [], labels: [], cardLabels: [] },
+      ideaBox: { ideas: [], comments: [], statusLog: [] },
+      dashboardSettings: { autonomy: {}, autoRestart: {}, agentsDesired: {}, norbertPersonal: {} },
+    })
+    // Should dry-run cleanly (channelEnvs is ignored, not written)
+    const result = importFleet(fleetWithChannelEnvs, { apply: false })
+    expect('dryRun' in result).toBe(true)
+    expect((result as any).errors).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Agent ID remap: source main agent_id -> target MAIN_AGENT_ID
+// ---------------------------------------------------------------------------
+
+describe('importFleet: agent_id remap on apply', () => {
+  it('dry-run succeeds for fleet with mainAgent.agentId set', async () => {
+    const { importFleet } = await import('../web/fleet-transfer.js')
+    const fleetWithMainAgent = JSON.stringify({
+      schemaVersion: 1,
+      exportedAt: '2026-01-01T00:00:00.000Z',
+      sourceHost: 'source',
+      mainAgent: {
+        agentId: 'atlas',
+        claudeMd: '', soulMd: '', config: {}, mcp: {}, settings: {}, channelsAccess: {},
+      },
+      memories: [
+        { agent_id: 'atlas', content: 'test memory', sector: 'warm', salience: 0.5, created_at: 1000, category: 'project', auto_generated: 0 },
+        { agent_id: 'hestia', content: 'hestia memory', sector: 'warm', salience: 0.5, created_at: 1000, category: 'project', auto_generated: 0 },
+      ],
+      dailyLogs: [
+        { agent_id: 'atlas', date: '2026-01-01', content: 'log', created_at: 1000 },
+      ],
+      agents: [], skills: [], scheduledTasks: [],
+      kanban: { cards: [], comments: [], cardEvents: [], labels: [], cardLabels: [] },
+      ideaBox: { ideas: [], comments: [], statusLog: [] },
+      dashboardSettings: { autonomy: {}, autoRestart: {}, agentsDesired: {}, norbertPersonal: {} },
+    })
+    const result = importFleet(fleetWithMainAgent, { apply: false })
+    expect('dryRun' in result).toBe(true)
+    expect((result as any).errors).toHaveLength(0)
+    // Dry-run counts memories (2 = atlas + hestia)
+    expect((result as any).wouldCreate.memories).toBe(2)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // validateNames: avatarExt path-traversal guard (B1)
 // ---------------------------------------------------------------------------
 

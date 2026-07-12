@@ -15,7 +15,7 @@ import { homedir, hostname } from 'node:os'
 import {
   randomBytes, createCipheriv, createDecipheriv, scryptSync,
 } from 'node:crypto'
-import { PROJECT_ROOT, STORE_DIR } from '../config.js'
+import { PROJECT_ROOT, STORE_DIR, MAIN_AGENT_ID } from '../config.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { AGENTS_BASE_DIR, listAgentNames } from './agent-config.js'
 import { safeJoin } from './sanitize.js'
@@ -28,6 +28,16 @@ import { logger } from '../logger.js'
 // Schema version -- bump when the JSON shape changes incompatibly.
 // ---------------------------------------------------------------------------
 export const FLEET_SCHEMA_VERSION = 1
+
+// ---------------------------------------------------------------------------
+// UserFacingError -- user-fixable condition; route maps to 400 (not 500).
+// ---------------------------------------------------------------------------
+export class UserFacingError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'UserFacingError'
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Name validation (used to guard all import-side path joins -- B1)
@@ -63,12 +73,13 @@ export interface FleetJson {
 
 // Main agent lives at PROJECT_ROOT (not under agents/), so it needs its own export section.
 export interface MainAgentExport {
+  agentId: string  // source MAIN_AGENT_ID -- used to remap memories/logs to target MAIN_AGENT_ID on import
   claudeMd: string
   soulMd: string
   config: Record<string, unknown>
   mcp: Record<string, unknown>
   settings: Record<string, unknown>
-  channelsAccess: Record<string, unknown>  // provider -> access.json content
+  channelsAccess: Record<string, unknown>  // provider -> access.json (pairing config, NOT bot token)
 }
 
 export interface AgentExport {
@@ -139,7 +150,9 @@ export interface VaultExport {
   vaultKey: string  // raw base64 content of .vault-key (safe: whole JSON is encrypted when password given)
   entries: Record<string, unknown>[]
   bindings: Record<string, unknown>[]
-  channelEnvs: { provider: string; content: string }[]  // plaintext .env file content
+  // NOTE: channel .env (bot tokens) deliberately NOT exported -- re-pair model:
+  // a Telegram bot accepts only one active poller; exporting+auto-activating tokens
+  // would cause 409 errors and silent messages on the source. Target must re-pair manually.
 }
 
 export interface DiffReport {
@@ -155,6 +168,10 @@ export interface DiffReport {
     labels: number
     dailyLogs: number
     ideaBox: number
+  }
+  wouldOverwrite: {
+    agents: string[]  // existing sub-agent names that would be overwritten
+    mainAgent: boolean
   }
   warnings: string[]
   errors: string[]
@@ -373,7 +390,7 @@ function placeholderMcp(
     }
 
     if (blockingFields.length > 0) {
-      throw new Error(
+      throw new UserFacingError(
         `Titkosítatlan secret az .mcp.json-ban: szerver="${serverName}": ${blockingFields.join('; ')}. ` +
         `Kösd be a vault-ba a dashboard Vault oldalán, majd próbáld újra az exportot.`
       )
@@ -468,7 +485,7 @@ function exportMainAgent(
   if (!withSecrets && typeof settings.env === 'object' && settings.env !== null) {
     for (const [key, val] of Object.entries(settings.env as Record<string, unknown>)) {
       if (typeof val === 'string' && looksLikeSecret(val)) {
-        throw new Error(
+        throw new UserFacingError(
           `Titkosítatlan secret a settings.json env blokkjában: kulcs="${key}". ` +
           `Adj meg vault jelszót az exporthoz, vagy távolítsd el a titkot a settings.json-ból.`
         )
@@ -480,6 +497,7 @@ function exportMainAgent(
   const channelsAccess = exportChannelsAccess(join(homedir(), '.claude', 'channels'))
 
   return {
+    agentId: MAIN_AGENT_ID,
     claudeMd: safeReadText(join(PROJECT_ROOT, 'CLAUDE.md')),
     soulMd: safeReadText(join(PROJECT_ROOT, 'SOUL.md')),
     config: safeReadJson(join(PROJECT_ROOT, 'agent-config.json')),
@@ -510,7 +528,7 @@ function exportAgent(
   if (!withSecrets && typeof settings.env === 'object' && settings.env !== null) {
     for (const [key, val] of Object.entries(settings.env as Record<string, unknown>)) {
       if (typeof val === 'string' && looksLikeSecret(val)) {
-        throw new Error(
+        throw new UserFacingError(
           `Titkosítatlan secret az agent "${name}" settings.json env blokkjában: kulcs="${key}". ` +
           `Adj meg vault jelszót az exporthoz, vagy távolítsd el a titkot a settings.json-ból.`
         )
@@ -595,18 +613,8 @@ function exportVault(): VaultExport | null {
   const bindingsStore = safeReadJson(bindingsPath)
   const bindings = (bindingsStore.bindings as Record<string, unknown>[]) ?? []
 
-  const channelEnvs: { provider: string; content: string }[] = []
-  const channelsBase = join(homedir(), '.claude', 'channels')
-  if (existsSync(channelsBase)) {
-    for (const provider of readdirSync(channelsBase)) {
-      const envPath = join(channelsBase, provider, '.env')
-      if (existsSync(envPath)) {
-        channelEnvs.push({ provider, content: readFileSync(envPath, 'utf-8') })
-      }
-    }
-  }
-
-  return { vaultKey, entries, bindings, channelEnvs }
+  // Channel .env (bot tokens) are intentionally NOT exported -- see re-pair model comment in VaultExport.
+  return { vaultKey, entries, bindings }
 }
 
 // Encrypted export wrapper: {"enc":1,"blob":"<base64-of-encrypted-fleet-json>"}
@@ -756,13 +764,6 @@ function validateNames(fleet: FleetJson): string[] {
       errors.push(`Érvénytelen scheduledTask.dirName: "${String(task.dirName).slice(0, 60)}"`)
     }
   }
-  if (fleet.vault) {
-    for (const { provider } of fleet.vault.channelEnvs ?? []) {
-      if (!SAFE_NAME_RE.test(String(provider ?? ''))) {
-        errors.push(`Érvénytelen vault channelEnv provider: "${String(provider).slice(0, 60)}"`)
-      }
-    }
-  }
   return errors
 }
 
@@ -807,13 +808,15 @@ function buildDiffReport(fleet: FleetJson): DiffReport {
     warnings.push('vault szekció hiányzik -- az MCP szerverek token nélkül indulnak el, manuális re-auth szükséges.')
   }
 
-  // H3: warn about existing agents and main agent files that would be overwritten
+  // H3: track which existing agents and main agent would be overwritten
   const existingAgentsToOverwrite = (fleet.agents ?? []).map(a => a.name).filter(n => existingAgents.has(n))
-  if (existingAgentsToOverwrite.length > 0) {
-    warnings.push(`Meglévő ügynökök fájljai FELÜLÍRÓDNAK (FIGYELMEZTETÉS): ${existingAgentsToOverwrite.join(', ')}`)
-  }
-  if (fleet.mainAgent && existsSync(join(PROJECT_ROOT, 'CLAUDE.md'))) {
-    warnings.push('A fő-agent fájljai (CLAUDE.md, .mcp.json, settings.json, agent-config.json) FELÜLÍRÓDNAK.')
+  const mainAgentOverwrite = !!fleet.mainAgent && existsSync(join(PROJECT_ROOT, 'CLAUDE.md'))
+
+  // Channels: always warn -- bot tokens are not exported (re-pair model)
+  const hasChannels = Object.keys(fleet.mainAgent?.channelsAccess ?? {}).length > 0 ||
+    (fleet.agents ?? []).some(a => Object.keys(a.channelsAccess ?? {}).length > 0)
+  if (hasChannels) {
+    warnings.push('Csatornák: újra-párosítás szükséges a célgépen (bot token újboli megadása).')
   }
 
   return {
@@ -829,6 +832,10 @@ function buildDiffReport(fleet: FleetJson): DiffReport {
       labels: newLabels,
       dailyLogs: newDailyLogs,
       ideaBox: (fleet.ideaBox?.ideas ?? []).length,
+    },
+    wouldOverwrite: {
+      agents: existingAgentsToOverwrite,
+      mainAgent: mainAgentOverwrite,
     },
     warnings,
     errors: [],
@@ -936,18 +943,13 @@ function importVaultSection(vault: VaultExport, tracker: WriteTracker): void {
   trackedWrite(join(STORE_DIR, '.vault-key'), vault.vaultKey, tracker, { mode: 0o600 })
   trackedWrite(join(STORE_DIR, 'vault.json'), JSON.stringify({ entries: vault.entries }, null, 2), tracker, { mode: 0o600 })
   trackedWrite(join(STORE_DIR, 'vault-bindings.json'), JSON.stringify({ bindings: vault.bindings }, null, 2), tracker)
-
-  const channelsBase = join(homedir(), '.claude', 'channels')
-  for (const { provider, content } of vault.channelEnvs ?? []) {
-    const provDir = safeJoin(channelsBase, provider)
-    trackedMkdir(provDir, tracker)
-    trackedWrite(join(provDir, '.env'), content, tracker, { mode: 0o600 })
-  }
+  // Channel .env (bot tokens) are intentionally NOT imported -- target must re-pair channels manually.
 }
 
 const EMPTY_DIFF: DiffReport = {
   dryRun: true,
   wouldCreate: { mainAgent: false, agents: [], globalSkills: 0, scheduledTasks: 0, memories: 0, kanbanCards: 0, kanbanComments: 0, labels: 0, dailyLogs: 0, ideaBox: 0 },
+  wouldOverwrite: { agents: [], mainAgent: false },
   warnings: [],
   errors: [],
 }
@@ -1112,24 +1114,32 @@ export function importFleet(
       }
 
       // memories -- idempotent on (agent_id, content); covers ALL agent_ids
+      // Remap: source main agent_id -> target MAIN_AGENT_ID (backward-compat: skip if no agentId)
+      const sourceMainAgentId = fleet.mainAgent?.agentId
       const now = Math.floor(Date.now() / 1000)
       for (const mem of fleet.memories ?? []) {
-        if (!db.prepare('SELECT 1 FROM memories WHERE agent_id = ? AND content = ?').get(mem.agent_id, mem.content)) {
+        const targetAgentId = (sourceMainAgentId && mem.agent_id === sourceMainAgentId && sourceMainAgentId !== MAIN_AGENT_ID)
+          ? MAIN_AGENT_ID
+          : mem.agent_id
+        if (!db.prepare('SELECT 1 FROM memories WHERE agent_id = ? AND content = ?').get(targetAgentId, mem.content)) {
           db.prepare(
             `INSERT INTO memories
              (chat_id, topic_key, content, sector, salience, created_at, accessed_at,
               agent_id, category, auto_generated, keywords)
              VALUES ('', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).run(mem.content, mem.sector, mem.salience, mem.created_at, mem.accessed_at ?? now,
-            mem.agent_id, mem.category, mem.auto_generated ?? 0, mem.keywords ?? null)
+            targetAgentId, mem.category, mem.auto_generated ?? 0, mem.keywords ?? null)
         }
       }
 
       // daily logs -- idempotent on (agent_id, date, content); multiple rows per date are preserved
       for (const log of fleet.dailyLogs ?? []) {
-        if (!db.prepare('SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ? AND content = ?').get(log.agent_id, log.date, log.content)) {
+        const targetAgentId = (sourceMainAgentId && log.agent_id === sourceMainAgentId && sourceMainAgentId !== MAIN_AGENT_ID)
+          ? MAIN_AGENT_ID
+          : log.agent_id
+        if (!db.prepare('SELECT 1 FROM daily_logs WHERE agent_id = ? AND date = ? AND content = ?').get(targetAgentId, log.date, log.content)) {
           db.prepare('INSERT INTO daily_logs (agent_id, date, content, created_at) VALUES (?, ?, ?, ?)')
-            .run(log.agent_id, log.date, log.content, log.created_at)
+            .run(targetAgentId, log.date, log.content, log.created_at)
         }
       }
 
