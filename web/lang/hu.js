@@ -1436,5 +1436,6 @@ window._i18n.hu = {
   'fleet.stat.skills':            'Globális skillek',
   'fleet.stat.tasks':             'Ütemezett feladatok',
   'fleet.stat.agent_names':       'Ügynökök',
+  'fleet.stat.overwrite_agents':  'Felülírásra kerül',
 
 }

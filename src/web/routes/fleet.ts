@@ -1,6 +1,6 @@
 import { logger } from '../../logger.js'
 import { readBody, json } from '../http-helpers.js'
-import { exportFleet, importFleet, MIN_VAULT_PASSWORD_LEN, type ExportedFleet } from '../fleet-transfer.js'
+import { exportFleet, importFleet, MIN_VAULT_PASSWORD_LEN, UserFacingError, type ExportedFleet } from '../fleet-transfer.js'
 import type { RouteContext } from './types.js'
 
 export async function tryHandleFleet(ctx: RouteContext): Promise<boolean> {
@@ -26,8 +26,12 @@ export async function tryHandleFleet(ctx: RouteContext): Promise<boolean> {
       })
       res.end(buf)
     } catch (err: any) {
-      logger.error({ err: err.message }, 'Fleet export failed')
-      json(res, { error: `Export hiba: ${err.message}` }, 500)
+      if (err instanceof UserFacingError) {
+        json(res, { error: err.message }, 400)
+      } else {
+        logger.error({ err: err.message }, 'Fleet export failed')
+        json(res, { error: `Export hiba: ${err.message}` }, 500)
+      }
     }
     return true
   }

@@ -9050,27 +9050,41 @@ document.getElementById('fleetDryRunBtn').addEventListener('click', async () => 
     const data = await res.json()
 
     const wc = data.wouldCreate || {}
+    const wo = data.wouldOverwrite || {}
     const hasErrors = data.errors && data.errors.length > 0
     const hasWarnings = data.warnings && data.warnings.length > 0
 
     resultEl.className = `fleet-dry-run-result ${hasErrors ? 'has-errors' : 'ok'}`
     resultEl.hidden = false
 
-    const agentNames = Array.isArray(wc.agents) ? wc.agents : []
-    const agentLabel = agentNames.length
-      ? `${agentNames.length} (${agentNames.join(', ')})`
-      : '0'
+    const newAgentNames = Array.isArray(wc.agents) ? wc.agents : []
+    const overwriteAgentNames = Array.isArray(wo.agents) ? wo.agents : []
+
+    // Main agent tile: ✓ = new install, ↻ = overwrites existing, — = not in export
+    const mainAgentValue = !wc.mainAgent ? '—' : wo.mainAgent ? '↻' : '✓'
+
+    // Agents tile: show create count + overwrite indicator when applicable
+    let agentsValue
+    if (newAgentNames.length === 0 && overwriteAgentNames.length === 0) {
+      agentsValue = '0'
+    } else if (overwriteAgentNames.length === 0) {
+      agentsValue = String(newAgentNames.length)
+    } else if (newAgentNames.length === 0) {
+      agentsValue = `↻${overwriteAgentNames.length}`
+    } else {
+      agentsValue = `${newAgentNames.length} +↻${overwriteAgentNames.length}`
+    }
 
     resultEl.innerHTML = `
       <div class="fleet-dry-run-title">${hasErrors ? '❌ ' + t('fleet.import.dryrun_errors') : '✅ ' + t('fleet.import.dryrun_ok')}</div>
       ${!hasErrors ? `
       <div class="fleet-dry-run-grid">
         <div class="fleet-dry-run-stat">
-          <div class="fleet-dry-run-stat-value">${wc.mainAgent ? '✓' : '—'}</div>
+          <div class="fleet-dry-run-stat-value">${mainAgentValue}</div>
           <div class="fleet-dry-run-stat-label">${t('fleet.stat.main_agent')}</div>
         </div>
         <div class="fleet-dry-run-stat">
-          <div class="fleet-dry-run-stat-value">${agentNames.length}</div>
+          <div class="fleet-dry-run-stat-value">${agentsValue}</div>
           <div class="fleet-dry-run-stat-label">${t('fleet.stat.agents')}</div>
         </div>
         <div class="fleet-dry-run-stat">
@@ -9090,7 +9104,8 @@ document.getElementById('fleetDryRunBtn').addEventListener('click', async () => 
           <div class="fleet-dry-run-stat-label">${t('fleet.stat.tasks')}</div>
         </div>
       </div>
-      ${agentNames.length ? `<div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">${t('fleet.stat.agent_names')}: ${escapeHtml(agentNames.join(', '))}</div>` : ''}
+      ${newAgentNames.length ? `<div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">${t('fleet.stat.agent_names')}: ${escapeHtml(newAgentNames.join(', '))}</div>` : ''}
+      ${overwriteAgentNames.length ? `<div style="font-size:12px;color:var(--text-warning,#f59e0b);margin-bottom:6px">↻ ${t('fleet.stat.overwrite_agents')}: ${escapeHtml(overwriteAgentNames.join(', '))}</div>` : ''}
       ` : ''}
       ${hasErrors ? `<div class="fleet-dry-run-errors">${data.errors.map(e => escapeHtml(e)).join('<br>')}</div>` : ''}
       ${hasWarnings ? `<div class="fleet-dry-run-warnings">⚠️ ${data.warnings.map(w => escapeHtml(w)).join('<br>')}</div>` : ''}
