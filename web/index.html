@@ -876,52 +876,6 @@
           </div>
         </div>
 
-        <!-- Docs collapsible -->
-        <details class="fleet-docs">
-          <summary class="fleet-docs-summary" data-i18n="fleet.docs.title">Dokumentáció</summary>
-          <div class="fleet-docs-body">
-            <h4 data-i18n="fleet.docs.what_title">Mit csinál a teljes flotta migráció?</h4>
-            <p data-i18n="fleet.docs.what_body">Egyetlen hordozható JSON-t készít a teljes flottáról, amit egy friss telepítésre be lehet tölteni. Segítségével gépek között lehet átköltözni anélkül, hogy az összes ügynököt és memóriát kézzel kellene újrakonfigurálni.</p>
-
-            <h4 data-i18n="fleet.docs.carries_title">Mit visz magával az export?</h4>
-            <ul class="fleet-docs-list">
-              <li data-i18n="fleet.docs.carries_1">Fő ügynök persona: CLAUDE.md, SOUL.md, agent-config.json, beállítások, csatorna-párosítás</li>
-              <li data-i18n="fleet.docs.carries_2">Al-ügynökök: teljes konfiguráció, személyiség, csatornák, képek</li>
-              <li data-i18n="fleet.docs.carries_3">Memóriák: az összes ügynök memóriabejegyzése (atlas, marveen, al-ügynökök)</li>
-              <li data-i18n="fleet.docs.carries_4">Napi napló bejegyzések</li>
-              <li data-i18n="fleet.docs.carries_5">Skillek: globális és ügynök-szintű</li>
-              <li data-i18n="fleet.docs.carries_6">Ütemezett feladatok (szüneteltetve: enabled=false érkeznek)</li>
-              <li data-i18n="fleet.docs.carries_7">Kanban tábla: kártyák, kommentek, címkék</li>
-              <li data-i18n="fleet.docs.carries_8">Ötletláda (idea box)</li>
-              <li data-i18n="fleet.docs.carries_9">Dashboard beállítások (autonómia, auto-restart, preferenciák)</li>
-              <li data-i18n="fleet.docs.carries_10">Vault (opcionális, jelszóval titkosítva): MCP-titkok, bot-tokenek</li>
-            </ul>
-
-            <h4 data-i18n="fleet.docs.not_title">Mit NEM visz magával?</h4>
-            <ul class="fleet-docs-list">
-              <li data-i18n="fleet.docs.not_1">Google/Gmail/Calendar OAuth bejelentkezések: a célgépen újra kell hitelesíteni</li>
-              <li data-i18n="fleet.docs.not_2">Dashboard-token: a célgép saját tokenjét kell használni</li>
-              <li data-i18n="fleet.docs.not_3">Forráskód és build-eredmények: a normál telepítésből jönnek (npm ci, npm run build)</li>
-              <li data-i18n="fleet.docs.not_4">Telemetria, session-logok, conversation-history</li>
-            </ul>
-
-            <h4 data-i18n="fleet.docs.dryrun_title">Dry-run biztonság</h4>
-            <p data-i18n="fleet.docs.dryrun_body">Az "Ellenőrzés" gomb csak beolvassa a fájlt és megmutatja, mi jönne létre, de nem ír semmit a rendszerbe. Az "Apply" gomb csak a dry-run után érhető el, és egy megerősítési lépéssel véd a véletlen felülírás ellen.</p>
-
-            <h4 data-i18n="fleet.docs.vault_title">Vault jelszó szerepe</h4>
-            <p data-i18n="fleet.docs.vault_body">Ha az exportnál megadsz jelszót, az MCP-titkok és bot-tokenek titkosítva kerülnek a JSON-ba (scrypt+AES-256-GCM). Importáláskor ugyanezt a jelszót kell megadni a visszafejtéshez. Jelszó nélkül a titkok kimaradnak, az ügynökök indulás után manuális token-beállítást igényelnek.</p>
-
-            <h4 data-i18n="fleet.docs.steps_title">Lépéssor</h4>
-            <ol class="fleet-docs-list">
-              <li data-i18n="fleet.docs.step_1">A régi gépen: Export, opcionálisan vault jelszóval. Mentsd el a JSON-t.</li>
-              <li data-i18n="fleet.docs.step_2">Az új gépen: telepítsd a dashboardot (git clone, npm ci, npm run build, indítás).</li>
-              <li data-i18n="fleet.docs.step_3">Tallózd be a JSON-t, add meg a vault jelszót (ha volt), futtasd az Ellenőrzést.</li>
-              <li data-i18n="fleet.docs.step_4">Ellenőrizd a dry-run összefoglalót: ügynökök, memóriák, kanban számai helyesek-e.</li>
-              <li data-i18n="fleet.docs.step_5">Végrehajtás (apply): az ügynökök, memóriák és beállítások beírva. A vault-titkok visszafejtve.</li>
-              <li data-i18n="fleet.docs.step_6">Indítsd újra a dashboardot, hitelesítsd újra az OAuth-kapcsolatokat.</li>
-            </ol>
-          </div>
-        </details>
       </div>
     </div>
 

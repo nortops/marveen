@@ -6591,67 +6591,6 @@ body {
   margin-bottom: 6px;
 }
 
-.fleet-docs {
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--bg-card);
-  overflow: hidden;
-}
-
-.fleet-docs-summary {
-  padding: 14px 18px;
-  font-size: 14px;
-  font-weight: 500;
-  cursor: pointer;
-  user-select: none;
-  list-style: none;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.fleet-docs-summary::-webkit-details-marker { display: none; }
-
-.fleet-docs-summary::before {
-  content: '▶';
-  font-size: 10px;
-  color: var(--text-muted);
-  transition: transform var(--transition);
-}
-
-details.fleet-docs[open] .fleet-docs-summary::before {
-  transform: rotate(90deg);
-}
-
-.fleet-docs-body {
-  padding: 0 20px 20px;
-  border-top: 1px solid var(--border);
-}
-
-.fleet-docs-body h4 {
-  font-size: 13px;
-  font-weight: 600;
-  margin: 16px 0 6px;
-  color: var(--text-secondary);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.fleet-docs-body p {
-  font-size: 13px;
-  line-height: 1.65;
-  color: var(--text);
-}
-
-.fleet-docs-list {
-  font-size: 13px;
-  line-height: 1.7;
-  padding-left: 18px;
-  color: var(--text);
-}
-
-.fleet-docs-list li { margin-bottom: 2px; }
-
 @media (max-width: 768px) {
   /* Off-canvas drawer is position:fixed, so it ignores the <body> padding above.
    * When opened in portrait, keep its top brand below the notch and its footer
