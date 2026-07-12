@@ -41,9 +41,9 @@ Jelszó nélkül az export garantáltan titok-mentes: a rendszer kiszűri a titk
 
 ## Fő ügynök identitása (import után)
 
-Import után a cél rendszer ÁTVESZI a forrás fő ügynökének identitását: a fő ügynök neve a forrásé lesz (pl. atlas), és minden adata is a forrás nevén marad. Ez azért kell, hogy a memóriák, naplók és a sub-agentek CLAUDE.md-hivatkozásai konzisztensek maradjanak, semmit nem kell kézzel átnevezni. A rendszer generikus: bármi is a forrás fő ügynökének neve, azt veszi át.
+Import után a cél rendszer ÁTVESZI a forrás fő ügynökének identitását: a fő ügynök neve a forrásé lesz, és minden adata is a forrás nevén marad. Ez azért kell, hogy a memóriák, naplók és a sub-agentek CLAUDE.md-hivatkozásai konzisztensek maradjanak, semmit nem kell kézzel átnevezni. A rendszer generikus: bármi is a forrás fő ügynökének neve, azt veszi át.
 
-A beállítás a `store/config-overrides.json`-ba íródik (MAIN_AGENT_ID), és a dashboard ÚJRAINDÍTÁSA után lép életbe. Az apply után az import figyelmeztet erre.
+A beállítás a `store/config-overrides.json`-ba íródik (fő ügynök azonosító, megjelenített név, brand, tulajdonos), és a dashboard ÚJRAINDÍTÁSA után lép életbe. Az apply után az import figyelmeztet erre.
 
 ## Lépéssor
 
