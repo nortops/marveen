@@ -101,7 +101,7 @@ export function brandSlug(raw: string): string {
 // labels, API routing, etc. The installer derives this from BOT_NAME
 // (NFKD + ASCII + lowercase dashes). Older installs without this env var
 // fall back to "marveen" so nothing breaks when upgrading in place.
-export const MAIN_AGENT_ID = env['MAIN_AGENT_ID'] ?? 'marveen'
+export const MAIN_AGENT_ID = cfg('MAIN_AGENT_ID') ?? 'marveen'
 
 // Identifier the OS service manager uses for the main agent's units (launchd
 // label com.<id>.channels / com.<id>.dashboard, systemd <id>-channels, etc.).

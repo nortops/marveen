@@ -228,37 +228,70 @@ describe('exportFleet: channelEnvs not in VaultExport', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Agent ID remap: source main agent_id -> target MAIN_AGENT_ID
+// Identity takeover: source mainAgent.agentId preserved as-is; config-overrides written on apply
 // ---------------------------------------------------------------------------
 
-describe('importFleet: agent_id remap on apply', () => {
-  it('dry-run succeeds for fleet with mainAgent.agentId set', async () => {
+const FLEET_WITH_SOURCE_ID = JSON.stringify({
+  schemaVersion: 1,
+  exportedAt: '2026-01-01T00:00:00.000Z',
+  sourceHost: 'source',
+  mainAgent: {
+    agentId: 'atlas',
+    claudeMd: '', soulMd: '', config: {}, mcp: {}, settings: {}, channelsAccess: {},
+  },
+  memories: [
+    { agent_id: 'atlas', content: 'atlas memory', sector: 'warm', salience: 0.5, created_at: 1000, category: 'project', auto_generated: 0 },
+    { agent_id: 'hestia', content: 'hestia memory', sector: 'warm', salience: 0.5, created_at: 1000, category: 'project', auto_generated: 0 },
+  ],
+  dailyLogs: [
+    { agent_id: 'atlas', date: '2026-01-01', content: 'log', created_at: 1000 },
+  ],
+  agents: [], skills: [], scheduledTasks: [],
+  kanban: { cards: [], comments: [], cardEvents: [], labels: [], cardLabels: [] },
+  ideaBox: { ideas: [], comments: [], statusLog: [] },
+  dashboardSettings: { autonomy: {}, autoRestart: {}, agentsDesired: {}, norbertPersonal: {} },
+})
+
+describe('importFleet: identity takeover', () => {
+  it('dry-run includes identity warning when mainAgent.agentId is present', async () => {
     const { importFleet } = await import('../web/fleet-transfer.js')
-    const fleetWithMainAgent = JSON.stringify({
-      schemaVersion: 1,
-      exportedAt: '2026-01-01T00:00:00.000Z',
-      sourceHost: 'source',
-      mainAgent: {
-        agentId: 'atlas',
-        claudeMd: '', soulMd: '', config: {}, mcp: {}, settings: {}, channelsAccess: {},
-      },
-      memories: [
-        { agent_id: 'atlas', content: 'test memory', sector: 'warm', salience: 0.5, created_at: 1000, category: 'project', auto_generated: 0 },
-        { agent_id: 'hestia', content: 'hestia memory', sector: 'warm', salience: 0.5, created_at: 1000, category: 'project', auto_generated: 0 },
-      ],
-      dailyLogs: [
-        { agent_id: 'atlas', date: '2026-01-01', content: 'log', created_at: 1000 },
-      ],
-      agents: [], skills: [], scheduledTasks: [],
-      kanban: { cards: [], comments: [], cardEvents: [], labels: [], cardLabels: [] },
-      ideaBox: { ideas: [], comments: [], statusLog: [] },
-      dashboardSettings: { autonomy: {}, autoRestart: {}, agentsDesired: {}, norbertPersonal: {} },
-    })
-    const result = importFleet(fleetWithMainAgent, { apply: false })
+    const result = importFleet(FLEET_WITH_SOURCE_ID, { apply: false })
     expect('dryRun' in result).toBe(true)
     expect((result as any).errors).toHaveLength(0)
-    // Dry-run counts memories (2 = atlas + hestia)
+    const warnings: string[] = (result as any).warnings
+    expect(warnings.some(w => w.includes('atlas') && w.includes('identitás'))).toBe(true)
+    // Counts: 2 memories (atlas + hestia) preserved with original agent_ids
     expect((result as any).wouldCreate.memories).toBe(2)
+  })
+
+  it('apply writes MAIN_AGENT_ID to config-overrides.json and returns warning', async () => {
+    const { importFleet } = await import('../web/fleet-transfer.js')
+    const { atomicWriteFileSync } = await import('../web/atomic-write.js')
+
+    const result = importFleet(FLEET_WITH_SOURCE_ID, { apply: true })
+    // ImportResult (not DiffReport)
+    expect('ok' in result).toBe(true)
+    const ir = result as any
+    // config-overrides.json written with atlas as MAIN_AGENT_ID
+    const configOverrideCalls = (atomicWriteFileSync as any).mock.calls
+      .filter((c: string[]) => c[0]?.includes('config-overrides.json'))
+    expect(configOverrideCalls.length).toBeGreaterThan(0)
+    const written = JSON.parse(configOverrideCalls[configOverrideCalls.length - 1][1])
+    expect(written['MAIN_AGENT_ID']).toBe('atlas')
+    // Warning present in ImportResult
+    expect(ir.warnings).toBeDefined()
+    expect(ir.warnings.some((w: string) => w.includes('atlas'))).toBe(true)
+  })
+
+  it('dry-run counts both atlas and hestia memories (no remap dedup)', async () => {
+    // If remap were active (atlas -> marveen), duplicate dedup could collapse rows.
+    // With original agent_ids preserved, all 2 memories count as new.
+    const { importFleet } = await import('../web/fleet-transfer.js')
+    const result = importFleet(FLEET_WITH_SOURCE_ID, { apply: false })
+    expect('dryRun' in result).toBe(true)
+    expect((result as any).wouldCreate.memories).toBe(2)
+    // Daily logs: 1 entry (atlas) counted
+    expect((result as any).wouldCreate.dailyLogs).toBe(1)
   })
 })
 
