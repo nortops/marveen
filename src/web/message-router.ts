@@ -63,7 +63,7 @@ export function shouldAbandon(sessionExists: boolean, ageMs: number, windowMs: n
 let _tickRunning = false
 
 // Max messages drained per 5s tick; a larger backlog rolls to the next tick.
-const MAX_MESSAGES_PER_TICK = 25
+export const MAX_MESSAGES_PER_TICK = 25
 
 export function startMessageRouter(): NodeJS.Timeout {
   return setInterval(async () => {
@@ -72,6 +72,18 @@ export function startMessageRouter(): NodeJS.Timeout {
     if (_tickRunning) return
     _tickRunning = true
     try {
+      await runMessageRouterTick()
+    } finally {
+      _tickRunning = false
+    }
+  }, 5000)
+}
+
+// One router pass: drain up to MAX_MESSAGES_PER_TICK pending inter-agent
+// messages and inject each into its target tmux session. Extracted from the
+// setInterval body so it can be exercised directly in unit tests (the
+// _tickRunning re-entrancy guard stays in startMessageRouter, around the call).
+export async function runMessageRouterTick(): Promise<void> {
     // Cap work per tick: process at most MAX_MESSAGES_PER_TICK messages, the
     // rest roll to the next 5s tick. Bounds a single tick's wall-time so a
     // backlog (e.g. after a delivery stall) can never make one tick run long
@@ -206,11 +218,13 @@ export function startMessageRouter(): NodeJS.Timeout {
       try {
         // channel-inbound carries the STT-applied deliveryContent; the agent
         // wrap (trusted/untrusted) carries the raw content. Single-source frame.
+        // msgId passed so receiving agents can write back via PUT /api/messages/:id.
         const content = isChannelInbound ? deliveryContent : msg.content
-        const { prefix: basePrefix, wrapped } = wrapAgentMessageForDelivery(category, safeFromAgent, msg.from_agent, content)
-        // Inject msg_id so the recipient can write back via PUT /api/messages/:id.
-        // Channel-inbound messages are native-channel relays, not inter-agent calls -- no msg_id.
-        const prefix = isChannelInbound ? basePrefix : basePrefix.replace(']: ', `, msg_id:${msg.id}]: `)
+        // Adopt upstream's msgId-aware wrap API, but preserve our fork's rule:
+        // channel-inbound messages are native-channel relays, not inter-agent
+        // calls, so they carry NO msg_id -- pass undefined so no write-back id
+        // is injected (upstream unconditionally passed msg.id here).
+        const { prefix, wrapped } = wrapAgentMessageForDelivery(category, safeFromAgent, msg.from_agent, content, isChannelInbound ? undefined : msg.id)
         // Inline preamble so a fresh session (post hard-restart) doesn't miss
         // the context that explains the tag semantics.
         sendPromptToSession(session, prefix + wrapped, host)
@@ -227,10 +241,6 @@ export function startMessageRouter(): NodeJS.Timeout {
         routerLoggedMisses.delete(msg.id)
       }
     }
-    } finally {
-      _tickRunning = false
-    }
-  }, 5000)
 }
 
 // ---- voice helpers (message-router level) ----------------------------------
