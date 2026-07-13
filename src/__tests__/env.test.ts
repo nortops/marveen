@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { writeFileSync, unlinkSync, existsSync } from 'node:fs'
+import { writeFileSync, unlinkSync, existsSync, readFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -65,5 +65,53 @@ describe('readEnvFile', () => {
     expect(result['A']).toBe('1')
     expect(result['C']).toBe('3')
     expect(result['B']).toBeUndefined()
+  })
+})
+
+describe('updateEnvFile', () => {
+  it('meglevo kulcsot lecserel, a tobbi sort es kommentet megorzi', async () => {
+    writeFileSync(testEnvPath, '# fej\nMAIN_AGENT_ID=marveen\nOTHER=keep\n')
+    const { updateEnvFile } = await import('../env.js')
+    updateEnvFile({ MAIN_AGENT_ID: 'atlas' })
+    const out = readFileSync(testEnvPath, 'utf-8')
+    expect(out).toContain('# fej')
+    expect(out).toContain('MAIN_AGENT_ID=atlas')
+    expect(out).not.toContain('MAIN_AGENT_ID=marveen')
+    expect(out).toContain('OTHER=keep')
+  })
+
+  it('hianyzo kulcsot hozzafuz', async () => {
+    writeFileSync(testEnvPath, 'OTHER=keep\n')
+    const { updateEnvFile } = await import('../env.js')
+    updateEnvFile({ BOT_NAME: 'Atlas' })
+    const out = readFileSync(testEnvPath, 'utf-8')
+    expect(out).toContain('OTHER=keep')
+    expect(out).toContain('BOT_NAME=Atlas')
+  })
+
+  it('a teljes identitas-keszletet irja, unquoted (channels.sh cut-kompatibilis)', async () => {
+    writeFileSync(testEnvPath, 'MAIN_AGENT_ID=marveen\n')
+    const { updateEnvFile } = await import('../env.js')
+    updateEnvFile({
+      MAIN_AGENT_ID: 'atlas',
+      BOT_NAME: 'Atlas',
+      BRAND_NAME: 'Atlas',
+      OWNER_NAME: 'Norbert',
+      CHANNEL_PROVIDER: 'telegram',
+    })
+    const out = readFileSync(testEnvPath, 'utf-8')
+    expect(out).toContain('MAIN_AGENT_ID=atlas')
+    expect(out).toContain('CHANNEL_PROVIDER=telegram')
+    // no quotes around values -- channels.sh parses with `cut -d= -f2-`
+    expect(out).not.toContain('MAIN_AGENT_ID="atlas"')
+  })
+
+  it('ures update eseten nem ir (no-op)', async () => {
+    writeFileSync(testEnvPath, 'A=1\n')
+    const { updateEnvFile } = await import('../env.js')
+    updateEnvFile({})
+    updateEnvFile({ EMPTY: '' })
+    const out = readFileSync(testEnvPath, 'utf-8')
+    expect(out).toBe('A=1\n')
   })
 })

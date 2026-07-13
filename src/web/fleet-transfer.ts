@@ -17,6 +17,7 @@ import {
 } from 'node:crypto'
 import { PROJECT_ROOT, STORE_DIR, MAIN_AGENT_ID, BOT_NAME, BRAND_NAME, OWNER_NAME, CHANNEL_PROVIDER } from '../config.js'
 import { atomicWriteFileSync } from './atomic-write.js'
+import { updateEnvFile } from '../env.js'
 import { AGENTS_BASE_DIR, listAgentNames } from './agent-config.js'
 import { safeJoin } from './sanitize.js'
 import { SCHEDULED_TASKS_DIR } from './scheduled-tasks-io.js'
@@ -1235,6 +1236,23 @@ export function importFleet(
         overrides['MAIN_AGENT_ID'] = sourceAgentId
       }
       atomicWriteFileSync(overridesPath, JSON.stringify(overrides, null, 2))
+
+      // Mirror the identity into .env as well. The dashboard reads identity via
+      // cfg() (config-overrides.json > .env), but shell-side launchers -- above
+      // all scripts/channels.sh -- read MAIN_AGENT_ID / CHANNEL_PROVIDER
+      // DIRECTLY from .env. Without this the main agent would launch under the
+      // pre-import identity (`${old-id}-channels`) while the dashboard looks for
+      // `${new-id}-channels` and reports the main agent as down.
+      const envIdentity: Record<string, string> = {}
+      if (sourceIdentity && typeof sourceIdentity === 'object') {
+        for (const [key, val] of Object.entries(sourceIdentity)) {
+          if (typeof val === 'string' && val.length > 0) envIdentity[key] = val
+        }
+      } else {
+        envIdentity['MAIN_AGENT_ID'] = sourceAgentId
+      }
+      updateEnvFile(envIdentity)
+
       applyWarnings.push(
         `Fő-agent identitás átvéve: ${sourceAgentId}. Újraindítás kell hogy a dashboard ${sourceAgentId}-ként induljon.`
       )

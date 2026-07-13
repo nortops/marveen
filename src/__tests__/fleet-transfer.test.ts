@@ -99,6 +99,10 @@ vi.mock('../web/vault-bindings.js', () => ({
   getBindings: () => [],
 }))
 
+vi.mock('../env.js', () => ({
+  updateEnvFile: vi.fn(),
+}))
+
 vi.mock('../logger.js', () => ({
   logger: { info: () => {}, warn: () => {}, error: () => {} },
 }))
@@ -297,6 +301,23 @@ describe('importFleet: identity takeover', () => {
     // Warning present in ImportResult
     expect(ir.warnings).toBeDefined()
     expect(ir.warnings.some((w: string) => w.includes('atlas'))).toBe(true)
+  })
+
+  it('apply mirrors the full identity into .env (channels.sh reads .env, not config-overrides)', async () => {
+    const { importFleet } = await import('../web/fleet-transfer.js')
+    const { updateEnvFile } = await import('../env.js')
+
+    importFleet(FLEET_WITH_SOURCE_ID, { apply: true })
+
+    expect(updateEnvFile as any).toHaveBeenCalled()
+    const envArg = (updateEnvFile as any).mock.calls.at(-1)[0]
+    expect(envArg).toEqual({
+      MAIN_AGENT_ID: 'atlas',
+      BOT_NAME: 'Atlas',
+      BRAND_NAME: 'Atlas',
+      OWNER_NAME: 'Norbert',
+      CHANNEL_PROVIDER: 'telegram',
+    })
   })
 
   it('dry-run counts both atlas and hestia memories (no remap dedup)', async () => {
