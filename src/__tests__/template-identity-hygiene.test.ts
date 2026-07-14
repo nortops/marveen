@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { resolveTemplatePlaceholders } from '../web/agent-scaffold.js'
+import { resolveTemplatePlaceholders, substituteTemplatePlaceholders } from '../web/agent-scaffold.js'
 
 // Repo root = two levels up from src/__tests__/.
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
@@ -200,6 +200,34 @@ describe('runtime-seeded placeholders are all substituted', () => {
   // operator's identity) -- otherwise the shipped updater would re-introduce
   // exactly the leak it is meant to guard against. (The roster list lives here
   // in the test, never in shipped code.)
+  // 3. Guard: templates/CLAUDE.md.template and src/web/agent-scaffold.ts must
+  // use {{WEB_PORT}} / ${WEB_PORT} placeholders, not a hardcoded port literal.
+  // A hardcoded localhost:3420 bypasses the substitution and breaks agents on
+  // non-default ports (their memory/kanban/inter-agent API calls silently fail).
+  it('CLAUDE.md.template contains no hardcoded localhost:3420', () => {
+    const template = readFileSync(join(REPO_ROOT, 'templates', 'CLAUDE.md.template'), 'utf-8')
+    expect(template, 'templates/CLAUDE.md.template must use {{WEB_PORT}}, not localhost:3420').not.toContain('localhost:3420')
+  })
+
+  it('agent-scaffold.ts contains no hardcoded localhost:3420 in its generateClaudeMd prompt', () => {
+    const scaffold = readFileSync(join(REPO_ROOT, 'src', 'web', 'agent-scaffold.ts'), 'utf-8')
+    expect(scaffold, 'src/web/agent-scaffold.ts must use ${WEB_PORT}, not localhost:3420').not.toContain('localhost:3420')
+  })
+
+  it('substituteTemplatePlaceholders with non-default WEB_PORT seeds the correct port into CLAUDE.md.template', () => {
+    const template = readFileSync(join(REPO_ROOT, 'templates', 'CLAUDE.md.template'), 'utf-8')
+    const out = substituteTemplatePlaceholders(template, {
+      projectRoot: '/test',
+      mainAgentId: 'atlas',
+      botName: 'TestBot',
+      ownerName: 'TestOwner',
+      webPort: 3421,
+    })
+    expect(out, 'substituted template must not contain localhost:3420').not.toContain('localhost:3420')
+    expect(out, 'substituted template must not contain unresolved {{WEB_PORT}}').not.toContain('{{WEB_PORT}}')
+    expect(out, 'substituted template must contain localhost:3421').toContain('localhost:3421')
+  })
+
   it('update.sh stays host-agnostic (no hardcoded roster or operator identity)', () => {
     const updateSh = readFileSync(join(REPO_ROOT, 'update.sh'), 'utf8')
     for (const name of ['samu', 'zara', 'boni', 'iris', 'deeper', 'slacker']) {
