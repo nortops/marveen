@@ -214,6 +214,16 @@ describe('runtime-seeded placeholders are all substituted', () => {
     expect(scaffold, 'src/web/agent-scaffold.ts must use ${WEB_PORT}, not localhost:3420').not.toContain('localhost:3420')
   })
 
+  it('install scripts write WEB_PORT into the generated .env (heredoc contains WEB_PORT line)', () => {
+    for (const script of ['install-linux.sh', 'install-macos.sh']) {
+      const src = readFileSync(join(REPO_ROOT, script), 'utf-8')
+      // The .env heredoc block must contain a WEB_PORT= line so the runtime
+      // dashboard reads the correct port from .env and matches what the
+      // CLAUDE.md templates were seeded with at install time.
+      expect(src, `${script}: .env heredoc must contain WEB_PORT= line`).toMatch(/WEB_PORT=/)
+    }
+  })
+
   it('substituteTemplatePlaceholders with non-default WEB_PORT seeds the correct port into CLAUDE.md.template', () => {
     const template = readFileSync(join(REPO_ROOT, 'templates', 'CLAUDE.md.template'), 'utf-8')
     const out = substituteTemplatePlaceholders(template, {
