@@ -221,6 +221,8 @@ describe('runtime-seeded placeholders are all substituted', () => {
       // dashboard reads the correct port from .env and matches what the
       // CLAUDE.md templates were seeded with at install time.
       expect(src, `${script}: .env heredoc must contain WEB_PORT= line`).toMatch(/WEB_PORT=/)
+      // A --port CLI flag must exist so non-default-port installs are ergonomic.
+      expect(src, `${script}: must accept a --port CLI flag`).toMatch(/--port/)
     }
   })
 

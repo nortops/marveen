@@ -89,6 +89,24 @@ ensure_block_in_rc() {
 
 INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# CLI flag parsing -- runs before the interactive wizard.
+# WEB_PORT can also be set as an env var (env var wins if --port is not given).
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --port|--web-port)
+      if [[ -z "${2:-}" || "${2}" == --* ]]; then
+        echo "Error: --port requires a numeric argument (e.g. --port 3421)" >&2; exit 1
+      fi
+      WEB_PORT="$2"; shift 2 ;;
+    --help|-h)
+      echo "Usage: $0 [--port <N>]"
+      echo "  --port <N>   Dashboard port (default: 3420). Also settable via WEB_PORT env var."
+      exit 0 ;;
+    *) echo "Unknown option: $1 (use --help for usage)" >&2; exit 1 ;;
+  esac
+done
+WEB_PORT="${WEB_PORT:-3420}"
+
 clear
 echo ""
 echo -e "${BOLD}  ▐▛███▜▌   Marveen${NC}"
