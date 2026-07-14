@@ -21,7 +21,7 @@ const ROOT = join(__dirname, '..', '..')
 const PRUNE_SCRIPT = join(ROOT, 'scripts', 'boot-hook-prune.py')
 const STALENESS_HOOK = join(ROOT, 'scripts', 'hooks', 'staleness-guard.py')
 
-import { isUnsafeHookCommand } from '../web/agent-scaffold.js'
+import { isUnsafeHookCommand, upgradeLegacyHookCommands } from '../web/agent-scaffold.js'
 
 // ---------------------------------------------------------------------------
 // (a) Registration guard rejects /tmp and non-existent paths
@@ -198,5 +198,115 @@ describe('fail-open wrapper (UserPromptSubmit)', () => {
   it('bare python3 on a missing file exits non-zero (proves the wrapper is necessary)', () => {
     const result = spawnSync('python3', ['/nonexistent/path/hook.py'])
     expect(result.status).not.toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// (e) upgradeLegacyHookCommands: automatic in-place migration
+// ---------------------------------------------------------------------------
+describe('upgradeLegacyHookCommands (automatic migration)', () => {
+  const SCRIPT_DIR = join(ROOT, 'scripts', 'hooks')
+  const VOICE_HOOK = join(SCRIPT_DIR, 'voice-reply-directive.py')
+  const WRAPPER_STALENESS = `bash -c '[ -f ${STALENESS_HOOK} ] && exec python3 ${STALENESS_HOOK}; exit 0'`
+  const WRAPPER_VOICE = `bash -c '[ -f ${VOICE_HOOK} ] && exec python3 ${VOICE_HOOK}; exit 0'`
+  const OLD_STALENESS = `python3 ${STALENESS_HOOK}`
+  const OLD_VOICE = `python3 ${VOICE_HOOK}`
+
+  const makeTplHooks = () => ({
+    UserPromptSubmit: [{
+      hooks: [
+        { type: 'command', command: WRAPPER_STALENESS, timeout: 10 },
+        { type: 'command', command: WRAPPER_VOICE, timeout: 60 },
+      ],
+    }],
+  })
+
+  // (a) bare staleness command is replaced by wrapper, no duplicate entry
+  it('replaces bare staleness-guard command with fail-open wrapper (no duplicate)', () => {
+    const existingHooks: Record<string, unknown> = {
+      UserPromptSubmit: [{
+        hooks: [{ type: 'command', command: OLD_STALENESS, timeout: 10 }],
+      }],
+    }
+    const changed = upgradeLegacyHookCommands(existingHooks, makeTplHooks())
+    expect(changed).toBe(true)
+    const cmds = (existingHooks.UserPromptSubmit as { hooks: { command: string }[] }[])
+      .flatMap((e) => e.hooks.map((h) => h.command))
+    expect(cmds).toContain(WRAPPER_STALENESS)
+    expect(cmds).not.toContain(OLD_STALENESS)
+    expect(cmds.filter((c) => c.includes('staleness-guard'))).toHaveLength(1)
+  })
+
+  // (b) idempotent: second run on already-upgraded settings returns false (no write)
+  it('is idempotent: second run on already-wrapper settings returns false', () => {
+    const existingHooks: Record<string, unknown> = {
+      UserPromptSubmit: [{
+        hooks: [
+          { type: 'command', command: WRAPPER_STALENESS, timeout: 10 },
+          { type: 'command', command: WRAPPER_VOICE, timeout: 60 },
+        ],
+      }],
+    }
+    const changed = upgradeLegacyHookCommands(existingHooks, makeTplHooks())
+    expect(changed).toBe(false)
+    const cmds = (existingHooks.UserPromptSubmit as { hooks: { command: string }[] }[])
+      .flatMap((e) => e.hooks.map((h) => h.command))
+    expect(cmds).toContain(WRAPPER_STALENESS)
+    expect(cmds).toContain(WRAPPER_VOICE)
+  })
+
+  // (c) voice-reply-directive.py is also upgraded
+  it('replaces bare voice-reply-directive command with fail-open wrapper', () => {
+    const existingHooks: Record<string, unknown> = {
+      UserPromptSubmit: [{
+        hooks: [
+          { type: 'command', command: OLD_STALENESS, timeout: 10 },
+          { type: 'command', command: OLD_VOICE, timeout: 60 },
+        ],
+      }],
+    }
+    const changed = upgradeLegacyHookCommands(existingHooks, makeTplHooks())
+    expect(changed).toBe(true)
+    const cmds = (existingHooks.UserPromptSubmit as { hooks: { command: string }[] }[])
+      .flatMap((e) => e.hooks.map((h) => h.command))
+    expect(cmds).not.toContain(OLD_STALENESS)
+    expect(cmds).not.toContain(OLD_VOICE)
+    expect(cmds).toContain(WRAPPER_STALENESS)
+    expect(cmds).toContain(WRAPPER_VOICE)
+    expect(cmds.filter((c) => c.includes('staleness-guard'))).toHaveLength(1)
+    expect(cmds.filter((c) => c.includes('voice-reply-directive'))).toHaveLength(1)
+  })
+
+  // (d) a settings with already-wrapper form is left untouched
+  it('leaves a settings that already has the wrapper form unchanged', () => {
+    const existingHooks: Record<string, unknown> = {
+      UserPromptSubmit: [{
+        hooks: [{ type: 'command', command: WRAPPER_STALENESS, timeout: 10 }],
+      }],
+    }
+    const before = JSON.stringify(existingHooks)
+    const changed = upgradeLegacyHookCommands(existingHooks, makeTplHooks())
+    expect(changed).toBe(false)
+    expect(JSON.stringify(existingHooks)).toBe(before)
+  })
+
+  // (e) unrelated hooks are preserved; timeout is updated alongside the command
+  it('preserves unrelated hooks and updates timeout on upgrade', () => {
+    const existingHooks: Record<string, unknown> = {
+      UserPromptSubmit: [{
+        hooks: [
+          { type: 'command', command: OLD_STALENESS, timeout: 5 },
+          { type: 'command', command: 'python3 /stable/custom-hook.py', timeout: 30 },
+        ],
+      }],
+    }
+    upgradeLegacyHookCommands(existingHooks, makeTplHooks())
+    const hooks = (existingHooks.UserPromptSubmit as { hooks: { command: string; timeout: number }[] }[])[0].hooks
+    // staleness upgraded
+    expect(hooks.find((h) => h.command === WRAPPER_STALENESS)?.timeout).toBe(10)
+    // custom hook untouched
+    expect(hooks.find((h) => h.command === 'python3 /stable/custom-hook.py')?.timeout).toBe(30)
+    // old bare gone
+    expect(hooks.some((h) => h.command === OLD_STALENESS)).toBe(false)
   })
 })
