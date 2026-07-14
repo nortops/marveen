@@ -453,6 +453,7 @@ if [ -f "$INSTALL_DIR/templates/CLAUDE.md.template" ]; then
       -e "s/{{CHAT_ID}}/$CHAT_ID/g" \
       -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
       -e "s/{{MAIN_AGENT_ID}}/$MAIN_AGENT_ID/g" \
+      -e "s/{{WEB_PORT}}/${WEB_PORT:-3420}/g" \
       "$INSTALL_DIR/templates/CLAUDE.md.template" > "$INSTALL_DIR/CLAUDE.md"
   echo -e "  ${GREEN}✓${NC} $(_t macos.claude_md_generated)"
 else
@@ -1004,10 +1005,10 @@ if [ -f "$INSTALL_DIR/store/.dashboard-token" ]; then
   DASH_TOKEN=$(cat "$INSTALL_DIR/store/.dashboard-token")
 fi
 if [ -n "$DASH_TOKEN" ]; then
-  echo -e "  ${BOLD}Dashboard:${NC} ${BLUE}http://localhost:3420/?token=${DASH_TOKEN}${NC}"
+  echo -e "  ${BOLD}Dashboard:${NC} ${BLUE}http://localhost:${WEB_PORT:-3420}/?token=${DASH_TOKEN}${NC}"
   echo -e "  ${DIM}$(_t dash.token_hint)${NC}"
 else
-  echo -e "  ${BOLD}Dashboard:${NC} http://localhost:3420"
+  echo -e "  ${BOLD}Dashboard:${NC} http://localhost:${WEB_PORT:-3420}"
   echo -e "  ${DIM}$(_t dash.no_token_hint)${NC}"
 fi
 echo -e "  ${BOLD}Telegram:${NC} $(_t telegram.write_hint)"
