@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { homedir } from 'node:os'
+import { homedir, userInfo } from 'node:os'
 import { execFileSync } from 'node:child_process'
 import { PROJECT_ROOT, STORE_DIR } from '../../config.js'
 import { logger } from '../../logger.js'
@@ -34,59 +34,41 @@ function readEnvValue(key: string): string | null {
   return null
 }
 
-// Pure auth-presence decision, testable without I/O. Given the probe results
-// (env values, raw credentials.json content, platform, and a lazy Keychain
-// probe) decide whether a usable Claude credential exists. The Keychain probe
-// is only consulted on macOS after the env/file checks miss, so a caller that
-// already has a token (or is not on darwin) never triggers it.
-export function decideClaudeAuthPresent(p: {
-  oauthTokenEnv: string | null
-  apiKeyEnv: string | null
-  credentialsJson: string | null
-  platform: NodeJS.Platform
-  keychainHasCredentials: () => boolean
-}): boolean {
-  if (p.oauthTokenEnv) return true
-  if (p.apiKeyEnv) return true
-  if (p.credentialsJson) {
-    try {
-      const d = JSON.parse(p.credentialsJson) as {
-        claudeAiOauth?: { accessToken?: string }; apiKey?: string
-      }
-      if (d?.claudeAiOauth?.accessToken) return true
-      if (d?.apiKey) return true
-    } catch { /* malformed credentials.json -- treat as absent */ }
-  }
-  // macOS keeps Claude Code credentials in the login Keychain, not in a
-  // credentials.json file. Without this probe a fully-authenticated Mac
-  // install falsely reports no-auth and pops the onboarding wizard over a
-  // working dashboard.
-  if (p.platform === 'darwin' && p.keychainHasCredentials()) return true
-  return false
-}
-
-// Probe the macOS login Keychain for the Claude Code credential item. Any
-// non-zero exit (item absent, `security` unavailable) means "no auth".
+// True auth presence -- an env OAuth token / API key, a real credentials.json
+// OAuth credential, or (macOS) the login Keychain credential. NOT merely "the
+// .env line exists" (it could be empty).
+//
+// The Keychain leg matters: on macOS Claude Code stores the subscription login
+// in the login Keychain and writes NO ~/.claude/.credentials.json, so a fully
+// authenticated fleet looked logged-out to the wizard and the dashboard nagged
+// for a token that would have created a second, drifting credential path.
+// The probe is presence-only: no `-w`, so the credential secret itself never
+// enters this process just to answer a yes/no question. It fails closed (false
+// off macOS / on any lookup error), so a Keychain ACL that refused `security`
+// just falls back to the previous behaviour.
 function keychainHasClaudeCredentials(): boolean {
+  if (process.platform !== 'darwin') return false
   try {
-    execFileSync('security', ['find-generic-password', '-s', 'Claude Code-credentials'], { stdio: 'ignore', timeout: 5000 })
+    execFileSync(
+      '/usr/bin/security',
+      ['find-generic-password', '-s', 'Claude Code-credentials', '-a', userInfo().username],
+      { timeout: 3000, stdio: 'ignore' },
+    )
     return true
   } catch { return false }
 }
 
-// True auth presence -- an env OAuth token / API key, a real credentials.json
-// OAuth credential, or (on macOS) a Keychain credential. NOT merely "the .env
-// line exists" (it could be empty).
 function claudeAuthPresent(): boolean {
-  let credentialsJson: string | null = null
-  try { credentialsJson = readFileSync(HOME_CREDENTIALS, 'utf-8') } catch { /* no / unreadable credentials.json */ }
-  return decideClaudeAuthPresent({
-    oauthTokenEnv: readEnvValue('CLAUDE_CODE_OAUTH_TOKEN'),
-    apiKeyEnv: readEnvValue('ANTHROPIC_API_KEY'),
-    credentialsJson,
-    platform: process.platform,
-    keychainHasCredentials: keychainHasClaudeCredentials,
-  })
+  if (readEnvValue('CLAUDE_CODE_OAUTH_TOKEN')) return true
+  if (readEnvValue('ANTHROPIC_API_KEY')) return true
+  try {
+    const d = JSON.parse(readFileSync(HOME_CREDENTIALS, 'utf-8')) as {
+      claudeAiOauth?: { accessToken?: string }; apiKey?: string
+    }
+    if (d?.claudeAiOauth?.accessToken) return true
+    if (d?.apiKey) return true
+  } catch { /* no / unreadable credentials.json */ }
+  return keychainHasClaudeCredentials()
 }
 
 function telegramConfigured(): boolean {
@@ -120,6 +102,22 @@ function setEnvKey(key: string, value: string): void {
   atomicWriteFileSync(ENV_FILE, kept.join('\n') + '\n', { mode: 0o600 })
 }
 
+// Replace every standalone occurrence of `from` with `to` in a persona file
+// (CLAUDE.md / SOUL.md). Plain global string replace -- the persona files are
+// generated from templates where the name appears verbatim. Atomic write, and
+// a no-op when the file is missing or nothing matched.
+function renameInPersonaFile(file: string, from: string, to: string): void {
+  if (!from || !to || from === to) return
+  let content: string
+  try { content = readFileSync(file, 'utf-8') } catch { return }
+  if (!content.includes(from)) return
+  atomicWriteFileSync(file, content.split(from).join(to))
+}
+
+function identityConfirmed(): boolean {
+  return readEnvValue('IDENTITY_CONFIRMED') === '1'
+}
+
 export async function tryHandleOnboarding(ctx: RouteContext): Promise<boolean> {
   const { req, res, path, method } = ctx
 
@@ -130,12 +128,68 @@ export async function tryHandleOnboarding(ctx: RouteContext): Promise<boolean> {
     const tg = telegramConfigured()
     const pr = paired()
     json(res, {
+      identityConfirmed: identityConfirmed(),
+      currentAgentName: readEnvValue('BRAND_NAME') || readEnvValue('BOT_NAME') || 'Marveen',
+      currentOwnerName: readEnvValue('OWNER_NAME') || '',
       claudeAuthPresent: claude,
       agentsRunning: running,
       telegramConfigured: tg,
       paired: pr,
+      // The identity step never re-opens the wizard on an already-configured
+      // install: it only participates while first-run setup is incomplete.
       needsOnboarding: !claude || !running || !tg || !pr,
     })
+    return true
+  }
+
+  // Identity step: agent display name + owner name. SAFETY: MAIN_AGENT_ID and
+  // SERVICE_ID are baked into the plumbing at install time (tmux session name,
+  // DB rows, OS service-unit names) -- rewriting them after the services exist
+  // orphans running units and can lock the owner out. The display name and the
+  // internal id may freely differ, so:
+  //   - services not yet launched: BOT_NAME + BRAND_NAME + OWNER_NAME may all
+  //     be set (launch picks them up from .env); the id plumbing stays as the
+  //     installer derived it.
+  //   - services already running: only BRAND_NAME + OWNER_NAME + the persona
+  //     files change. BOT_NAME is left alone with the rest of the plumbing.
+  if (path === '/api/onboarding/identity' && method === 'POST') {
+    let body: { agentName?: string; ownerName?: string } = {}
+    try { body = JSON.parse((await readBody(req)).toString()) as typeof body } catch { /* empty */ }
+    const agentName = (body.agentName ?? '').trim()
+    const ownerName = (body.ownerName ?? '').trim()
+    if (!agentName || !ownerName) { json(res, { error: 'agentName es ownerName szukseges.', reason: 'missing' }, 400); return true }
+    if (agentName.length > 40 || ownerName.length > 60 || /[\n\r\0=]/.test(agentName + ownerName)) {
+      json(res, { error: 'A nev tul hosszu vagy tiltott karaktert tartalmaz.', reason: 'bad-name' }, 400)
+      return true
+    }
+
+    const servicesUp = agentsRunning()
+    const prevAgentName = readEnvValue('BOT_NAME') || 'Marveen'
+    const prevOwnerName = readEnvValue('OWNER_NAME') || ''
+    try {
+      setEnvKey('OWNER_NAME', ownerName)
+      setEnvKey('BRAND_NAME', agentName)
+      if (!servicesUp) setEnvKey('BOT_NAME', agentName)
+      setEnvKey('IDENTITY_CONFIRMED', '1')
+    } catch (err) {
+      logger.error({ err }, 'onboarding: failed to persist identity to .env')
+      json(res, { error: 'Nem sikerult elmenteni az .env-be.', reason: 'write-failed' }, 500)
+      return true
+    }
+
+    // Persona files: the agent introduces itself by this name. Never touches
+    // owner/access config, only the two persona documents.
+    try {
+      for (const f of [join(PROJECT_ROOT, 'CLAUDE.md'), join(PROJECT_ROOT, 'SOUL.md')]) {
+        renameInPersonaFile(f, prevAgentName, agentName)
+        if (prevOwnerName) renameInPersonaFile(f, prevOwnerName, ownerName)
+      }
+    } catch (err) {
+      logger.warn({ err }, 'onboarding: persona rename failed (identity saved to .env regardless)')
+    }
+
+    logger.info({ servicesUp, botNameUpdated: !servicesUp }, 'onboarding: identity configured')
+    json(res, { ok: true, botNameUpdated: !servicesUp })
     return true
   }
 

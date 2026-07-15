@@ -292,11 +292,12 @@ export PATH="$HOME/.local/bin:$PATH"
 # binary cannot wedge the installer).
 _claude_runs() { command -v claude >/dev/null 2>&1 && timeout 25 claude --version </dev/null >/dev/null 2>&1; }
 
-# Pinned Node-based fallback for AVX-less hosts. @2.0.76 ships bin=cli.js (a
-# `#!/usr/bin/env node` entrypoint) that runs without AVX; npm-latest (2.1.x)
-# still bundles the Bun ELF binary, so DO NOT use latest here. Verified on the
-# AVX-less pilot VPS.
-CLAUDE_PIN="2.0.76"
+# Pinned Node-based fallback for AVX-less hosts. @2.1.110 is the LAST version
+# that ships bin=cli.js (a `#!/usr/bin/env node` entrypoint) running without
+# AVX -- 2.1.120+ bundles only the Bun ELF binary, so DO NOT use latest here.
+# Unlike the old 2.0.76 pin, 2.1.110 also understands `--channels`, which
+# channels.sh requires to boot the bot. Verified on the AVX-less pilot VPS.
+CLAUDE_PIN="2.1.110"
 
 if _claude_runs; then
   ok "claude mar telepitve es fut: $(claude --version 2>/dev/null || echo 'ok')"
@@ -307,6 +308,11 @@ else
   if grep -qE '^flags[[:space:]]*:' /proc/cpuinfo 2>/dev/null && ! grep -qiw avx /proc/cpuinfo 2>/dev/null; then
     warn "A CPU nem tamogatja az AVX-et; a hivatalos installer Bun-binaryja elszallna (SIGILL)."
     echo -e "  ${DIM}Pinnelt Node-verzio telepitese: @${CLAUDE_PIN} (nehany legfrissebb Claude Code fix kimaradhat, de fut AVX nelkul).${NC}"
+    # The auto-updater would replace the pinned Node cli.js with the latest
+    # Bun binary on first run -> SIGILL. Disable it persistently (rc files for
+    # interactive shells; channels.sh exports it for the agent sessions).
+    ensure_in_rc 'DISABLE_AUTOUPDATER' 'export DISABLE_AUTOUPDATER=1'
+    export DISABLE_AUTOUPDATER=1
     if command -v npm >/dev/null 2>&1; then
       npm install -g "@anthropic-ai/claude-code@${CLAUDE_PIN}" || warn "npm install sikertelen (@${CLAUDE_PIN})."
     else
@@ -1240,6 +1246,11 @@ cat >"$SYSTEMD_DIR/${CHAN_UNIT}.service" <<EOF
 [Unit]
 Description=${BOT_NAME} Channels (Telegram bridge)
 After=network.target
+# StartLimit* belong in [Unit], not [Service] (systemd logs "Unknown key
+# StartLimitIntervalSec in section [Service]" and ignores them there), so the
+# crash-loop throttle only applies when they live here.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -1257,8 +1268,6 @@ ExecStartPre=$INSTALL_DIR/scripts/ensure-native-modules.sh
 ExecStart=$INSTALL_DIR/scripts/channels.sh
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=300
-StartLimitBurst=5
 StandardOutput=append:$INSTALL_DIR/store/channels.log
 StandardError=append:$INSTALL_DIR/store/channels.error.log
 Environment=PATH=$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin
@@ -1300,6 +1309,57 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+# marveen-host-watchdog.service -- host/WSL-VM restart detector (btime-based).
+# Distinguishes a whole-VM restart (all units down at once, NOT an app crash)
+# from a service crash, and Telegrams it. See scripts/host-restart-watchdog.sh.
+cat >"$SYSTEMD_DIR/${SERVICE_ID}-host-watchdog.service" <<EOF
+[Unit]
+Description=${BOT_NAME} host/WSL-VM restart watchdog (btime-based)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_DIR/scripts/host-restart-watchdog.sh
+Environment=MARVEEN_STORE=$INSTALL_DIR/store
+Environment=TELEGRAM_ENV=$HOME/.claude/channels/telegram/.env
+Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=$HOME
+${TZ_LINE}
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+EOF
+
+# marveen-notify@.service -- templated app-crash notifier, fired by OnFailure=
+# drop-ins on the dashboard/channels units. OnFailure => app crash (vs the
+# host-watchdog's btime-change => host restart).
+cat >"$SYSTEMD_DIR/${SERVICE_ID}-notify@.service" <<EOF
+[Unit]
+Description=${BOT_NAME} app-crash notifier for %i
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_DIR/scripts/unit-fail-notify.sh %i
+Environment=TELEGRAM_ENV=$HOME/.claude/channels/telegram/.env
+Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=$HOME
+${TZ_LINE}
+StandardOutput=journal
+StandardError=journal
+EOF
+
+# OnFailure drop-ins: wire the app-crash notifier onto the two long-running units.
+for u in "${DASH_UNIT}" "${CHAN_UNIT}"; do
+  mkdir -p "$SYSTEMD_DIR/${u}.service.d"
+  cat >"$SYSTEMD_DIR/${u}.service.d/onfailure.conf" <<EOF
+[Unit]
+OnFailure=${SERVICE_ID}-notify@%n.service
+EOF
+done
+
 # 1. linger eloszor: ez engedelyezi a user systemd sessiont boot utan is,
 #    es headless-en az aktualis script futasa alatt is szukseges lehet
 if loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
@@ -1328,7 +1388,7 @@ fi
 SVCFAIL=0
 if pidof systemd >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
   systemctl --user daemon-reload
-  systemctl --user enable "${DASH_UNIT}" "${CHAN_UNIT}" "${MORN_UNIT}.timer" 2>/dev/null || true
+  systemctl --user enable "${DASH_UNIT}" "${CHAN_UNIT}" "${MORN_UNIT}.timer" "${SERVICE_ID}-host-watchdog.service" 2>/dev/null || true
   ok "systemd unitok generalva es engedelyezve"
   systemctl --user start "${DASH_UNIT}" "${CHAN_UNIT}" 2>/dev/null || true
   sleep 2
