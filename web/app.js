@@ -4773,7 +4773,7 @@ const HEARTBEAT_TEMPLATES = {
   },
   kanban: {
     desc: () => t('tasks.heartbeat.tpl.kanban'),
-    prompt: 'Ellenorizd a kanban tablat (curl -s http://localhost:3420/api/kanban). Ha van olyan kartya aminek ma jar le a hatrideje vagy urgent prioritasu es meg nincs done, szolj Telegramon. Ha minden rendben, ne irj semmit.',
+    prompt: `Ellenorizd a kanban tablat (curl -s http://localhost:${window.location.port || 3420}/api/kanban). Ha van olyan kartya aminek ma jar le a hatrideje vagy urgent prioritasu es meg nincs done, szolj Telegramon. Ha minden rendben, ne irj semmit.`,
     schedule: '0 */2 * * *',
   },
   full: {
