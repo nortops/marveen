@@ -17,6 +17,16 @@ export interface ReauthState {
 // Each entry: a distinctive marker Claude Code renders on an auth failure, and
 // the short reason surfaced to the UI. Ordered most-specific first.
 const REAUTH_MARKERS: { rx: RegExp; reason: string }[] = [
+  // Not a token failure: Claude Code's FIRST-RUN picker, shown when
+  // ~/.claude.json lost hasCompletedOnboarding. It blocks the TUI exactly like
+  // a dead login (2026-07-15 bootcamp "mass /login": the on-disk credential was
+  // valid the whole time) and needs the same owner-visible badge/escalation.
+  // A monitored respawn self-heals it via ensureSharedClaudeOnboarded().
+  { rx: /Select login method/i, reason: 'First-run onboarding picker (Select login method)' },
+  // The state the picker advances into when something blindly hits Enter on it
+  // (e.g. channels.sh's first-run guard): a browser OAuth prompt no headless
+  // box can complete. Same first-run-gate family, same restart heal.
+  { rx: /Use the url below to sign in|Paste code here if prompted/i, reason: 'Browser sign-in screen (first-run gate)' },
   { rx: /Invalid authentication credentials/i, reason: 'Invalid authentication credentials (401)' },
   { rx: /Please run\s+\/login/i, reason: 'Please run /login' },
   { rx: /Not logged in/i, reason: 'Not logged in' },
@@ -33,6 +43,20 @@ const REAUTH_MARKERS: { rx: RegExp; reason: string }[] = [
 // (Caught in review 2026-06-03: the reviewer's own pane was full of these
 // markers from reading reauth-detect.ts and would have falsely badged.)
 const TAIL_LINES = 15
+
+// Self-quote guard (found 2026-07-13: 5 false escalations in ~18h, each
+// shortly after the alert text was pasted back into the chat). The healer's
+// own escalation message embeds the raw marker `reason` string verbatim, e.g.
+// "... jelez (Please run /login) ...". Once that message is quoted back into
+// the pane -- the owner forwarding it, the dashboard rendering it, or the
+// agent discussing the bug -- it re-matches REAUTH_MARKERS against its own
+// alert and re-fires, forever. These substrings are unique to
+// buildEscalationMessage / buildQuietSummaryMessage in reauth-healer.ts and
+// never appear in a real Claude Code CLI auth failure.
+const ESCALATION_QUOTE_MARKERS: RegExp[] = [
+  /ágens halott OAuth tokent jelez/i,
+  /Manuális browser \/login kell a dashboardon/i,
+]
 
 function tailOf(pane: string, n: number): string {
   const lines = pane.split('\n')
@@ -74,11 +98,13 @@ function liveStatusRegion(pane: string): string | null {
  * running) -- absence of evidence is not evidence of an auth problem. Scans the
  * live status region when the pane has Claude Code's input box, else falls back
  * to the last TAIL_LINES, so scrollback that merely mentions the markers does
- * not trigger a false badge.
+ * not trigger a false badge. A region that is itself a quote of a prior
+ * escalation message is also excluded (see ESCALATION_QUOTE_MARKERS).
  */
 export function detectReauthNeeded(pane: string | null | undefined): ReauthState {
   if (!pane) return { needsReauth: false }
   const region = liveStatusRegion(pane) ?? tailOf(pane, TAIL_LINES)
+  if (ESCALATION_QUOTE_MARKERS.some((rx) => rx.test(region))) return { needsReauth: false }
   for (const m of REAUTH_MARKERS) {
     if (m.rx.test(region)) return { needsReauth: true, reason: m.reason }
   }

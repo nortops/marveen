@@ -129,7 +129,7 @@ describe('boot-hook-prune.py', () => {
       hooks: {
         UserPromptSubmit: [{
           hooks: [
-            { type: 'command', command: 'python3 /home/northber/Projects/DELETED/scripts/hooks/staleness-guard.py', timeout: 10 },
+            { type: 'command', command: 'python3 /opt/removed-checkout/scripts/hooks/staleness-guard.py', timeout: 10 },
           ],
         }],
       },

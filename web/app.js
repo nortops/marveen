@@ -33,15 +33,31 @@
   // Initialise from localStorage; server default fetched async below.
   applyLang(localStorage.getItem(LS_KEY) || 'hu')
 
-  // Fetch server default (DASHBOARD_LANG) and apply only if localStorage not set.
-  fetch('/api/settings')
-    .then(r => r.ok ? r.json() : null)
-    .then(data => {
-      if (!data || localStorage.getItem(LS_KEY)) return
-      const entry = (data.settings || []).find(s => s.key === 'DASHBOARD_LANG')
-      if (entry && VALID.has(entry.value)) applyLang(entry.value)
-    })
-    .catch(() => {})
+  // Fetch server default (DASHBOARD_LANG) and apply only if localStorage not
+  // set. Deferred to a MICROTASK: this IIFE evaluates before the fetch-wrapper
+  // IIFE installs the Bearer-injecting window.fetch, so an eager call here
+  // went out with the native fetch, got 401 from the /api gate, and the
+  // server default was silently dead code. Microtasks run after the whole
+  // classic script has evaluated, when window.fetch is the wrapped version.
+  queueMicrotask(() => {
+    fetch('/api/settings')
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (!data || localStorage.getItem(LS_KEY)) return
+        const entry = (data.settings || []).find(s => s.key === 'DASHBOARD_LANG')
+        if (!entry || !VALID.has(entry.value) || entry.value === window._lang) return
+        // Apply WITHOUT persisting (localStorage must keep overriding the
+        // server default), and re-run the render dance: the initial
+        // DOMContentLoaded render almost always beats this response, so a
+        // plain applyLang would leave the page painted in the old language.
+        applyLang(entry.value)
+        if (typeof renderNav === 'function') renderNav()
+        if (typeof renderStaticI18n === 'function') renderStaticI18n()
+        const activeLink = document.querySelector('.sb-link.active[data-page]')
+        if (activeLink && typeof switchPage === 'function') switchPage(activeLink.dataset.page)
+      })
+      .catch(() => {})
+  })
 
   window.setLang = function setLang(lang) {
     if (!VALID.has(lang)) return
@@ -280,7 +296,7 @@ function switchPage(pageId) {
   if (pageId === 'recall') loadRecallPage()
   if (pageId === 'bgTasks') loadBgTasksPage()
   if (pageId === 'vault') loadVaultPage()
-  if (pageId === 'autonomy') loadAutonomy()
+  if (pageId === 'approvals') loadApprovalsPage()
   if (pageId === 'settings') loadSettings()
   if (pageId === 'updates') loadUpdates()
   if (pageId === 'team') { loadTeamGraph() }
@@ -290,6 +306,7 @@ function switchPage(pageId) {
   if (pageId === 'ideas') loadIdeasPage()
   if (pageId === 'archived') loadArchivedPage()
   if (pageId === 'naplo') loadNaplo()
+  if (pageId === 'federation') loadFederationPage()
 }
 
 // Mobile off-canvas sidebar toggle. No-op visual effect on desktop (the
@@ -330,9 +347,9 @@ const NAV_I18N = {
   messages: 'nav.messages', tasks: 'nav.tasks', memories: 'nav.memories',
   recall: 'nav.recall', naplo: 'nav.recall', bgTasks: 'nav.bgTasks',
   skills: 'nav.skills', connectors: 'nav.connectors', migrate: 'nav.migrate',
-  docs: 'nav.docs', status: 'nav.status', autonomy: 'nav.autonomy',
+  approvals: 'nav.approvals',
   settings: 'nav.settings', vault: 'nav.vault', tokenUsage: 'nav.tokenUsage',
-  ideas: 'nav.ideas', updates: 'nav.updates', costs: 'nav.costs',
+  ideas: 'nav.ideas', federation: 'nav.federation', updates: 'nav.updates', costs: 'nav.costs',
 }
 
 function renderNav() {
@@ -368,7 +385,6 @@ const PAGE_HEADER_I18N = {
   statusPage:     { title: 'status.page_title',      sub: 'status.page_subtitle' },
   teamPage:       { title: 'team.page_title',        sub: 'team.page_subtitle' },
   messagesPage:   { title: 'messages.page_title',    sub: 'messages.page_subtitle' },
-  autonomyPage:   { title: 'autonomy.page_title',    sub: 'autonomy.page_subtitle' },
   settingsPage:   { title: 'settings.page_title',    sub: 'settings.page_subtitle' },
   ideasPage:      { title: 'ideas.page_title',       sub: 'ideas.page_subtitle' },
   vaultPage:      { title: 'vault.page_title',       sub: 'vault.page_subtitle' },
@@ -376,6 +392,8 @@ const PAGE_HEADER_I18N = {
   updatesPage:    { title: 'updates.page_title',     sub: null },
   naploPage:      { title: 'naplo.page_title',       sub: 'naplo.page_subtitle' },
   costsPage:      { title: 'costs.page_title',       sub: 'costs.page_subtitle' },
+  federationPage: { title: 'federation.page_title',  sub: 'federation.page_subtitle' },
+  approvalsPage:  { title: 'approvals.page_title',   sub: 'approvals.page_subtitle' },
 }
 
 function renderStaticI18n() {
@@ -429,11 +447,6 @@ function renderStaticI18n() {
   if (overviewTeamMeta) overviewTeamMeta.textContent = t('overview.meta.live')
   const overviewActivityH3 = document.querySelector('#overviewPage .overview-grid .overview-card:nth-child(2) h3')
   if (overviewActivityH3) overviewActivityH3.textContent = t('overview.card.activity')
-  const overviewAgentH3 = document.querySelector('#overviewPage .overview-grid .overview-card:nth-child(3) h3')
-  if (overviewAgentH3) overviewAgentH3.textContent = t('overview.card.agent_activity')
-  const overviewAgentMeta = document.querySelector('#overviewPage .overview-grid .overview-card:nth-child(3) .overview-card-meta')
-  if (overviewAgentMeta) overviewAgentMeta.textContent = t('overview.meta.messages')
-
   // Kanban filter labels
   const kanbanProjectLabel = document.querySelector('label[for="kanbanProjectFilter"]')
   if (kanbanProjectLabel) kanbanProjectLabel.textContent = t('kanban.filter.project_label')
@@ -2380,11 +2393,16 @@ function showToast(msg, duration = 3000) {
 // === Agents API ===
 async function loadAgents() {
   try {
-    const [agentsRes, marveenRes] = await Promise.all([
+    // The federation status fetch is deliberately failure-proof (.catch ->
+    // null): it must NEVER take down the Agents page -- including on an
+    // older backend where the route 404s.
+    const [agentsRes, marveenRes, fedStatus] = await Promise.all([
       fetch('/api/agents'),
       fetch('/api/marveen'),
+      fetch('/api/federation/status').then((r) => (r.ok ? r.json() : null)).catch(() => null),
     ])
     agents = await agentsRes.json()
+    if (fedStatus && Array.isArray(fedStatus.peers)) federatedPeerStatus = fedStatus.peers
     if (marveenRes.ok) {
       window._marveen = await marveenRes.json()
       // A backend CHANNEL_PROVIDER-éhez igazitsuk a kliens-default-ot,
@@ -2480,7 +2498,27 @@ async function openMarveenDetail() {
   // Sync the settings tab model select with Marveen's actual model so it
   // doesn't carry over the previously opened sub-agent's selection.
   const marveenModelSelect = document.getElementById('editAgentModel')
-  if (marveenModelSelect) marveenModelSelect.value = m.activeModel || m.model || ''
+  if (marveenModelSelect) {
+    // The main agent's real model (e.g. 'claude-opus-4-8') may not match any
+    // static option verbatim (the option is 'claude-opus-4-8[1m]'), so a plain
+    // .value assignment finds no match and the select silently displays the
+    // first option (Fable 5), misrepresenting what the agent actually runs.
+    // Inject the real id as an option so the (read-only) select shows the truth
+    // -- same trick as the sub-agent panel's dynamic-model-opt.
+    const mv = m.activeModel || m.model || ''
+    Array.from(marveenModelSelect.querySelectorAll('option.dynamic-model-opt')).forEach(o => o.remove())
+    if (mv && !Array.from(marveenModelSelect.options).some(o => o.value === mv)) {
+      const opt = document.createElement('option')
+      opt.value = mv
+      opt.className = 'dynamic-model-opt'
+      opt.textContent = mv
+      marveenModelSelect.appendChild(opt)
+    }
+    marveenModelSelect.value = mv
+  }
+  // Populate the model dropdown groups (auto/manual) AND surface the OpenRouter
+  // curation button -- this is the main agent, the only place curation lives.
+  loadAvailableModels()
   // Surface the "channels restart" button -- destructive, but mobile-safe
   // when the Telegram plugin wedges and you're away from a terminal.
   document.getElementById('marveenRestartBtn').hidden = false
@@ -2727,6 +2765,68 @@ function renderAgents() {
     if (isRunning) attachTmuxCopyButtons(card, agent)
     agentsGrid.insertBefore(card, addBtn)
   }
+  renderFederatedAgentCards(agentsGrid, addBtn)
+}
+
+// Federated (remote-system) agents from the manifest-poller cache. Kept in a
+// SEPARATE array from `agents`: that global feeds the team editor and the
+// create-wizard, where qualified ids would be selectable-and-invalid.
+// "remote" already means SSH agents in this codebase -- these are FEDERATED.
+let federatedPeerStatus = []
+
+// System/plumbing agent names never shown as message targets.
+const FEDERATED_HIDDEN_AGENTS = new Set(['heartbeat', 'telegram-coordinator', 'channel-coordinator'])
+
+function federatedAgentEntries() {
+  const out = []
+  for (const peer of federatedPeerStatus) {
+    const manifest = peer && peer.manifest
+    if (!manifest || !Array.isArray(manifest.agents)) continue
+    for (const a of manifest.agents) {
+      if (!a || typeof a.id !== 'string' || FEDERATED_HIDDEN_AGENTS.has(a.id.split('/').pop())) continue
+      out.push({ peer: peer.id, peerState: peer.state, qualified: `${peer.id}/${a.id}`, displayName: a.displayName || a.id, model: a.model || '' })
+    }
+  }
+  return out
+}
+
+function renderFederatedAgentCards(agentsGrid, addBtn) {
+  for (const fa of federatedAgentEntries()) {
+    const card = document.createElement('div')
+    card.className = 'agent-card federated-agent-card'
+    const reachable = fa.peerState === 'ok'
+    // SECURITY: every manifest-derived string is peer-controlled. Text nodes
+    // go through escapeHtml; NOTHING peer-controlled may land in an attribute
+    // (escapeHtml does not encode quotes). The model badge is a plain text
+    // span WITHOUT a model-derived class.
+    const gradientClass = 'gradient-' + ((fa.qualified.charCodeAt(0) % 3) + 1)
+    card.innerHTML = `
+      <div class="agent-card-top">
+        <div class="agent-avatar ${gradientClass}">${escapeHtml(fa.displayName.charAt(0).toUpperCase())}</div>
+        <div class="agent-card-info">
+          <div class="agent-name">${escapeHtml(fa.displayName)} <span class="federated-badge">${t('federation.badge', { peer: fa.peer })}</span></div>
+          <div class="agent-desc">${escapeHtml(fa.qualified)}</div>
+        </div>
+      </div>
+      <div class="agent-card-footer">
+        <span class="agent-model-badge">${escapeHtml(fa.model)}</span>
+        <span class="tg-status"><span class="tg-dot ${reachable ? 'connected' : 'disconnected'}"></span> ${reachable ? t('federation.peer_state.ok') : t('federation.peer_state.' + (fa.peerState || 'unknown'))}</span>
+      </div>
+      <div class="agent-card-actions">
+        <button class="btn-secondary btn-compact federated-message-btn">${t('federation.btn.message')}</button>
+      </div>`
+    card.querySelector('.federated-message-btn').addEventListener('click', (e) => {
+      e.stopPropagation()
+      openFederatedThread(fa.qualified)
+    })
+    agentsGrid.insertBefore(card, addBtn)
+  }
+}
+
+function openFederatedThread(qualifiedId) {
+  chatSelectedAgent = qualifiedId
+  if (location.hash === '#messages') switchPage('messages')
+  else location.hash = 'messages'
 }
 
 // === Agent Detail ===
@@ -2764,7 +2864,22 @@ async function openAgentDetail(agentName) {
   // Settings tab - load Ollama + DeepSeek models then set value
   loadAvailableModels()
   loadOllamaModels().then(() => {
-    document.getElementById('editAgentModel').value = currentAgent.activeModel || currentAgent.model || 'claude-opus-4-8[1m]'
+    const sel = document.getElementById('editAgentModel')
+    const mv = currentAgent.activeModel || currentAgent.model || 'claude-opus-4-8[1m]'
+    // The model <select> is one shared element reused per agent. A manual
+    // OpenRouter id (or openrouter-auto:tier) may not be among the static/auto
+    // options, so setting .value would silently show nothing. Inject THIS
+    // agent's model as a selectable option (cleaning any stale injected ones
+    // first) so every agent always displays its own model, per-agent.
+    Array.from(sel.querySelectorAll('option.dynamic-model-opt')).forEach(o => o.remove())
+    if (!Array.from(sel.options).some(o => o.value === mv)) {
+      const opt = document.createElement('option')
+      opt.value = mv
+      opt.className = 'dynamic-model-opt'
+      opt.textContent = mv.startsWith('openrouter-auto:') ? `🔀 ${mv}` : `🔀 ${mv}`
+      sel.appendChild(opt)
+    }
+    sel.value = mv
   })
   populateProfileSelect(
     document.getElementById('editAgentProfile'),
@@ -3259,8 +3374,188 @@ async function loadAvailableModels() {
       }
     }
     if (hint) hint.style.display = deepseekModels.length === 0 ? 'block' : 'none'
+
+    // OpenRouter: two optgroups per select (Auto = weekly-fresh tier
+    // recommendation, value `openrouter-auto:<tier>`; Manual = the 2 concrete
+    // ids per tier). Backend gates the whole block behind the vault key, so a
+    // null payload means OpenRouter is not connected -> keep the groups hidden.
+    const or = data.openrouter
+    const orTiers = or && Array.isArray(or.tiers) ? or.tiers : []
+    // Auto = one entry per tier in the dropdown (weekly-fresh recommendation).
+    const autoGroups = [document.getElementById('openrouterAutoGroup'), document.getElementById('agentModelOpenrouterAutoGroup')]
+    for (const g of autoGroups) {
+      if (!g) continue
+      g.innerHTML = ''
+      if (orTiers.length === 0) { g.style.display = 'none'; continue }
+      g.style.display = ''
+      for (const t of orTiers) {
+        const opt = document.createElement('option')
+        opt.value = t.autoId
+        opt.textContent = `${t.label} - auto (${t.auto})`
+        g.appendChild(opt)
+      }
+    }
+    // Manual = the user-curated list -> "OpenRouter - kézi" optgroup in every
+    // select. Curated once (main agent's browse popup, checkboxes); assignable
+    // per agent here. Empty list -> group hidden.
+    const orManual = Array.isArray(data.openrouterManual) ? data.openrouterManual : []
+    openrouterCurated = new Set(orManual.map(m => m.id))
+    const manualGroups = [document.getElementById('openrouterManualGroup'), document.getElementById('agentModelOpenrouterManualGroup')]
+    for (const g of manualGroups) {
+      if (!g) continue
+      g.innerHTML = ''
+      if (orManual.length === 0) { g.style.display = 'none'; continue }
+      g.style.display = ''
+      for (const m of orManual) {
+        const opt = document.createElement('option')
+        opt.value = m.id
+        opt.textContent = `🔀 ${m.name || m.id}`
+        g.appendChild(opt)
+      }
+    }
+    // Browse popup = the curation UI (tick/untick which manual models exist).
+    // MAIN AGENT ONLY -- sub-agents just pick from the curated dropdown above.
+    // The main agent opens via openMarveenDetail(), whose currentAgent comes
+    // from window._marveen and has NO `role` field -- so detect it by name too.
+    const mid = (typeof mainAgentId === 'function') ? mainAgentId() : ''
+    const isMainAgent = !!currentAgent && (
+      currentAgent.role === 'main' ||
+      currentAgent.name === mid ||
+      currentAgent.agentId === mid
+    )
+    const orBtn = document.getElementById('openrouterBrowseBtn')
+    if (orBtn) orBtn.style.display = (data.openrouterConfigured && isMainAgent) ? '' : 'none'
   } catch { /* dashboard not available */ }
 }
+
+// --- OpenRouter manual-list curation (tick models into the shared dropdown) ---
+let openrouterAllModels = null
+let openrouterCurated = new Set()  // ids currently in the curated manual list
+
+async function openOpenrouterModal() {
+  const modal = document.getElementById('openrouterModal')
+  const listEl = document.getElementById('openrouterModalList')
+  const agentEl = document.getElementById('openrouterModalAgent')
+  const searchEl = document.getElementById('openrouterModalSearch')
+  const freeEl = document.getElementById('openrouterModalFreeOnly')
+  if (!modal || !listEl) return
+  // The modal markup lives inside the (hidden) connectors page; reparent it to
+  // <body> so it renders full-viewport regardless of which tab is active.
+  if (modal.parentElement !== document.body) document.body.appendChild(modal)
+  if (agentEl) agentEl.textContent = (currentAgent && (currentAgent.displayName || currentAgent.name)) || 'ágens'
+  // Two competing .modal-overlay CSS rules: one hides via [hidden], the other
+  // via opacity/visibility (toggled by .active). Set both so the modal shows
+  // regardless of which rule wins the cascade.
+  modal.hidden = false
+  modal.classList.add('active')
+  listEl.innerHTML = '<div style="padding:14px;color:var(--text-muted);font-size:13px">Modellek betöltése…</div>'
+  if (searchEl) searchEl.value = ''
+  if (freeEl) freeEl.checked = false
+  try {
+    // Load the full model list (cached) and the current curated set in parallel
+    // so the checkboxes render already ticked for the manual models in the list.
+    const [allRes, curRes] = await Promise.all([
+      openrouterAllModels ? Promise.resolve(null) : fetch('/api/openrouter/models'),
+      fetch('/api/openrouter/manual'),
+    ])
+    if (allRes) {
+      if (!allRes.ok) throw new Error('fetch failed')
+      const data = await allRes.json()
+      openrouterAllModels = Array.isArray(data.models) ? data.models : []
+    }
+    if (curRes && curRes.ok) {
+      const cur = await curRes.json()
+      openrouterCurated = new Set((Array.isArray(cur.models) ? cur.models : []).map(m => m.id))
+    }
+    renderOpenrouterList()
+  } catch {
+    listEl.innerHTML = '<div style="padding:14px;color:var(--danger,#dc2626);font-size:13px">Nem sikerült betölteni az OpenRouter modelleket.</div>'
+  }
+}
+
+function renderOpenrouterList() {
+  const listEl = document.getElementById('openrouterModalList')
+  const countEl = document.getElementById('openrouterModalCount')
+  const q = (document.getElementById('openrouterModalSearch')?.value || '').toLowerCase().trim()
+  const freeOnly = !!document.getElementById('openrouterModalFreeOnly')?.checked
+  if (!listEl || !openrouterAllModels) return
+  const rows = openrouterAllModels.filter(m => {
+    if (freeOnly && !m.free) return false
+    if (!q) return true
+    return (m.id + ' ' + m.name).toLowerCase().includes(q)
+  })
+  // Ticked (curated) models float to the top so the current selection is visible.
+  rows.sort((a, b) => {
+    const ca = openrouterCurated.has(a.id), cb = openrouterCurated.has(b.id)
+    if (ca !== cb) return ca ? -1 : 1
+    return a.id.localeCompare(b.id)
+  })
+  if (countEl) countEl.textContent = `${rows.length} modell · ${openrouterCurated.size} kézi listán`
+  listEl.innerHTML = ''
+  for (const m of rows.slice(0, 400)) {
+    const checked = openrouterCurated.has(m.id)
+    const row = document.createElement('label')
+    row.className = 'openrouter-model-row'
+    row.style.cssText = 'display:flex;align-items:flex-start;gap:10px;padding:8px 10px;border-bottom:1px solid var(--border);cursor:pointer;font-size:13px'
+    const price = m.free ? '<span style="color:var(--success,#16a34a);font-weight:600">ingyenes</span>'
+      : `$${m.promptPrice.toFixed(2)}/$${m.completionPrice.toFixed(2)} /M`
+    const ctx = m.contextLength ? ` · ${Math.round(m.contextLength / 1000)}k ctx` : ''
+    const cb = document.createElement('input')
+    cb.type = 'checkbox'
+    cb.checked = checked
+    cb.style.cssText = 'margin-top:3px;flex:0 0 auto'
+    cb.addEventListener('change', () => toggleCuratedModel(m.id, m.name, cb.checked))
+    const info = document.createElement('div')
+    info.style.cssText = 'flex:1 1 auto;min-width:0'
+    info.innerHTML = `<div style="font-weight:600">${escapeHtml(m.name)}</div>`
+      + `<div style="color:var(--text-muted);font-size:11.5px"><code>${escapeHtml(m.id)}</code> · ${price}${ctx}</div>`
+    row.appendChild(cb)
+    row.appendChild(info)
+    row.addEventListener('mouseenter', () => { row.style.background = 'var(--surface-hover, #f1f5f9)' })
+    row.addEventListener('mouseleave', () => { row.style.background = '' })
+    listEl.appendChild(row)
+  }
+  if (rows.length === 0) listEl.innerHTML = '<div style="padding:14px;color:var(--text-muted);font-size:13px">Nincs találat.</div>'
+}
+
+// Tick/untick a model into the curated manual list. Persists server-side, then
+// refreshes the shared dropdown so the "kézi" optgroup reflects the change.
+async function toggleCuratedModel(id, name, checked) {
+  // Optimistic local update so the checkbox + counter feel instant.
+  if (checked) openrouterCurated.add(id); else openrouterCurated.delete(id)
+  const countEl = document.getElementById('openrouterModalCount')
+  if (countEl) {
+    const total = countEl.textContent.split('·')[0].trim()
+    countEl.textContent = `${total} · ${openrouterCurated.size} kézi listán`
+  }
+  try {
+    const res = await fetch('/api/openrouter/manual', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, name, checked }),
+    })
+    if (!res.ok) throw new Error('save failed')
+    const data = await res.json()
+    openrouterCurated = new Set((Array.isArray(data.models) ? data.models : []).map(m => m.id))
+    // Repopulate the dropdown "kézi" optgroups without disturbing selections.
+    loadAvailableModels()
+  } catch {
+    // Roll back the optimistic change on failure.
+    if (checked) openrouterCurated.delete(id); else openrouterCurated.add(id)
+    renderOpenrouterList()
+  }
+}
+
+function closeOpenrouterModal() {
+  const modal = document.getElementById('openrouterModal')
+  if (modal) { modal.hidden = true; modal.classList.remove('active') }
+}
+
+document.getElementById('openrouterBrowseBtn')?.addEventListener('click', openOpenrouterModal)
+document.getElementById('openrouterModalClose')?.addEventListener('click', closeOpenrouterModal)
+document.getElementById('openrouterModalCancel')?.addEventListener('click', closeOpenrouterModal)
+document.getElementById('openrouterModalSearch')?.addEventListener('input', renderOpenrouterList)
+document.getElementById('openrouterModalFreeOnly')?.addEventListener('change', renderOpenrouterList)
 
 let modelRestartPollTimer = null
 let modelRestartPollName = null
@@ -8769,7 +9064,11 @@ document.getElementById('saveConnectorBtn').addEventListener('click', async () =
 function escapeHtml(str) {
   const d = document.createElement('div')
   d.textContent = str
-  return d.innerHTML
+  // textContent->innerHTML escapes & < > but NOT quotes. Encode quotes too so
+  // the result is safe in ATTRIBUTE contexts as well as text nodes -- several
+  // renderers interpolate escapeHtml() output into data-*/title/value="..."
+  // attributes, where a surviving " would allow an attribute breakout.
+  return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;')
 }
 
 // ============================================================
@@ -9335,41 +9634,27 @@ document.getElementById('fleetDryRunBtn').addEventListener('click', async () => 
     const data = await res.json()
 
     const wc = data.wouldCreate || {}
-    const wo = data.wouldOverwrite || {}
     const hasErrors = data.errors && data.errors.length > 0
     const hasWarnings = data.warnings && data.warnings.length > 0
 
     resultEl.className = `fleet-dry-run-result ${hasErrors ? 'has-errors' : 'ok'}`
     resultEl.hidden = false
 
-    const newAgentNames = Array.isArray(wc.agents) ? wc.agents : []
-    const overwriteAgentNames = Array.isArray(wo.agents) ? wo.agents : []
-
-    // Main agent tile: ✓ = new install, ↻ = overwrites existing, — = not in export
-    const mainAgentValue = !wc.mainAgent ? '—' : wo.mainAgent ? '↻' : '✓'
-
-    // Agents tile: show create count + overwrite indicator when applicable
-    let agentsValue
-    if (newAgentNames.length === 0 && overwriteAgentNames.length === 0) {
-      agentsValue = '0'
-    } else if (overwriteAgentNames.length === 0) {
-      agentsValue = String(newAgentNames.length)
-    } else if (newAgentNames.length === 0) {
-      agentsValue = `↻${overwriteAgentNames.length}`
-    } else {
-      agentsValue = `${newAgentNames.length} +↻${overwriteAgentNames.length}`
-    }
+    const agentNames = Array.isArray(wc.agents) ? wc.agents : []
+    const agentLabel = agentNames.length
+      ? `${agentNames.length} (${agentNames.join(', ')})`
+      : '0'
 
     resultEl.innerHTML = `
       <div class="fleet-dry-run-title">${hasErrors ? '❌ ' + t('fleet.import.dryrun_errors') : '✅ ' + t('fleet.import.dryrun_ok')}</div>
       ${!hasErrors ? `
       <div class="fleet-dry-run-grid">
         <div class="fleet-dry-run-stat">
-          <div class="fleet-dry-run-stat-value">${mainAgentValue}</div>
+          <div class="fleet-dry-run-stat-value">${wc.mainAgent ? '✓' : '—'}</div>
           <div class="fleet-dry-run-stat-label">${t('fleet.stat.main_agent')}</div>
         </div>
         <div class="fleet-dry-run-stat">
-          <div class="fleet-dry-run-stat-value">${agentsValue}</div>
+          <div class="fleet-dry-run-stat-value">${agentNames.length}</div>
           <div class="fleet-dry-run-stat-label">${t('fleet.stat.agents')}</div>
         </div>
         <div class="fleet-dry-run-stat">
@@ -9389,8 +9674,7 @@ document.getElementById('fleetDryRunBtn').addEventListener('click', async () => 
           <div class="fleet-dry-run-stat-label">${t('fleet.stat.tasks')}</div>
         </div>
       </div>
-      ${newAgentNames.length ? `<div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">${t('fleet.stat.agent_names')}: ${escapeHtml(newAgentNames.join(', '))}</div>` : ''}
-      ${overwriteAgentNames.length ? `<div style="font-size:12px;color:var(--text-warning,#f59e0b);margin-bottom:6px">↻ ${t('fleet.stat.overwrite_agents')}: ${escapeHtml(overwriteAgentNames.join(', '))}</div>` : ''}
+      ${agentNames.length ? `<div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">${t('fleet.stat.agent_names')}: ${escapeHtml(agentNames.join(', '))}</div>` : ''}
       ` : ''}
       ${hasErrors ? `<div class="fleet-dry-run-errors">${data.errors.map(e => escapeHtml(e)).join('<br>')}</div>` : ''}
       ${hasWarnings ? `<div class="fleet-dry-run-warnings">⚠️ ${data.warnings.map(w => escapeHtml(w)).join('<br>')}</div>` : ''}
@@ -9471,6 +9755,25 @@ const skillsEmpty = document.getElementById('skillsEmpty')
 const skillDetailOverlay = document.getElementById('skillDetailOverlay')
 
 let globalSkills = []
+let localAgentSkills = []
+let skillsActiveFilter = 'all'
+let skillsSearchQuery = ''
+let skillsActiveCategory = 'all'
+
+function deriveSkillCategory(name) {
+  // Use the first dash-separated segment as the category group.
+  // "fleet-dashboard-api" -> "fleet", "morning-chain" -> "morning",
+  // "handoff" -> "handoff"
+  const seg = name.split(':').pop() || name  // strip plugin prefix
+  return seg.split('-')[0] || seg
+}
+
+function formatMtime(ms) {
+  if (!ms) return ''
+  const d = new Date(ms)
+  const pad = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}.${pad(d.getMonth() + 1)}.${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
 
 document.getElementById('skillDetailClose').addEventListener('click', () => closeModal(skillDetailOverlay))
 skillDetailOverlay.addEventListener('click', (e) => { if (e.target === skillDetailOverlay) closeModal(skillDetailOverlay) })
@@ -9505,14 +9808,56 @@ async function loadGlobalSkills() {
   skillsGrid.innerHTML = `<div class="connector-loading"><span class="spinner"></span> ${t('skills.loading')}</div>`
   skillsStats.innerHTML = ''
   try {
-    const res = await fetch('/api/skills')
-    globalSkills = await res.json()
+    const [globalRes, localRes] = await Promise.all([
+      fetch('/api/skills'),
+      fetch('/api/skills/local'),
+    ])
+    globalSkills = await globalRes.json()
+    localAgentSkills = localRes.ok ? await localRes.json() : []
     renderGlobalSkills()
   } catch (err) {
     console.error('Skills betoltes hiba:', err)
     skillsGrid.innerHTML = `<div class="connector-loading">${t('skills.error')}</div>`
   }
 }
+
+// Wire search, filter, and export controls once DOM is ready
+;(() => {
+  const searchEl = document.getElementById('skillsSearch')
+  if (searchEl) {
+    searchEl.addEventListener('input', () => {
+      skillsSearchQuery = searchEl.value.toLowerCase().trim()
+      renderSkillsSidebar()
+      renderGlobalSkillsGrid()
+    })
+  }
+
+  const filterBtns = document.getElementById('skillsFilterBtns')
+  if (filterBtns) {
+    filterBtns.addEventListener('click', (e) => {
+      const btn = e.target.closest('.skills-filter-btn')
+      if (!btn) return
+      filterBtns.querySelectorAll('.skills-filter-btn').forEach(b => b.classList.remove('active'))
+      btn.classList.add('active')
+      skillsActiveFilter = btn.dataset.filter || 'all'
+      skillsActiveCategory = 'all'
+      renderSkillsSidebar()
+      renderGlobalSkillsGrid()
+    })
+  }
+
+  const exportBtn = document.getElementById('skillsExportBtn')
+  if (exportBtn) {
+    exportBtn.addEventListener('click', () => {
+      const a = document.createElement('a')
+      a.href = '/api/skills/export'
+      a.download = 'skills-export.zip'
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+    })
+  }
+})()
 
 function getSkillIcon(name) {
   if (name.includes('factory') || name.includes('creator')) return '\u{1F3ED}'
@@ -9526,10 +9871,48 @@ function getSkillIcon(name) {
   return '\u2699\uFE0F'
 }
 
-function renderGlobalSkills() {
-  skillsGrid.innerHTML = ''
+function renderSkillsSidebar() {
+  const sidebar = document.getElementById('skillsCategorySidebar')
+  if (!sidebar) return
 
-  const withSkillMd = globalSkills.filter(s => s.description)
+  // For the 'agent' filter, category counts come from localAgentSkills so the
+  // sidebar stays populated. All other filters draw from globalSkills as before.
+  const sourceFiltered = skillsActiveFilter === 'agent'
+    ? localAgentSkills
+    : skillsActiveFilter === 'all'
+      ? globalSkills
+      : globalSkills.filter(s => s.source === skillsActiveFilter)
+
+  const catCounts = new Map()
+  for (const s of sourceFiltered) {
+    const cat = deriveSkillCategory(s.name)
+    catCounts.set(cat, (catCounts.get(cat) || 0) + 1)
+  }
+
+  const cats = [...catCounts.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+
+  sidebar.innerHTML = `
+    <div class="skills-cat-title">${t('skills.category.title')}</div>
+    <button class="skills-cat-btn${skillsActiveCategory === 'all' ? ' active' : ''}" data-cat="all">
+      ${t('skills.filter.all')} <span class="skills-cat-count">${sourceFiltered.length}</span>
+    </button>
+    ${cats.map(([cat, count]) => `
+      <button class="skills-cat-btn${skillsActiveCategory === cat ? ' active' : ''}" data-cat="${escapeHtml(cat)}">
+        ${escapeHtml(cat)} <span class="skills-cat-count">${count}</span>
+      </button>
+    `).join('')}
+  `
+
+  sidebar.addEventListener('click', (e) => {
+    const btn = e.target.closest('.skills-cat-btn')
+    if (!btn) return
+    skillsActiveCategory = btn.dataset.cat || 'all'
+    renderSkillsSidebar()
+    renderGlobalSkillsGrid()
+  })
+}
+
+function renderGlobalSkills() {
   const userCount = globalSkills.filter(s => s.source === 'user').length
   const pluginCount = globalSkills.filter(s => s.source === 'plugin').length
 
@@ -9537,55 +9920,140 @@ function renderGlobalSkills() {
     <div class="stat-card"><div class="stat-value">${globalSkills.length}</div><div class="stat-label">${t('skills.stat.total')}</div></div>
     <div class="stat-card"><div class="stat-value" style="color:var(--info)">${userCount}</div><div class="stat-label">${t('skills.stat.user')}</div></div>
     ${pluginCount ? `<div class="stat-card"><div class="stat-value" style="color:var(--accent)">${pluginCount}</div><div class="stat-label">${t('skills.stat.plugin')}</div></div>` : ''}
-    <div class="stat-card"><div class="stat-value" style="color:var(--success)">${withSkillMd.length}</div><div class="stat-label">${t('skills.stat.documented')}</div></div>
+    ${localAgentSkills.length ? `<div class="stat-card"><div class="stat-value" style="color:var(--warning)">${localAgentSkills.length}</div><div class="stat-label">${t('skills.stat.agent_local')}</div></div>` : ''}
   `
 
-  if (globalSkills.length === 0) {
+  skillsActiveCategory = 'all'
+  renderSkillsSidebar()
+  renderGlobalSkillsGrid()
+}
+
+function renderGlobalSkillsGrid() {
+  skillsGrid.innerHTML = ''
+
+  const isAgentFilter = skillsActiveFilter === 'agent'
+
+  // When 'agent' filter is active, show only local agent skills; otherwise show global/plugin.
+  const filteredGlobal = isAgentFilter ? [] : globalSkills.filter(s => {
+    if (skillsActiveFilter !== 'all' && s.source !== skillsActiveFilter) return false
+    if (skillsActiveCategory !== 'all' && deriveSkillCategory(s.name) !== skillsActiveCategory) return false
+    if (!skillsSearchQuery) return true
+    const haystack = [s.name, s.label, s.description, ...(s.keywords || [])].join(' ').toLowerCase()
+    return haystack.includes(skillsSearchQuery)
+  })
+
+  // Local agent skills: always merged in for 'all' or filtered to 'agent'.
+  const filteredLocal = (skillsActiveFilter === 'all' || isAgentFilter) ? localAgentSkills.filter(s => {
+    if (skillsActiveCategory !== 'all' && deriveSkillCategory(s.name) !== skillsActiveCategory) return false
+    if (!skillsSearchQuery) return true
+    const haystack = [s.name, s.label, s.description, s.agentId, ...(s.keywords || [])].join(' ').toLowerCase()
+    return haystack.includes(skillsSearchQuery)
+  }) : []
+
+  const allFiltered = [...filteredGlobal, ...filteredLocal]
+
+  if (allFiltered.length === 0) {
     skillsEmpty.hidden = false
     return
   }
   skillsEmpty.hidden = true
 
-  const sourceLabels = { user: 'user', plugin: 'plugin' }
+  const sourceLabels = { user: 'user', plugin: 'plugin', agent: t('skills.filter.agent') }
 
-  for (const skill of globalSkills) {
+  const renderCard = (skill, isLocal) => {
     const card = document.createElement('div')
-    card.className = 'skills-card'
+    card.className = isLocal ? 'skills-card skills-card--local' : 'skills-card'
     const icon = getSkillIcon(skill.name)
-    const sourceBadge = skill.source
-      ? `<span class="connector-source-badge">${escapeHtml(sourceLabels[skill.source] || skill.source)}</span>`
+    const sourceBadge = isLocal
+      ? `<span class="connector-source-badge skills-badge--agent">${escapeHtml(skill.agentId)}</span>`
+      : (skill.source ? `<span class="connector-source-badge">${escapeHtml(sourceLabels[skill.source] || skill.source)}</span>` : '')
+
+    const hasDesc = !!skill.description
+    const healthClass = hasDesc ? 'skill-health-ok' : 'skill-health-warn'
+    const healthTitle = hasDesc ? t('skills.health.ok') : t('skills.health.nodesc')
+
+    const kws = (skill.keywords || []).slice(0, 3)
+    const kwTags = kws.map(k => `<span class="skill-keyword-tag">${escapeHtml(k)}</span>`).join('')
+
+    const agents = skill.agents || []
+    const agentBadges = agents.length > 0
+      ? `<span class="skills-agent-badge skill-agent-count" title="${escapeHtml(agents.join(', '))}">&#x1F916; ${agents.length} ${t('skills.agents.count')}</span>`
       : ''
+
+    const mtimeStr = skill.mtime ? formatMtime(skill.mtime) : ''
 
     const displayName = skill.label || skill.name
     card.innerHTML = `
       <div class="skills-card-header">
         <div class="skills-card-icon">${icon}</div>
         <div class="skills-card-info">
-          <div class="skills-card-name">${escapeHtml(displayName)} ${sourceBadge}</div>
+          <div class="skills-card-name">
+            ${escapeHtml(displayName)} ${sourceBadge}
+            <span class="skill-health-dot ${healthClass}" title="${escapeHtml(healthTitle)}"></span>
+          </div>
           <div class="skills-card-desc">${escapeHtml(skill.description || t('skills.no_description'))}</div>
         </div>
       </div>
+      ${(kwTags || agentBadges || mtimeStr) ? `
+      <div class="skills-card-footer">
+        ${kwTags}
+        ${agentBadges}
+        ${mtimeStr ? `<span class="skill-card-mtime" title="${t('skills.mtime.title')}">${escapeHtml(mtimeStr)}</span>` : ''}
+      </div>` : ''}
     `
-    card.addEventListener('click', () => openSkillDetail(skill.name, skill.label))
+    card.addEventListener('click', () => openSkillDetail(skill.name, skill.label, skill.agentId || null))
     skillsGrid.appendChild(card)
   }
+
+  for (const skill of filteredGlobal) renderCard(skill, false)
+  for (const skill of filteredLocal) renderCard(skill, true)
 }
 
-async function openSkillDetail(skillName, displayLabel) {
+let _skillDetailCurrentName = null
+let _skillDetailCurrentAgentId = null
+let _skillDetailIsPlugin = false
+
+function _skillDetailExitEdit() {
+  const editor = document.getElementById('skillDetailEditor')
+  const contentEl = document.getElementById('skillDetailContent')
+  const editActions = document.getElementById('skillDetailEditActions')
+  const editBtn = document.getElementById('skillDetailEditBtn')
+  editor.hidden = true
+  contentEl.hidden = false
+  editActions.hidden = true
+  editBtn.disabled = false
+}
+
+async function openSkillDetail(skillName, displayLabel, agentId = null) {
+  _skillDetailCurrentName = skillName
+  _skillDetailCurrentAgentId = agentId
+  _skillDetailExitEdit()
+
   document.getElementById('skillDetailTitle').textContent = displayLabel || skillName
 
+  const editBtn = document.getElementById('skillDetailEditBtn')
+  if (editBtn) {
+    editBtn.hidden = false
+    editBtn.disabled = false
+  }
+
   try {
-    const res = await fetch(`/api/skills/${encodeURIComponent(skillName)}`)
+    const detailUrl = agentId
+      ? `/api/skills/${encodeURIComponent(skillName)}?agent=${encodeURIComponent(agentId)}`
+      : `/api/skills/${encodeURIComponent(skillName)}`
+    const res = await fetch(detailUrl)
     if (!res.ok) throw new Error('Failed to fetch skill detail')
     const detail = await res.json()
+    _skillDetailIsPlugin = detail.source === 'plugin'
+
+    // Hide edit button for plugin skills
+    if (editBtn) editBtn.hidden = _skillDetailIsPlugin
 
     // Description
     const descEl = document.getElementById('skillDetailDesc')
     descEl.textContent = detail.description || t('skills.no_description')
 
-    // Meta line: source + path. Replaces the old per-agent assignment
-    // UI -- sub-agents share the caller's HOME, so the skill is already
-    // available to every agent without any copy-to-agent action.
+    // Meta: source + mtime
     const metaEl = document.getElementById('skillDetailMeta')
     if (metaEl) {
       const sourceLabel = detail.source === 'plugin'
@@ -9593,26 +10061,130 @@ async function openSkillDetail(skillName, displayLabel) {
         : detail.source === 'user'
         ? t('skills.source.user')
         : t('skills.source.unknown')
+      const mtimeStr = detail.mtime ? formatMtime(detail.mtime) : ''
       metaEl.innerHTML = `
-        <div class="skill-detail-source">${t('skills.detail.source_label')} <strong>${sourceLabel}</strong></div>
+        <div class="skill-detail-source">${t('skills.detail.source_label')} <strong>${sourceLabel}</strong>${mtimeStr ? ` &middot; <span title="${escapeHtml(t('skills.mtime.title'))}">${escapeHtml(mtimeStr)}</span>` : ''}</div>
         <div class="skill-detail-note">${t('skills.detail.auto_available')}</div>
       `
     }
 
-    // Content
+    // Keywords
+    const kwEl = document.getElementById('skillDetailKeywords')
+    if (kwEl) {
+      const kws = detail.keywords || []
+      if (kws.length > 0) {
+        kwEl.hidden = false
+        kwEl.innerHTML = `<span class="skill-kw-label">${t('skills.keywords.label')}</span> ` +
+          kws.map(k => `<span class="skill-keyword-tag">${escapeHtml(k)}</span>`).join(' ')
+      } else {
+        kwEl.hidden = true
+      }
+    }
+
+    // Agent coverage
+    const agentsEl = document.getElementById('skillDetailAgentsCoverage')
+    if (agentsEl) {
+      const agents = detail.agents || []
+      if (agents.length > 0) {
+        agentsEl.hidden = false
+        agentsEl.innerHTML = `<span class="skill-kw-label">${t('skills.agents.label')}</span> ` +
+          agents.map(a => `<span class="skills-agent-badge">${escapeHtml(a)}</span>`).join(' ')
+      } else {
+        agentsEl.hidden = true
+      }
+    }
+
+    // Health indicator
+    const healthEl = document.getElementById('skillDetailHealth')
+    if (healthEl) {
+      const hasDesc = !!detail.description
+      const hasContent = !!detail.content
+      if (hasDesc && hasContent) {
+        healthEl.className = 'skill-health-label skill-health-ok'
+        healthEl.textContent = t('skills.health.ok')
+      } else if (hasContent) {
+        healthEl.className = 'skill-health-label skill-health-warn'
+        healthEl.textContent = t('skills.health.nodesc')
+      } else {
+        healthEl.className = 'skill-health-label skill-health-err'
+        healthEl.textContent = t('skills.health.empty')
+      }
+    }
+
+    // Content: render as markdown
     const contentEl = document.getElementById('skillDetailContent')
-    contentEl.textContent = detail.content || t('skills.content_not_found')
+    const rawContent = detail.content || t('skills.content_not_found')
+    contentEl.innerHTML = renderMarkdown(rawContent)
+
+    // Prefill editor
+    const editor = document.getElementById('skillDetailEditor')
+    if (editor) editor.value = rawContent
 
   } catch (err) {
     console.error('Skill detail hiba:', err)
     document.getElementById('skillDetailDesc').textContent = t('connectors.error_list')
-    document.getElementById('skillDetailContent').textContent = ''
+    document.getElementById('skillDetailContent').innerHTML = ''
     const metaEl = document.getElementById('skillDetailMeta')
     if (metaEl) metaEl.innerHTML = ''
+    if (editBtn) editBtn.hidden = true
   }
 
   openModal(skillDetailOverlay)
 }
+
+// Inline edit wiring
+;(() => {
+  const editBtn = document.getElementById('skillDetailEditBtn')
+  const saveBtn = document.getElementById('skillDetailSaveBtn')
+  const cancelBtn = document.getElementById('skillDetailCancelEditBtn')
+  const editor = document.getElementById('skillDetailEditor')
+  const contentEl = document.getElementById('skillDetailContent')
+  const editActions = document.getElementById('skillDetailEditActions')
+
+  if (editBtn) {
+    editBtn.addEventListener('click', () => {
+      if (_skillDetailIsPlugin) return
+      contentEl.hidden = true
+      editor.hidden = false
+      editActions.hidden = false
+      editBtn.disabled = true
+      editor.focus()
+    })
+  }
+
+  if (cancelBtn) {
+    cancelBtn.addEventListener('click', _skillDetailExitEdit)
+  }
+
+  if (saveBtn) {
+    saveBtn.addEventListener('click', async () => {
+      if (!_skillDetailCurrentName || _skillDetailIsPlugin) return
+      const newContent = editor.value
+      saveBtn.disabled = true
+      try {
+        const putUrl = _skillDetailCurrentAgentId
+          ? `/api/skills/${encodeURIComponent(_skillDetailCurrentName)}?agent=${encodeURIComponent(_skillDetailCurrentAgentId)}`
+          : `/api/skills/${encodeURIComponent(_skillDetailCurrentName)}`
+        const res = await fetch(putUrl, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: newContent }),
+        })
+        if (!res.ok) throw new Error('PUT failed: ' + res.status)
+        contentEl.innerHTML = renderMarkdown(newContent)
+        _skillDetailExitEdit()
+        showToast(t('skills.toast.saved'))
+        // Refresh list to pick up new description/keywords
+        loadGlobalSkills()
+      } catch (err) {
+        console.error('Skill mentés hiba:', err)
+        showToast(t('skills.toast.save_error'))
+      } finally {
+        saveBtn.disabled = false
+      }
+    })
+  }
+})()
 
 // === Team page ===
 async function loadTeamGraph() {
@@ -9834,18 +10406,29 @@ async function loadChatAgentList() {
   const sidebar = document.getElementById('chatAgentList')
   if (!sidebar) return
   try {
-    // Load fleet agents + threads in parallel
-    const [agentsRes, threadsRes] = await Promise.all([
+    // Load fleet agents + threads in parallel (the federation status fetch is
+    // failure-proof: it must never take down the Messages page)
+    const [agentsRes, threadsRes, fedStatus] = await Promise.all([
       fetch('/api/agents'),
       fetch('/api/messages/threads'),
+      fetch('/api/federation/status').then((r) => (r.ok ? r.json() : null)).catch(() => null),
     ])
     const agentsRaw = agentsRes.ok ? await agentsRes.json() : []
     const threads = threadsRes.ok ? await threadsRes.json() : []
+    if (fedStatus && Array.isArray(fedStatus.peers)) federatedPeerStatus = fedStatus.peers
 
-    // Build fleet list: API agents + marveen, minus system agents
+    // Build fleet list: API agents + marveen, minus system agents; plus
+    // federated agents from the poller cache so a remote conversation can be
+    // STARTED without prior history. The system-agent filter runs on the
+    // unqualified segment too ('teodor/heartbeat' is just as much noise).
     const fleetNames = [mainAgentId(), ...agentsRaw.map(a => a.name || a)]
       .filter(n => !CHAT_SYSTEM_AGENTS.has(n))
       .filter((n, i, arr) => arr.indexOf(n) === i)
+    for (const fa of federatedAgentEntries()) {
+      if (!fleetNames.includes(fa.qualified) && !CHAT_SYSTEM_AGENTS.has(fa.qualified.split('/').pop())) {
+        fleetNames.push(fa.qualified)
+      }
+    }
 
     // Populate avatar map from API data
     chatAgentHasAvatar.clear()
@@ -9910,7 +10493,14 @@ async function loadChatAgentList() {
       })
     })
 
-    if (!chatSelectedAgent) {
+    if (chatSelectedAgent && chatThreadState.agent !== chatSelectedAgent) {
+      // Preselected target (e.g. the federated card's message button): open
+      // its thread. Direct loadChatThread fallback covers targets with no
+      // sidebar entry yet (composer + history render for any id).
+      const el = sidebar.querySelector(`.chat-agent-item[data-agent="${CSS.escape(chatSelectedAgent)}"]`)
+      if (el) el.click()
+      else loadChatThread(chatSelectedAgent)
+    } else if (!chatSelectedAgent) {
       const first = sidebar.querySelector('.chat-agent-item')
       if (first) first.click()
     }
@@ -10001,6 +10591,8 @@ function buildBubbleHtml(m) {
         ${!isOutgoing ? `<span class="bubble-sender">${escapeHtml(senderLabel)}</span>` : ''}
         <span class="bubble-id-chip">#${m.id}</span>
         <span class="badge ${statusMeta.cls}" style="font-size:10px">${escapeHtml(statusMeta.label)}</span>
+        ${m.status === 'pending' && m.to_agent === mainAgentId() ? `<span style="font-size:10px;color:var(--text-muted)">${escapeHtml(t('messages.pending_main_hint'))}</span>` : ''}
+        ${m.origin_note ? `<span class="badge" style="font-size:10px" title="Self-declared by the sender, not verified (card 06f062e4)">origin: ${escapeHtml(m.origin_note)}</span>` : ''}
       </div>
       <div class="bubble-text">${escapeHtml(m.content || '')}</div>
       <div class="bubble-time">${when}</div>
@@ -10585,11 +11177,25 @@ async function fetchOnboardingStatus() {
 function onboardingCurrentStep(s) {
   if (!s.identityConfirmed) return 1
   if (!s.claudeAuthPresent || !s.agentsRunning) return 2
-  if (!s.telegramConfigured) return 3
+  if (!s.channelConfigured) return 3
   if (!s.paired) return 4
   return 0
 }
+// Operator can dismiss the wizard (skip/close). A false positive must never
+// lock the dashboard, so the choice persists across reloads; normal UI still
+// covers any real setup that remains.
+const ONBOARDING_DISMISS_KEY = 'mvOnboardingDismissed'
+function onboardingDismissed() {
+  try { return localStorage.getItem(ONBOARDING_DISMISS_KEY) === '1' } catch { return false }
+}
+function dismissOnboarding() {
+  try { localStorage.setItem(ONBOARDING_DISMISS_KEY, '1') } catch { /* private mode */ }
+  const overlay = document.getElementById('onboardingOverlay')
+  if (overlay) { overlay.classList.remove('active'); overlay.hidden = true }
+  document.body.style.overflow = ''
+}
 async function initOnboarding() {
+  if (onboardingDismissed()) return
   const s = await fetchOnboardingStatus()
   if (!s || !s.needsOnboarding) return
   renderOnboarding(s)
@@ -10599,6 +11205,7 @@ async function refreshOnboarding() {
   if (s) renderOnboarding(s)
 }
 function renderOnboarding(s) {
+  if (onboardingDismissed()) return
   const overlay = document.getElementById('onboardingOverlay')
   if (!overlay) return
   const step = onboardingCurrentStep(s)
@@ -10757,6 +11364,10 @@ populateAvatarGrid()
 loadMemAgents()
 loadOverview()
 loadAvailableModels()
+{
+  const onbClose = document.getElementById('onboardingClose')
+  if (onbClose) onbClose.addEventListener('click', dismissOnboarding)
+}
 initOnboarding()
 
 // "DeepSeek API kulcs hozzáadása" link az agent edit panel-en --
@@ -11213,19 +11824,15 @@ async function cancelBgTask(id) {
 // === Autonomy ===
 // ============================================================
 
-document.getElementById('refreshAutonomyBtn').addEventListener('click', loadAutonomy)
-
-async function loadAutonomy() {
-  const grid = document.getElementById('autonomyGrid')
-  const footer = document.getElementById('autonomyUpdatedAt')
-  grid.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('autonomy.loading')}</p>`
+async function renderAutonomyContent(gridEl, footerEl) {
+  gridEl.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('autonomy.loading')}</p>`
 
   try {
     const res = await fetch('/api/autonomy')
     if (!res.ok) throw new Error('fetch failed')
     const config = await res.json()
 
-    grid.innerHTML = ''
+    gridEl.innerHTML = ''
     for (const cat of config.categories) {
       const isCapped = !cat.locked && cat.maxLevel < 3
       const row = document.createElement('div')
@@ -11264,18 +11871,20 @@ async function loadAutonomy() {
         row.appendChild(cap)
       }
       row.appendChild(levels)
-      grid.appendChild(row)
+      gridEl.appendChild(row)
     }
 
-    if (config.updated_at > 0) {
-      const d = new Date(config.updated_at * 1000)
-      footer.textContent = t('autonomy.last_modified', { date: d.toLocaleString('hu-HU') })
-    } else {
-      footer.textContent = t('autonomy.not_modified')
+    if (footerEl) {
+      if (config.updated_at > 0) {
+        const d = new Date(config.updated_at * 1000)
+        footerEl.textContent = t('autonomy.last_modified', { date: d.toLocaleString('hu-HU') })
+      } else {
+        footerEl.textContent = t('autonomy.not_modified')
+      }
     }
   } catch (err) {
-    grid.innerHTML = `<p style="color:var(--danger)">${t('autonomy.error')}</p>`
-    footer.textContent = ''
+    gridEl.innerHTML = `<p style="color:var(--danger)">${t('autonomy.error')}</p>`
+    if (footerEl) footerEl.textContent = ''
   }
 }
 
@@ -11291,9 +11900,220 @@ async function setAutonomyLevel(key, level) {
       showToast(data.error || 'Hiba')
       return
     }
-    loadAutonomy()
+    // Refresh the settings tab autonomy grid if it is visible
+    const tabGrid = document.getElementById('settingsAutonomyGrid')
+    const tabFooter = document.getElementById('settingsAutonomyUpdatedAt')
+    if (tabGrid) renderAutonomyContent(tabGrid, tabFooter)
   } catch {
     showToast(t('kanban.toast.save_error'))
+  }
+}
+
+// ============================================================
+// === Approvals ===
+// ============================================================
+
+const APPROVALS_PAGE_LIMIT = 50
+
+let _approvalsCountdownInterval = null
+const _approvalsState = { status: '', agent: '', category: '', offset: 0 }
+
+document.getElementById('refreshApprovalsBtn').addEventListener('click', loadApprovalsPage)
+document.getElementById('approvalsFilterStatus').addEventListener('change', (e) => {
+  _approvalsState.status = e.target.value
+  _approvalsState.offset = 0
+  _renderApprovalsTable()
+})
+document.getElementById('approvalsFilterAgent').addEventListener('input', (e) => {
+  _approvalsState.agent = e.target.value.trim()
+  _approvalsState.offset = 0
+  _renderApprovalsTable()
+})
+document.getElementById('approvalsFilterCategory').addEventListener('input', (e) => {
+  _approvalsState.category = e.target.value.trim()
+  _approvalsState.offset = 0
+  _renderApprovalsTable()
+})
+
+let _approvalsAll = []
+
+async function loadApprovalsPage() {
+  const tbody = document.getElementById('approvalsTbody')
+  const statsEl = document.getElementById('approvalsStats')
+  tbody.innerHTML = `<tr><td colspan="7" style="color:var(--text-muted);padding:24px;text-align:center">${t('approvals.loading')}</td></tr>`
+  statsEl.innerHTML = ''
+  if (_approvalsCountdownInterval) { clearInterval(_approvalsCountdownInterval); _approvalsCountdownInterval = null }
+
+  try {
+    const res = await fetch('/api/approvals?limit=500')
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    _approvalsAll = await res.json()
+    _renderApprovalsStats()
+    _renderApprovalsTable()
+    _approvalsCountdownInterval = setInterval(_updateCountdowns, 1000)
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="7" style="color:var(--danger);padding:24px;text-align:center">${t('approvals.error')}</td></tr>`
+  }
+}
+
+function _renderApprovalsStats() {
+  const counts = { pending: 0, approved: 0, rejected: 0, timeout: 0 }
+  for (const a of _approvalsAll) counts[a.status] = (counts[a.status] || 0) + 1
+  const statsEl = document.getElementById('approvalsStats')
+  statsEl.innerHTML = `
+    <div class="stat-card"><div class="stat-value" style="color:var(--warning)">${counts.pending}</div><div class="stat-label">${t('approvals.stat.pending')}</div></div>
+    <div class="stat-card"><div class="stat-value" style="color:var(--success)">${counts.approved}</div><div class="stat-label">${t('approvals.stat.approved')}</div></div>
+    <div class="stat-card"><div class="stat-value" style="color:var(--danger)">${counts.rejected}</div><div class="stat-label">${t('approvals.stat.rejected')}</div></div>
+    <div class="stat-card"><div class="stat-value" style="color:var(--text-muted)">${counts.timeout}</div><div class="stat-label">${t('approvals.stat.timeout')}</div></div>
+  `
+
+  // Sidebar badge: show pending count, hidden when zero
+  const badge = document.getElementById('approvalsPendingBadge')
+  if (badge) {
+    badge.textContent = counts.pending
+    badge.hidden = counts.pending === 0
+  }
+
+  // Pending notice banner above stat cards
+  const banner = document.getElementById('approvalsPendingBanner')
+  if (banner) {
+    if (counts.pending === 0) {
+      banner.hidden = true
+    } else {
+      const pendingRows = _approvalsAll.filter(a => a.status === 'pending')
+      const oldest = pendingRows.reduce((min, a) => a.requested_at < min.requested_at ? a : min, pendingRows[0])
+      const ageMin = Math.round((Date.now() / 1000 - oldest.requested_at) / 60)
+      const timeoutMin = oldest.timeout_at ? Math.max(0, Math.round((oldest.timeout_at - Date.now() / 1000) / 60)) : null
+      const timeoutPart = timeoutMin !== null ? ` ${t('approvals.banner.timeout', { n: timeoutMin })}` : ''
+      banner.hidden = false
+      banner.textContent = `${t('approvals.banner.notice', { n: counts.pending, age: ageMin, agent: oldest.agent_id, category: oldest.category })}${timeoutPart}`
+    }
+  }
+}
+
+function _filterApprovals() {
+  const { status, agent, category } = _approvalsState
+  return _approvalsAll.filter(a => {
+    if (status && a.status !== status) return false
+    if (agent && !a.agent_id.includes(agent)) return false
+    if (category && !a.category.includes(category)) return false
+    return true
+  })
+}
+
+function _renderApprovalsTable() {
+  const filtered = _filterApprovals()
+  const { offset } = _approvalsState
+  const page = filtered.slice(offset, offset + APPROVALS_PAGE_LIMIT)
+  const tbody = document.getElementById('approvalsTbody')
+
+  if (!page.length) {
+    tbody.innerHTML = `<tr><td colspan="7" style="color:var(--text-muted);padding:24px;text-align:center">${t('approvals.empty')}</td></tr>`
+    _renderApprovalsPagination(filtered.length)
+    return
+  }
+
+  tbody.innerHTML = page.map(a => {
+    const isPending = a.status === 'pending'
+    const rowStyle = isPending ? 'background:color-mix(in srgb, var(--warning) 8%, transparent)' : ''
+    const time = a.requested_at ? new Date(a.requested_at * 1000).toLocaleString('hu-HU', { dateStyle: 'short', timeStyle: 'short' }) : '-'
+    const badge = _approvalBadge(a.status)
+    const countdown = isPending && a.timeout_at ? `<span class="approvals-countdown" data-timeout="${a.timeout_at}" id="cd-${a.id}"></span>` : (a.timeout_at ? '-' : '')
+    const actions = isPending
+      ? `<div style="display:flex;gap:4px">
+           <button class="btn-primary btn-compact approvals-decide" data-id="${escapeAttr(a.id)}" data-decision="approved" style="font-size:11px">${t('approvals.btn.approve')}</button>
+           <button class="btn-danger btn-compact approvals-decide" data-id="${escapeAttr(a.id)}" data-decision="rejected" style="font-size:11px">${t('approvals.btn.reject')}</button>
+         </div>`
+      : (() => {
+          const resolvedBy = escapeHtml(a.resolved_by || '')
+          if (!a.resolved_at) return `<span style="font-size:12px;color:var(--text-muted)">${resolvedBy}</span>`
+          const resolvedDate = new Date(a.resolved_at * 1000)
+          const requestedDate = a.requested_at ? new Date(a.requested_at * 1000) : null
+          const sameDay = requestedDate && resolvedDate.toDateString() === requestedDate.toDateString()
+          const resolvedStr = resolvedDate.toLocaleString('hu-HU', sameDay ? { timeStyle: 'short' } : { dateStyle: 'short', timeStyle: 'short' })
+          return `<span style="font-size:12px;color:var(--text-muted)">${resolvedBy}<br><span style="font-size:11px;opacity:0.7">${escapeHtml(resolvedStr)}</span></span>`
+        })()
+    return `<tr style="${rowStyle}">
+      <td style="white-space:nowrap;font-size:12px">${escapeHtml(time)}</td>
+      <td><code style="font-size:12px">${escapeHtml(a.agent_id)}</code></td>
+      <td style="font-size:12px">${escapeHtml(a.category)}</td>
+      <td style="max-width:280px;font-size:12px" title="${escapeAttr(a.action_description)}">${escapeHtml(a.action_description.length > 80 ? a.action_description.slice(0, 80) + '...' : a.action_description)}</td>
+      <td>${badge}</td>
+      <td style="font-size:12px;white-space:nowrap">${countdown}</td>
+      <td>${actions}</td>
+    </tr>`
+  }).join('')
+
+  _updateCountdowns()
+  _renderApprovalsPagination(filtered.length)
+
+  tbody.querySelectorAll('.approvals-decide').forEach(btn => {
+    btn.addEventListener('click', () => _resolveApproval(btn.dataset.id, btn.dataset.decision))
+  })
+}
+
+function _approvalBadge(status) {
+  const colors = { pending: 'var(--warning)', approved: 'var(--success)', rejected: 'var(--danger)', timeout: 'var(--text-muted)' }
+  const color = colors[status] || 'var(--text-muted)'
+  return `<span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;background:color-mix(in srgb,${color} 15%,transparent);color:${color}">${t('approvals.status.' + status) || status}</span>`
+}
+
+function _updateCountdowns() {
+  const now = Math.floor(Date.now() / 1000)
+  document.querySelectorAll('.approvals-countdown[data-timeout]').forEach(el => {
+    const timeout = parseInt(el.dataset.timeout, 10)
+    const diff = timeout - now
+    if (diff <= 0) {
+      el.textContent = t('approvals.countdown.expired')
+      el.style.color = 'var(--danger)'
+    } else {
+      const h = Math.floor(diff / 3600)
+      const m = Math.floor((diff % 3600) / 60)
+      const s = diff % 60
+      el.textContent = h > 0 ? `${h}h ${m}m` : `${m}m ${s}s`
+      el.style.color = diff < 300 ? 'var(--danger)' : 'var(--text-muted)'
+    }
+  })
+}
+
+function _renderApprovalsPagination(total) {
+  const pager = document.getElementById('approvalsPagination')
+  if (total <= APPROVALS_PAGE_LIMIT) { pager.innerHTML = ''; return }
+  const { offset } = _approvalsState
+  const hasPrev = offset > 0
+  const hasNext = offset + APPROVALS_PAGE_LIMIT < total
+  pager.innerHTML = `
+    <button class="btn-secondary btn-compact" ${hasPrev ? '' : 'disabled'} id="approvalsPrev">&#8592; Előző</button>
+    <span style="font-size:12px;color:var(--text-muted)">${offset + 1}-${Math.min(offset + APPROVALS_PAGE_LIMIT, total)} / ${total}</span>
+    <button class="btn-secondary btn-compact" ${hasNext ? '' : 'disabled'} id="approvalsNext">Következő &#8594;</button>
+  `
+  pager.querySelector('#approvalsPrev')?.addEventListener('click', () => {
+    _approvalsState.offset = Math.max(0, offset - APPROVALS_PAGE_LIMIT)
+    _renderApprovalsTable()
+  })
+  pager.querySelector('#approvalsNext')?.addEventListener('click', () => {
+    _approvalsState.offset = offset + APPROVALS_PAGE_LIMIT
+    _renderApprovalsTable()
+  })
+}
+
+async function _resolveApproval(id, decision) {
+  try {
+    const res = await fetch(`/api/approvals/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: decision, resolved_by: 'dashboard' }),
+    })
+    const data = await res.json()
+    if (!res.ok) { showToast(t('approvals.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    showToast(t(decision === 'approved' ? 'approvals.toast.approved' : 'approvals.toast.rejected'))
+    // Update in-place to avoid full reload flicker
+    const idx = _approvalsAll.findIndex(a => a.id === id)
+    if (idx !== -1) _approvalsAll[idx] = data
+    _renderApprovalsStats()
+    _renderApprovalsTable()
+  } catch (err) {
+    showToast(t('approvals.toast.error', { msg: String(err.message || err) }))
   }
 }
 
@@ -11345,9 +12165,15 @@ function markSettingDirty(key, input, originalValue, type, errorEl) {
   updateSettingsSaveBar()
 }
 
+const SETTINGS_ACTIVE_TAB_KEY = 'settings-active-tab'
+
 async function loadSettings() {
-  const container = document.getElementById('settingsGroups')
-  container.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('settings.loading')}</p>`
+  const tabNav = document.getElementById('settingsTabNav')
+  const tabPanels = document.getElementById('settingsTabPanels')
+  if (!tabNav || !tabPanels) return
+
+  tabNav.innerHTML = `<span style="color:var(--text-muted);font-size:13px;padding:12px 0;display:inline-block">${t('settings.loading')}</span>`
+  tabPanels.innerHTML = ''
   settingsDirty.clear()
   updateSettingsSaveBar()
 
@@ -11362,28 +12188,105 @@ async function loadSettings() {
       byModule.get(s.module).push(s)
     }
 
-    container.innerHTML = ''
+    tabNav.innerHTML = ''
+    tabPanels.innerHTML = ''
+
     if (byModule.size === 0) {
-      container.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('settings.empty')}</p>`
+      tabPanels.innerHTML = `<p style="padding:24px;color:var(--text-muted);font-size:13px">${t('settings.empty')}</p>`
       return
     }
 
+    const allModules = [...byModule.keys(), 'autonomy']
+    const savedTab = localStorage.getItem(SETTINGS_ACTIVE_TAB_KEY) || allModules[0]
+    const activeTab = allModules.includes(savedTab) ? savedTab : allModules[0]
+
+    // Build a tab button + panel for each settings module
     for (const [mod, defs] of byModule) {
+      const btn = document.createElement('button')
+      btn.className = 'tab-btn' + (mod === activeTab ? ' active' : '')
+      btn.dataset.tab = mod
+      btn.textContent = settingsModuleLabel(mod)
+      btn.addEventListener('click', () => activateSettingsTab(mod))
+      tabNav.appendChild(btn)
+
+      const panel = document.createElement('div')
+      panel.className = 'tab-panel'
+      panel.id = `settings-panel-${mod}`
+      panel.hidden = mod !== activeTab
+
       const group = document.createElement('div')
       group.className = 'settings-group'
-
-      const heading = document.createElement('h3')
-      heading.className = 'settings-group-title'
-      heading.textContent = settingsModuleLabel(mod)
-      group.appendChild(heading)
-
       for (const def of defs) {
         group.appendChild(buildSettingRow(def))
       }
-      container.appendChild(group)
+      panel.appendChild(group)
+      tabPanels.appendChild(panel)
+    }
+
+    // Autonomy tab
+    {
+      const mod = 'autonomy'
+      const btn = document.createElement('button')
+      btn.className = 'tab-btn' + (mod === activeTab ? ' active' : '')
+      btn.dataset.tab = mod
+      btn.textContent = settingsModuleLabel(mod)
+      btn.addEventListener('click', () => activateSettingsTab(mod))
+      tabNav.appendChild(btn)
+
+      const panel = document.createElement('div')
+      panel.className = 'tab-panel'
+      panel.id = `settings-panel-${mod}`
+      panel.hidden = mod !== activeTab
+
+      const legend = document.createElement('div')
+      legend.className = 'autonomy-legend'
+      legend.innerHTML = `
+        <div class="autonomy-legend-item"><span class="autonomy-level-dot" style="background:var(--text-muted)"></span><span><strong>1</strong> ${t('autonomy.level.1')}</span></div>
+        <div class="autonomy-legend-item"><span class="autonomy-level-dot" style="background:var(--accent)"></span><span><strong>2</strong> ${t('autonomy.level.2')}</span></div>
+        <div class="autonomy-legend-item"><span class="autonomy-level-dot" style="background:var(--success)"></span><span><strong>3</strong> ${t('autonomy.level.3')}</span></div>
+      `
+      panel.appendChild(legend)
+
+      const grid = document.createElement('div')
+      grid.className = 'autonomy-grid'
+      grid.id = 'settingsAutonomyGrid'
+      panel.appendChild(grid)
+
+      const footer = document.createElement('p')
+      footer.className = 'autonomy-footer'
+      footer.id = 'settingsAutonomyUpdatedAt'
+      panel.appendChild(footer)
+
+      const refreshBtn = document.createElement('button')
+      refreshBtn.className = 'btn-secondary btn-compact'
+      refreshBtn.textContent = t('common.btn.refresh')
+      refreshBtn.addEventListener('click', () => renderAutonomyContent(grid, footer))
+      panel.appendChild(refreshBtn)
+
+      tabPanels.appendChild(panel)
+
+      if (mod === activeTab) {
+        renderAutonomyContent(grid, footer)
+      }
     }
   } catch (err) {
-    container.innerHTML = `<p style="color:var(--danger)">${t('settings.error')}</p>`
+    tabPanels.innerHTML = `<p style="padding:24px;color:var(--danger)">${t('settings.error')}</p>`
+  }
+}
+
+function activateSettingsTab(mod) {
+  document.querySelectorAll('#settingsTabNav .tab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.tab === mod)
+  })
+  document.querySelectorAll('#settingsTabPanels .tab-panel').forEach(panel => {
+    panel.hidden = panel.id !== `settings-panel-${mod}`
+  })
+  localStorage.setItem(SETTINGS_ACTIVE_TAB_KEY, mod)
+
+  if (mod === 'autonomy') {
+    const grid = document.getElementById('settingsAutonomyGrid')
+    const footer = document.getElementById('settingsAutonomyUpdatedAt')
+    if (grid && !grid.innerHTML.trim()) renderAutonomyContent(grid, footer)
   }
 }
 
@@ -13221,6 +14124,313 @@ document.getElementById('conversationClose')?.addEventListener('click', () => {
 document.getElementById('conversationSearch')?.addEventListener('input', () => renderConversation())
 document.getElementById('conversationShowActions')?.addEventListener('change', () => renderConversation())
 document.getElementById('conversationRefresh')?.addEventListener('click', () => loadConversation())
+
+// === Federation page ===
+// State lets live BEFORE the router IIFE (top-level code runs in order; a
+// first-load #federation route must not hit a TDZ on these).
+let fedPageWired = false
+let fedPeersViewCache = null
+
+async function loadFederationPage() {
+  wireFederationPage()
+  const statsEl = document.getElementById('federationStats')
+  const masterEl = document.getElementById('federationMaster')
+  const peersEl = document.getElementById('federationPeers')
+  if (!statsEl || !masterEl || !peersEl) return
+  peersEl.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('common.loading')}</p>`
+  try {
+    const [peersRes, statusRes] = await Promise.all([
+      fetch('/api/federation/peers'),
+      fetch('/api/federation/status').then((r) => (r.ok ? r.json() : null)).catch(() => null),
+    ])
+    if (!peersRes.ok) throw new Error('HTTP ' + peersRes.status)
+    fedPeersViewCache = await peersRes.json()
+    if (statusRes && Array.isArray(statusRes.peers)) federatedPeerStatus = statusRes.peers
+    renderFederationPage()
+  } catch (e) {
+    peersEl.innerHTML = `<p style="color:var(--danger)">${t('federation.error', { msg: escapeHtml(String(e.message || e)) })}</p>`
+  }
+}
+
+function fedStateLabel(state) {
+  const key = 'federation.peer_state.' + (state || 'unknown')
+  return t(key)
+}
+
+function renderFederationPage() {
+  const view = fedPeersViewCache
+  if (!view) return
+  const statsEl = document.getElementById('federationStats')
+  const masterEl = document.getElementById('federationMaster')
+  const peersEl = document.getElementById('federationPeers')
+  const statusById = new Map(federatedPeerStatus.map((p) => [p.id, p]))
+  const okCount = federatedPeerStatus.filter((p) => p.state === 'ok').length
+
+  const statBox = (value, label) => `<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 16px;min-width:110px">
+    <div style="font-size:20px;font-weight:600">${value}</div>
+    <div style="font-size:12px;color:var(--text-muted)">${label}</div>
+  </div>`
+  statsEl.innerHTML = [
+    statBox(view.enabled ? t('common.yes') : t('common.no'), t('federation.stat.enabled')),
+    statBox(String(view.peers.length), t('federation.stat.peers')),
+    statBox(String(okCount), t('federation.stat.reachable')),
+    statBox(escapeHtml(view.systemId || '-'), t('federation.stat.system_id')),
+  ].join('')
+
+  const routingMode = view.routingMode || 'catalog-first'
+  const routingRadios = ['strong', 'catalog-first', 'advisory'].map((m) => `
+    <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;padding:5px 0">
+      <input type="radio" name="fedRoutingMode" value="${m}" ${routingMode === m ? 'checked' : ''} style="margin-top:3px;accent-color:var(--accent)">
+      <span>
+        <span style="font-weight:600">${t('federation.routing.mode.' + m + '.label')}</span>
+        <span style="display:block;font-size:12px;color:var(--text-muted)">${t('federation.routing.mode.' + m + '.hint')}</span>
+      </span>
+    </label>`).join('')
+  masterEl.innerHTML = `
+    <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+      <input type="checkbox" id="fedEnabledToggle" style="width:16px;height:16px;accent-color:var(--accent)" ${view.enabled ? 'checked' : ''}>
+      <span style="font-weight:600">${t('federation.master_label')}</span>
+    </label>
+    <p style="font-size:12px;color:var(--text-muted);margin:6px 0 0 26px">${t('federation.master_hint')}</p>
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+      <div style="font-weight:600">${t('federation.routing.title')}</div>
+      <p style="font-size:12px;color:var(--text-muted);margin:2px 0 8px 0">${t('federation.routing.subtitle')}</p>
+      ${routingRadios}
+      <p style="font-size:12px;color:var(--text-muted);margin:8px 0 0 0">${t('federation.routing.apply_note')}</p>
+    </div>`
+  document.getElementById('fedEnabledToggle').addEventListener('change', async (e) => {
+    const enabled = e.target.checked
+    if (!enabled && !confirm(t('federation.confirm.disable'))) { e.target.checked = true; return }
+    try {
+      const res = await fetch('/api/federation/enabled', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); e.target.checked = !enabled; return }
+      showToast(enabled ? t('federation.toast.enabled') : t('federation.toast.disabled'))
+      fedRefreshAndReload()
+    } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })); e.target.checked = !enabled }
+  })
+  document.querySelectorAll('input[name="fedRoutingMode"]').forEach((radio) => {
+    radio.addEventListener('change', async (e) => {
+      const mode = e.target.value
+      try {
+        const res = await fetch('/api/federation/routing-mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }) })
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+        showToast(t('federation.routing.toast_set', { mode: t('federation.routing.mode.' + mode + '.label') }))
+      } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+    })
+  })
+
+  if (!view.peers.length) {
+    peersEl.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('federation.peers_empty')}</p>`
+    return
+  }
+  peersEl.innerHTML = ''
+  for (const peer of view.peers) {
+    const st = statusById.get(peer.id)
+    const state = peer.hasOutboundToken ? (st ? st.state : 'unknown') : 'unpaired'
+    const reachable = state === 'ok'
+    const lastOk = st && st.lastOkAt ? new Date(st.lastOkAt).toLocaleString() : '-'
+    const agentCount = st && st.manifest && Array.isArray(st.manifest.agents) ? String(st.manifest.agents.length) : '-'
+    const card = document.createElement('div')
+    card.className = 'card'
+    card.style.cssText = 'padding:12px 16px;display:flex;flex-direction:column;gap:8px'
+    // Peer ids/baseUrls are OWNER-entered and segment-validated; state labels
+    // come from t(). Still: text nodes only, escapeHtml everywhere.
+    card.innerHTML = `
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <strong style="font-size:15px">${escapeHtml(peer.id)}</strong>
+        <span class="tg-status"><span class="tg-dot ${reachable ? 'connected' : 'disconnected'}"></span> ${fedStateLabel(state)}</span>
+        <span style="color:var(--text-muted);font-size:12px;margin-left:auto">${t('federation.card.last_ok')}: ${escapeHtml(lastOk)} · ${t('federation.card.agents')}: ${escapeHtml(agentCount)}</span>
+      </div>
+      <div style="font-size:13px;color:var(--text-muted);word-break:break-all">${escapeHtml(peer.baseUrl)}</div>
+      ${st && st.error ? `<div style="font-size:12px;color:var(--danger)">${escapeHtml(st.error)}</div>` : ''}
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-muted);cursor:pointer">
+        <input type="checkbox" class="fed-share-cap" ${peer.shareCapabilitySummaries ? 'checked' : ''} style="accent-color:var(--accent)">
+        ${t('federation.share_cap_label')}
+      </label>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn-secondary btn-compact" data-action="reveal">${t('federation.btn.reveal')}</button>
+        <button class="btn-secondary btn-compact" data-action="rotate">${t('federation.btn.rotate')}</button>
+        <button class="btn-secondary btn-compact" data-action="edit">${t('common.edit')}</button>
+        <button class="btn-secondary btn-compact" data-action="delete" style="color:var(--danger)">${t('common.delete')}</button>
+      </div>
+      <div class="fed-token-reveal" hidden style="font-family:monospace;font-size:12px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px;word-break:break-all"></div>`
+    card.querySelector('[data-action="reveal"]').addEventListener('click', () => fedRevealToken(peer.id, card))
+    card.querySelector('[data-action="rotate"]').addEventListener('click', () => fedRotateToken(peer.id))
+    card.querySelector('[data-action="edit"]').addEventListener('click', () => fedOpenPeerModal(peer))
+    card.querySelector('[data-action="delete"]').addEventListener('click', () => fedDeletePeer(peer.id))
+    card.querySelector('.fed-share-cap').addEventListener('change', (e) => fedToggleShareCap(peer.id, e.target.checked))
+    peersEl.appendChild(card)
+  }
+}
+
+async function fedRevealToken(peerId, card) {
+  const box = card.querySelector('.fed-token-reveal')
+  if (!box.hidden) { box.hidden = true; box.textContent = ''; return }
+  try {
+    const res = await fetch(`/api/federation/peers/${encodeURIComponent(peerId)}/inbound-token`)
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    box.textContent = data.inboundToken
+    box.hidden = false
+    navigator.clipboard?.writeText(data.inboundToken).then(
+      () => showToast(t('federation.toast.token_copied')),
+      () => {},
+    )
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+}
+
+async function fedRotateToken(peerId) {
+  if (!confirm(t('federation.confirm.rotate', { peer: peerId }))) return
+  try {
+    const res = await fetch(`/api/federation/peers/${encodeURIComponent(peerId)}/rotate-inbound-token`, { method: 'POST' })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    showToast(t('federation.toast.rotated'))
+    loadFederationPage()
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+}
+
+async function fedToggleShareCap(peerId, share) {
+  try {
+    const res = await fetch(`/api/federation/peers/${encodeURIComponent(peerId)}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ shareCapabilitySummaries: share }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); loadFederationPage(); return }
+    showToast(share ? t('federation.toast.share_cap_on') : t('federation.toast.share_cap_off'))
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })); loadFederationPage() }
+}
+
+async function fedDeletePeer(peerId) {
+  if (!confirm(t('federation.confirm.delete_peer', { peer: peerId }))) return
+  try {
+    const res = await fetch(`/api/federation/peers/${encodeURIComponent(peerId)}`, { method: 'DELETE' })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    // Sweep browser leftovers scoped to the removed peer.
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const key = localStorage.key(i)
+      if (key && key.startsWith('chat_last_seen_' + peerId + '/')) localStorage.removeItem(key)
+    }
+    if (chatSelectedAgent && chatSelectedAgent.startsWith(peerId + '/')) chatSelectedAgent = null
+    showToast(t('federation.toast.peer_deleted'))
+    loadFederationPage()
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+}
+
+// Apply federation config changes to the RUNNING main agent by restarting it
+// (it reloads CLAUDE.md, which carries the federation onboarding + delegation
+// directive). Reuses the existing main-agent restart endpoint -- no new
+// backend, no terminal command for the operator.
+async function fedApplyToMainAgent() {
+  if (!confirm(t('federation.confirm.apply'))) return
+  try {
+    // Server-side apply: restarts the main channels agent by MAIN_AGENT_ID,
+    // so the client does not depend on window._marveen being loaded (the
+    // Federation page does not populate it -> the old /api/agents/:name path
+    // 404'd when it fell back to the 'marveen' default).
+    const res = await fetch('/api/federation/apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    showToast(t('federation.toast.applied'))
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+}
+
+// Re-poll peer reachability then re-render. Called after config mutations
+// (enable, peer add/edit) so the status shows fresh -- there is no separate
+// manual "refresh" button anymore (the apply action owns the top-right slot).
+async function fedRefreshAndReload() {
+  try { await fetch('/api/federation/refresh', { method: 'POST' }) } catch { /* best effort */ }
+  loadFederationPage()
+}
+
+let fedPeerModalEditId = null
+
+function fedOpenPeerModal(peer) {
+  fedPeerModalEditId = peer ? peer.id : null
+  document.getElementById('fedPeerModalTitle').textContent = peer ? t('federation.modal.edit_title', { peer: peer.id }) : t('federation.modal.add_title')
+  const idInput = document.getElementById('fedPeerId')
+  idInput.value = peer ? peer.id : ''
+  idInput.disabled = !!peer
+  document.getElementById('fedPeerBaseUrl').value = peer ? peer.baseUrl : ''
+  document.getElementById('fedPeerOutboundToken').value = ''
+  document.getElementById('fedPeerOutboundToken').placeholder = peer && peer.hasOutboundToken ? t('federation.modal.outbound_keep') : ''
+  document.getElementById('fedPeerAbandonWindow').value = peer && peer.abandonWindowMinutes ? String(peer.abandonWindowMinutes) : ''
+  openModal(document.getElementById('fedPeerModalOverlay'))
+}
+
+async function fedSavePeerModal() {
+  // Ids are case-insensitive server-side (stored lowercase); fold here too so
+  // the operator immediately sees the canonical form.
+  const id = document.getElementById('fedPeerId').value.trim().toLowerCase()
+  const baseUrl = document.getElementById('fedPeerBaseUrl').value.trim()
+  const outbound = document.getElementById('fedPeerOutboundToken').value.trim()
+  const abandonRaw = document.getElementById('fedPeerAbandonWindow').value.trim()
+  try {
+    let res, data
+    if (fedPeerModalEditId) {
+      const body = { baseUrl }
+      if (outbound) body.outboundToken = outbound
+      if (abandonRaw) body.abandonWindowMinutes = parseInt(abandonRaw, 10)
+      else body.abandonWindowMinutes = null
+      res = await fetch(`/api/federation/peers/${encodeURIComponent(fedPeerModalEditId)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      data = await res.json().catch(() => ({}))
+      if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+      showToast(t('federation.toast.peer_saved'))
+    } else {
+      const body = { id, baseUrl }
+      if (outbound) body.outboundToken = outbound
+      res = await fetch('/api/federation/peers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      data = await res.json().catch(() => ({}))
+      if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+      // The minted inbound token is shown ONCE right away: the owner hands it
+      // to the peer's operator during pairing.
+      prompt(t('federation.modal.minted_token_hint'), data.inboundToken)
+      showToast(t('federation.toast.peer_added'))
+    }
+    closeModal(document.getElementById('fedPeerModalOverlay'))
+    fedRefreshAndReload()
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+}
+
+async function fedRemoveAll() {
+  if (!confirm(t('federation.confirm.remove'))) return
+  try {
+    const res = await fetch('/api/federation/remove', { method: 'POST' })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    federatedPeerStatus = []
+    // Sweep browser leftovers for ALL federated (qualified) threads -- the
+    // per-peer DELETE path does this per peer, full removal must do it wholesale.
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const key = localStorage.key(i)
+      if (key && /^chat_last_seen_[^/]+\//.test(key)) localStorage.removeItem(key)
+    }
+    if (chatSelectedAgent && chatSelectedAgent.includes('/')) chatSelectedAgent = null
+    showToast(t('federation.toast.removed'))
+    loadFederationPage()
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+}
+
+function wireFederationPage() {
+  if (fedPageWired) return
+  fedPageWired = true
+  const fedApplyBtn = document.getElementById('federationApplyBtn')
+  if (fedApplyBtn) { fedApplyBtn.title = t('federation.apply_hint'); fedApplyBtn.addEventListener('click', fedApplyToMainAgent) }
+  document.getElementById('federationAddPeerBtn')?.addEventListener('click', () => fedOpenPeerModal(null))
+  document.getElementById('federationRemoveBtn')?.addEventListener('click', fedRemoveAll)
+  document.getElementById('fedPeerModalSave')?.addEventListener('click', fedSavePeerModal)
+  document.getElementById('fedPeerModalCancel')?.addEventListener('click', () => closeModal(document.getElementById('fedPeerModalOverlay')))
+  document.getElementById('fedPeerModalClose')?.addEventListener('click', () => closeModal(document.getElementById('fedPeerModalOverlay')))
+  const overlay = document.getElementById('fedPeerModalOverlay')
+  overlay?.addEventListener('click', (e) => { if (e.target === overlay) closeModal(overlay) })
+}
+
 ;(() => {
   function routeFromHash() {
     let pageId = decodeURIComponent((location.hash || '').replace(/^#/, ''))
@@ -13270,7 +14480,7 @@ function renderMarkdown(md) {
       i++
       while (i < lines.length && !/^```\s*$/.test(lines[i])) { code.push(lines[i]); i++ }
       i++
-      out.push('<pre><code>' + escapeHtml(code.join('\n')) + '</code></pre>')
+      out.push('<pre><code' + (fence[1] ? ' class="language-' + escapeHtml(fence[1]) + '"' : '') + '>' + escapeHtml(code.join('\n')) + '</code></pre>')
       continue
     }
     const h = line.match(/^(#{1,6})\s+(.*)$/)
@@ -13366,7 +14576,7 @@ async function openDoc(name) {
       '<div class="docs-content-toolbar">' +
         '<button class="btn-secondary btn-compact" id="docsDownloadBtn">' + t('docs.download_btn') + '</button>' +
       '</div>' +
-      '<div class="docs-rendered markdown-body">' + renderMarkdown(content) + '</div>'
+      '<div class="docs-rendered markdown-body md-rendered">' + renderMarkdown(content) + '</div>'
     const dl = document.getElementById('docsDownloadBtn')
     if (dl) dl.addEventListener('click', () => downloadMarkdown(name, content))
   } catch (e) {
