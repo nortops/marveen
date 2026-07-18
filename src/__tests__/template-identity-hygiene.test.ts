@@ -230,7 +230,7 @@ describe('runtime-seeded placeholders are all substituted', () => {
     const template = readFileSync(join(REPO_ROOT, 'templates', 'CLAUDE.md.template'), 'utf-8')
     const out = substituteTemplatePlaceholders(template, {
       projectRoot: '/test',
-      mainAgentId: 'atlas',
+      mainAgentId: 'testbot',
       botName: 'TestBot',
       ownerName: 'TestOwner',
       webPort: 3421,

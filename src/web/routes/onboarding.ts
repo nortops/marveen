@@ -2,14 +2,15 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir, userInfo } from 'node:os'
 import { execFileSync } from 'node:child_process'
-import { PROJECT_ROOT, STORE_DIR } from '../../config.js'
+import { PROJECT_ROOT, STORE_DIR, CHANNEL_PROVIDER } from '../../config.js'
 import { logger } from '../../logger.js'
 import { resolveFromPath } from '../../platform.js'
 import { atomicWriteFileSync } from '../atomic-write.js'
-import { channelStateDir } from '../../channel-provider.js'
+import { channelStateDir, readChannelToken } from '../../channel-provider.js'
 import { sessionExistsOnHost } from '../agent-process.js'
 import { MAIN_CHANNELS_SESSION } from '../main-agent.js'
 import { hardRestartMarveenChannels } from '../channel-monitor.js'
+import { liveProbeAuth, stampTokenVerified } from '../claude-credentials-guard.js'
 import { json, readBody } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
 
@@ -71,15 +72,17 @@ function claudeAuthPresent(): boolean {
   return keychainHasClaudeCredentials()
 }
 
-function telegramConfigured(): boolean {
-  try {
-    return /^TELEGRAM_BOT_TOKEN=\S/m.test(readFileSync(join(channelStateDir('telegram'), '.env'), 'utf-8'))
-  } catch { return false }
+// Active-channel checks, provider-aware (NOT hardcoded to Telegram). A
+// Discord-switched (or Slack/etc.) install has no telegram/ state dir, so a
+// telegram-only probe would report "not configured" forever and pop the wizard
+// over a working dashboard. readChannelToken knows each provider's env key.
+function channelConfigured(): boolean {
+  return readChannelToken(CHANNEL_PROVIDER, join(channelStateDir(CHANNEL_PROVIDER), '.env')) != null
 }
 
 function paired(): boolean {
   try {
-    const a = JSON.parse(readFileSync(join(channelStateDir('telegram'), 'access.json'), 'utf-8')) as {
+    const a = JSON.parse(readFileSync(join(channelStateDir(CHANNEL_PROVIDER), 'access.json'), 'utf-8')) as {
       allowFrom?: unknown[]; groups?: Record<string, unknown>
     }
     const allow = Array.isArray(a.allowFrom) ? a.allowFrom.length : 0
@@ -125,7 +128,7 @@ export async function tryHandleOnboarding(ctx: RouteContext): Promise<boolean> {
   if (path === '/api/onboarding/status' && method === 'GET') {
     const claude = claudeAuthPresent()
     const running = agentsRunning()
-    const tg = telegramConfigured()
+    const ch = channelConfigured()
     const pr = paired()
     json(res, {
       identityConfirmed: identityConfirmed(),
@@ -133,11 +136,11 @@ export async function tryHandleOnboarding(ctx: RouteContext): Promise<boolean> {
       currentOwnerName: readEnvValue('OWNER_NAME') || '',
       claudeAuthPresent: claude,
       agentsRunning: running,
-      telegramConfigured: tg,
+      channelConfigured: ch,
       paired: pr,
       // The identity step never re-opens the wizard on an already-configured
       // install: it only participates while first-run setup is incomplete.
-      needsOnboarding: !claude || !running || !tg || !pr,
+      needsOnboarding: !claude || !running || !ch || !pr,
     })
     return true
   }
@@ -204,11 +207,33 @@ export async function tryHandleOnboarding(ctx: RouteContext): Promise<boolean> {
     if (token && !/^sk-ant-oat/.test(token)) { json(res, { error: 'A setup-token formatuma nem stimmel (sk-ant-oat...).', reason: 'bad-token' }, 400); return true }
     if (apiKey && !/^sk-ant-/.test(apiKey)) { json(res, { error: 'Az API-kulcs formatuma nem stimmel (sk-ant-...).', reason: 'bad-key' }, 400); return true }
 
+    // Verify BEFORE persisting, with a REAL probe. 2026-07-15 bootcamp bug 3:
+    // the old persist-then-verify order stored a mistyped/revoked token into
+    // .env + the fleet token file and still returned ok:true -- and since
+    // CLAUDE_CODE_OAUTH_TOKEN env strictly overrides a valid
+    // ~/.claude/.credentials.json, that single bad paste 401-ed ("Invalid
+    // bearer token") every sub-agent launched afterwards while the env-less
+    // main agent kept working. NOTE: `claude auth status` is NOT a validator --
+    // it exits 0 for a garbage token (it reports the auth source; proven live
+    // on the reference VPS) -- so this uses liveProbeAuth (one tiny haiku
+    // `claude -p` call). Only a probe that PROVES the credential dead blocks
+    // the persist; an inconclusive probe (binary missing / network flake)
+    // keeps the old best-effort behaviour and stores it as verified:false.
+    const probe = await liveProbeAuth(token ? { CLAUDE_CODE_OAUTH_TOKEN: token } : { ANTHROPIC_API_KEY: apiKey })
+    if (probe === 'auth-rejected') {
+      logger.warn({ mode: token ? 'oauth' : 'apikey' }, 'onboarding: Claude auth REJECTED by live probe; nothing persisted')
+      json(res, { error: 'A megadott token/kulcs nem ervenyes (a proba-hivast a szerver elutasitotta). Ellenorizd, hogy a teljes setup-tokent illesztetted-e be.', reason: 'verify-failed', verified: false }, 400)
+      return true
+    }
+    const verified = probe === 'ok'
+
     try {
       if (token) {
         setEnvKey('CLAUDE_CODE_OAUTH_TOKEN', token)
         // Keep the credentials-guard fleet token file in sync (harmless if unused).
         try { mkdirSync(STORE_DIR, { recursive: true }); writeFileSync(FLEET_TOKEN_FILE, token, { mode: 0o600 }) } catch { /* optional */ }
+        // A live-verified token needs no boot-time re-probe.
+        if (verified) stampTokenVerified(token)
       } else {
         setEnvKey('ANTHROPIC_API_KEY', apiKey)
       }
@@ -217,17 +242,6 @@ export async function tryHandleOnboarding(ctx: RouteContext): Promise<boolean> {
       json(res, { error: 'Nem sikerult elmenteni az .env-be.', reason: 'write-failed' }, 500)
       return true
     }
-
-    // Verify WITHOUT an API spend: `claude auth status` only inspects the token.
-    let verified = false
-    try {
-      execFileSync(resolveFromPath('claude'), ['auth', 'status'], {
-        timeout: 25_000,
-        stdio: 'ignore',
-        env: { ...process.env, ...(token ? { CLAUDE_CODE_OAUTH_TOKEN: token } : { ANTHROPIC_API_KEY: apiKey }) },
-      })
-      verified = true
-    } catch { verified = false }
     logger.info({ verified, mode: token ? 'oauth' : 'apikey' }, 'onboarding: Claude auth stored')
     json(res, { ok: true, verified })
     return true

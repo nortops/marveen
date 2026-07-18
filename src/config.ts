@@ -40,6 +40,14 @@ function cfg(key: string): string | undefined {
   return env[key]
 }
 
+// The single timezone for this install -- drives BOTH cron scheduling (cron.ts)
+// AND every human-facing time render (heartbeat, daily-log, memory labels, etc.).
+// One env var (SCHEDULER_TZ) so the whole box shares one zone; falls back to the
+// process zone (the TZ env / OS) when unset. Replaces the ~15 hardcoded
+// 'Europe/Budapest' literals -- change the zone in ONE place, and an update that
+// re-introduces a hardcoded literal is caught by a single grep, not a full review.
+export const APP_TZ = cfg('SCHEDULER_TZ') || Intl.DateTimeFormat().resolvedOptions().timeZone
+
 export const TELEGRAM_BOT_TOKEN = env['TELEGRAM_BOT_TOKEN'] ?? ''
 export const ALLOWED_CHAT_ID = env['ALLOWED_CHAT_ID'] ?? ''
 
@@ -47,13 +55,19 @@ export const SLACK_BOT_TOKEN = env['SLACK_BOT_TOKEN'] ?? ''
 export const SLACK_APP_TOKEN = env['SLACK_APP_TOKEN'] ?? ''
 export const SLACK_CHANNEL_ID = env['SLACK_CHANNEL_ID'] ?? ''
 
-export const OWNER_NAME = cfg('OWNER_NAME') ?? 'Szabolcs'
+// Distribution placeholder for an unconfigured owner name. Exported so
+// consumers that treat the owner name as PRIVATE data (federation outbound
+// scrub) can tell "a real configured name" apart from this generic English
+// word -- scrubbing the literal word "owner" false-positives on fixed template
+// text like "owner channels".
+export const OWNER_NAME_PLACEHOLDER = 'Owner'
+export const OWNER_NAME = env['OWNER_NAME'] ?? OWNER_NAME_PLACEHOLDER
 // Shared Google Drive folder ID the fleet writes deliverables into. Empty by
 // default (distribution-safe: no owner-specific folder is baked into a fresh
 // install's generated agent CLAUDE.md); set OWNER_DRIVE_FOLDER in .env to wire
 // the default shared drive for this install.
 export const OWNER_DRIVE_FOLDER = env['OWNER_DRIVE_FOLDER'] ?? ''
-export const BOT_NAME = cfg('BOT_NAME') ?? 'Marveen'
+export const BOT_NAME = env['BOT_NAME'] ?? 'Marveen'
 
 // Product / system brand shown in the dashboard chrome (browser tab title,
 // mobile topbar, sidebar, updates page). Kept SEPARATE from BOT_NAME so an
@@ -61,7 +75,7 @@ export const BOT_NAME = cfg('BOT_NAME') ?? 'Marveen'
 // another (BOT_NAME, the agent's display name). Defaults to BOT_NAME -- which
 // itself defaults to 'Marveen' -- so an install that sets neither, or only
 // BOT_NAME, behaves exactly as before.
-export const BRAND_NAME = cfg('BRAND_NAME') ?? BOT_NAME
+export const BRAND_NAME = env['BRAND_NAME'] ?? BOT_NAME
 
 // Pure resolution rule for BRAND_NAME, so the default (brandEnv unset =>
 // botName) is provable without a live .env. brandEnv is the raw env value
@@ -101,7 +115,7 @@ export function brandSlug(raw: string): string {
 // labels, API routing, etc. The installer derives this from BOT_NAME
 // (NFKD + ASCII + lowercase dashes). Older installs without this env var
 // fall back to "marveen" so nothing breaks when upgrading in place.
-export const MAIN_AGENT_ID = cfg('MAIN_AGENT_ID') ?? 'marveen'
+export const MAIN_AGENT_ID = env['MAIN_AGENT_ID'] ?? 'marveen'
 
 // Identifier the OS service manager uses for the main agent's units (launchd
 // label com.<id>.channels / com.<id>.dashboard, systemd <id>-channels, etc.).
@@ -217,7 +231,7 @@ const rawKanbanLabelColors = (env['KANBAN_LABEL_COLORS'] ?? '#3b82f6,#0ea5e9,#10
   .filter(Boolean)
 export const KANBAN_LABEL_COLORS = rawKanbanLabelColors.length > 0 ? rawKanbanLabelColors : ['#64748b']
 
-export const CHANNEL_PROVIDER: ChannelProviderType = getProviderType(cfg('CHANNEL_PROVIDER'))
+export const CHANNEL_PROVIDER: ChannelProviderType = getProviderType(env['CHANNEL_PROVIDER'])
 export const CHANNEL_TOKEN = getChannelToken(CHANNEL_PROVIDER, env)
 export const CHANNEL_CHAT_ID = getChannelChatId(CHANNEL_PROVIDER, env)
 
@@ -254,10 +268,37 @@ export const HEARTBEAT_START_HOUR = parseInt(env['HEARTBEAT_START_HOUR'] ?? '9',
 export const HEARTBEAT_AGENT_ENABLED =
   ['1', 'true', 'yes', 'on'].includes((cfg('HEARTBEAT_AGENT_ENABLED') ?? '').trim().toLowerCase())
 
+// Sub-agent Telegram inbox delivery-path tee (opt-in, DEFAULT OFF).
+// When enabled, a telegram sub-agent loads the channel plugin via a per-agent
+// mcp.json wrapped in the inbound-tee (scripts/channel-inbound-tee.mjs), which
+// persists each inbound notification to <state>/inbox-pending.jsonl for the
+// channel-inbox-drain UserPromptSubmit hook to pull into the next turn. This
+// swaps the default `--channels` delivery path, so it is DEFAULT OFF: an install
+// that does not opt in keeps the exact upstream `--channels` behaviour and never
+// writes message content to disk. Enable with SUBAGENT_INBOX_TEE=1 (required for
+// SUBAGENT_TELEGRAM_WAKE_ENABLED to have an inbox to wake on).
+export const SUBAGENT_INBOX_TEE =
+  ['1', 'true', 'yes', 'on'].includes((cfg('SUBAGENT_INBOX_TEE') ?? '').trim().toLowerCase())
+
+// Sub-agent Telegram inbox wake-nudge (opt-in, DEFAULT OFF).
+// The message-router can nudge an idle sub-agent whose derived Telegram inbox
+// (<state>/inbox-pending.jsonl) has stuck inbound messages, so its drain hook
+// fires and claims the backlog. This is the ACTIVE tail of the SUBAGENT_INBOX_TEE
+// delivery path: the tee writer and the UserPromptSubmit drain hook now ship in
+// this repo, but both are gated -- with SUBAGENT_INBOX_TEE off no inbox file is
+// produced and this watcher is a no-op even when enabled. Ships DISABLED so an
+// upstream install sees zero behaviour change and pays no per-tick cost; enable
+// with SUBAGENT_TELEGRAM_WAKE_ENABLED=1 (alongside SUBAGENT_INBOX_TEE=1).
+export const SUBAGENT_TELEGRAM_WAKE_ENABLED =
+  ['1', 'true', 'yes', 'on'].includes((cfg('SUBAGENT_TELEGRAM_WAKE_ENABLED') ?? '').trim().toLowerCase())
+
 // Google Calendar account the heartbeat summarises (next 2h). Empty (the
 // default) means the agent uses whatever calendar its MCP server is
 // authenticated as, so no personal address is baked into the shipped
-// scaffold.
-export const HEARTBEAT_CALENDAR_ACCOUNT = (env['HEARTBEAT_CALENDAR_ACCOUNT'] ?? '').trim()
+// scaffold. Read through cfg() so a value saved from the Settings UI
+// (config-overrides.json) actually reaches these boot-time consts on the next
+// restart -- with a bare env[] read the dashboard showed the saved value while
+// the heartbeat silently never saw it.
+export const HEARTBEAT_CALENDAR_ACCOUNT = (cfg('HEARTBEAT_CALENDAR_ACCOUNT') ?? '').trim()
 export const HEARTBEAT_END_HOUR = parseInt(env['HEARTBEAT_END_HOUR'] ?? '23', 10)
-export const HEARTBEAT_CALENDAR_ID = env['HEARTBEAT_CALENDAR_ID'] ?? ''
+export const HEARTBEAT_CALENDAR_ID = (cfg('HEARTBEAT_CALENDAR_ID') ?? '').trim()
