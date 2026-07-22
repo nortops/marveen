@@ -371,6 +371,7 @@ window._i18n.hu = {
   'agents.model.inherit':        'Öröklött (alapértelmezett)',
   'agents.model.fable5':         'Fable 5 (legújabb)',
   'agents.model.opus48':         'Opus 4.8 (1M kontextus, alapértelmezett)',
+  'agents.model.sonnet5':        'Sonnet 5 (legújabb Sonnet, Opus-közeli)',
   'agents.model.sonnet46':       'Sonnet 4.6 (gyors és okos)',
   'agents.model.haiku45':        'Haiku 4.5 (leggyorsabb)',
   'agents.skills.empty':         'Nincsenek skillek hozzáadva',

@@ -13,6 +13,8 @@ export const DEFAULT_MODEL = 'claude-opus-4-8[1m]'
 export const MODEL_ALIASES: Record<string, string> = {
   'opus': 'claude-opus-4-8[1m]',
   'sonnet': 'claude-sonnet-4-6',
+  'sonnet-5': 'claude-sonnet-5',
+  'sonnet5': 'claude-sonnet-5',
   'haiku': 'claude-haiku-4-5-20251001',
   'inherit': DEFAULT_MODEL,
 }
