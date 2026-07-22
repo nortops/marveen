@@ -947,6 +947,7 @@ window._i18n.en = {
   'agents.model.inherit':        'Inherited (default)',
   'agents.model.fable5':         'Fable 5 (latest)',
   'agents.model.opus48':         'Opus 4.8 (1M context, default)',
+  'agents.model.sonnet5':        'Sonnet 5 (newest Sonnet, near-Opus)',
   'agents.model.sonnet46':       'Sonnet 4.6 (fast and smart)',
   'agents.model.haiku45':        'Haiku 4.5 (fastest)',
   'agents.skills.empty':         'No skills added',

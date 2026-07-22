@@ -46,6 +46,7 @@ import {
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { sendTelegramMessage } from './telegram.js'
 import { runCommandTask } from './command-task.js'
+import { paneShowsContextSaturation, detectsFirstRunGate } from '../pane-state.js'
 
 // How many bare-Enter attempts the post-send resubmit tries before escalating
 // to a clear + re-inject, and the hard cap after which it gives up.
@@ -193,7 +194,7 @@ async function attemptFireTask(
   now: number,
   preCheckPrefix?: string,
   lateCatchUpMs?: number,
-): Promise<'fired' | 'busy' | 'missing' | 'starting' | 'error' | 'mcp-missing'> {
+): Promise<'fired' | 'busy' | 'missing' | 'starting' | 'error' | 'mcp-missing' | 'first-run'> {
   const isMainAgent = agentName === MAIN_AGENT_ID
   // Allow per-task session override via targetSession config field.
   // Falls back to the standard agent session name derivation.
@@ -234,18 +235,52 @@ async function attemptFireTask(
   // will process it at the next idle slot. This prevents the infinite
   // retry loop observed when the target session stays busy for hours
   // (275 retries overnight in production).
-  //
-  // KNOWN FOLLOW-UP: forceSend also bypasses the context-saturation refusal
-  // now folded into isSessionReadyForPrompt(). A forceSend task can therefore
-  // still land on a 100%-context session. Left open deliberately -- forceSend's
-  // contract is "always eventually land, never silently drop", and a saturated
-  // session needs a separate delivery policy, tracked as future work.
   if (!task.forceSend && !(await isSessionReadyForPrompt(session, host))) {
+    // Distinguish a first-run gate (fresh-install folder-trust / login picker
+    // parked forever) from an ordinary busy turn: the retry row's reason then
+    // drives a first-run-specific operator alert instead of a generic
+    // "varakozik" -- and 'first-run' is exempt from skipIfBusy in the caller,
+    // because a gated session never frees up on its own the way a busy one
+    // does (recovery is the channel-monitor's dialog answering).
+    const notReadyPane = capturePane(session, host)
+    const gate = notReadyPane != null ? detectsFirstRunGate(notReadyPane) : null
+    if (gate) {
+      logger.warn({ task: task.name, agent: agentName, session, gate }, 'Schedule target session parked on a Claude Code first-run dialog, deferring to retry queue')
+      return 'first-run'
+    }
     logger.warn({ task: task.name, agent: agentName, session }, 'Schedule target session busy or has pending input, will retry')
     return 'busy'
   }
 
   if (task.forceSend) {
+    // forceSend's contract is "always eventually land, never silently drop" --
+    // but injecting into a 100%-context session IS a silent drop with extra
+    // steps: the pane accepts the keystrokes and the wedged session never acts
+    // on them, and the context-guard's rescue restart then discards the queued
+    // input (2026-07-17: reggeli-napindito force-injected into a saturated
+    // marveen-channels and vanished without a trace). Closes the KNOWN
+    // FOLLOW-UP that previously lived here: saturation is the one busy-state
+    // forceSend must respect. Defer via the pending-retry queue (the caller
+    // maps 'busy' to a retry row, exempt from skipIfBusy for forceSend); the
+    // retry lands on the first tick after the session has been rescued. All
+    // other busy states keep the bypass.
+    const pane = capturePane(session, host)
+    if (pane != null && paneShowsContextSaturation(pane)) {
+      logger.warn({ task: task.name, agent: agentName, session }, 'forceSend target session is context-saturated (100%) -- deferring to retry queue instead of injecting into a wedged session')
+      return 'busy'
+    }
+    // Same non-negotiable for a first-run gate: a fresh install's agent parked
+    // on the folder-trust dialog / login picker has no input box at all, so a
+    // force-injected prompt is typed blindly into the DIALOG (digits select
+    // options, Enter confirms them) and the prompt is lost -- a silent drop
+    // with extra steps, plus keystroke roulette on a consent dialog. Defer to
+    // the retry queue; the channel-monitor answers the dialogs (or alerts on
+    // the login picker) and the retry lands on the first tick after.
+    const forceGate = pane != null ? detectsFirstRunGate(pane) : null
+    if (forceGate) {
+      logger.warn({ task: task.name, agent: agentName, session, gate: forceGate }, 'forceSend target session is parked on a Claude Code first-run dialog -- deferring to retry queue instead of typing into the dialog')
+      return 'first-run'
+    }
     logger.info({ task: task.name, agent: agentName, session }, 'forceSend=true, bypassing busy-state check')
   }
 
@@ -396,6 +431,22 @@ async function attemptFireTask(
   }
 }
 
+// Injection priority within one tick: when several tasks are due in the same
+// scan window, the order of attemptFireTask calls decides who gets the target
+// session first -- and an injection takes seconds to a minute (readiness
+// double-sample, waitForIdle gate, chunked typing, post-send verify), so the
+// first task can push every later one well past its scheduled minute.
+// listScheduledTasks() returns directory (alphabetical) order, which let a
+// routine 30-min heartbeat outrank the operator-facing morning briefing every
+// day (2026-07-20: alkuszoktatas-feedback-figyelo injected first at 07:30 and
+// reggeli-napindito starved behind it). Rank: forceSend tasks (operator-marked
+// must-deliver) first, plain tasks next, heartbeats (short-cadence, typically
+// skipIfBusy) last. The sort is stable, so name order is kept within a rank.
+export function taskInjectionRank(t: Pick<ScheduledTask, 'forceSend' | 'type'>): number {
+  if (t.forceSend) return 0
+  return t.type === 'heartbeat' ? 2 : 1
+}
+
 // Manual "Run now": fire a scheduled task immediately, bypassing the cron
 // match + lastRun catch-up + skipIfBusy guards (the operator explicitly asked
 // for it). Reuses attemptFireTask, so a stopped agent is auto-started and the
@@ -424,7 +475,7 @@ export async function runScheduledTaskNow(
     // busy session both get a queued retry that lands once the session is
     // ready. We deliberately do NOT consult skipIfBusy here -- that flag trims
     // redundant cron ticks, but an explicit run-now must not be dropped.
-    if (result === 'starting' || result === 'busy' || result === 'mcp-missing') {
+    if (result === 'starting' || result === 'busy' || result === 'mcp-missing' || result === 'first-run') {
       const reason = result === 'mcp-missing' ? mcpMissingReason(task.name, agentName) : result
       insertPendingTaskRetryIfNew(task.name, agentName, now, reason)
     }
@@ -484,11 +535,22 @@ function sendPendingRetryAlert(view: PendingRetryView, nowMs: number): void {
   const mcpMissing = view.lastReason?.startsWith('mcp-missing')
     ? view.lastReason.slice('mcp-missing:'.length) || 'ismeretlen'
     : null
+  // A first-run-gated session (fresh install: mappa-trust dialog / belépés-
+  // választó) needs the operator to know the ACTUAL blocker: the fix is a
+  // one-time login/consent on the agent session, not waiting for a busy
+  // session to free up.
+  const firstRunStuck = view.lastReason === 'first-run'
   const text = (mcpMissing
     ? [
         `[${BOT_NAME} scheduler] A(z) "${view.taskName}" (${view.agentName}) feladat NEM tud lefutni: a szükséges MCP szerver(ek) nem futnak a cél-sessionben: ${mcpMissing}.`,
         `Első próbálkozás: ${firstAttempt} (${ageMinutes} perce).`,
         'Amint az MCP szerver újra elérhető, a feladat magától lefut; a dashboard /Ütemezések oldalán visszavonható.',
+      ]
+    : firstRunStuck
+    ? [
+        `[${BOT_NAME} scheduler] A(z) "${view.taskName}" (${view.agentName}) feladat NEM tud lefutni: az agent session a Claude Code első-indítási képernyőjén áll (mappa-jóváhagyás vagy belépés szükséges).`,
+        `Első próbálkozás: ${firstAttempt} (${ageMinutes} perce).`,
+        `A rendszer a jóváhagyás-dialogokat magától továbblépteti; ha belépés kell: tmux attach -t agent-${view.agentName}, majd válaszd ki a belépési módot. Utána a feladat magától lefut.`,
       ]
     : [
         `[${BOT_NAME} scheduler] A(z) "${view.taskName}" (${view.agentName}) ütemezett feladat ${ageMinutes} perce várakozik.`,
@@ -624,6 +686,12 @@ export function startScheduleRunner(): NodeJS.Timeout {
       if (stillPresent && view.alertDue) sendPendingRetryAlert(view, now)
     }
 
+    // Fire in injection-priority order, not directory order: with several
+    // tasks due in one window, each injection delays the next by seconds to a
+    // minute, so forceSend/task entries must reach the session before the
+    // routine heartbeats (see taskInjectionRank). listScheduledTasks() builds
+    // a fresh array every tick, so the in-place sort leaks nowhere.
+    tasks.sort((a, b) => taskInjectionRank(a) - taskInjectionRank(b))
     for (const task of tasks) {
       if (!task.enabled) continue
       if (!cronDueBetween(task.schedule, fromMs, now)) continue
@@ -689,7 +757,12 @@ export function startScheduleRunner(): NodeJS.Timeout {
           // pending-retry loop then sends as soon as Claude has booted.
           insertPendingTaskRetryIfNew(task.name, agentName, now, 'starting')
         } else if (result === 'busy') {
-          if (task.skipIfBusy) {
+          // A forceSend task only ever reports 'busy' from the context-
+          // saturation deferral inside attemptFireTask -- every other busy
+          // state is bypassed. Dropping that on skipIfBusy would turn the
+          // deferral into a silent loss, so forceSend is exempt from the
+          // skip and always queues the retry.
+          if (task.skipIfBusy && !task.forceSend) {
             // Opt-in skip for short-cadence tasks (e.g. 30-min heartbeats):
             // a single missed tick is harmless because the next one is
             // already on the way, and queueing them produces spurious
@@ -711,6 +784,13 @@ export function startScheduleRunner(): NodeJS.Timeout {
           // pre-check exists to eliminate. The retry row keeps the task alive
           // until the server returns, and the alert names the dead server.
           insertPendingTaskRetryIfNew(task.name, agentName, now, mcpMissingReason(task.name, agentName))
+        } else if (result === 'first-run') {
+          // Also exempt from skipIfBusy: a session parked on a first-run
+          // dialog (fresh install) never frees up between ticks the way a
+          // busy one does, so dropping ticks would starve the task with no
+          // trace. The retry row keeps it alive and the aged alert names the
+          // actual blocker instead of a generic "busy".
+          insertPendingTaskRetryIfNew(task.name, agentName, now, 'first-run')
         }
       }
     }

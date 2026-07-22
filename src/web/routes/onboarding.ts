@@ -59,6 +59,18 @@ function keychainHasClaudeCredentials(): boolean {
   } catch { return false }
 }
 
+// The fleet setup-token leg (#654): the wizard's own auth step stores the
+// token into FLEET_TOKEN_FILE (see the /api/onboarding/claude-auth handler
+// below), so an install authenticated ONLY via the fleet token has no env
+// var, no ~/.claude/.credentials.json and no Keychain entry -- without this
+// check the wizard re-nagged on every reload right after completing itself.
+// Presence-only, non-empty, same spirit as the other legs.
+function fleetTokenPresent(): boolean {
+  try {
+    return readFileSync(FLEET_TOKEN_FILE, 'utf-8').trim().length > 0
+  } catch { return false }
+}
+
 function claudeAuthPresent(): boolean {
   if (readEnvValue('CLAUDE_CODE_OAUTH_TOKEN')) return true
   if (readEnvValue('ANTHROPIC_API_KEY')) return true
@@ -69,6 +81,7 @@ function claudeAuthPresent(): boolean {
     if (d?.claudeAiOauth?.accessToken) return true
     if (d?.apiKey) return true
   } catch { /* no / unreadable credentials.json */ }
+  if (fleetTokenPresent()) return true
   return keychainHasClaudeCredentials()
 }
 
