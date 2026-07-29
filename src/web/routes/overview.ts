@@ -1,14 +1,14 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { PROJECT_ROOT, MAIN_AGENT_ID, BOT_NAME } from '../../config.js'
+import { PROJECT_ROOT, MAIN_AGENT_ID, currentBotName } from '../../config.js'
 import { getDb, countTaskRunsBetween } from '../../db.js'
 import {
   agentDir, listAgentNames, readAgentDisplayName,
 } from '../agent-config.js'
 import { readAgentTeam } from '../agent-team.js'
 import { isAgentRunning } from '../agent-process.js'
-import { json } from '../http-helpers.js'
+import { json, jsonMaybeGzip } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
 
 // Count "real" user turns (operator prompts, Telegram messages) in every
@@ -58,7 +58,7 @@ function countUserTurns(fromMs: number, toMs: number = Number.POSITIVE_INFINITY)
 }
 
 export async function tryHandleOverview(ctx: RouteContext): Promise<boolean> {
-  const { res, path, method } = ctx
+  const { req, res, path, method } = ctx
 
   if (path === '/api/overview' && method === 'GET') {
     const subAgents = listAgentNames()
@@ -126,7 +126,7 @@ export async function tryHandleOverview(ctx: RouteContext): Promise<boolean> {
     ].some(existsSync)
     agentsForTeam.push({
       id: MAIN_AGENT_ID,
-      label: BOT_NAME,
+      label: currentBotName(),
       role: 'main',
       running: true,
       hasAvatar: mainHasAvatar,
@@ -143,7 +143,7 @@ export async function tryHandleOverview(ctx: RouteContext): Promise<boolean> {
         avatarUrl: `/api/agents/${encodeURIComponent(a)}/avatar`,
       })
     }
-    json(res, {
+    jsonMaybeGzip(req, res, {
       agents: { total, running },
       tasksToday,
       tasksYesterday,

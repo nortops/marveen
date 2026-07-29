@@ -3,11 +3,12 @@ import { join, extname, dirname } from 'node:path'
 import { homedir, platform, tmpdir } from 'node:os'
 import { execSync } from 'node:child_process'
 import { logger } from '../../logger.js'
-import { MAIN_AGENT_ID, BOT_NAME, PROJECT_ROOT } from '../../config.js'
+import { MAIN_AGENT_ID, currentBotName, PROJECT_ROOT } from '../../config.js'
 import { createAgentMessage, listPendingChannelRequests, updateChannelRequestStatus, getDb, claimPendingForAgent, markMessageFailed } from '../../db.js'
 import { classifyAgentMessage, wrapAgentMessageForDelivery } from '../agent-message-wrap.js'
 import { ensureFederationClaudeMdSection } from '../federation/onboarding.js'
 import { atomicWriteFileSync } from '../atomic-write.js'
+import { CHANNEL_PLUGIN_IDS } from '../plugin-ids.js'
 import { getSecret, setSecret, deleteSecret, listSecrets } from '../vault.js'
 import { loadOpenRouterCatalog, fetchAllOpenRouterModels, loadCuratedManual, addCuratedManual, removeCuratedManual } from '../openrouter-models.js'
 import {
@@ -49,6 +50,7 @@ import {
   writeAgentTeam,
   sanitizeTeamConfig,
   cleanupTeamReferences,
+  reportsToCreatesCycle,
   type TeamConfig,
 } from '../agent-team.js'
 import {
@@ -115,7 +117,7 @@ import {
 } from '../profiles.js'
 import { sanitizeAgentName, safeJoin } from '../sanitize.js'
 import { parseMultipart } from '../multipart.js'
-import { readBody, json, serveFile } from '../http-helpers.js'
+import { readBody, json, jsonMaybeGzip, serveFile } from '../http-helpers.js'
 import {
   exportAgentBundle,
   importAgentBundle,
@@ -244,14 +246,7 @@ export function setAgentEnabledPlugins(name: string, provider: ChannelProviderTy
     try { existing = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { /* overwrite */ }
   }
   const plugins = (existing.enabledPlugins ?? {}) as Record<string, boolean>
-  const allPlugins: Record<ChannelProviderType, string> = {
-    telegram: 'telegram@claude-plugins-official',
-    slack: 'slack-channel@marveen-marketplace',
-    discord: 'discord@claude-plugins-official',
-    googlechat: 'googlechat@claude-channel-googlechat',
-    teams: 'teams@marveen-marketplace',
-  }
-  for (const [p, pluginKey] of Object.entries(allPlugins)) {
+  for (const [p, pluginKey] of Object.entries(CHANNEL_PLUGIN_IDS)) {
     plugins[pluginKey] = p === provider
   }
   existing.enabledPlugins = plugins
@@ -467,8 +462,14 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   // Claude IDs are static. DeepSeek is gated behind a vault secret because
   // the agent-process launcher reads the key from there at start time --
   // surfacing the option in the UI without the key would let the operator
-  // pick a model that 401s on first prompt. The frontend renders this list
-  // both in the "new agent" wizard and the agent edit panel.
+  // pick a model that 401s on first prompt.
+  //
+  // NOTE: loadAvailableModels() in web/app.js consumes only `deepseek` and
+  // `openrouter` from this payload -- the Claude options are static <option>
+  // elements in web/index.html (wizard + edit panel). The `claude` array is
+  // therefore an API-only listing today; keep it in sync with those options so
+  // a client that does read it (or a future refactor that drops the static
+  // markup) does not silently offer a stale set.
   if (path === '/api/models/available' && method === 'GET') {
     const hasDeepseek = getSecret('DEEPSEEK_API_KEY') !== null
     // OpenRouter is gated behind the vault key, same as DeepSeek: surfacing the
@@ -477,8 +478,10 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     const orCatalog = loadOpenRouterCatalog()
     json(res, {
       claude: [
-        { id: 'claude-fable-5', label: 'Fable 5 (legújabb)' },
-        { id: 'claude-opus-4-8[1m]', label: 'Opus 4.8 (1M kontextus, alapértelmezett)' },
+        { id: 'claude-opus-5', label: 'Opus 5 (legújabb Opus)' },
+        { id: 'claude-sonnet-5', label: 'Sonnet 5' },
+        { id: 'claude-fable-5', label: 'Fable 5' },
+        { id: 'claude-opus-4-8[1m]', label: 'Opus 4.8 (1M kontextus)' },
         { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
         { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5 (leggyorsabb)' },
       ],
@@ -555,7 +558,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   }
 
   if (path === '/api/agents' && method === 'GET') {
-    json(res, listAgentSummaries())
+    jsonMaybeGzip(req, res, listAgentSummaries())
     return true
   }
 
@@ -623,7 +626,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       entries.push({ name, isMain: false, running, state, tail: tailOf(pane) })
     }
 
-    json(res, entries)
+    jsonMaybeGzip(req, res, entries)
     return true
   }
 
@@ -808,7 +811,8 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   if (avatarUploadMatch && method === 'GET') {
     const name = decodeURIComponent(avatarUploadMatch[1])
     const avatarPath = findAvatarForAgent(name)
-    if (avatarPath) { serveFile(req, res, avatarPath); return true }
+    // 1h client cache: see /api/marveen/avatar for the staleness trade-off.
+    if (avatarPath) { serveFile(req, res, avatarPath, { cacheSeconds: 3600 }); return true }
     res.writeHead(404); res.end()
     return true
   }
@@ -1165,7 +1169,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     }> = []
     nodes.push({
       id: MAIN_AGENT_ID,
-      label: BOT_NAME,
+      label: currentBotName(),
       role: 'main',
       reportsTo: null,
       delegatesTo: [],
@@ -1191,7 +1195,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
         : (n.id === MAIN_AGENT_ID ? null : MAIN_AGENT_ID)
       if (reports) edges.push({ from: reports, to: n.id })
     }
-    json(res, { nodes, edges, mainAgentId: MAIN_AGENT_ID })
+    jsonMaybeGzip(req, res, { nodes, edges, mainAgentId: MAIN_AGENT_ID })
     return true
   }
 
@@ -1222,9 +1226,21 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
         ? data.trustFrom.filter((x: unknown) => typeof x === 'string')
         : (current.trustFrom ?? []),
     }
+    // Reject a reportsTo that would create a reporting cycle (e.g. dragging a
+    // manager under its own report in the Team graph). Keep the current parent
+    // and flag it so the UI can explain why the drop was ignored.
+    let cycleRejected = false
+    if (
+      proposed.reportsTo &&
+      proposed.reportsTo !== current.reportsTo &&
+      reportsToCreatesCycle(name, proposed.reportsTo, readAgentTeam, MAIN_AGENT_ID)
+    ) {
+      proposed.reportsTo = current.reportsTo
+      cycleRejected = true
+    }
     const { team: next, warnings } = sanitizeTeamConfig(name, proposed)
     writeAgentTeam(name, next)
-    json(res, { ok: true, team: next, warnings })
+    json(res, { ok: true, team: next, warnings, cycleRejected })
     return true
   }
 
@@ -1562,6 +1578,10 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   const startMatch = path.match(/^\/api\/agents\/([^/]+)\/start$/)
   if (startMatch && method === 'POST') {
     const name = decodeURIComponent(startMatch[1])
+    if (isMainChannelsAgent(name)) {
+      json(res, { error: 'Main agent lifecycle is service-managed; use /api/marveen/restart for recovery' }, 400)
+      return true
+    }
     if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
     // Optional { "fresh": true } body -> no `--continue`. Required for channel
     // agents on Claude Code 2.1.193, where a `--continue` resume does not load
@@ -1580,6 +1600,10 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   const stopMatch = path.match(/^\/api\/agents\/([^/]+)\/stop$/)
   if (stopMatch && method === 'POST') {
     const name = decodeURIComponent(stopMatch[1])
+    if (isMainChannelsAgent(name)) {
+      json(res, { error: 'Main agent lifecycle is service-managed; use /api/marveen/restart for recovery' }, 400)
+      return true
+    }
     const result = stopAgentProcess(name)
     // Explicit stop clears intent so the monitor will not resurrect it.
     removeDesiredAgent(name)
@@ -1807,6 +1831,10 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   if (agentMatch && method === 'PUT') {
     const name = decodeURIComponent(agentMatch[1])
     if (!isKnownAgent(name)) { json(res, { error: 'Agent not found' }, 404); return true }
+    if (isMainChannelsAgent(name)) {
+      json(res, { error: 'Main agent configuration is read-only through the dashboard API' }, 400)
+      return true
+    }
     const body = await readBody(req)
     const configRoot = agentConfigRoot(name)
     const data = JSON.parse(body.toString()) as {

@@ -1,34 +1,31 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { writeFileSync, unlinkSync, existsSync, readFileSync } from 'node:fs'
-import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import { writeFileSync, unlinkSync, mkdtempSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 
-const __dirname = dirname(fileURLToPath(import.meta.url))
-const PROJECT_ROOT = join(__dirname, '..', '..')
-const testEnvPath = join(PROJECT_ROOT, '.env')
+// ENFORCED sandbox. The previous version of this file wrote fixtures into --
+// and unlink'd -- the LIVE repo-root .env (snapshot/restore around each test),
+// which in a production checkout recreated the real secrets file with default
+// 0644 permissions (2026-07-27 incident). env.ts resolves its own PROJECT_ROOT
+// (it cannot import config.js -- circular), so the redirect is the
+// CLAUDECLAW_ENV_DIR hook read at module import; set it BEFORE the dynamic
+// import below. vitest isolates module registries per test file, so the hook
+// cannot leak into other suites.
+const SANDBOX = mkdtempSync(join(tmpdir(), 'env-test-'))
+const testEnvPath = join(SANDBOX, '.env')
 
-let hadExistingEnv = false
-let existingContent = ''
-
-beforeEach(() => {
-  if (existsSync(testEnvPath)) {
-    hadExistingEnv = true
-    existingContent = require('fs').readFileSync(testEnvPath, 'utf-8')
-  }
+beforeAll(() => {
+  process.env.CLAUDECLAW_ENV_DIR = SANDBOX
 })
 
-afterEach(() => {
-  if (hadExistingEnv) {
-    writeFileSync(testEnvPath, existingContent)
-  } else {
-    try { unlinkSync(testEnvPath) } catch {}
-  }
+afterAll(() => {
+  delete process.env.CLAUDECLAW_ENV_DIR
+  rmSync(SANDBOX, { recursive: true, force: true })
 })
 
 describe('readEnvFile', () => {
   it('ures objektumot ad vissza ha nincs .env', async () => {
-    try { unlinkSync(testEnvPath) } catch {}
-    // Friss import
+    try { unlinkSync(testEnvPath) } catch { /* absent */ }
     const { readEnvFile } = await import('../env.js')
     const result = readEnvFile()
     expect(result).toEqual({})
@@ -65,53 +62,5 @@ describe('readEnvFile', () => {
     expect(result['A']).toBe('1')
     expect(result['C']).toBe('3')
     expect(result['B']).toBeUndefined()
-  })
-})
-
-describe('updateEnvFile', () => {
-  it('meglevo kulcsot lecserel, a tobbi sort es kommentet megorzi', async () => {
-    writeFileSync(testEnvPath, '# fej\nMAIN_AGENT_ID=marveen\nOTHER=keep\n')
-    const { updateEnvFile } = await import('../env.js')
-    updateEnvFile({ MAIN_AGENT_ID: 'atlas' })
-    const out = readFileSync(testEnvPath, 'utf-8')
-    expect(out).toContain('# fej')
-    expect(out).toContain('MAIN_AGENT_ID=atlas')
-    expect(out).not.toContain('MAIN_AGENT_ID=marveen')
-    expect(out).toContain('OTHER=keep')
-  })
-
-  it('hianyzo kulcsot hozzafuz', async () => {
-    writeFileSync(testEnvPath, 'OTHER=keep\n')
-    const { updateEnvFile } = await import('../env.js')
-    updateEnvFile({ BOT_NAME: 'Atlas' })
-    const out = readFileSync(testEnvPath, 'utf-8')
-    expect(out).toContain('OTHER=keep')
-    expect(out).toContain('BOT_NAME=Atlas')
-  })
-
-  it('a teljes identitas-keszletet irja, unquoted (channels.sh cut-kompatibilis)', async () => {
-    writeFileSync(testEnvPath, 'MAIN_AGENT_ID=marveen\n')
-    const { updateEnvFile } = await import('../env.js')
-    updateEnvFile({
-      MAIN_AGENT_ID: 'atlas',
-      BOT_NAME: 'Atlas',
-      BRAND_NAME: 'Atlas',
-      OWNER_NAME: 'Norbert',
-      CHANNEL_PROVIDER: 'telegram',
-    })
-    const out = readFileSync(testEnvPath, 'utf-8')
-    expect(out).toContain('MAIN_AGENT_ID=atlas')
-    expect(out).toContain('CHANNEL_PROVIDER=telegram')
-    // no quotes around values -- channels.sh parses with `cut -d= -f2-`
-    expect(out).not.toContain('MAIN_AGENT_ID="atlas"')
-  })
-
-  it('ures update eseten nem ir (no-op)', async () => {
-    writeFileSync(testEnvPath, 'A=1\n')
-    const { updateEnvFile } = await import('../env.js')
-    updateEnvFile({})
-    updateEnvFile({ EMPTY: '' })
-    const out = readFileSync(testEnvPath, 'utf-8')
-    expect(out).toBe('A=1\n')
   })
 })

@@ -76,6 +76,11 @@ export function currentGitHead(): string {
   return gitSafe(['rev-parse', 'HEAD'], 3000) ?? ''
 }
 
+export function trackedBranch(): string {
+  const b = gitSafe(['rev-parse', '--abbrev-ref', 'HEAD'], 3000)
+  return b && b !== 'HEAD' ? b : 'main'
+}
+
 // "git@github.com:Owner/Repo.git" | "https://github.com/Owner/Repo.git" -> "Owner/Repo"
 function remoteSlug(remote: string): string {
   const url = gitSafe(['config', '--get', `remote.${remote}.url`], 3000)
