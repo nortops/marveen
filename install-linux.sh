@@ -297,7 +297,9 @@ if [ ! -f "$INSTALL_DIR/package.json" ]; then
     ok "Repo klonozva: $TARGET_DIR"
   fi
   echo -e "  Telepito ujrainditasa a checkoutbol..."
-  exec bash "$TARGET_DIR/install-linux.sh"
+  # Forward argv so a run from outside the repo (curl bootstrap, or an explicit
+  # `install-linux.sh --port N`) keeps its flags across the self-reclone exec.
+  exec bash "$TARGET_DIR/install-linux.sh" "$@"
 fi
 
 INSTALL_STEP="claude-bun-install"
@@ -742,33 +744,61 @@ INSTALL_STEP="configuration"
 echo ""
 echo -e "${BOLD}  Konfiguracio letrehozasa...${NC}"
 
-(
-  umask 077 && cat >"$INSTALL_DIR/.env" <<ENVEOF
-# Main agent konfiguracio
-CHANNEL_PROVIDER=${CHANNEL_PROVIDER}
-OWNER_NAME=${OWNER_NAME}
-BOT_NAME=${BOT_NAME}
-BRAND_NAME=${BRAND_NAME}
-MAIN_AGENT_ID=${MAIN_AGENT_ID}
-SERVICE_ID=${SERVICE_ID}
-WEB_PORT=${WEB_PORT:-3420}
-ENVEOF
-)
+# Create or UPDATE .env -- MERGE, never replace (card 8290FF71). The old
+# cat> heredoc regenerated the file on every run, silently dropping every
+# line the installer does not own: wizard-saved credentials
+# (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY), operator-added keys
+# (WEB_HOST, GOOGLE_API_KEY, MAIN_AGENT_ISOLATED_CONFIG, ...) and a live
+# pairing (ALLOWED_CHAT_ID) -- so a re-run over a working install broke it.
+# Critical toggles should additionally live in store/config-overrides.json
+# (two-layer store), which install/update never touches.
+env_merge_key() {
+  # env_merge_key KEY VALUE -- drop any existing KEY= line, append KEY=VALUE.
+  _emk_tmp="$INSTALL_DIR/.env.tmp.$$"
+  grep -v "^$1=" "$INSTALL_DIR/.env" > "$_emk_tmp" 2>/dev/null || true
+  printf '%s=%s\n' "$1" "$2" >> "$_emk_tmp"
+  mv "$_emk_tmp" "$INSTALL_DIR/.env"
+  chmod 600 "$INSTALL_DIR/.env"
+}
+env_keep_or_set() {
+  # env_keep_or_set KEY VALUE -- like env_merge_key, but an EMPTY new value
+  # never clobbers an existing non-empty one (re-run with a skipped prompt).
+  _eks_existing="$(grep "^$1=" "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+  if [ -z "$2" ] && [ -n "$_eks_existing" ]; then return 0; fi
+  env_merge_key "$1" "$2"
+}
+(umask 077 && touch "$INSTALL_DIR/.env")
+chmod 600 "$INSTALL_DIR/.env"
+[ -s "$INSTALL_DIR/.env" ] || printf '# Main agent konfiguracio\n' >> "$INSTALL_DIR/.env"
+env_merge_key CHANNEL_PROVIDER "${CHANNEL_PROVIDER}"
+env_merge_key OWNER_NAME "${OWNER_NAME}"
+env_merge_key BOT_NAME "${BOT_NAME}"
+env_merge_key BRAND_NAME "${BRAND_NAME}"
+env_merge_key MAIN_AGENT_ID "${MAIN_AGENT_ID}"
+env_merge_key SERVICE_ID "${SERVICE_ID}"
+env_merge_key WEB_PORT "${WEB_PORT:-3420}"
 if [ "$CHANNEL_PROVIDER" = "telegram" ]; then
-  echo "TELEGRAM_BOT_TOKEN=${BOT_TOKEN}" >> "$INSTALL_DIR/.env"
-  echo "ALLOWED_CHAT_ID=${CHAT_ID}" >> "$INSTALL_DIR/.env"
+  env_keep_or_set TELEGRAM_BOT_TOKEN "${BOT_TOKEN}"
+  # Never demote a paired install: CHAT_ID=0 means pairing was skipped THIS
+  # run -- it must not overwrite a real chat id from a previous run.
+  _existing_chat="$(grep '^ALLOWED_CHAT_ID=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+  if [ "${CHAT_ID}" != "0" ] || [ -z "$_existing_chat" ]; then
+    env_merge_key ALLOWED_CHAT_ID "${CHAT_ID}"
+  fi
 elif [ "$CHANNEL_PROVIDER" = "discord" ]; then
-  echo "DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}" >> "$INSTALL_DIR/.env"
-  echo "DISCORD_CHANNEL_ID=${DISCORD_CHANNEL_ID}" >> "$INSTALL_DIR/.env"
-  echo "OPERATOR_DISCORD_USER_ID=${OPERATOR_DISCORD_USER_ID}" >> "$INSTALL_DIR/.env"
+  env_keep_or_set DISCORD_BOT_TOKEN "${DISCORD_BOT_TOKEN}"
+  env_keep_or_set DISCORD_CHANNEL_ID "${DISCORD_CHANNEL_ID}"
+  env_keep_or_set OPERATOR_DISCORD_USER_ID "${OPERATOR_DISCORD_USER_ID}"
 else
-  echo "SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}" >> "$INSTALL_DIR/.env"
-  echo "SLACK_APP_TOKEN=${SLACK_APP_TOKEN}" >> "$INSTALL_DIR/.env"
+  env_keep_or_set SLACK_BOT_TOKEN "${SLACK_BOT_TOKEN}"
+  env_keep_or_set SLACK_APP_TOKEN "${SLACK_APP_TOKEN}"
 fi
 # Claude auth credentials (API key or OAuth token) -- channels.sh reads
 # these selectively so the tmux-spawned claude process can authenticate.
+# Merged by key, so an auth line saved by a previous run (or the dashboard
+# wizard) survives a re-run where the prompt was skipped.
 if [ -n "${CLAUDE_AUTH_ENV_LINE:-}" ]; then
-  echo "$CLAUDE_AUTH_ENV_LINE" >> "$INSTALL_DIR/.env"
+  env_merge_key "${CLAUDE_AUTH_ENV_LINE%%=*}" "${CLAUDE_AUTH_ENV_LINE#*=}"
 fi
 chmod 600 "$INSTALL_DIR/.env"
 # Fleet setup-token file: per-agent config-dir isolation and the credentials
@@ -1333,10 +1363,16 @@ ${TZ_LINE}
 EOF
 
 # ${MORN_UNIT}.timer
+# NO Requires=/Wants= on the service here: a [Unit] dependency on the
+# triggered service makes EVERY activation of the timer unit (each systemd
+# user-manager start, not just the 07:27 elapse) queue an immediate start of
+# the briefing service. Under user-manager restart churn that multiplied the
+# morning briefing (customer report 2026-07-26: 5 deliveries in one day).
+# The [Timer] section binds to ${MORN_UNIT}.service by name on elapse, which
+# is the only coupling a timer needs.
 cat >"$SYSTEMD_DIR/${MORN_UNIT}.timer" <<EOF
 [Unit]
 Description=${BOT_NAME} Reggeli Napindito Timer
-Requires=${MORN_UNIT}.service
 
 [Timer]
 OnCalendar=*-*-* 07:27:00

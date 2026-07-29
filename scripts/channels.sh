@@ -25,6 +25,11 @@ if [ -f "$INSTALL_DIR/.env" ]; then
   MAIN_AGENT_ID="$(grep -E '^MAIN_AGENT_ID=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2-)"
   CHANNEL_PROVIDER="$(grep -E '^CHANNEL_PROVIDER=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2-)"
   BOT_NAME="$(grep -E '^BOT_NAME=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2-)"
+  # Optional extra channel plugins to co-listen alongside the PRIMARY provider
+  # (space-separated plugin IDs, e.g. "discord@claude-plugins-official"). The
+  # primary provider still drives the orphan-reaper + liveness watchdog logic
+  # below unchanged; the extras are best-effort co-listeners on the same session.
+  CHANNEL_PLUGINS_EXTRA="$(grep -E '^CHANNEL_PLUGINS_EXTRA=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2-)"
   # Claude Code auth: pass API key or OAuth token so the tmux-spawned
   # claude process can authenticate. These are safe to export -- unlike
   # TELEGRAM_BOT_TOKEN they don't cause cross-session conflicts.
@@ -45,14 +50,64 @@ fi
 CHANNEL_PROVIDER="${CHANNEL_PROVIDER:-telegram}"
 SESSION="${MAIN_AGENT_ID:-marveen}-channels"
 
-# Resolve plugin ID from provider
-case "$CHANNEL_PROVIDER" in
-  slack)    PLUGIN_ID="slack-channel@marveen-marketplace" ;;
-  whatsapp) PLUGIN_ID="whatsapp@marveen-marketplace" ;;
-  teams)    PLUGIN_ID="teams@marveen-marketplace" ;;
-  discord)  PLUGIN_ID="discord@claude-plugins-official" ;;
-  *)        PLUGIN_ID="telegram@claude-plugins-official" ;;
-esac
+# Resolve plugin ID from provider.
+#
+# PLUGIN_ID is the marketplace-qualified id the `--channels` flag takes.
+# PLUGIN_PANE_ID is the *MCP server* id the /mcp TUI renders, which is a
+# DIFFERENT string (`plugin:<plugin>:<mcp-server>`). Keep this map in sync with
+# `pluginPaneId` in src/channel-provider.ts -- the post-init unlock below greps
+# the /mcp pane for it.
+resolve_plugin_ids() {
+  case "$1" in
+    slack)    PLUGIN_ID="slack-channel@marveen-marketplace"; PLUGIN_PANE_ID="plugin:slack-channel:marveen-marketplace" ;;
+    whatsapp) PLUGIN_ID="whatsapp@marveen-marketplace";      PLUGIN_PANE_ID="plugin:whatsapp:marveen-marketplace" ;;
+    teams)    PLUGIN_ID="teams@marveen-marketplace";         PLUGIN_PANE_ID="plugin:teams:marveen-marketplace" ;;
+    discord)  PLUGIN_ID="discord@claude-plugins-official";   PLUGIN_PANE_ID="plugin:discord:discord" ;;
+    *)        PLUGIN_ID="telegram@claude-plugins-official";  PLUGIN_PANE_ID="plugin:telegram:telegram" ;;
+  esac
+}
+resolve_plugin_ids "$CHANNEL_PROVIDER"
+
+# --- pure classifier for the /mcp pane ----------------------------------------
+# Takes a captured pane as $1 and sets MCP_PLUGIN_STATE (failed|ok) plus the row
+# it judged in MCP_PLUGIN_ROW for logging. Assigns rather than prints so the
+# caller keeps the row without a subshell. Extracted so it is testable without a
+# live tmux session (see scripts/__tests__/channels-mcp-unlock.test.sh) -- the
+# previous inline matcher went stale against a Claude Code TUI change and no
+# test could have caught it.
+#
+# Only the plugin's OWN row is considered, and only the status word decides:
+#   - The row label is the MCP server id, not the marketplace id. Claude Code
+#     2.1.159 rendered `plugin:telegram@claude-plugins-official`, 2.1.220
+#     renders `plugin:telegram:telegram`. Both are accepted.
+#   - The failure marker moved from `✗ Failed` (U+2717, capitalised) to
+#     `✘ failed` (U+2718, lowercase), so the glyph is not matched at all. The
+#     status vocabulary mirrors PLUGIN_FAILED_RX in
+#     src/web/channel-health-monitor.ts.
+# The status-marker pre-filter keeps a scrollback mention of the plugin id (the
+# "Listening for channel messages from:" banner) from being read as the /mcp
+# row; `tail -1` prefers the menu, which renders at the bottom of the pane.
+MCP_PLUGIN_ROW=""
+MCP_PLUGIN_STATE="ok"
+classify_mcp_plugin_row() {
+  MCP_PLUGIN_ROW="$(printf '%s\n' "$1" \
+    | grep -F -e "$PLUGIN_PANE_ID" -e "plugin:$PLUGIN_ID" \
+    | grep -iE 'failed|error|disconnected|connected|disabled' \
+    | tail -1)"
+  case "$(printf '%s' "$MCP_PLUGIN_ROW" | tr '[:upper:]' '[:lower:]')" in
+    *failed*|*error*|*disconnected*) MCP_PLUGIN_STATE="failed" ;;
+    *)                               MCP_PLUGIN_STATE="ok" ;;
+  esac
+}
+
+# Test hook: classify a pane from stdin and exit before anything touches tmux,
+# the store or a live session.
+if [ "${1:-}" = "--classify-mcp-pane" ]; then
+  resolve_plugin_ids "${2:-$CHANNEL_PROVIDER}"
+  classify_mcp_plugin_row "$(cat)"
+  echo "$MCP_PLUGIN_STATE"
+  exit 0
+fi
 
 # Self-healing guard: ensure PLUGIN_ID is enabled in the PROJECT settings.json
 # before launch. A PR review-reset or branch-switch that reverts
@@ -120,6 +175,19 @@ PYEOF
 }
 _ensure_plugin_enabled "$INSTALL_DIR/.claude/settings.json"
 unset -f _ensure_plugin_enabled
+
+# Build the extra --channels args from CHANNEL_PLUGINS_EXTRA (space-separated
+# plugin IDs). Each becomes an additional `plugin:<id>` token appended to the
+# --channels list. `claude --channels` accepts a space-separated plugin list,
+# so one session can co-listen on several providers (e.g. Telegram + Discord).
+# NOTE: co-listen also requires each extra plugin to be enabled in
+# .claude/settings.json enabledPlugins (true) -- CHANNEL_PLUGINS_EXTRA alone is
+# not enough; Claude Code only starts plugins marked true there.
+EXTRA_CHANNELS=""
+for _p in $CHANNEL_PLUGINS_EXTRA; do
+  [ -n "$_p" ] && EXTRA_CHANNELS="$EXTRA_CHANNELS plugin:$_p"
+done
+unset _p
 
 # ROOT-CAUSE NOTE (kali-linux WSL, claude-code 2.1.152, 2026-05-27):
 # Inbound MCP notifications from the `--channels` plugin go through a SECOND
@@ -222,15 +290,17 @@ MODEL_FLAG=""
 # tmux command-string round-trip without the inner shell glob-expanding `[1m]`.
 [ -n "$MAIN_MODEL" ] && MODEL_FLAG="--model '$MAIN_MODEL' "
 
-# macOS main-agent config isolation (OPT-IN, default OFF).
+# Main-agent config isolation (OPT-IN, default OFF).
 #
-# By default the main channels agent keeps the shared ~/.claude and, on macOS,
-# authenticates from the ROTATING Keychain OAuth session -- which periodically
-# expires and 401s the main bot ("Please run /login"), while the isolated
-# sub-agents (long-lived fleet setup-token) never do. The helper provisions an
-# isolated CLAUDE_CONFIG_DIR (same code path as the sub-agents, via
-# dist/web/agent-process.js) and authenticates the main agent from the fleet
-# setup-token instead.
+# By default the main channels agent keeps the shared ~/.claude and
+# authenticates from whatever on-process credential refreshes that shared root
+# -- the ROTATING macOS Keychain OAuth session, or (Linux) the shared
+# ~/.claude/.credentials.json -- both periodically expire and 401 the main bot
+# ("Please run /login"), while the isolated sub-agents (long-lived fleet
+# setup-token) never do (confirmed root cause of the 2026-07-23 marveen-channels
+# silent outage). The helper provisions an isolated CLAUDE_CONFIG_DIR (same code
+# path as the sub-agents, via dist/web/agent-process.js) and authenticates the
+# main agent from the fleet setup-token instead.
 #
 # The decision lives ENTIRELY in the helper, which prints "<mode>\t<path>" (or
 # nothing) and covers the two mutually exclusive ways the main agent can get its
@@ -241,10 +311,10 @@ MODEL_FLAG=""
 #     fleet's). That dir carries its own .credentials.json, so we must NOT inject
 #     the fleet token: doing so would authenticate the bot as the fleet. Works on
 #     every platform.
-#   isolated -- MAIN_AGENT_ISOLATED_CONFIG=1 on macOS with a fleet setup-token:
-#     the helper provisions a credential-less dir and we export the fleet token
-#     (same code path as the sub-agents), so the bot stops depending on the
-#     rotating Keychain OAuth session.
+#   isolated -- MAIN_AGENT_ISOLATED_CONFIG=1 (any platform) with a fleet
+#     setup-token: the helper provisions a credential-less dir and we export the
+#     fleet token (same code path as the sub-agents), so the bot stops depending
+#     on the rotating/shared on-disk credential.
 #
 # Both settings resolve through the settings-store (dashboard toggle in
 # store/config-overrides.json OR a hand-set .env key -- resolution override>.env>
@@ -269,6 +339,27 @@ if [ -n "$_node_bin" ] && [ -f "$INSTALL_DIR/dist/web/agent-process.js" ]; then
       CFG_ENV="export CLAUDE_CONFIG_DIR='$_cfg_dir' && export CLAUDE_CODE_OAUTH_TOKEN=\"\$(cat '$INSTALL_DIR/store/.claude-oauth-token')\" && "
     fi
     echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: main-agent $_cfg_mode CLAUDE_CONFIG_DIR=$_cfg_dir" >> "$INSTALL_DIR/store/channels-failures.log"
+  fi
+  # LOUD REGRESSION GUARD: an isolated main-agent config dir on disk (provisioned
+  # by an earlier isolated boot) combined with THIS boot resolving to the shared
+  # ~/.claude means the isolation setting was lost -- e.g. store/config-overrides.json
+  # deleted with no .env key backing it. The silent fallback rides the rotating
+  # shared credential session, which is exactly how the 2026-07-27 evening 401
+  # outage started and was only noticed hours later when the owner got no replies.
+  # Surface it at START time instead: a failures-log line plus a best-effort
+  # inter-agent message to the main agent. Installs that never ran isolated have
+  # no .channels-config dir and stay quiet, so default setups see no new noise.
+  if [ -z "$CFG_ENV" ] && [ -d "$INSTALL_DIR/.channels-config" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: WARN main-agent starting on SHARED ~/.claude although isolated dir $INSTALL_DIR/.channels-config exists -- MAIN_AGENT_ISOLATED_CONFIG resolution came back empty (overrides/.env key lost?). Auth rides the rotating shared session and can 401." >> "$INSTALL_DIR/store/channels-failures.log"
+    if [ -f "$INSTALL_DIR/store/.dashboard-token" ]; then
+      _guard_port="$(grep -E '^WEB_PORT=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+      curl -s --max-time 5 -X POST "http://localhost:${_guard_port:-3420}/api/messages" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $(cat "$INSTALL_DIR/store/.dashboard-token")" \
+        -d "{\"from\":\"channels-sh-guard\",\"to\":\"${MAIN_AGENT_ID:-marveen}\",\"content\":\"[GUARD] A channels session most a KOZOS ~/.claude alol indult, pedig letezik izolalt config dir (.channels-config). A MAIN_AGENT_ISOLATED_CONFIG beallitas valoszinuleg elveszett (store/config-overrides.json torlodott es nincs .env kulcs). Az auth a rotalodo shared sessionbol megy, 401-veszely. Teendo: MAIN_AGENT_ISOLATED_CONFIG=1 visszaallitasa, majd channels session restart.\"}" \
+        >/dev/null 2>&1 || true
+      unset _guard_port
+    fi
   fi
   unset _cfg_line _cfg_mode _cfg_dir
 fi
@@ -359,9 +450,20 @@ fi
 # never reaches the channels claude -> "Not logged in" until the hourly restart.
 # Setting it -g makes the launch order irrelevant. Safe to share globally: every
 # agent uses the same Claude login (unlike the channel tokens scrubbed above,
-# which DO conflict and are -u'd). `|| true` tolerates "no server yet" -- in that
-# case new-session creates the server from this shell's exported env, which is
-# already correct.
+# which DO conflict and are -u'd).
+#
+# `start-server` first, because the "no server yet -> new-session inherits this
+# shell's env" assumption below is only safe when NOTHING ELSE creates the
+# server in between. At boot it does: systemd starts marveen-channels and
+# marveen-dashboard in the same second, and the dashboard's worker sessions win
+# the race about half the time. Then `set-environment -g` silently no-ops (no
+# server), the dashboard creates the server WITHOUT the token, and our
+# new-session inherits that empty global env instead of this shell's -- the
+# channels claude comes up "Not logged in - Please run /login" and the Telegram
+# plugin dies in a restart loop, on a headless box where /login is impossible.
+# Creating the server ourselves makes set-environment -g always land, which is
+# what the fix intended. start-server is idempotent and cheap.
+$TMUX start-server 2>/dev/null || true
 if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
   $TMUX set-environment -g CLAUDE_CODE_OAUTH_TOKEN "$CLAUDE_CODE_OAUTH_TOKEN" 2>/dev/null || true
 fi
@@ -392,7 +494,7 @@ $TMUX set-environment -g CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION false 2>/dev/null 
 # otherwise new-session below fails with "duplicate session".
 $TMUX kill-session -t "$SESSION" 2>/dev/null || true
 $TMUX new-session -d -s "$SESSION" -c "$INSTALL_DIR" \
-  "${MCP_BATCH_ENV}${CFG_ENV}$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}"
+  "${MCP_BATCH_ENV}${CFG_ENV}$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}${EXTRA_CHANNELS}"
 
 # Session startup guard: a Claude Code first-run dialogusait auto-accept-eljuk
 # kulonben a headless session orokre parkolna a prompton es a Telegram plugin
@@ -433,7 +535,7 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
         # entry); see the PR description / card 7EB18437.
         [ -e "$INSTALL_DIR/CLAUDE.md" ] && ln -sf "$INSTALL_DIR/CLAUDE.md" "$_CHANNELS_STARTDIR/CLAUDE.md" 2>/dev/null || true
         $TMUX new-session -d -s "$SESSION" -c "$_CHANNELS_STARTDIR" \
-          "${MCP_BATCH_ENV}${CFG_ENV}$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}"
+          "${MCP_BATCH_ENV}${CFG_ENV}$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}${EXTRA_CHANNELS}"
         unset _CHANNELS_STARTDIR
       fi
       continue
@@ -501,7 +603,7 @@ date +%s > "$INSTALL_DIR/store/.channel-last-respawn"
 #      poller" even when one is running. A direct child-of-claude pgrep is the
 #      authoritative signal.
 #
-#   2. capture-pane after `/mcp` shows the plugin row marked with "✗ Failed".
+#   2. capture-pane after `/mcp` shows the plugin's own row in a failed state.
 #      Connected/Enabled rows must NOT trigger the keystroke sequence, because
 #      then `Up`+`Enter`+`Enter` would land on "Disable" in the submenu and
 #      disable the plugin instead of reconnecting it (Szabi msg 427).
@@ -523,19 +625,21 @@ date +%s > "$INSTALL_DIR/store/.channel-last-respawn"
     exit 0
   fi
 
-  # Check 2: TUI confirmation that the plugin shows ✗ Failed. The /mcp view
-  # also shows "(disabled)" markers; we only fire on Failed, never on disabled
-  # (Enable-only submenu has no Reconnect, the Up+Enter+Enter sequence would
-  # land somewhere unsafe).
+  # Check 2: TUI confirmation that the plugin's row is in a failed state. The
+  # /mcp view also shows "(disabled)" markers; we only fire on failed, never on
+  # disabled (Enable-only submenu has no Reconnect, the Up+Enter+Enter sequence
+  # would land somewhere unsafe). See classify_mcp_plugin_row above for why the
+  # matching is row-scoped and glyph-agnostic.
   $TMUX send-keys -t "$SESSION" Escape
   sleep 1
   $TMUX send-keys -t "$SESSION" "/mcp" Enter
   sleep 3
   PANE="$($TMUX capture-pane -t "$SESSION" -p 2>/dev/null || true)"
 
-  case "$PANE" in
-    *"plugin:telegram@"*"✗ Failed"*|*"plugin:telegram@"*"✗ failed"*)
-      echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh post-init: telegram plugin in ✗ Failed state, firing /mcp Up+Enter+Enter unlock" >> "$INSTALL_DIR/store/channels-failures.log"
+  classify_mcp_plugin_row "$PANE"
+  case "$MCP_PLUGIN_STATE" in
+    failed)
+      echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh post-init: $CHANNEL_PROVIDER plugin row failed, firing /mcp Up+Enter+Enter unlock -- row: $MCP_PLUGIN_ROW" >> "$INSTALL_DIR/store/channels-failures.log"
       $TMUX send-keys -t "$SESSION" Up
       sleep 1
       $TMUX send-keys -t "$SESSION" Enter
@@ -549,7 +653,8 @@ date +%s > "$INSTALL_DIR/store/.channel-last-respawn"
       # out safely. If the plugin row literally doesn't appear in the /mcp
       # listing (truly unreachable), the dashboard's channel-monitor will
       # detect down and run its own recovery ladder; we don't second-guess.
-      echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh post-init: no Failed plugin row in /mcp pane, skipping unlock (bun child absent but plugin not failed - check manually)" >> "$INSTALL_DIR/store/channels-failures.log"
+      # Log the row we DID see -- a stale matcher is invisible without it.
+      echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh post-init: no failed plugin row in /mcp pane, skipping unlock (bun child absent but plugin not failed - check manually) -- looked for '$PLUGIN_PANE_ID', row: ${MCP_PLUGIN_ROW:-<none>}" >> "$INSTALL_DIR/store/channels-failures.log"
       $TMUX send-keys -t "$SESSION" Escape
       ;;
   esac
