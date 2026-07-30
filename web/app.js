@@ -13457,11 +13457,19 @@ function buildProvidersUI(container, providers) {
         <td style="padding:6px 8px;font-family:monospace;font-size:12px;word-break:break-all">${escapeHtml(p.baseUrl)}</td>
         <td style="padding:6px 8px">${escapeHtml(p.authHeader)}</td>
         <td style="padding:6px 8px;font-family:monospace;font-size:12px">${p.vaultKey ? escapeHtml(p.vaultKey) : '<em style="color:var(--text-muted)">nincs</em>'}</td>
-        <td style="padding:6px 8px;text-align:right">
+        <td style="padding:6px 8px;text-align:right;white-space:nowrap">
+          <button class="btn-secondary btn-compact" data-provider-edit="${escapeHtml(p.id)}" style="margin-right:4px">Szerkesztés</button>
           <button class="btn-secondary btn-compact" style="color:var(--danger)" data-provider-delete="${escapeHtml(p.id)}">Törlés</button>
         </td>`
       tbody.appendChild(tr)
     }
+    tbody.querySelectorAll('[data-provider-edit]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const id = btn.dataset.providerEdit
+        const p = providers.find(x => x.id === id)
+        if (p) openAddProviderModal(container, p)
+      })
+    })
     tbody.querySelectorAll('[data-provider-delete]').forEach(btn => {
       btn.addEventListener('click', async () => {
         const id = btn.dataset.providerDelete
@@ -13488,9 +13496,12 @@ function buildProvidersUI(container, providers) {
   container.appendChild(addBtn)
 }
 
-function openAddProviderModal(container) {
+function openAddProviderModal(container, editProvider = null) {
   const existing = document.getElementById('addProviderModal')
   if (existing) existing.remove()
+
+  const isEdit = editProvider !== null
+  const v = (field) => isEdit ? escapeHtml(editProvider[field] || '') : ''
 
   const overlay = document.createElement('div')
   overlay.id = 'addProviderModal'
@@ -13498,33 +13509,33 @@ function openAddProviderModal(container) {
   overlay.innerHTML = `
     <div class="modal" style="max-width:480px">
       <div class="modal-header">
-        <h2>Új egyéni provider</h2>
+        <h2>${isEdit ? 'Provider szerkesztése' : 'Új egyéni provider'}</h2>
         <button class="modal-close" id="addProviderModalClose">&times;</button>
       </div>
       <div class="modal-body" style="display:flex;flex-direction:column;gap:12px">
         <div class="form-group">
           <label class="form-label">Megjelenő név *</label>
-          <input type="text" id="cpLabel" class="input" placeholder="pl. DeepSeek (saját kulcs)">
+          <input type="text" id="cpLabel" class="input" placeholder="pl. DeepSeek (saját kulcs)" value="${v('label')}">
         </div>
         <div class="form-group">
           <label class="form-label">ID * <small style="color:var(--text-muted)">(egyedi, csak a-z 0-9 _ -)</small></label>
-          <input type="text" id="cpId" class="input" placeholder="pl. my-deepseek">
+          <input type="text" id="cpId" class="input" placeholder="pl. my-deepseek" value="${v('id')}"${isEdit ? ' readonly style="opacity:0.6;cursor:not-allowed"' : ''}>
         </div>
         <div class="form-group">
           <label class="form-label">Base URL * <small style="color:var(--text-muted)">(https:// vagy http://localhost)</small></label>
-          <input type="text" id="cpBaseUrl" class="input" placeholder="https://api.deepseek.com/anthropic">
+          <input type="text" id="cpBaseUrl" class="input" placeholder="https://api.deepseek.com/anthropic" value="${v('baseUrl')}">
         </div>
         <div class="form-group">
           <label class="form-label">Auth header *</label>
           <select id="cpAuthHeader" class="input">
-            <option value="x-api-key">x-api-key (ANTHROPIC_API_KEY)</option>
-            <option value="Bearer">Bearer (ANTHROPIC_AUTH_TOKEN)</option>
-            <option value="none">none (Ollama-szerű, token nélkül)</option>
+            <option value="x-api-key"${isEdit && editProvider.authHeader === 'x-api-key' ? ' selected' : ''}>x-api-key (ANTHROPIC_API_KEY)</option>
+            <option value="Bearer"${isEdit && editProvider.authHeader === 'Bearer' ? ' selected' : ''}>Bearer (ANTHROPIC_AUTH_TOKEN)</option>
+            <option value="none"${isEdit && editProvider.authHeader === 'none' ? ' selected' : ''}>none (Ollama-szerű, token nélkül)</option>
           </select>
         </div>
-        <div class="form-group" id="cpVaultKeyGroup">
+        <div class="form-group" id="cpVaultKeyGroup"${isEdit && editProvider.authHeader === 'none' ? ' style="display:none"' : ''}>
           <label class="form-label">Vault kulcs neve *</label>
-          <input type="text" id="cpVaultKey" class="input" placeholder="pl. my-deepseek-api-key">
+          <input type="text" id="cpVaultKey" class="input" placeholder="pl. my-deepseek-api-key" value="${v('vaultKey')}">
           <small style="display:block;margin-top:4px;color:var(--text-muted);font-size:12px">A kulcs értékét a Vault tabon veheted fel.</small>
         </div>
         <p style="font-size:12px;color:var(--text-muted);background:var(--surface-hover);padding:10px;border-radius:6px;line-height:1.5">
