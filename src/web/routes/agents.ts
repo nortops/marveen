@@ -1869,7 +1869,20 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     }
     if (data.soulMd !== undefined) atomicWriteFileSync(join(agentDir(name), 'SOUL.md'), data.soulMd)
     if (data.mcpJson !== undefined) atomicWriteFileSync(join(agentDir(name), '.mcp.json'), data.mcpJson)
-    if (data.model !== undefined) writeAgentModel(name, data.model)
+    if (data.model !== undefined) {
+      // When a custom provider is being set (either in this same request or
+      // already persisted), validate the model id to prevent apostrophe/shell
+      // metacharacter breakout from the single-quoted `'${model}'` in the
+      // agent launch command. Allow: alphanumeric, dot, underscore, dash, colon, slash.
+      const incomingProvider = data.customProvider !== undefined ? (data.customProvider || null) : readAgentCustomProvider(name)
+      if (incomingProvider) {
+        if (!/^[a-zA-Z0-9._/:+-]+$/.test(data.model)) {
+          json(res, { error: 'Custom provider model id contains disallowed characters (allowed: a-z A-Z 0-9 . _ / : + -)' }, 400)
+          return true
+        }
+      }
+      writeAgentModel(name, data.model)
+    }
     if (data.customProvider !== undefined) {
       writeAgentCustomProvider(name, data.customProvider || null)
     }

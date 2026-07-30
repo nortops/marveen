@@ -80,12 +80,33 @@ export function validateCustomProvider(data: unknown): string | null {
   const baseUrl = typeof d.baseUrl === 'string' ? d.baseUrl.trim() : ''
   if (!baseUrl) return 'baseUrl is required'
   if (baseUrl.length > 512) return 'baseUrl too long (max 512)'
-  if (
-    !baseUrl.startsWith('https://') &&
-    !baseUrl.startsWith('http://localhost') &&
-    !baseUrl.startsWith('http://127.')
-  ) {
-    return 'baseUrl must start with https:// or http://localhost'
+
+  // Shell-injection guard: the baseUrl is interpolated into a double-quoted
+  // shell export (`export ANTHROPIC_BASE_URL="<value>"`), so $(), backticks,
+  // and other shell metacharacters are active inside the quotes. Reject any
+  // character that could escape or inject into the command string.
+  // eslint-disable-next-line no-useless-escape
+  if (/["$`\\;|&(){}<>'\s]/.test(baseUrl)) {
+    return 'baseUrl contains disallowed characters (no quotes, shell metacharacters, or whitespace)'
+  }
+
+  // Parse with URL constructor to catch malformed inputs and verify the
+  // hostname explicitly -- startsWith checks are vulnerable to prefix tricks
+  // like http://localhost.evil.com or https://(empty host).
+  let parsed: URL
+  try { parsed = new URL(baseUrl) } catch {
+    return 'baseUrl is not a valid URL'
+  }
+  const protocol = parsed.protocol
+  const hostname = parsed.hostname
+  if (protocol !== 'https:' && protocol !== 'http:') {
+    return 'baseUrl must use https:// or http://'
+  }
+  if (protocol === 'http:' && hostname !== 'localhost' && !hostname.startsWith('127.')) {
+    return 'http:// is only allowed for localhost or 127.x.x.x'
+  }
+  if (!hostname) {
+    return 'baseUrl must have a non-empty hostname'
   }
 
   const authHeader = d.authHeader as string

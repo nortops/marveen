@@ -938,11 +938,16 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
     // custom Anthropic-compatible endpoint.
     const rawModel = readAgentModel(name)
     const customProviderId = readAgentCustomProvider(name)
+    // isCustom is true whenever an id is set -- even if the definition is missing.
+    // The guard below catches the missing-definition case and aborts before any
+    // string-pattern discriminator runs, so a deleted provider never silently
+    // falls through to the Ollama branch.
+    const isCustom = customProviderId !== null
     const customProviderDef = customProviderId ? loadCustomProvider(customProviderId) : null
-    const isCustom = customProviderDef !== null
 
-    if (isCustom && customProviderId && !customProviderDef) {
-      // Provider id is set in agent-config but not found in custom-providers.json.
+    if (isCustom && !customProviderDef) {
+      // Provider id is set in agent-config but not found in custom-providers.json
+      // (deleted via DELETE /api/custom-providers/:id or corrupt store).
       // Abort launch with a clear error rather than silently falling through to Ollama.
       logger.error({ name, customProviderId }, 'Custom provider not found in store -- agent launch aborted. Add it in Settings > Providers.')
       throw new Error(`Custom provider "${customProviderId}" not found. Add it in Settings > Providers.`)
