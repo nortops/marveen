@@ -12,6 +12,7 @@ store/
 workspace/
 agents/
 reports/
+research/
 .claude/
 !.claude/settings.json
 .config/
