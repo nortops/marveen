@@ -1,6 +1,10 @@
 #!/bin/bash
 # Start main agent services
 
+# Dashboard port: env WEB_PORT, else the install .env, else the 3420 default.
+WEB_PORT="${WEB_PORT:-$(grep -E '^WEB_PORT=' "$(dirname "$0")/../.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' "')}"
+WEB_PORT="${WEB_PORT:-3420}"
+
 INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Read only what this script actually needs; avoid `set -a && source .env`,
@@ -20,6 +24,11 @@ source "${INSTALL_DIR}/install-lang.sh"
 # The dashboard (and the agent tmux sessions it spawns) hit the same wall as
 # channels.sh, so export the sandbox escape hatch for the whole stack when root.
 [ "$(id -u)" = "0" ] && export IS_SANDBOX=1
+
+# Prune stale hook paths (e.g. /tmp scratchpad installs that survived a reboot)
+# before launching agents -- a missing hook script causes non-zero exit which
+# blocks every UserPromptSubmit, creating a silent fleet lockout (2026-07-14 incident).
+INSTALL_DIR="$INSTALL_DIR" python3 "${INSTALL_DIR}/scripts/boot-hook-prune.py" 2>&1 | grep -v '^$' | sed 's/^/[boot-hook-prune] /' || true
 
 echo "${BOT_NAME:-Marveen} $(_t start.starting)"
 OS="$(uname -s)"
@@ -55,5 +64,5 @@ elif [ "$OS" = "Linux" ]; then
   fi
 fi
 
-echo "✓ Dashboard: http://localhost:3420"
+echo "✓ Dashboard: http://localhost:${WEB_PORT:-3420}"
 echo "$(_t start.channel_started)"

@@ -38,6 +38,7 @@ Részletes, funkciónkénti leírások a [`docs/`](docs/README.md) mappában —
 | Memória-rendszer (FTS5 + vektor + RRF) | [docs/memory-system.md](docs/memory-system.md) |
 | Kanban (auto-breakdown, swimlane, WIP-limit, card-aging) | [docs/kanban.md](docs/kanban.md) |
 | Ügynök-flotta + inter-agent | [docs/agent-fleet.md](docs/agent-fleet.md) |
+| Föderáció (több példány összekötése, dashboard-menüvel) | [docs/federation.md](docs/federation.md) |
 | Skill-factory (öntanulás) | [docs/skill-factory.md](docs/skill-factory.md) |
 | Channels (Telegram / Slack) | [docs/channels.md](docs/channels.md) |
 | Printing-press CLI-k | [docs/printing-press-cli.md](docs/printing-press-cli.md) |
@@ -70,9 +71,16 @@ Minden ágens saját, réteges memóriával rendelkezik (hot / warm / cold / sha
 ### macOS / Linux
 
 ```bash
-git clone https://github.com/Szotasz/marveen.git
+cd ~
+git clone --branch main https://github.com/Szotasz/marveen.git
 cd marveen
 ./install.sh
+```
+
+Alapértelmezés szerint a dashboard a 3420-as porton indul (`http://localhost:3420`). Egyedi port beállításához:
+
+```bash
+./install-linux.sh --port 3421   # vagy: WEB_PORT=3421 ./install-linux.sh
 ```
 
 ### Windows (WSL)
@@ -83,7 +91,7 @@ irm https://raw.githubusercontent.com/Szotasz/marveen/main/install-windows.ps1 |
 
 Vagy manuálisan:
 ```powershell
-git clone https://github.com/Szotasz/marveen.git
+git clone --branch main https://github.com/Szotasz/marveen.git
 cd marveen
 .\install-windows.ps1
 ```
@@ -92,7 +100,7 @@ A Windows telepítő automatikusan beállítja a WSL-t (Windows Subsystem for Li
 
 > **Ha a PowerShell ablak bezárul / a telepítő nem jut túl a WSL+Ubuntu lépésen:** nyisd meg az Ubuntu-t (Start menü → Ubuntu), majd a WSL Ubuntu shellben futtasd közvetlenül a Linux-telepítőt (a PowerShell wrapper megkerülése):
 > ```bash
-> curl -fsSL https://raw.githubusercontent.com/Szotasz/marveen/main/install-linux.sh -o install.sh && bash install.sh
+> cd ~ && curl -fsSL https://raw.githubusercontent.com/Szotasz/marveen/main/install-linux.sh -o install.sh && bash install.sh
 > ```
 > Ez a megbízható út, ha a `wsl.exe`/Windows-claude környezet összeakad.
 
@@ -217,6 +225,32 @@ ssh macmini "/opt/homebrew/bin/tmux kill-session -t monitor" && \
 
 A script automatikusan felderíti a futó `agent-*` és `marveen-channels` session-öket. A monitor session törlése nem érinti az ágens session-öket -- csak a linked-window referenciákat szünteti meg.
 
+### Remote access key enrollment
+
+A helper that lets an operator enroll a single device's SSH public key with a tightly restricted `authorized_keys` entry, then hands back a copyable connection bundle. Each device carries its own revocation id (`marveen-remote:<uuid>`) so access can be replaced or removed per device.
+
+Run it with the public key line as a single quoted argument:
+
+```bash
+npm run remote-enroll -- "ssh-ed25519 <base64 key> marveen-remote:<uuid>"
+# optional flags:
+npm run remote-enroll -- --host 203.0.113.10 --port 2222 "ssh-ed25519 <base64 key> marveen-remote:<uuid>"
+```
+
+The public key line must be exactly three fields (type, key, comment) with no `authorized_keys` options and no extra fields. Only `ssh-ed25519` keys are accepted, and the comment must be `marveen-remote:<uuid>` (uuid v4).
+
+It appends (or replaces, when the same id is re-enrolled) this restricted line to the invoking user's `~/.ssh/authorized_keys`:
+
+```
+restrict,port-forwarding,permitopen="127.0.0.1:3420",command="/bin/false" ssh-ed25519 <base64 key> marveen-remote:<uuid>
+```
+
+`restrict` disables pty, agent, and X11 forwarding; the forced command is `/bin/false`; and the only endpoint the key may open is `127.0.0.1:3420`. The write is atomic (temp file plus rename) and guarded by an `authorized_keys.lock` file so concurrent runs cannot corrupt the list. `~/.ssh` is created 0700 and `authorized_keys` 0600 when missing; if either already exists with looser permissions the tool warns instead of changing them silently.
+
+After enrolling, it prints a base64 connection bundle between clearly marked delimiters. The bundle carries the host, SSH port and user, the fixed remote port (3420), the device id, the machine's `ssh-ed25519` host key, and -- by default -- the dashboard bearer token (`DASHBOARD_TOKEN` env or `store/.dashboard-token`), so the connecting app can authenticate against the dashboard without a separate step. A token-bearing bundle is a SECRET: hand it over on a private channel only, never by email or shared chat. Pass `--no-dashboard-token` to emit a token-free bundle (the device user must then obtain the dashboard access URL out of band). If no token can be found the tool warns and emits a token-free bundle. The host key is looked up in the known public-key locations (`/etc/ssh`, `/private/etc/ssh`, Homebrew and `/usr/local` prefixes) and, when none of those files exist -- as on stock macOS -- read from the running SSH server itself via `ssh-keyscan` on loopback. The connecting side requires the host key, so if it cannot be obtained from any source the tool exits with an error instead of printing an unusable bundle; start the SSH server (macOS: System Settings > General > Sharing > Remote Login) and re-run. When `--host` is not given, the tool prints a hint to verify the resolved address is the one the device will reach.
+
+To revoke a device, delete the line whose comment matches its id (`marveen-remote:<uuid>`) from `~/.ssh/authorized_keys`.
+
 ### Frissítés
 ```bash
 ./update.sh
@@ -239,7 +273,8 @@ claude setup-token
 
 # 2. A VPS-en:
 export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
-git clone https://github.com/Szotasz/marveen.git
+cd ~
+git clone --branch main https://github.com/Szotasz/marveen.git
 cd marveen
 ./install.sh    # automatikusan install-linux.sh-t futtat
 ```

@@ -1,8 +1,10 @@
+import { CronExpressionParser } from 'cron-parser'
 import { hostname } from 'node:os'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readEnvFile } from './env.js'
+import { DISTRIBUTION_DEFAULT_AGENT_MODEL } from './config-registry.js'
 import { getProviderType, getChannelToken, getChannelChatId, type ChannelProviderType } from './channel-provider.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -40,6 +42,77 @@ function cfg(key: string): string | undefined {
   return env[key]
 }
 
+// The single timezone for this install -- drives BOTH cron scheduling (cron.ts)
+// AND every human-facing time render (heartbeat, daily-log, memory labels, etc.).
+// One env var (SCHEDULER_TZ) so the whole box shares one zone; falls back to the
+// process zone (the TZ env / OS) when unset. Replaces the ~15 hardcoded
+// 'Europe/Budapest' literals -- change the zone in ONE place, and an update that
+// re-introduces a hardcoded literal is caught by a single grep, not a full review.
+// Exported separately so the scheduler's startup reporter can tell "an operator
+// pinned this zone" apart from "we fell back to the host zone" -- reading
+// process.env there cannot distinguish the two, because cfg() layers
+// config-overrides.json over .env and neither lands in process.env. See
+// resolveCronTz in web/cron.ts.
+//
+// A MISSPELLED zone is worse than an unset one. cron-parser throws on every
+// parse with an unknown tz ("CronDate: unhandled timestamp: Invalid Date"),
+// cronDueBetween's catch turns that throw into "not due", and so EVERY
+// scheduled task silently never fires -- a total outage with no error, no
+// warning, and a startup report that still looks healthy (it would name the
+// configured-but-invalid zone as the winning source). The dashboard Settings
+// path is fenced -- SCHEDULER_TZ carries a valueSet that validateSettingValue
+// enforces -- but a hand-edited .env or a hand-written config-overrides.json
+// reaches here unchecked, and hand-editing .env is the documented way to set
+// the zone. So validate once at boot, keep scheduling on the process zone
+// (degraded but alive, exactly the unset-value behaviour) and hand the
+// rejected value to the startup report rather than scheduling into a void.
+function isUsableCronTz(tz: string): boolean {
+  // Probe with the ACTUAL consumer, not with Intl. The two disagree on inputs
+  // like "+02:00" -- newer ICU accepts offset strings, older rejects them --
+  // so an Intl guard answers a different question than the code it protects,
+  // engine-dependently. That divergence between a check and its subject is the
+  // exact failure class this patch exists to remove; reproducing it inside the
+  // fix would be self-defeating. Whatever cron-parser can schedule against is
+  // by definition usable here.
+  try {
+    CronExpressionParser.parse('0 0 * * *', { tz }).next()
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function resolveAppTz(
+  configured: string | undefined,
+  systemTz: string = Intl.DateTimeFormat().resolvedOptions().timeZone,
+): { tz: string; configured?: string; invalid?: string } {
+  if (!configured) return { tz: systemTz }
+  if (!isUsableCronTz(configured)) return { tz: systemTz, invalid: configured }
+  return { tz: configured, configured }
+}
+
+const appTz = resolveAppTz(cfg('SCHEDULER_TZ'))
+// Only a zone that survived validation counts as "an operator pinned this":
+// reporting a rejected value here would tell the operator that the zone the
+// scheduler just refused is the one in effect, and would also mask the
+// UTC-fallback warning below it (source would read 'SCHEDULER_TZ', never
+// 'system-default').
+export const SCHEDULER_TZ_CONFIGURED = appTz.configured
+export const APP_TZ = appTz.tz
+// The configured zone that was REJECTED, if any -- undefined on the healthy
+// path. config.ts is imported too early to own a logger (logger imports config
+// -> circular), so the loud reporting lives in startScheduleRunner.
+export const APP_TZ_INVALID = appTz.invalid
+
+// The model new agents are scaffolded with, and the model the background worker
+// sessions run. One key so an install that standardises on a newer model does
+// not have to patch three separate literals in src/ (which an update would then
+// clobber). Deliberately NOT applied to existing agents: agent-config.json keeps
+// whatever model it was created with, so raising this never silently
+// reconfigures a running fleet.
+export const DEFAULT_AGENT_MODEL =
+  cfg('DEFAULT_AGENT_MODEL') || DISTRIBUTION_DEFAULT_AGENT_MODEL
+
 export const TELEGRAM_BOT_TOKEN = env['TELEGRAM_BOT_TOKEN'] ?? ''
 export const ALLOWED_CHAT_ID = env['ALLOWED_CHAT_ID'] ?? ''
 
@@ -47,7 +120,13 @@ export const SLACK_BOT_TOKEN = env['SLACK_BOT_TOKEN'] ?? ''
 export const SLACK_APP_TOKEN = env['SLACK_APP_TOKEN'] ?? ''
 export const SLACK_CHANNEL_ID = env['SLACK_CHANNEL_ID'] ?? ''
 
-export const OWNER_NAME = env['OWNER_NAME'] ?? 'Szabolcs'
+// Distribution placeholder for an unconfigured owner name. Exported so
+// consumers that treat the owner name as PRIVATE data (federation outbound
+// scrub) can tell "a real configured name" apart from this generic English
+// word -- scrubbing the literal word "owner" false-positives on fixed template
+// text like "owner channels".
+export const OWNER_NAME_PLACEHOLDER = 'Owner'
+export const OWNER_NAME = env['OWNER_NAME'] ?? OWNER_NAME_PLACEHOLDER
 // Shared Google Drive folder ID the fleet writes deliverables into. Empty by
 // default (distribution-safe: no owner-specific folder is baked into a fresh
 // install's generated agent CLAUDE.md); set OWNER_DRIVE_FOLDER in .env to wire
@@ -71,6 +150,23 @@ export const BRAND_NAME = env['BRAND_NAME'] ?? BOT_NAME
 export function resolveBrandName(brandEnv: string | undefined, botName: string): string {
   const b = (brandEnv ?? '').trim()
   return b || botName
+}
+
+// Per-call reads of the two display names, so a wizard rename shows up on the
+// dashboard without a process restart. BOT_NAME/BRAND_NAME above are frozen at
+// module load; the identity/label routes read these instead. Display only --
+// MAIN_AGENT_ID / SERVICE_ID stay the boot-time constants (they key tmux
+// sessions, service units and DB rows, and are never rewritten at runtime).
+export function currentBotName(): string {
+  const b = (readEnvFile(['BOT_NAME'])['BOT_NAME'] ?? '').trim()
+  return b || BOT_NAME
+}
+export function currentBrandName(): string {
+  return resolveBrandName(readEnvFile(['BRAND_NAME'])['BRAND_NAME'], currentBotName())
+}
+export function currentOwnerName(): string {
+  const o = (readEnvFile(['OWNER_NAME'])['OWNER_NAME'] ?? '').trim()
+  return o || OWNER_NAME
 }
 
 // Pure derivation of the OS service id from a brand slug and the agent id:
@@ -112,6 +208,48 @@ export const MAIN_AGENT_ID = env['MAIN_AGENT_ID'] ?? 'marveen'
 // (launchctl unload/load, kickstart) still targets the right unit.
 export const SERVICE_ID = env['SERVICE_ID'] ?? MAIN_AGENT_ID
 
+// Legacy service id from before the OS service units were keyed off SERVICE_ID
+// (the project originally shipped as "claudeclaw"). Retained so the standalone
+// installer can retire a stale unit on re-run and the status command still
+// recognizes a service created by an older install.
+export const LEGACY_SERVICE_ID = 'claudeclaw'
+export const LEGACY_APP_SERVICE_LABEL = `com.${LEGACY_SERVICE_ID}.app`
+
+// launchd Label for the standalone interactive installer's app process
+// (scripts/setup.ts, `npm run setup`). Keyed off SERVICE_ID so a branded
+// install names its background service after the brand, matching how
+// install-macos.sh already derives its com.<id>.dashboard / .channels units.
+export function appServiceLabel(serviceId: string): string {
+  return `com.${serviceId}.app`
+}
+
+// grep -E alternation matching this install's dashboard/app launchd unit
+// regardless of which installer created it: the SERVICE_ID-derived app service
+// (com.<id>.app from the standalone installer) or dashboard service
+// (com.<id>.dashboard from install-macos.sh), plus the legacy
+// "com.claudeclaw.app". The status command uses it so a running dashboard is
+// detected on every install shape -- the old check only matched the legacy name
+// and silently reported a modern (brand-aware) install as stopped. Anchored
+// with a trailing `$` (the launchd Label is the last field of a
+// `launchctl list` line) so only the exact unit matches -- an ancillary unit
+// whose final segment merely starts with app/dashboard (e.g.
+// com.<id>.dashboard-helper, com.<id>.appliance) does NOT count as "the
+// dashboard is running". The pattern is used unchanged in both `grep -E` and a
+// JS RegExp, so it sticks to features common to both (`$`, groups, `\.`).
+// serviceId is an ASCII slug, so no regex escaping is needed.
+export function launchdStatusPattern(serviceId: string): string {
+  return `(com\\.${serviceId}\\.(app|dashboard)|com\\.${LEGACY_SERVICE_ID}\\.app)$`
+}
+
+// systemd --user unit names to probe for the dashboard, newest install shape
+// first: install-linux.sh's "<id>-dashboard", the standalone installer's
+// "<id>", then the legacy "claudeclaw". The status command reports active if
+// any is active. Deduplicated so an id that already equals the legacy id does
+// not probe the same unit twice.
+export function systemdStatusUnits(serviceId: string): string[] {
+  return [...new Set([`${serviceId}-dashboard`, serviceId, LEGACY_SERVICE_ID])]
+}
+
 export const WEB_PORT = parseInt(env['WEB_PORT'] ?? '3420', 10)
 
 export const WEB_HOST = env['WEB_HOST'] ?? '127.0.0.1'
@@ -134,6 +272,7 @@ export const KANBAN_AGING_CRITICAL_COLOR = env['KANBAN_AGING_CRITICAL_COLOR'] ??
 // that genuinely wants the boot-time value.
 export const KANBAN_WIP_PLANNED = parseInt(env['KANBAN_WIP_PLANNED'] ?? '0', 10)
 export const KANBAN_WIP_IN_PROGRESS = parseInt(env['KANBAN_WIP_IN_PROGRESS'] ?? '0', 10)
+export const KANBAN_WIP_TESTING = parseInt(env['KANBAN_WIP_TESTING'] ?? '0', 10)
 export const KANBAN_WIP_WAITING = parseInt(env['KANBAN_WIP_WAITING'] ?? '0', 10)
 export const KANBAN_WIP_DONE = parseInt(env['KANBAN_WIP_DONE'] ?? '0', 10)
 // Utilisation % at which the badge turns yellow (default 80)
@@ -211,10 +350,37 @@ export const HEARTBEAT_START_HOUR = parseInt(env['HEARTBEAT_START_HOUR'] ?? '9',
 export const HEARTBEAT_AGENT_ENABLED =
   ['1', 'true', 'yes', 'on'].includes((cfg('HEARTBEAT_AGENT_ENABLED') ?? '').trim().toLowerCase())
 
+// Sub-agent Telegram inbox delivery-path tee (opt-in, DEFAULT OFF).
+// When enabled, a telegram sub-agent loads the channel plugin via a per-agent
+// mcp.json wrapped in the inbound-tee (scripts/channel-inbound-tee.mjs), which
+// persists each inbound notification to <state>/inbox-pending.jsonl for the
+// channel-inbox-drain UserPromptSubmit hook to pull into the next turn. This
+// swaps the default `--channels` delivery path, so it is DEFAULT OFF: an install
+// that does not opt in keeps the exact upstream `--channels` behaviour and never
+// writes message content to disk. Enable with SUBAGENT_INBOX_TEE=1 (required for
+// SUBAGENT_TELEGRAM_WAKE_ENABLED to have an inbox to wake on).
+export const SUBAGENT_INBOX_TEE =
+  ['1', 'true', 'yes', 'on'].includes((cfg('SUBAGENT_INBOX_TEE') ?? '').trim().toLowerCase())
+
+// Sub-agent Telegram inbox wake-nudge (opt-in, DEFAULT OFF).
+// The message-router can nudge an idle sub-agent whose derived Telegram inbox
+// (<state>/inbox-pending.jsonl) has stuck inbound messages, so its drain hook
+// fires and claims the backlog. This is the ACTIVE tail of the SUBAGENT_INBOX_TEE
+// delivery path: the tee writer and the UserPromptSubmit drain hook now ship in
+// this repo, but both are gated -- with SUBAGENT_INBOX_TEE off no inbox file is
+// produced and this watcher is a no-op even when enabled. Ships DISABLED so an
+// upstream install sees zero behaviour change and pays no per-tick cost; enable
+// with SUBAGENT_TELEGRAM_WAKE_ENABLED=1 (alongside SUBAGENT_INBOX_TEE=1).
+export const SUBAGENT_TELEGRAM_WAKE_ENABLED =
+  ['1', 'true', 'yes', 'on'].includes((cfg('SUBAGENT_TELEGRAM_WAKE_ENABLED') ?? '').trim().toLowerCase())
+
 // Google Calendar account the heartbeat summarises (next 2h). Empty (the
 // default) means the agent uses whatever calendar its MCP server is
 // authenticated as, so no personal address is baked into the shipped
-// scaffold.
-export const HEARTBEAT_CALENDAR_ACCOUNT = (env['HEARTBEAT_CALENDAR_ACCOUNT'] ?? '').trim()
+// scaffold. Read through cfg() so a value saved from the Settings UI
+// (config-overrides.json) actually reaches these boot-time consts on the next
+// restart -- with a bare env[] read the dashboard showed the saved value while
+// the heartbeat silently never saw it.
+export const HEARTBEAT_CALENDAR_ACCOUNT = (cfg('HEARTBEAT_CALENDAR_ACCOUNT') ?? '').trim()
 export const HEARTBEAT_END_HOUR = parseInt(env['HEARTBEAT_END_HOUR'] ?? '23', 10)
-export const HEARTBEAT_CALENDAR_ID = env['HEARTBEAT_CALENDAR_ID'] ?? ''
+export const HEARTBEAT_CALENDAR_ID = (cfg('HEARTBEAT_CALENDAR_ID') ?? '').trim()

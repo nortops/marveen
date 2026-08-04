@@ -15,21 +15,44 @@
   <script src="/lang/hu.js"></script>
   <script src="/lang/en.js"></script>
   <link rel="icon" href="/api/marveen/avatar">
-  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="/api/marveen/avatar">
   <link rel="manifest" href="/manifest.json">
   <meta name="theme-color" content="#1a1917">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Marveen">
   <script>
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => {
-        navigator.serviceWorker.register('/sw.js').catch(() => {});
-      });
+    // Service worker intentionally DISABLED. A caching SW caused iOS load
+    // failures (respondWith null on cache miss) and a reload-loop when combined
+    // with re-registration. We no longer register one, and we actively
+    // unregister any previously-installed SW so a wedged client self-heals on
+    // the next visit. The dashboard is a localhost/tailnet tool that does not
+    // need offline caching.
+    if ('serviceWorker' in navigator && navigator.serviceWorker.getRegistrations) {
+      navigator.serviceWorker.getRegistrations()
+        .then((regs) => regs.forEach((r) => r.unregister()))
+        .catch(() => {});
     }
   </script>
 </head>
 <body>
+  <!-- First-run onboarding wizard (shown by app.js when /api/onboarding/status needs setup) -->
+  <div class="modal-overlay onboarding-overlay" id="onboardingOverlay" hidden>
+    <div class="modal onboarding-modal">
+      <button class="modal-close" id="onboardingClose" title="Bezárás" aria-label="Bezárás">&times;</button>
+      <h2 data-i18n="onboarding.title">Marveen beállítása</h2>
+      <p class="onb-sub" data-i18n="onboarding.subtitle">Fejezd be a beállítást innen, a dashboardból -- SSH nélkül.</p>
+      <div class="onboarding-steps" id="onboardingSteps">
+        <div class="onboarding-step" data-ostep="1"><span class="onb-num">1</span> <span data-i18n="onboarding.identity.tab">Név</span></div>
+        <div class="onboarding-step" data-ostep="2"><span class="onb-num">2</span> <span data-i18n="onboarding.step1.tab">Claude auth</span></div>
+        <div class="onboarding-step" data-ostep="3"><span class="onb-num">3</span> <span data-i18n="onboarding.step2.tab">Telegram bot</span></div>
+        <div class="onboarding-step" data-ostep="4"><span class="onb-num">4</span> <span data-i18n="onboarding.step3.tab">Párosítás</span></div>
+      </div>
+      <p class="onb-flow-note" id="onbFlowNote"></p>
+      <div id="onboardingBody" class="onboarding-body"></div>
+    </div>
+  </div>
+
   <div class="mobile-topbar">
     <button class="mobile-menu-btn" id="mobileMenuBtn" aria-label="Menü" aria-expanded="false">
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
@@ -42,7 +65,7 @@
       <div class="sidebar-brand-mark" id="sidebarBrandMark">M</div>
       <div class="sidebar-brand-text">
         <div class="sidebar-brand-name" id="sidebarBrandName">Marveen</div>
-        <div class="sidebar-brand-sub" id="sidebarBrandSub">online</div>
+        <div class="sidebar-brand-sub">online</div>
       </div>
     </div>
     <nav class="sidebar-nav">
@@ -54,88 +77,135 @@
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="5" height="16" rx="1"/><rect x="10" y="4" width="5" height="10" rx="1"/><rect x="17" y="4" width="4" height="13" rx="1"/></svg>
         <span class="sb-label">Kanban</span>
       </a>
-      <a href="#" class="sb-link" data-page="archived">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5" rx="1"/><line x1="10" y1="12" x2="14" y2="12"/></svg>
-        <span class="sb-label">Archivált</span>
+      <a href="#" class="sb-link" data-page="approvals">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+        <span class="sb-label">Jóváhagyások</span>
+        <span class="approvals-pending-badge sb-badge" id="approvalsPendingBadge" hidden></span>
       </a>
-      <a href="#" class="sb-link" data-page="agents">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-        <span class="sb-label">Ügynökök</span>
-      </a>
-      <a href="#" class="sb-link" data-page="activity">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49M7.76 16.24a6 6 0 0 1 0-8.49M19.07 4.93a10 10 0 0 1 0 14.14M4.93 19.07a10 10 0 0 1 0-14.14"/></svg>
-        <span class="sb-label">Aktivitás</span>
-      </a>
-      <a href="#" class="sb-link" data-page="team">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="3"/><path d="M12 8v4"/><circle cx="5" cy="18" r="3"/><circle cx="19" cy="18" r="3"/><path d="M12 12l-7 6M12 12l7 6"/></svg>
-        <span class="sb-label">Csapat</span>
-      </a>
-      <a href="#" class="sb-link" data-page="messages">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-        <span class="sb-label">Üzenetek</span>
-      </a>
-      <a href="#" class="sb-link" data-page="tasks">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
-        <span class="sb-label">Ütemezések</span>
-      </a>
-      <a href="#" class="sb-link" data-page="memories">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3C7.5 3 4 6.5 4 11v4l-2 3h4v2a3 3 0 0 0 3 3h1a3 3 0 0 0 3-3v0a3 3 0 0 0 3 3h1a3 3 0 0 0 3-3v-2h4l-2-3v-4c0-4.5-3.5-8-8-8z"/></svg>
-        <span class="sb-label">Memória</span>
-      </a>
-      <a href="#" class="sb-link" data-page="naplo">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
-        <span class="sb-label">Napló</span>
-      </a>
-      <a href="#" class="sb-link" data-page="bgTasks">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-        <span class="sb-label">Háttér</span>
-      </a>
-      <a href="#" class="sb-link" data-page="skills">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15 8.5 22 9.3 17 14.2 18.2 21 12 17.8 5.8 21 7 14.2 2 9.3 9 8.5"/></svg>
-        <span class="sb-label">Skillek</span>
-      </a>
-      <a href="#" class="sb-link" data-page="connectors">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 0 0-7.07-7.07l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 0 0 7.07 7.07l1.5-1.5"/></svg>
-        <span class="sb-label">MCP</span>
-      </a>
-      <a href="#" class="sb-link" data-page="migrate">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/><polyline points="7 10 12 5 17 10"/><line x1="12" y1="5" x2="12" y2="17"/></svg>
-        <span class="sb-label">Költöztetés</span>
-      </a>
+      <div class="sb-group" data-group="team">
+        <button type="button" class="sb-group-header" aria-expanded="false" aria-controls="sbGroupTeam">
+          <span class="sb-group-label" data-i18n="nav.group.team">CSAPAT</span>
+          <svg class="sb-group-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>
+        <div class="sb-group-items" id="sbGroupTeam">
+          <a href="#" class="sb-link" data-page="agents">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            <span class="sb-label">Ügynökök</span>
+          </a>
+          <a href="#" class="sb-link" data-page="activity">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49M7.76 16.24a6 6 0 0 1 0-8.49M19.07 4.93a10 10 0 0 1 0 14.14M4.93 19.07a10 10 0 0 1 0-14.14"/></svg>
+            <span class="sb-label">Aktivitás</span>
+          </a>
+          <a href="#" class="sb-link" data-page="messages">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+            <span class="sb-label">Üzenetek</span>
+          </a>
+          <a href="#" class="sb-link" data-page="tasks">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
+            <span class="sb-label">Ütemezések</span>
+          </a>
+          <a href="#" class="sb-link" data-page="bgTasks">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+            <span class="sb-label">Háttér</span>
+          </a>
+        </div>
+      </div>
+      <div class="sb-group" data-group="knowledge">
+        <button type="button" class="sb-group-header" aria-expanded="false" aria-controls="sbGroupKnowledge">
+          <span class="sb-group-label" data-i18n="nav.group.knowledge">TUDÁS</span>
+          <svg class="sb-group-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>
+        <div class="sb-group-items" id="sbGroupKnowledge">
+          <a href="#" class="sb-link" data-page="memories">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3C7.5 3 4 6.5 4 11v4l-2 3h4v2a3 3 0 0 0 3 3h1a3 3 0 0 0 3-3v0a3 3 0 0 0 3 3h1a3 3 0 0 0 3-3v-2h4l-2-3v-4c0-4.5-3.5-8-8-8z"/></svg>
+            <span class="sb-label">Memória</span>
+          </a>
+          <a href="#" class="sb-link" data-page="naplo">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            <span class="sb-label">Napló</span>
+          </a>
+          <a href="#" class="sb-link" data-page="skills">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15 8.5 22 9.3 17 14.2 18.2 21 12 17.8 5.8 21 7 14.2 2 9.3 9 8.5"/></svg>
+            <span class="sb-label">Skillek</span>
+          </a>
+          <a href="#" class="sb-link" data-page="research">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <span class="sb-label" data-i18n="nav.research">Kutatás</span>
+          </a>
+          <a href="#" class="sb-link" data-page="ideas">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>
+            <span class="sb-label">Ötletláda</span>
+          </a>
+        </div>
+      </div>
+      <div class="sb-group" data-group="stats">
+        <button type="button" class="sb-group-header" aria-expanded="false" aria-controls="sbGroupStats">
+          <span class="sb-group-label" data-i18n="nav.group.stats">STATISZTIKÁK</span>
+          <svg class="sb-group-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>
+        <div class="sb-group-items" id="sbGroupStats">
+          <a href="#" class="sb-link" data-page="costs">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+            <span class="sb-label">Költségek</span>
+          </a>
+          <a href="#" class="sb-link" data-page="tokenUsage">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg>
+            <span class="sb-label">Token Monitor</span>
+          </a>
+        </div>
+      </div>
+      <div class="sb-group" data-group="system">
+        <button type="button" class="sb-group-header" aria-expanded="false" aria-controls="sbGroupSystem">
+          <span class="sb-group-label" data-i18n="nav.group.system">RENDSZER</span>
+          <svg class="sb-group-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>
+        <div class="sb-group-items" id="sbGroupSystem">
+          <a href="#" class="sb-link" data-page="status">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+            <span class="sb-label">Státusz</span>
+          </a>
+          <a href="#" class="sb-link" data-page="updates">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+            <span class="sb-label">Frissítések</span>
+            <span class="updates-badge sb-badge" id="updatesBadge" hidden></span>
+          </a>
+          <a href="#" class="sb-link" data-page="settings">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            <span class="sb-label">Beállítások</span>
+          </a>
+          <a href="#" class="sb-link" data-page="vault">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/><circle cx="12" cy="16" r="1"/></svg>
+            <span class="sb-label">Vault</span>
+          </a>
+        </div>
+      </div>
+      <div class="sb-group" data-group="connections">
+        <button type="button" class="sb-group-header" aria-expanded="false" aria-controls="sbGroupConnections">
+          <span class="sb-group-label" data-i18n="nav.group.connections">KAPCSOLATOK</span>
+          <svg class="sb-group-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>
+        <div class="sb-group-items" id="sbGroupConnections">
+          <a href="#" class="sb-link" data-page="connectors">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 0 0-7.07-7.07l-1.5 1.5"/><path d="M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 0 0 7.07 7.07l1.5-1.5"/></svg>
+            <span class="sb-label">MCP</span>
+          </a>
+          <a href="#" class="sb-link" data-page="federation">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="12" r="3"/><circle cx="19" cy="12" r="3"/><path d="M8 12h8"/><path d="M12 9v-3"/><path d="M12 15v3"/></svg>
+            <span class="sb-label">Föderáció</span>
+          </a>
+          <a href="#" class="sb-link" data-page="migrate">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/><polyline points="7 10 12 5 17 10"/><line x1="12" y1="5" x2="12" y2="17"/></svg>
+            <span class="sb-label">Költöztetés</span>
+          </a>
+        </div>
+      </div>
+    </nav>
+    <div class="sidebar-docs">
       <a href="#" class="sb-link" data-page="docs">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
         <span class="sb-label">Dokumentáció</span>
       </a>
-      <a href="#" class="sb-link" data-page="status">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-        <span class="sb-label">Státusz</span>
-      </a>
-      <a href="#" class="sb-link" data-page="autonomy">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-        <span class="sb-label">Autonómia</span>
-      </a>
-      <a href="#" class="sb-link" data-page="settings">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-        <span class="sb-label">Beállítások</span>
-      </a>
-      <a href="#" class="sb-link" data-page="vault">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/><circle cx="12" cy="16" r="1"/></svg>
-        <span class="sb-label">Vault</span>
-      </a>
-      <a href="#" class="sb-link" data-page="tokenUsage">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg>
-        <span class="sb-label">Token Monitor</span>
-      </a>
-      <a href="#" class="sb-link" data-page="ideas">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>
-        <span class="sb-label">Ötletláda</span>
-      </a>
-      <a href="#" class="sb-link" data-page="updates" id="updatesNavLink">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-        <span class="sb-label">Frissítések</span>
-        <span class="updates-badge sb-badge" id="updatesBadge" hidden></span>
-      </a>
-    </nav>
+    </div>
     <div class="sidebar-footer">
       <button class="theme-toggle" id="langToggle" title="Language / Nyelv">HU</button>
       <button class="theme-toggle" id="mobileLoginBtn" title="Mobil belépés (QR)">
@@ -153,6 +223,30 @@
   </aside>
 
   <main>
+    <!-- Non-blocking, dismissible banner shown when the operator is authed via
+         the token but has not yet created a browser (username+password) login.
+         Motivated by the existing remote-access surfaces (Tailscale Serve,
+         DASHBOARD_PUBLIC_URL / LAN, mobile QR). Populated by initAuthBanner(). -->
+    <!-- Non-blocking, dismissible warning shown when the checkout follows a
+         branch other than main (the release/product branch): the install keeps
+         receiving unreleased code until switched back. Dev machines are on
+         develop on purpose, so the dismissal persists per browser+branch.
+         Populated by updateBranchDriftUI() from /api/updates. -->
+    <div id="branchDriftBanner" class="auth-setup-banner branch-drift-banner" hidden>
+      <span id="branchDriftBannerText"></span>
+      <span class="auth-setup-banner-actions">
+        <button class="auth-setup-banner-close" id="branchDriftDismiss" aria-label="Dismiss">&times;</button>
+      </span>
+    </div>
+
+    <div id="authSetupBanner" class="auth-setup-banner" hidden>
+      <span data-i18n="auth.banner.text">Add a username+password login for browser access.</span>
+      <span class="auth-setup-banner-actions">
+        <button class="btn-secondary btn-compact" id="authBannerGoBtn" data-i18n="auth.banner.action">Set up login</button>
+        <button class="auth-setup-banner-close" id="authBannerDismiss" aria-label="Dismiss">&times;</button>
+      </span>
+    </div>
+
     <!-- === Overview Page (default) === -->
     <div class="page" id="overviewPage">
       <div class="overview-stats">
@@ -191,19 +285,20 @@
           </div>
           <div class="overview-activity" id="overviewActivity"></div>
         </div>
-        <div class="overview-card">
-          <div class="overview-card-head">
-            <h3 data-i18n="overview.card.agent_activity">Ügynök aktivitás</h3>
-            <span class="overview-card-meta" data-i18n="overview.meta.messages">mai üzenetek</span>
-          </div>
-          <div id="agentActivityWidget"></div>
-        </div>
       </div>
     </div>
 
     <!-- === Kanban Page === -->
     <div class="page" id="kanbanPage" hidden>
-      <div style="margin-bottom:12px;display:flex;align-items:center;gap:8px;">
+      <!-- View switcher: board vs gantt (top, always visible) -->
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
+        <button class="view-btn active" id="kanbanViewBoard" style="width:auto;padding:0 12px;" data-i18n="kanban.view.board">Tábla</button>
+        <button class="view-btn" id="kanbanViewGantt" style="width:auto;padding:0 12px;" data-i18n="kanban.view.gantt">Idővonal</button>
+        <button class="view-btn" id="kanbanViewArchived" style="width:auto;padding:0 12px;margin-left:auto;" data-i18n="kanban.view.archived">Archiváltak</button>
+      </div>
+
+      <!-- Board-specific filter row (hidden when gantt active) -->
+      <div id="kanbanBoardFilters" style="margin-bottom:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
         <label for="kanbanProjectFilter" style="font-size:13px;color:var(--muted);white-space:nowrap;">Projekt:</label>
         <select id="kanbanProjectFilter" style="font-size:13px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--fg);min-width:140px;">
           <option value="">Mind</option>
@@ -214,8 +309,22 @@
           <option value="assignee" data-i18n="kanban.filter.group_assignee">Felelős szerint</option>
           <option value="priority" data-i18n="kanban.filter.group_priority">Prioritás szerint</option>
         </select>
+        <span id="kanbanColumnChipsLabel" style="font-size:13px;color:var(--muted);white-space:nowrap;margin-left:8px;" data-i18n="kanban.filter.columns_label">Oszlopok:</span>
+        <div id="kanbanColumnChips" style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;"></div>
         <div class="kanban-quick-filters" id="kanbanQuickFilters" style="margin-left:auto; display:flex; gap:6px; flex-wrap:wrap; align-items:center;"></div>
       </div>
+
+      <!-- Gantt-specific filter row (hidden when board active) -->
+      <div id="kanbanGanttFilters" style="display:none;margin-bottom:12px;align-items:center;gap:6px;flex-wrap:wrap;">
+        <button class="view-btn active" style="width:auto;padding:0 10px;" data-period="week" data-i18n="kanban.gantt.filter.period_week">Ezen hét</button>
+        <button class="view-btn" style="width:auto;padding:0 10px;" data-period="month" data-i18n="kanban.gantt.filter.period_month">Hónap</button>
+        <button class="view-btn" style="width:auto;padding:0 10px;" data-period="quarter" data-i18n="kanban.gantt.filter.period_quarter">Negyedév</button>
+        <label style="display:flex;align-items:center;gap:5px;font-size:13px;color:var(--muted);margin-left:10px;cursor:pointer;">
+          <input type="checkbox" id="ganttOverdueOnly" style="cursor:pointer;">
+          <span data-i18n="kanban.gantt.filter.overdue_only">Csak lejárt/közelgő</span>
+        </label>
+      </div>
+
       <div class="kanban-board" id="kanbanBoard">
         <div class="kanban-col" data-status="planned">
           <div class="kanban-col-header">
@@ -241,6 +350,14 @@
           </div>
           <div class="kanban-col-body" data-status="waiting"></div>
         </div>
+        <div class="kanban-col" data-status="testing">
+          <div class="kanban-col-header">
+            <span class="kanban-col-title">Tesztelés</span>
+            <span class="kanban-col-count" id="countTesting">0</span>
+            <button class="kanban-add-btn" data-status="testing" title="Új kártya">+</button>
+          </div>
+          <div class="kanban-col-body" data-status="testing"></div>
+        </div>
         <div class="kanban-col" data-status="done">
           <div class="kanban-col-header">
             <span class="kanban-col-title">Kész</span>
@@ -250,10 +367,16 @@
         </div>
       </div>
       <div class="kanban-board kanban-swimlane-board" id="kanbanSwimlaneBoard" hidden></div>
+      <!-- Gantt / timeline view container -->
+      <div id="kanbanGanttView" style="display:none;"></div>
     </div>
 
     <!-- === Archived Cards Page === -->
     <div class="page" id="archivedPage" hidden>
+      <!-- View switcher row (mirrors the kanban page's row that leads here) -->
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
+        <button class="view-btn" id="archivedBackToKanban" style="width:auto;padding:0 12px;" data-i18n="archived.backToKanban">Vissza a Kanbanra</button>
+      </div>
       <div class="page-header" style="margin-bottom:16px;">
         <h2 style="margin:0;font-size:18px;" data-i18n="archived.page_title">Archivált kártyák</h2>
       </div>
@@ -272,7 +395,7 @@
       <div id="archivedList"></div>
     </div>
 
-    <!-- === Agents Page === -->
+    <!-- === Agents Page (includes org-chart view, replaces separate Team page) === -->
     <div class="page" id="agentsPage" hidden>
       <div class="page-header">
         <div class="page-header-row">
@@ -281,20 +404,43 @@
             <p class="subtitle" data-i18n="agents.page_subtitle">AI csapattagok kezelése</p>
           </div>
           <div class="header-actions">
+            <div class="view-toggle" id="agentsViewToggle" role="group" aria-label="Nézet váltás">
+              <button class="btn-secondary btn-compact view-toggle-btn active" id="agentsViewGrid" data-view="grid" title="Kártyák">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+                Kártyák
+              </button>
+              <button class="btn-secondary btn-compact view-toggle-btn" id="agentsViewTree" data-view="tree" title="Org chart">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="3"/><path d="M12 8v4"/><circle cx="5" cy="18" r="3"/><circle cx="19" cy="18" r="3"/><path d="M12 12l-7 6M12 12l7 6"/></svg>
+                Org chart
+              </button>
+            </div>
+            <button class="btn-secondary btn-compact" id="exportAllAgentsBtn">Összes exportálása</button>
+            <button class="btn-secondary btn-compact" id="importAgentBtn">Ügynök importálása</button>
+            <input type="file" id="importAgentFile" accept=".gz,.tgz,application/gzip" hidden>
             <button class="btn-secondary btn-compact" id="analyzeAllModelsBtn" data-i18n="agents.page.analyze_btn">Modell elemzés</button>
           </div>
         </div>
       </div>
       <div id="agentsModelAnalysis" style="display:none;margin:0 0 16px"></div>
-      <div class="agents-grid" id="agentsGrid">
-        <button class="agent-card add-card" id="addAgentBtn">
-          <div class="add-icon">
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-            </svg>
-          </div>
-          <span data-i18n="agents.page.new_btn">Új ügynök</span>
-        </button>
+      <!-- Grid view -->
+      <div id="agentsGridView">
+        <div class="agents-grid" id="agentsGrid">
+          <button class="agent-card add-card" id="addAgentBtn">
+            <div class="add-icon">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+              </svg>
+            </div>
+            <span data-i18n="agents.page.new_btn">Új ügynök</span>
+          </button>
+        </div>
+      </div>
+      <!-- Tree / org-chart view (merged from separate Team page) -->
+      <div id="agentsTreeView" hidden>
+        <div id="teamGraph" class="team-graph"></div>
+        <p style="color:var(--text-muted);font-size:12px;margin-top:16px">
+          A szerep és a beosztott/vezető kapcsolatok az ügynök részletek &gt; Csapat fülén szerkeszthetők.
+        </p>
       </div>
     </div>
 
@@ -387,12 +533,20 @@
             <h1>Skillek</h1>
             <p class="subtitle" data-i18n="skills.page_subtitle">A Claude Code által látott skillek (user mappa + plugin cache)</p>
           </div>
-          <button class="btn-primary btn-compact" id="skillsPageNewBtn" data-i18n="skills.btn.new_skill">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-            </svg>
-            Új skill
-          </button>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button class="btn-secondary btn-compact" id="skillsExportBtn" data-i18n="skills.btn.export">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              Exportálás
+            </button>
+            <button class="btn-primary btn-compact" id="skillsPageNewBtn" data-i18n="skills.btn.new_skill">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+              </svg>
+              Új skill
+            </button>
+          </div>
         </div>
         <div class="info-box" id="skillsInfoBox">
           Minden itt listázott skill automatikusan elérhető minden sub-agent számára, mert ugyanabban a HOME-ban futnak, mint a fő session.
@@ -402,12 +556,31 @@
         </div>
       </div>
       <div class="skills-stats" id="skillsStats"></div>
-      <div class="skills-grid" id="skillsGrid"></div>
-      <div class="skills-empty" id="skillsEmpty" hidden>
-        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"/>
-        </svg>
-        <p data-i18n="skills.empty">Nincsenek skillek</p>
+      <div class="skills-toolbar">
+        <div class="skills-search-wrap">
+          <svg class="skills-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          <input type="text" id="skillsSearch" class="skills-search" data-i18n-placeholder="skills.search.placeholder" placeholder="Keresés...">
+        </div>
+        <div class="skills-filter-btns" id="skillsFilterBtns">
+          <button class="skills-filter-btn active" data-filter="all" data-i18n="skills.filter.all">Összes</button>
+          <button class="skills-filter-btn" data-filter="user" data-i18n="skills.filter.user">User</button>
+          <button class="skills-filter-btn" data-filter="plugin" data-i18n="skills.filter.plugin">Plugin</button>
+          <button class="skills-filter-btn" data-filter="agent" data-i18n="skills.filter.agent">Ágens</button>
+        </div>
+      </div>
+      <div class="skills-body-wrap">
+        <nav class="skills-category-sidebar" id="skillsCategorySidebar"></nav>
+        <div class="skills-main-area">
+          <div class="skills-grid" id="skillsGrid"></div>
+          <div class="skills-empty" id="skillsEmpty" hidden>
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"/>
+            </svg>
+            <p data-i18n="skills.empty">Nincsenek skillek</p>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -720,6 +893,25 @@
         </div>
       </div>
 
+      <div class="modal-overlay" id="openrouterModal" hidden>
+        <div class="modal-content" style="max-width:660px">
+          <div class="modal-header">
+            <h3>🔀 OpenRouter kézi modellek</h3>
+            <button class="modal-close" id="openrouterModalClose">&times;</button>
+          </div>
+          <div class="modal-body">
+            <p class="modal-desc">Pipáld be azokat a modelleket, amelyek megjelenjenek a legördülő "OpenRouter - kézi" csoportjában (minden ágensnél választható lesz). A pipa levétele lekerül a listáról. A hozzárendelést utána ágensenként a legördülőben végzed.</p>
+            <input type="text" id="openrouterModalSearch" placeholder="Keresés: név, provider, id..." style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);margin-bottom:8px">
+            <label style="font-size:12px;color:var(--text-muted);display:flex;align-items:center;gap:6px;margin-bottom:8px"><input type="checkbox" id="openrouterModalFreeOnly"> Csak ingyenes (:free)</label>
+            <div id="openrouterModalCount" style="font-size:11px;color:var(--text-muted);margin-bottom:4px"></div>
+            <div id="openrouterModalList" style="max-height:340px;overflow-y:auto;border:1px solid var(--border);border-radius:6px"></div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn-secondary" id="openrouterModalCancel">Kész</button>
+          </div>
+        </div>
+      </div>
+
       <!-- Gallery tab -->
       <div class="connector-tab-content" id="connectorGalleryTab" hidden>
         <div class="catalog-filters" id="catalogFilters">
@@ -783,6 +975,63 @@
           <button class="btn-secondary btn-compact" id="migrateNewBtn" style="margin-top:16px" data-i18n="migrate.btn.new">Új költöztetés</button>
         </div>
       </div>
+
+      <!-- === Teljes flotta migráció === -->
+      <div class="fleet-section">
+        <div class="fleet-section-header">
+          <h2 class="fleet-section-title" data-i18n="fleet.section_title">Teljes flotta migráció</h2>
+          <p class="fleet-section-desc" data-i18n="fleet.section_desc">Az összes ügynök, memória, kanban és beállítás egyetlen JSON-ban.</p>
+        </div>
+
+        <div class="fleet-warning">
+          <span class="fleet-warning-icon">⚠️</span>
+          <span data-i18n="fleet.warning">Az import kizárólag üres/friss telepítésre való, nem merge-re. Google/Gmail OAuth és a dashboard-token nem utazik: a célgépen re-auth szükséges.</span>
+        </div>
+
+        <div class="fleet-cards">
+          <!-- Export -->
+          <div class="fleet-card">
+            <h3 class="fleet-card-title" data-i18n="fleet.export.title">Export</h3>
+            <p class="fleet-card-desc" data-i18n="fleet.export.desc">A teljes flotta egy JSON-ban. Jelszó megadásával a vault-titkok is (titkosítva).</p>
+            <div class="form-group" style="margin-bottom:12px">
+              <label for="fleetExportPassword" data-i18n="fleet.vault_password_label">Vault jelszó (opcionális)</label>
+              <input type="password" id="fleetExportPassword" data-i18n-ph="fleet.vault_password_ph" placeholder="Ha üresen hagyod, titkok nélkül exportál">
+            </div>
+            <button class="btn-primary btn-compact" id="fleetExportBtn">
+              <span class="btn-text" data-i18n="fleet.export.btn">Letöltés (JSON)</span>
+              <span class="btn-loading" hidden><span class="spinner"></span> <span data-i18n="fleet.export.loading">Exportálás...</span></span>
+            </button>
+          </div>
+
+          <!-- Import -->
+          <div class="fleet-card">
+            <h3 class="fleet-card-title" data-i18n="fleet.import.title">Import</h3>
+            <p class="fleet-card-desc" data-i18n="fleet.import.desc">Tallózz egy korábban exportált fleet-export-*.json fájlt.</p>
+            <div class="form-group" style="margin-bottom:12px">
+              <label for="fleetImportFile" data-i18n="fleet.import.file_label">Fleet JSON fájl</label>
+              <input type="file" id="fleetImportFile" accept="application/json,.json" class="fleet-file-input">
+            </div>
+            <div class="form-group" style="margin-bottom:12px">
+              <label for="fleetImportPassword" data-i18n="fleet.vault_password_label">Vault jelszó (opcionális)</label>
+              <input type="password" id="fleetImportPassword" data-i18n-ph="fleet.import_vault_password_ph" placeholder="Ha üresen hagyod, titkok nélkül importál">
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn-secondary btn-compact" id="fleetDryRunBtn">
+                <span class="btn-text" data-i18n="fleet.import.dryrun_btn">Ellenőrzés (dry-run)</span>
+                <span class="btn-loading" hidden><span class="spinner"></span> <span data-i18n="fleet.import.dryrun_loading">Ellenőrzés...</span></span>
+              </button>
+              <button class="btn-primary btn-compact" id="fleetApplyBtn" disabled>
+                <span class="btn-text" data-i18n="fleet.import.apply_btn">Végrehajtás (apply)</span>
+                <span class="btn-loading" hidden><span class="spinner"></span> <span data-i18n="fleet.import.apply_loading">Importálás...</span></span>
+              </button>
+            </div>
+
+            <!-- Dry-run result -->
+            <div id="fleetDryRunResult" hidden></div>
+          </div>
+        </div>
+
+      </div>
     </div>
 
     <!-- === Docs Page === -->
@@ -797,6 +1046,22 @@
         </aside>
         <article class="docs-content markdown-body" id="docsContent">
           <p class="muted" data-i18n="docs.select_hint">Válassz egy dokumentumot a bal oldali listából.</p>
+        </article>
+      </div>
+    </div>
+
+    <!-- === Research Page === -->
+    <div class="page" id="researchPage" hidden>
+      <div class="page-header">
+        <h1 data-i18n="research.page_title">Kutatás</h1>
+        <p class="subtitle" data-i18n="research.page_subtitle">Ágensek research/ mappái, olvasható formában</p>
+      </div>
+      <div class="docs-layout">
+        <aside class="docs-list" id="researchList">
+          <p class="muted" data-i18n="research.loading">Betöltés...</p>
+        </aside>
+        <article class="docs-content markdown-body" id="researchContent">
+          <p class="muted" data-i18n="research.select_hint">Válassz egy dokumentumot a bal oldali listából.</p>
         </article>
       </div>
     </div>
@@ -831,29 +1096,7 @@
       </div>
     </div>
 
-    <!-- === Team Page === -->
-    <div class="page" id="teamPage" hidden>
-      <div class="page-header">
-        <div class="page-header-row">
-          <div>
-            <h1>Csapat</h1>
-            <p class="subtitle" data-i18n="team.page_subtitle">Ki kinek jelent és ki kinek delegál</p>
-          </div>
-          <button class="btn-secondary btn-compact" id="refreshTeamBtn" data-i18n="common.btn.refresh">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-            </svg>
-            Frissítés
-          </button>
-        </div>
-      </div>
-
-      <div id="teamGraph" class="team-graph"></div>
-      <p style="color:var(--text-muted);font-size:12px;margin-top:16px">
-        A szerep és a beosztott/vezető kapcsolatok az ügynök részletek &gt; Csapat fülén szerkeszthetők.
-      </p>
-
-    </div>
+    <!-- Team page merged into Agents page (view toggle: grid / org-chart) -->
 
     <!-- === Messages Page === -->
     <div class="page" id="messagesPage" hidden>
@@ -882,15 +1125,15 @@
       </div>
     </div>
 
-    <!-- === Autonomy Page === -->
-    <div class="page" id="autonomyPage" hidden>
+<!-- === Approvals Page === -->
+    <div class="page" id="approvalsPage" hidden>
       <div class="page-header">
         <div class="page-header-row">
           <div>
-            <h1 data-i18n="autonomy.page_title">Autonómia</h1>
-            <p class="subtitle" data-i18n="autonomy.page_subtitle">Heartbeat fokozatos autonómia szintek</p>
+            <h1 data-i18n="approvals.page_title">Jóváhagyások</h1>
+            <p class="subtitle" data-i18n="approvals.page_subtitle">Ágens-kérések jóváhagyása, előzmények és státusz</p>
           </div>
-          <button class="btn-secondary btn-compact" id="refreshAutonomyBtn" data-i18n="common.btn.refresh">
+          <button class="btn-secondary btn-compact" id="refreshApprovalsBtn">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
             </svg>
@@ -899,23 +1142,39 @@
         </div>
       </div>
 
-      <div class="autonomy-legend">
-        <div class="autonomy-legend-item">
-          <span class="autonomy-level-dot" style="background:var(--text-muted)"></span>
-          <span><strong>1</strong> Csak jelez</span>
-        </div>
-        <div class="autonomy-legend-item">
-          <span class="autonomy-level-dot" style="background:var(--accent)"></span>
-          <span><strong>2</strong> <span data-i18n="autonomy.level.2">Javasol, jóváhagyásra vár</span></span>
-        </div>
-        <div class="autonomy-legend-item">
-          <span class="autonomy-level-dot" style="background:var(--success)"></span>
-          <span><strong>3</strong> <span data-i18n="autonomy.level.3">Autonóm, utólag jelent</span></span>
-        </div>
+      <div class="approvals-pending-banner" id="approvalsPendingBanner" hidden></div>
+      <div class="approvals-stats" id="approvalsStats"></div>
+
+      <div class="approvals-toolbar" id="approvalsToolbar">
+        <select class="input-sm" id="approvalsFilterStatus">
+          <option value="">Összes státusz</option>
+          <option value="pending">Várakozó</option>
+          <option value="approved">Jóváhagyott</option>
+          <option value="rejected">Elutasított</option>
+          <option value="timeout">Lejárt</option>
+        </select>
+        <input class="input-sm" type="text" id="approvalsFilterAgent" placeholder="Ágens szűrő..." style="min-width:120px">
+        <input class="input-sm" type="text" id="approvalsFilterCategory" placeholder="Kategória szűrő..." style="min-width:140px">
       </div>
 
-      <div class="autonomy-grid" id="autonomyGrid"></div>
-      <p class="autonomy-footer" id="autonomyUpdatedAt"></p>
+      <div class="ssh-table-wrap" style="margin-top:12px">
+        <table class="ssh-table" id="approvalsTable">
+          <thead>
+            <tr>
+              <th data-i18n="approvals.col.time">Időpont</th>
+              <th data-i18n="approvals.col.agent">Ágens</th>
+              <th data-i18n="approvals.col.category">Kategória</th>
+              <th data-i18n="approvals.col.action">Tevékenység</th>
+              <th data-i18n="approvals.col.status">Státusz</th>
+              <th data-i18n="approvals.col.timeout">Határidő</th>
+              <th data-i18n="approvals.col.actions">Döntés</th>
+            </tr>
+          </thead>
+          <tbody id="approvalsTbody"></tbody>
+        </table>
+      </div>
+
+      <div class="approvals-pagination" id="approvalsPagination"></div>
     </div>
 
     <!-- === Settings Page === -->
@@ -935,7 +1194,18 @@
         </div>
       </div>
 
-      <div id="settingsGroups"></div>
+      <!-- Dashboard browser login (optional). Rendered by renderAuthCard():
+           create the first login when none exists, else change password + list
+           active sessions and log out. Starts hidden; loadSettings() moves it
+           into the Security tab panel and unhides it there (it stays here,
+           unhidden in place, only in the empty-registry fallback). -->
+      <div class="card auth-card" id="authCard" style="margin-bottom:16px" hidden>
+        <h3 data-i18n="auth.card.title">Dashboard login</h3>
+        <div id="authCardBody"></div>
+      </div>
+
+      <nav class="tab-nav" id="settingsTabNav" style="margin-bottom:0"></nav>
+      <div id="settingsTabPanels"></div>
       <!-- Sticky save bar -- shown only when there are unsaved changes -->
       <div id="settingsSaveBar" style="display:none;position:sticky;bottom:0;background:var(--bg-card);border-top:1px solid var(--border);padding:12px 24px;display:none;align-items:center;justify-content:space-between;gap:12px;z-index:10">
         <span id="settingsDirtyCount" style="font-size:13px;color:var(--text-muted)"></span>
@@ -1121,7 +1391,7 @@
           <div class="stat-label" data-i18n="vault.stat.total">Tarolt kulcs</div>
         </div>
         <div class="stat-card">
-          <div class="stat-value" id="vaultStatEncryption">AES-256</div>
+          <div class="stat-value">AES-256</div>
           <div class="stat-label" data-i18n="vault.stat.encryption">Titkositas</div>
         </div>
         <div class="stat-card">
@@ -1129,7 +1399,7 @@
           <div class="stat-label" data-i18n="vault.stat.bindings">Kotes</div>
         </div>
         <div class="stat-card">
-          <div class="stat-value" id="vaultStatStorage">Helyi</div>
+          <div class="stat-value">Helyi</div>
           <div class="stat-label" data-i18n="vault.stat.storage">Tarolas</div>
         </div>
       </div>
@@ -1176,6 +1446,276 @@
         </svg>
         <p data-i18n="vault.empty_msg">Meg nincs tarolt kulcs</p>
         <p class="vault-empty-hint" data-i18n="vault.empty_hint">Adj hozza egyet az "Uj kulcs" gombbal</p>
+      </div>
+
+      <!-- === SSH Key Store section === -->
+      <div class="ssh-section ssh-key-store-section">
+        <div class="ssh-section-header">
+          <div>
+            <h2 class="ssh-section-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+              Kulcstároló
+            </h2>
+            <p class="ssh-section-sub">Generált ed25519 kulcspárok – ezeket rendelheted a szerverekhez</p>
+          </div>
+          <div class="ssh-section-actions">
+            <button class="btn-primary btn-compact" id="sshKeyNewBtn">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              Új kulcs generálása
+            </button>
+          </div>
+        </div>
+        <div class="ssh-table-wrap" id="sshKeysView" hidden>
+          <table class="ssh-table">
+            <thead>
+              <tr>
+                <th>Cimke</th>
+                <th>Felhasználónév</th>
+                <th>Típus</th>
+                <th>Ujjlenyomat</th>
+                <th>Létrehozva</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="sshKeysTableBody"></tbody>
+          </table>
+        </div>
+        <div id="sshKeysEmpty" class="vault-empty">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+          <p>Még nincs kulcs</p>
+          <p class="vault-empty-hint">Generálj egyet, majd rendeld hozzá a szerverekhez</p>
+        </div>
+      </div>
+
+      <!-- === SSH Servers section === -->
+      <div class="ssh-section">
+        <div class="ssh-section-header">
+          <div>
+            <h2 class="ssh-section-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+              SSH Szerverek
+            </h2>
+            <p class="ssh-section-sub">Szerver hozzáférések és SSH kulcs állapotok</p>
+          </div>
+          <div class="ssh-section-actions">
+            <div class="schedule-view-toggle">
+              <button class="view-btn" id="sshViewCards" title="Kártya nézet">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+              </button>
+              <button class="view-btn active" id="sshViewTable" title="Táblázat nézet">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+              </button>
+              <button class="view-btn" id="sshInfoGlobalBtn" title="Telepítési útmutató (meglévő szerver)">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+              </button>
+            </div>
+            <button class="btn-primary btn-compact" id="sshNewBtn">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              Új szerver
+            </button>
+          </div>
+        </div>
+
+        <!-- Add server panel -->
+        <div class="vault-add-panel" id="sshAddPanel" hidden>
+          <div class="vault-add-panel-header">
+            <h3 id="sshAddPanelTitle">Szerver hozzáadása</h3>
+            <button class="modal-close" id="sshAddPanelClose">&times;</button>
+          </div>
+          <div class="vault-add-fields" style="grid-template-columns:1fr 1fr 1fr">
+            <div class="vault-field-group">
+              <label class="vault-field-label">Név</label>
+              <input type="text" id="sshNameInput" class="input" placeholder="pl. web-prod-01">
+            </div>
+            <div class="vault-field-group">
+              <label class="vault-field-label">IP / Hostnév</label>
+              <input type="text" id="sshHostInput" class="input" placeholder="192.168.1.10">
+            </div>
+            <div class="vault-field-group">
+              <label class="vault-field-label">Felhasználónév</label>
+              <input type="text" id="sshUserInput" class="input" placeholder="root">
+            </div>
+            <div class="vault-field-group">
+              <label class="vault-field-label">Port</label>
+              <input type="number" id="sshPortInput" class="input" placeholder="22" value="22">
+            </div>
+            <div class="vault-field-group">
+              <label class="vault-field-label">SSH kulcs</label>
+              <div class="ssh-key-select-wrap">
+                <select id="sshKeySelectInput" class="input ssh-key-select">
+                  <option value="">-- Nincs kulcs --</option>
+                </select>
+                <button type="button" class="btn-secondary btn-compact" id="sshKeyNewFromFormBtn" title="Új kulcs generálása">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                  Új kulcs
+                </button>
+                <button type="button" class="ssh-info-btn" id="sshKeyInstallFromFormBtn" title="Telepítési útmutató (ehhez az új szerverhez)">i</button>
+              </div>
+            </div>
+            <div class="vault-field-group">
+              <label class="vault-field-label">Leírás (opcionális)</label>
+              <input type="text" id="sshDescInput" class="input" placeholder="pl. Produkciós webszerver">
+            </div>
+          </div>
+          <div class="vault-add-actions">
+            <button class="btn-primary" id="sshAddBtn">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/></svg>
+              Szerver mentése
+            </button>
+          </div>
+        </div>
+
+        <!-- Card view -->
+        <div class="ssh-cards schedule-view" id="sshCardsView"></div>
+
+        <!-- Table view -->
+        <div class="schedule-view" id="sshTableView" hidden>
+          <div class="ssh-table-wrap">
+            <table class="ssh-table">
+              <thead>
+                <tr>
+                  <th>Név</th>
+                  <th>IP / Hostnév</th>
+                  <th>Felhasználó</th>
+                  <th>Port</th>
+                  <th>Hozzárendelt kulcs</th>
+                  <th>Leírás</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="sshTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div id="sshEmpty" class="vault-empty" hidden>
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+          <p>Még nincs szerver</p>
+          <p class="vault-empty-hint">Add hozzá az "Új szerver" gombbal</p>
+        </div>
+      </div>
+
+      <!-- SSH Key Generation modal (standalone key store) -->
+      <div class="modal-overlay" id="sshKeygenOverlay">
+        <div class="modal" style="max-width:520px">
+          <div class="modal-header">
+            <h2>SSH kulcs generálása</h2>
+            <button class="modal-close" id="sshKeygenClose">&times;</button>
+          </div>
+          <div class="modal-body">
+            <p class="vault-scan-desc">Új ed25519 kulcspár generálása. A privát kulcs titkosítva tárolódik a Vault-ban, soha nem hagyja el a szervert.</p>
+            <div id="sshKeygenForm">
+              <div class="form-group">
+                <label for="sshKeygenLabelInput">Cimke</label>
+                <input type="text" id="sshKeygenLabelInput" class="input" placeholder="pl. bishop-ro jumphost">
+              </div>
+              <div class="form-group">
+                <label for="sshKeygenUserInput">Felhasználónév (ssh komment)</label>
+                <input type="text" id="sshKeygenUserInput" class="input" placeholder="pl. bishop-ro">
+              </div>
+            </div>
+            <div id="sshKeygenSpinner" hidden style="text-align:center;padding:20px 0">
+              <svg class="spin" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+              <p style="margin-top:8px;font-size:13px;color:var(--text-muted)">Generálás folyamatban...</p>
+            </div>
+            <div id="sshKeygenResult" hidden>
+              <div class="ssh-pubkey-label">
+                <span>Publikus kulcs</span>
+                <button class="btn-secondary btn-compact" id="sshKeygenCopyBtn">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                  Másolás
+                </button>
+              </div>
+              <textarea id="sshKeygenPubkeyBox" class="ssh-pubkey-box" readonly rows="3"></textarea>
+              <p class="ssh-pubkey-hint">A kulcs mentve a Kulcstárolóba. Rendeld hozzá egy szerverhez, majd telepítsd az (i) gomb segítségével.</p>
+            </div>
+          </div>
+          <div class="modal-footer" id="sshKeygenFooter">
+            <button class="btn-primary" id="sshKeygenSubmitBtn">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+              Generálás
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- SSH Install Info modal -->
+      <div class="modal-overlay" id="sshInfoOverlay">
+        <div class="modal" style="max-width:580px">
+          <div class="modal-header">
+            <h2>Kulcs telepítése – <span id="sshInfoServerName"></span></h2>
+            <button class="modal-close" id="sshInfoClose">&times;</button>
+          </div>
+          <div class="modal-body">
+            <!-- Part 0: Server selector -->
+            <div class="ssh-info-server-section">
+              <div class="ssh-info-key-section-label">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+                Szerver
+              </div>
+              <select id="sshInfoServerSelect" class="input ssh-key-select" style="width:100%;max-width:100%;height:34px;font-size:13px"></select>
+            </div>
+
+            <!-- Part 1: Key selector -->
+            <div class="ssh-info-key-section">
+              <div class="ssh-info-key-section-label">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+                Kulcs kiválasztása
+              </div>
+              <p class="ssh-section-sub" style="margin:0 0 8px">Válaszd ki, melyik Kulcstárolóban lévő kulcsot rendeled ehhez a szerverhez. A változás azonnal mentésre kerül.</p>
+              <select id="sshInfoKeySelect" class="input ssh-key-select"></select>
+            </div>
+
+            <!-- Part 2: Install commands -->
+            <div id="sshInfoInstallSection">
+              <p class="vault-scan-desc" style="margin-bottom:12px">Futtasd az alábbi parancsokat a célszerveren (<strong id="sshInfoUser"></strong> felhasználóval) a kiválasztott kulcs telepítéséhez:</p>
+              <div class="ssh-install-step" id="sshInfoStep0">
+                <div class="ssh-install-step-label">1. Felhasználó létrehozása (ha még nincs, root-tal futtatva)</div>
+                <div class="ssh-code-wrap">
+                  <code class="ssh-code" id="sshInfoCmd0"></code>
+                  <button class="ssh-code-copy" data-target="sshInfoCmd0" title="Másolás">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                  </button>
+                </div>
+              </div>
+              <div class="ssh-install-step">
+                <div class="ssh-install-step-label">2. SSH könyvtár létrehozása (ha még nincs)</div>
+                <div class="ssh-code-wrap">
+                  <code class="ssh-code" id="sshInfoCmd1">mkdir -p ~/.ssh &amp;&amp; chmod 700 ~/.ssh</code>
+                  <button class="ssh-code-copy" data-target="sshInfoCmd1" title="Másolás">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                  </button>
+                </div>
+              </div>
+              <div class="ssh-install-step">
+                <div class="ssh-install-step-label">3. Publikus kulcs hozzáfűzése</div>
+                <div class="ssh-code-wrap">
+                  <code class="ssh-code" id="sshInfoCmd2"></code>
+                  <button class="ssh-code-copy" data-target="sshInfoCmd2" title="Másolás">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                  </button>
+                </div>
+              </div>
+              <div class="ssh-install-step">
+                <div class="ssh-install-step-label">4. Jogosultság beállítása</div>
+                <div class="ssh-code-wrap">
+                  <code class="ssh-code" id="sshInfoCmd3">chmod 600 ~/.ssh/authorized_keys</code>
+                  <button class="ssh-code-copy" data-target="sshInfoCmd3" title="Másolás">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                  </button>
+                </div>
+              </div>
+              <div class="info-box" style="margin-top:16px">
+                <strong>Publikus kulcs:</strong>
+                <div id="sshInfoPubkey" style="font-family:monospace;font-size:11px;word-break:break-all;margin-top:4px;color:var(--text-muted)"></div>
+              </div>
+            </div>
+
+            <div id="sshInfoNoKey" hidden style="text-align:center;padding:16px 0;color:var(--text-muted);font-size:13px">
+              Nincs kulcs kiválasztva. Válassz egyet fentebb, vagy generálj újat a Kulcstárolóban.
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- Binding modal -->
@@ -1241,7 +1781,7 @@
         <div class="page-header-row" style="flex-wrap:wrap">
           <div style="flex:1;min-width:200px">
             <h1>Token Monitor</h1>
-            <p class="subtitle" id="tokenUsageSubtitle" data-i18n="tokenUsage.page_subtitle">Ügynök token-fogyasztás nyomon követése</p>
+            <p class="subtitle" data-i18n="tokenUsage.page_subtitle">Ügynök token-fogyasztás nyomon követése</p>
           </div>
           <div class="tu-header-controls" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
             <select id="tuPeriod" class="input-compact" style="width:auto">
@@ -1269,9 +1809,30 @@
 
       <div class="overview-card" style="margin-bottom:16px">
         <h3 data-i18n="tokenUsage.timeline_title">Idővonal</h3>
-        <div id="tuTimelineChart" style="height:370px;position:relative;overflow:hidden">
+        <div style="height:370px;position:relative;overflow:hidden">
           <canvas id="tuCanvas"></canvas>
         </div>
+      </div>
+
+      <div class="overview-card" id="tuModelDistSection" style="margin-bottom:16px">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+          <h3 style="margin:0" data-i18n="tokenUsage.model_dist_title">Modell eloszlás</h3>
+        </div>
+        <div id="tuModelDistContent" style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap">
+          <canvas id="tuModelPieCanvas" width="180" height="180" style="flex-shrink:0"></canvas>
+          <div id="tuModelDistTable" style="flex:1;min-width:220px"></div>
+        </div>
+      </div>
+
+      <div class="overview-card" id="tuToolStatsSection" style="margin-bottom:16px">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap">
+          <h3 style="margin:0" data-i18n="tokenUsage.tool_stats_title">MCP eszközhasználat</h3>
+          <label style="font-size:12px;color:var(--text-secondary);display:flex;align-items:center;gap:4px;cursor:pointer">
+            <input type="checkbox" id="tuToolAgentBreakdown">
+            <span data-i18n="tokenUsage.tool_stats_agent_toggle">Ágens bontás</span>
+          </label>
+        </div>
+        <div id="tuToolStatsContent"></div>
       </div>
 
       <div class="overview-card">
@@ -1308,12 +1869,36 @@
         </div>
       </div>
 
+      <div id="updatesBranchNotice" class="updates-branch-notice" hidden></div>
+
       <div id="updatesSummary" class="updates-summary"></div>
+
+      <div id="updatesDiagnose" class="updates-diagnose" hidden></div>
 
       <div class="updates-commits">
         <h3 data-i18n="tokenUsage.changes_title">Változások</h3>
         <div id="updatesCommitList" class="updates-commit-list"></div>
       </div>
+    </div>
+
+    <!-- Costs page (CostOps v0.1, PR #524) -->
+    <div class="page" id="costsPage" hidden>
+      <div class="page-header">
+        <div class="page-header-row">
+          <div>
+            <h1 data-i18n="costs.page_title">Költségek</h1>
+            <p class="subtitle" data-i18n="costs.page_subtitle">Havi költség-összefoglaló a helyi konfigurációból</p>
+          </div>
+          <button class="btn-secondary btn-compact" id="refreshCostsBtn" data-i18n="common.btn.refresh">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+            Frissítés
+          </button>
+        </div>
+      </div>
+
+      <div id="costsContent"></div>
     </div>
 
     <!-- Naplo page -->
@@ -1354,6 +1939,62 @@
       <div class="naplo-summary" id="naplo-summary"></div>
       <div class="naplo-timeline" id="naplo-timeline">
         <p class="naplo-empty" data-i18n="naplo.empty_hint">Válassz szűrőt és kattints Keresés-re.</p>
+      </div>
+    </div>
+
+    <div class="page" id="federationPage" hidden>
+      <div class="page-header">
+        <div class="page-header-row">
+          <div>
+            <h1 data-i18n="federation.page_title">Föderáció</h1>
+            <p class="subtitle" data-i18n="federation.page_subtitle">Társrendszerek összekötése: távoli ügynökök címzése rendszer/ügynök alakban</p>
+          </div>
+          <button class="btn-primary btn-compact" id="federationApplyBtn" data-i18n="federation.btn.apply"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg> Beállítások életbe léptetése</button>
+        </div>
+      </div>
+      <div id="federationStats" style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px"></div>
+      <div id="federationMaster" class="card" style="padding:14px 16px;margin-bottom:16px"></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <h3 style="font-size:15px;font-weight:600" data-i18n="federation.peers_title">Társrendszerek</h3>
+        <button class="btn-primary btn-compact" id="federationAddPeerBtn" data-i18n="federation.btn.add_peer">+ Társ hozzáadása</button>
+      </div>
+      <div id="federationPeers" style="display:flex;flex-direction:column;gap:10px;margin-bottom:24px"></div>
+      <div class="card" style="padding:14px 16px;border-color:var(--danger)">
+        <h3 style="font-size:14px;font-weight:600;color:var(--danger);margin-bottom:6px" data-i18n="federation.danger_title">Veszélyzóna</h3>
+        <p style="font-size:13px;color:var(--text-muted);margin-bottom:10px" data-i18n="federation.danger_hint">A teljes eltávolítás törli a konfigurációt, a tokeneket és lezárja a függő üzeneteket. A társrendszereken a párosítást külön kell megszüntetni.</p>
+        <button class="btn-secondary btn-compact" id="federationRemoveBtn" style="color:var(--danger);border-color:var(--danger)" data-i18n="federation.btn.remove_all">Föderáció teljes eltávolítása</button>
+      </div>
+
+      <div class="modal-overlay" id="fedPeerModalOverlay">
+        <div class="modal" style="max-width:520px">
+          <div class="modal-header">
+            <h2 id="fedPeerModalTitle">Társ hozzáadása</h2>
+            <button class="modal-close" id="fedPeerModalClose">&times;</button>
+          </div>
+          <div class="modal-body" style="display:flex;flex-direction:column;gap:12px">
+            <div class="form-group">
+              <label data-i18n="federation.modal.id_label">Rendszer-azonosító (pl. teodor)</label>
+              <input type="text" class="input" id="fedPeerId" placeholder="teodor">
+              <p style="font-size:12px;color:var(--text-muted);margin:4px 0 0" data-i18n="federation.modal.id_hint">A másik rendszer gépi azonosítója — a társ Föderáció-oldalán a „Saját azonosító" mezőből másold (nem a megjelenítési név). Kis-nagybetű nem számít.</p>
+            </div>
+            <div class="form-group">
+              <label data-i18n="federation.modal.url_label">Alap-URL (https://...)</label>
+              <input type="text" class="input" id="fedPeerBaseUrl" placeholder="https://gep.tailnet.ts.net">
+            </div>
+            <div class="form-group">
+              <label data-i18n="federation.modal.outbound_label">Tőle kapott token (üresen hagyható a párosításig)</label>
+              <input type="password" class="input" id="fedPeerOutboundToken" autocomplete="off">
+            </div>
+            <div class="form-group">
+              <label data-i18n="federation.modal.abandon_label">Türelmi ablak percben (üresen: 60)</label>
+              <input type="number" class="input" id="fedPeerAbandonWindow" min="5" max="10080" placeholder="60">
+            </div>
+          </div>
+          <div class="modal-footer" style="display:flex;gap:8px;justify-content:flex-end">
+            <button class="btn-secondary" id="fedPeerModalCancel" data-i18n="common.btn.cancel">Mégse</button>
+            <button class="btn-primary btn-compact" id="fedPeerModalSave" data-i18n="common.btn.save">Mentés</button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -1570,13 +2211,25 @@
               <option value="inherit" data-i18n="agents.model.inherit">Öröklött (alapértelmezett)</option>
               <optgroup label="☁️ Claude (felhő)">
                 <option value="claude-fable-5" data-i18n="agents.model.fable5">Fable 5 (legújabb)</option>
+                <option value="claude-opus-5" data-i18n="agents.model.opus5">Opus 5 (legújabb Opus)</option>
                 <option value="claude-opus-4-8[1m]" data-i18n="agents.model.opus48">Opus 4.8 (1M kontextus, alapértelmezett)</option>
+                <option value="claude-sonnet-5" data-i18n="agents.model.sonnet5">Sonnet 5 (legújabb Sonnet, Opus-közeli)</option>
                 <option value="claude-sonnet-4-6" data-i18n="agents.model.sonnet46">Sonnet 4.6 (gyors és okos)</option>
                 <option value="claude-haiku-4-5-20251001" data-i18n="agents.model.haiku45">Haiku 4.5 (leggyorsabb)</option>
               </optgroup>
               <optgroup label="🌊 DeepSeek (alternatív)" id="agentModelDeepseekGroup">
               </optgroup>
+              <optgroup label="🔀 OpenRouter - Auto (heti frissítésű ajánlott)" id="agentModelOpenrouterAutoGroup" style="display:none">
+              </optgroup>
+              <optgroup label="🔀 OpenRouter - kézi" id="agentModelOpenrouterManualGroup" style="display:none">
+              </optgroup>
+              <optgroup label="🔧 Egyéni provider" id="agentModelCustomProviderGroup" style="display:none">
+              </optgroup>
             </select>
+            <div id="agentModelCustomModelRow" style="display:none;margin-top:6px">
+              <input type="text" id="agentModelCustomModelId" class="input" placeholder="Model ID (pl. claude-3-opus-20240229)" style="width:100%">
+              <small style="display:block;margin-top:4px;color:var(--text-muted);font-size:12px">Anthropic Messages API (/v1/messages) kompatibilis végpont szükséges. Tiszta OpenAI végponthoz proxy kell.</small>
+            </div>
           </div>
           <div class="form-group">
             <label for="agentProfile" data-i18n="agents.wizard.profile_label">Biztonsági profil</label>
@@ -1691,7 +2344,7 @@
             </div>
           </div>
           <div class="agent-process-control" id="agentProcessControl">
-            <div class="process-status" id="processStatus">
+            <div class="process-status">
               <span class="process-dot" id="processDot"></span>
               <span id="processLabel" data-i18n="agents.detail.stopped">Leállva</span>
               <span class="process-uptime" id="processUptime"></span>
@@ -1724,17 +2377,30 @@
             <select id="editAgentModel">
               <optgroup label="☁️ Claude (felhő)">
                 <option value="claude-fable-5" data-i18n="agents.model.fable5">Fable 5 (legújabb)</option>
+                <option value="claude-opus-5" data-i18n="agents.model.opus5">Opus 5 (legújabb Opus)</option>
                 <option value="claude-opus-4-8[1m]" data-i18n="agents.model.opus48">Opus 4.8 (1M kontextus, alapértelmezett)</option>
+                <option value="claude-sonnet-5" data-i18n="agents.model.sonnet5">Sonnet 5 (legújabb Sonnet, Opus-közeli)</option>
                 <option value="claude-sonnet-4-6" data-i18n="agents.model.sonnet46">Sonnet 4.6 (gyors és okos)</option>
                 <option value="claude-haiku-4-5-20251001" data-i18n="agents.model.haiku45">Haiku 4.5 (leggyorsabb)</option>
               </optgroup>
               <optgroup label="🌊 DeepSeek (alternatív)" id="deepseekModelGroup">
               </optgroup>
+              <optgroup label="🔀 OpenRouter - Auto (heti frissítésű ajánlott)" id="openrouterAutoGroup" style="display:none">
+              </optgroup>
+              <optgroup label="🔀 OpenRouter - kézi" id="openrouterManualGroup" style="display:none">
+              </optgroup>
               <optgroup label="🏠 Ollama (lokális)" id="ollamaModelGroup">
               </optgroup>
+              <optgroup label="🔧 Egyéni provider" id="editAgentModelCustomProviderGroup" style="display:none">
+              </optgroup>
             </select>
+            <div id="editAgentModelCustomModelRow" style="display:none;margin-top:6px">
+              <input type="text" id="editAgentModelCustomModelId" class="input" placeholder="Model ID (pl. claude-3-opus-20240229)" style="width:100%">
+              <small style="display:block;margin-top:4px;color:var(--text-muted);font-size:12px">Anthropic Messages API (/v1/messages) kompatibilis végpont szükséges. Tiszta OpenAI végponthoz proxy kell.</small>
+            </div>
             <button class="btn-secondary btn-compact agent-save-section" id="saveModelBtn" data-i18n="common.btn.save">Mentés</button>
             <button class="btn-secondary btn-compact" id="modelSuggestBtn" style="margin-left:6px" data-i18n="agents.settings.model_suggest_btn">Javaslat</button>
+            <button class="btn-secondary btn-compact" id="openrouterBrowseBtn" style="margin-left:6px;display:none" title="Kézi OpenRouter modellek listájának szerkesztése (pipával)">🔀 OpenRouter kézi lista</button>
             <small id="deepseekHint" style="display:none;margin-top:6px;color:var(--text-muted);font-size:12px;line-height:1.4">
               <span data-i18n="agents.deepseek_hint_pre">DeepSeek-V4-Pro nincs konfigurálva.</span> <a href="#" id="deepseekConfigLink" data-i18n="agents.deepseek_link">API kulcs hozzáadása</a> <span data-i18n="agents.deepseek_hint_post">a Vault oldalon.</span>
             </small>
@@ -1780,6 +2446,16 @@
               Soha nem szakít meg futó munkát: csak üresjáratban (idle) indít újra, különben a következő körre halaszt.
             </small>
             <button class="btn-secondary btn-compact agent-save-section" id="saveAutoRestartBtn" style="margin-top:10px" data-i18n="common.btn.save">Mentés</button>
+          </div>
+          <div class="form-group" id="memoryIsolationGroup">
+            <label data-i18n="agents.settings.memory_isolation_label">Memória-izoláció</label>
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:normal">
+              <input type="checkbox" id="memoryIsolationToggle">
+              <span data-i18n="agents.settings.memory_isolation_toggle">Saját, izolált fájl-memória ennek az ágensnek</span>
+            </label>
+            <small style="display:block;margin-top:8px;color:var(--text-muted);font-size:12px;line-height:1.5" data-i18n="agents.settings.memory_isolation_desc">
+              Bekapcsolva az ágens a saját, kezdetben üres fájl-memóriájával indul, és nem látja a közös MEMORY.md-t. A megosztott SQLite-emlékek és a CLAUDE.md továbbra is elérnek hozzá. Több-felhasználós telepítésen ajánlott; egy-felhasználós telepítésen hagyd kikapcsolva. A következő újraindításkor lép életbe.
+            </small>
           </div>
           <div class="form-group" id="authModeGroup">
             <label data-i18n="agents.settings.auth_mode_label">Hitelesítési mód</label>
@@ -1856,10 +2532,43 @@
             <button class="btn-secondary btn-compact agent-save-section" id="saveAuthModeBtn" style="margin-top:12px" data-i18n="common.btn.save">Mentés</button>
           </div>
           <div class="form-group">
+            <label>Válaszmód (hang/szöveg)</label>
+            <!-- shown when toolkit is NOT installed -->
+            <div id="voiceNotInstalledBanner" hidden>
+              <p style="margin:8px 0;font-size:13px;color:var(--text-muted);line-height:1.5">A hang funkciók használatához először telepíteni kell a hang-toolkitet, ami a Whisper (beszédfelismerés) és a Piper (beszédszintézis) könyvtárakat tartalmazza.</p>
+              <div id="voiceInstallSudoHint" hidden style="margin:8px 0;padding:8px;background:var(--bg-secondary,#1e1e2e);border-radius:6px;font-size:12px;line-height:1.6"></div>
+              <div id="voiceInstallProgress" hidden style="margin:8px 0;font-size:13px;color:var(--text-muted)"><span class="spinner" style="width:14px;height:14px;display:inline-block;vertical-align:middle;margin-right:6px"></span>Telepítés folyamatban, ez eltarthat pár percig...</div>
+              <button class="btn-secondary btn-compact" id="voiceInstallBtn" style="margin-top:4px">Telepítés</button>
+            </div>
+            <!-- shown when toolkit IS installed -->
+            <div id="voiceInstalledControls" hidden>
+              <div style="display:flex;gap:8px;margin-bottom:10px">
+                <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                  <input type="radio" name="voiceResponseMode" value="text"> Szöveg
+                </label>
+                <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                  <input type="radio" name="voiceResponseMode" value="voice"> Hang
+                </label>
+                <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                  <input type="radio" name="voiceResponseMode" value="auto"> Auto
+                </label>
+              </div>
+              <label for="editAgentVoiceModel" style="font-size:12px;color:var(--text-muted)">Hangmodell</label>
+              <select id="editAgentVoiceModel" style="margin-top:4px"></select>
+              <button class="btn-secondary btn-compact agent-save-section" id="saveVoiceConfigBtn" style="margin-top:10px">Mentés</button>
+            </div>
+          </div>
+          <div class="form-group">
             <label for="editAgentProfile" data-i18n="agents.wizard.profile_label">Biztonsági profil</label>
             <select id="editAgentProfile"></select>
             <small id="editAgentProfileDesc" style="display:block;margin-top:6px;color:var(--text-muted);font-size:12px;line-height:1.4"></small>
             <button class="btn-secondary btn-compact agent-save-section" id="saveProfileBtn" data-i18n="common.btn.save">Mentés</button>
+          </div>
+          <div class="form-group" id="claudePlanGroup">
+            <label for="editAgentPlan" data-i18n="agents.settings.plan_label">Claude előfizetés</label>
+            <select id="editAgentPlan"></select>
+            <small id="editAgentPlanDesc" style="display:block;margin-top:6px;color:var(--text-muted);font-size:12px;line-height:1.4"></small>
+            <button class="btn-secondary btn-compact agent-save-section" id="savePlanBtn" data-i18n="common.btn.save">Mentés</button>
           </div>
           <div class="form-group">
             <label for="editClaudeMd">CLAUDE.md</label>
@@ -1886,6 +2595,7 @@
               <option value="telegram">Telegram</option>
               <option value="slack">Slack</option>
               <option value="discord">Discord</option>
+              <option value="teams">Microsoft Teams</option>
             </select>
           </div>
           <div id="chNotConnected">
@@ -1897,7 +2607,7 @@
                 <li>Masold be az API tokent ide</li>
               </ol>
             </div>
-            <div class="form-group">
+            <div class="form-group" id="chTokenGroup">
               <label for="chTokenInput" id="chTokenLabel">Bot API Token</label>
               <input type="text" id="chTokenInput" placeholder="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11">
             </div>
@@ -2067,6 +2777,7 @@
 
         <!-- Bottom actions -->
         <div class="detail-actions agent-detail-bottom" id="agentDetailActions">
+          <button class="btn-secondary" id="exportAgentBtn">Exportálás</button>
           <button class="btn-danger" id="deleteAgentBtn" data-i18n="common.btn.delete">Törlés</button>
         </div>
       </div>
@@ -2415,14 +3126,27 @@
     <div class="modal modal-wide">
       <div class="modal-header">
         <h2 id="skillDetailTitle">Skill reszletek</h2>
-        <button class="modal-close" id="skillDetailClose">&times;</button>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn-secondary btn-compact" id="skillDetailEditBtn" data-i18n="skills.btn.edit">Szerkesztés</button>
+          <button class="modal-close" id="skillDetailClose">&times;</button>
+        </div>
       </div>
       <div class="modal-body">
         <div class="skill-detail-desc" id="skillDetailDesc"></div>
         <div class="skill-detail-meta" id="skillDetailMeta"></div>
-        <div class="skill-detail-content-wrap">
-          <label class="form-label-sm">SKILL.md tartalom</label>
-          <div class="skill-detail-content" id="skillDetailContent"></div>
+        <div class="skill-detail-keywords" id="skillDetailKeywords" hidden></div>
+        <div class="skill-detail-agents-coverage" id="skillDetailAgentsCoverage" hidden></div>
+        <div class="skill-detail-content-wrap" id="skillDetailContentWrap">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <label class="form-label-sm" style="margin:0">SKILL.md tartalom</label>
+            <span class="skill-detail-health" id="skillDetailHealth"></span>
+          </div>
+          <div class="skill-detail-content skill-detail-rendered md-rendered" id="skillDetailContent"></div>
+          <textarea class="skill-detail-editor" id="skillDetailEditor" hidden rows="20" spellcheck="false"></textarea>
+          <div class="skill-detail-edit-actions" id="skillDetailEditActions" hidden>
+            <button class="btn-primary btn-compact" id="skillDetailSaveBtn" data-i18n="skills.btn.save">Mentés</button>
+            <button class="btn-secondary btn-compact" id="skillDetailCancelEditBtn" data-i18n="skills.btn.cancel_edit">Mégse</button>
+          </div>
         </div>
       </div>
     </div>
@@ -2487,7 +3211,13 @@
     <div class="modal terminal-modal">
       <div class="modal-header">
         <h2 id="terminalModalTitle">Terminal</h2>
-        <button class="modal-close" id="terminalClose">&times;</button>
+        <div style="display:flex;align-items:center;gap:10px;margin-left:auto;">
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#b8b2a6;cursor:pointer;user-select:none;" title="Enable keyboard input to the agent pane (owner-gated, audit-logged)">
+            <input type="checkbox" id="terminalInputToggle" style="cursor:pointer;">
+            <span id="terminalInputToggleLabel">Input off</span>
+          </label>
+          <button class="modal-close" id="terminalClose">&times;</button>
+        </div>
       </div>
       <div id="terminalContainer" style="background:#1a1a1a;padding:8px;border-radius:0 0 8px 8px;flex:1;min-height:360px;"></div>
     </div>

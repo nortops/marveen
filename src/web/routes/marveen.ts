@@ -1,11 +1,12 @@
 import { existsSync, unlinkSync, copyFileSync, writeFileSync } from 'node:fs'
 import { join, extname } from 'node:path'
 import {
-  PROJECT_ROOT, OWNER_NAME, BOT_NAME, BRAND_NAME, MAIN_AGENT_ID, CHANNEL_PROVIDER,
+  PROJECT_ROOT, MAIN_AGENT_ID, CHANNEL_PROVIDER,
+  currentBotName, currentBrandName, currentOwnerName,
   KANBAN_LABEL_COLORS,
 } from '../../config.js'
 import { getEffectiveSettingValue } from '../../settings-store.js'
-import { readMarveenTelegramConfig, readMarveenDiscordConfig, readMarveenSlackConfig, readMarveenGooglechatConfig, sendMarveenAvatarChange } from '../telegram.js'
+import { readMarveenTelegramConfig, readMarveenDiscordConfig, readMarveenSlackConfig, readMarveenGooglechatConfig, readMarveenTeamsConfig, sendMarveenAvatarChange } from '../telegram.js'
 import { hardRestartMarveenChannels } from '../channel-monitor.js'
 import { readFileOr } from '../agent-config.js'
 import { parseMultipart } from '../multipart.js'
@@ -56,23 +57,24 @@ export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promi
       || ''
     const firstLine = claudeMd.match(/^Te .+$/m)?.[0]?.trim() || ''
     const descFromPersonality = soulSection.split('\n').filter(l => l.trim()).slice(0, 2).join(' ').slice(0, 200)
-    const description = firstLine || descFromPersonality || `${OWNER_NAME} AI asszisztense`
+    const description = firstLine || descFromPersonality || `${currentOwnerName()} AI asszisztense`
     const tg = readMarveenTelegramConfig()
     const dc = readMarveenDiscordConfig()
     const sl = readMarveenSlackConfig()
     const gc = readMarveenGooglechatConfig()
+    const tc = readMarveenTeamsConfig()
     // Brand-relevant identity core. `name` = main agent display name (BOT_NAME),
     // `brandName` = product brand for the dashboard chrome (defaults to BOT_NAME;
     // the client falls back to its own HTML default "Marveen" if absent on a
     // legacy backend), `agentId` = canonical MAIN_AGENT_ID so the dashboard can
     // hit /api/agents/<id>/skills for the main agent.
-    const idCore = buildMarveenIdentityCore(BOT_NAME, BRAND_NAME, MAIN_AGENT_ID)
+    const idCore = buildMarveenIdentityCore(currentBotName(), currentBrandName(), MAIN_AGENT_ID)
     json(res, {
       ...idCore,
       // Configured owner display name (OWNER_NAME). The dashboard chat view uses
       // this to pin/label the owner's own message thread instead of a hardcoded
       // literal, so a renamed install recognizes its real owner.
-      ownerName: OWNER_NAME,
+      ownerName: currentOwnerName(),
       description,
       model: getActiveMarveenModel(),
       tmuxSession: MAIN_CHANNELS_SESSION,
@@ -86,6 +88,7 @@ export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promi
       hasDiscord: dc.hasDiscord,
       hasSlack: sl.hasSlack,
       hasGooglechat: gc.hasGooglechat,
+      hasTeams: tc.hasTeams,
       telegramBotUsername: tg.botUsername,
       personality: soulSection,
       claudeMd,
@@ -113,6 +116,7 @@ export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promi
         limits: {
           planned: getEffectiveSettingValue('KANBAN_WIP_PLANNED'),
           in_progress: getEffectiveSettingValue('KANBAN_WIP_IN_PROGRESS'),
+          testing: getEffectiveSettingValue('KANBAN_WIP_TESTING'),
           waiting: getEffectiveSettingValue('KANBAN_WIP_WAITING'),
           done: getEffectiveSettingValue('KANBAN_WIP_DONE'),
         },
@@ -150,12 +154,16 @@ export async function tryHandleMarveen(ctx: RouteContext, webDir: string): Promi
   }
 
   if (path === '/api/marveen/avatar' && method === 'GET') {
+    // Avatars are ~1MB each and rarely change: let browsers reuse them for an
+    // hour without a round-trip (an avatar swapped in another session shows up
+    // after at most 1h, then ETag revalidation; the swapping session itself
+    // busts via the frontend avatar epoch).
     for (const ext of ['.png', '.jpg', '.jpeg', '.webp']) {
       const p = join(PROJECT_ROOT, 'store', `marveen-avatar${ext}`)
-      if (existsSync(p)) { serveFile(req, res, p); return true }
+      if (existsSync(p)) { serveFile(req, res, p, { cacheSeconds: 3600 }); return true }
     }
     const fallback = join(webDir, 'avatars', '01_robot.png')
-    if (existsSync(fallback)) { serveFile(req, res, fallback); return true }
+    if (existsSync(fallback)) { serveFile(req, res, fallback, { cacheSeconds: 3600 }); return true }
     res.writeHead(404); res.end()
     return true
   }

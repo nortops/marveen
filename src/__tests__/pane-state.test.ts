@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   detectPaneState,
+  detectPermissionMode,
   detectsThinkingBlockError,
   detectsBlockingMenu,
   detectsPastePlaceholder,
@@ -10,9 +11,13 @@ import {
   decideSubmitFollowup,
   decidePaneErrorAlert,
   stuckInputSignature,
+  parkedPasteSignature,
   decideStuckInputRecovery,
   parkedChannelInput,
   parkedInputText,
+  parkedInputRowCount,
+  submitLanded,
+  paneShowsContextSaturation,
 } from '../pane-state.js'
 
 // Realistic pane fixtures modelled on actual `tmux capture-pane -p`
@@ -37,6 +42,30 @@ const IDLE_STRICT = [
   SEP,
   '  ? for shortcuts',
 ].join('\n')
+
+// Permission-mode footers OTHER than bypass. Every one of these is a real
+// `tmux capture-pane -p` tail copied verbatim from a running fleet session on
+// 2026-07-27 (the ⏵⏵/⏸ glyphs and the `·` separators are the actual bytes, not
+// retyped lookalikes) -- retyping them by hand is how the previous fix passed
+// its own tests while still missing the mode that was losing messages.
+//
+// The delivery bug: an agent parked in `accept edits on` read as 'unknown', so
+// the router refused to inject and four messages to it were swallowed without
+// an error, while bypass-mode agents received everything.
+const modeFooter = (tail: string) => ['', SEP, '❯ ', SEP, tail].join('\n')
+
+const IDLE_ACCEPT_EDITS = modeFooter('  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents')
+const IDLE_PLAN_MODE = modeFooter('  ⏸ plan mode on (shift+tab to cycle) · ← for agents')
+const IDLE_AUTO_MODE = modeFooter('  ⏵⏵ auto mode on (shift+tab to cycle)')
+const IDLE_MANUAL_MODE = modeFooter('  ⏵ manual mode on (shift+tab to cycle)')
+const IDLE_BYPASS_FLEETVIEW = modeFooter('  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents')
+// No shift+tab hint at all: the tail alone has to carry it.
+const IDLE_ACCEPT_EDITS_TAIL_ONLY = modeFooter('  ⏵⏵ accept edits on · 1 monitor · ← for agents')
+
+// The tail is what keeps prose out. Scrollback quoting a footer phrase without
+// the UI chrome must NOT read as idle -- otherwise a pasted log line parks the
+// router on a busy agent.
+const NOT_A_FOOTER_QUOTED = ['', SEP, '❯ ', SEP, '  valaki azt írta: bypass permissions on'].join('\n')
 
 const BUSY_FULL_FOOTER = [
   '✢ Combobulating… (52s · ↓ 2.6k tokens · thinking some more)',
@@ -374,6 +403,36 @@ const ERROR_NARROW_WRAP = [
   '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
 ].join('\n')
 
+// The mode the footer advertises, surfaced for the dashboard. Every mode is
+// still 'idle' for delivery -- this only answers "and what happens after it
+// arrives?", which is what nobody could see when an agent sat in an ask-first
+// mode for hours looking healthy.
+describe('detectPermissionMode', () => {
+  it.each([
+    ['bypass permissions', IDLE_BYPASS_FLEETVIEW],
+    ['accept edits', IDLE_ACCEPT_EDITS],
+    ['plan mode', IDLE_PLAN_MODE],
+    ['auto mode', IDLE_AUTO_MODE],
+    ['manual mode', IDLE_MANUAL_MODE],
+    ['accept edits', IDLE_ACCEPT_EDITS_TAIL_ONLY],
+  ])('reads %s off the footer', (expected, pane) => {
+    expect(detectPermissionMode(pane)).toBe(expected)
+  })
+
+  it('calls the no-banner footer "default" (asks about everything)', () => {
+    expect(detectPermissionMode(IDLE_STRICT)).toBe('default')
+  })
+
+  it('returns null when there is no footer to read', () => {
+    expect(detectPermissionMode('')).toBeNull()
+    expect(detectPermissionMode('csak valami szöveg')).toBeNull()
+  })
+
+  it('does not invent a mode from a quoted footer phrase', () => {
+    expect(detectPermissionMode(NOT_A_FOOTER_QUOTED)).toBeNull()
+  })
+})
+
 describe('detectPaneState', () => {
   it('returns unknown for empty input', () => {
     expect(detectPaneState('')).toBe('unknown')
@@ -387,6 +446,25 @@ describe('detectPaneState', () => {
   it('detects idle on strict-mode footer ("? for shortcuts")', () => {
     expect(detectPaneState(IDLE_STRICT)).toBe('idle')
   })
+
+  // Every permission mode must read as idle, not just bypass. Before this,
+  // anything else classified as 'unknown' and the router silently skipped it.
+  it.each([
+    ['accept edits', IDLE_ACCEPT_EDITS],
+    ['plan mode', IDLE_PLAN_MODE],
+    ['auto mode', IDLE_AUTO_MODE],
+    ['manual mode', IDLE_MANUAL_MODE],
+    ['bypass with the FleetView tail', IDLE_BYPASS_FLEETVIEW],
+    ['accept edits with no shift+tab hint', IDLE_ACCEPT_EDITS_TAIL_ONLY],
+  ])('detects idle on the %s footer', (_label, pane) => {
+    expect(detectPaneState(pane)).toBe('idle')
+    expect(isReadyForPrompt(pane)).toBe(true)
+  })
+
+  it('does not read a quoted footer phrase without the UI tail as idle', () => {
+    expect(detectPaneState(NOT_A_FOOTER_QUOTED)).not.toBe('idle')
+  })
+
 
   it('detects idle when the footer shows the multi-shell indicator', () => {
     // Regression: Claude Code rewrites "(shift+tab to cycle)" to
@@ -526,6 +604,29 @@ describe('detectPaneState', () => {
     // any agent's tool call. Only active-turn signals (spinner, tokens,
     // esc-to-interrupt, footer-scoped) count.
     expect(detectPaneState(IDLE_AFTER_TOOL_USE)).toBe('idle')
+  })
+
+  it('does NOT classify a stale token-counter scrolled above the box as busy', () => {
+    // 94-retry starvation regression (2026-06-30): a completed turn's final
+    // "Accomplishing… (Ns · ↓ N tokens)" frame lingered well above the idle
+    // input box. The token-counter scan is region-scoped, so a counter that
+    // has scrolled out of the live bottom region must not pin the pane busy.
+    const staleCounter = [
+      '✶ Accomplishing… (3m 8s · ↓ 9.3k tokens)',
+      '⏺ Done: rebuilt and restarted the dashboard.',
+      '⏺ Verified endpoints, logged the fix.',
+      '⏺ Extra trailing scrollback line one.',
+      '⏺ Extra trailing scrollback line two.',
+      '⏺ Extra trailing scrollback line three.',
+      '⏺ Extra trailing scrollback line four.',
+      '⏺ Extra trailing scrollback line five.',
+      '',
+      SEP,
+      '❯ ',
+      SEP,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n')
+    expect(detectPaneState(staleCounter)).toBe('idle')
   })
 
   it('detects typing when text is parked in the input box', () => {
@@ -1819,5 +1920,251 @@ describe('detectsPastePlaceholder', () => {
       '  paste again to expand',
     ].join('\n')
     expect(detectsPastePlaceholder(stubInBox)).toBe(true)
+  })
+})
+
+describe('parkedInputRowCount', () => {
+  it('returns 0 for an empty input box (bare prompt)', () => {
+    expect(parkedInputRowCount(IDLE_BYPASS)).toBe(0)
+    expect(parkedInputRowCount(BUSY_FULL_FOOTER)).toBe(0)
+  })
+
+  it('returns 0 when there is no input box at all', () => {
+    expect(parkedInputRowCount('just scrollback text\nno separators here')).toBe(0)
+  })
+
+  it('returns 1 for a single-row parked input', () => {
+    expect(parkedInputRowCount(TYPING_PARKED)).toBe(1)
+    expect(parkedInputRowCount(PENDING_PASTE)).toBe(1)
+  })
+
+  it('counts every visual row of a wrapped multi-row parked input', () => {
+    // A wrapped message occupying 3 box-interior rows; a bare Enter here would
+    // insert a newline instead of submitting.
+    const multiRow = [
+      '',
+      SEP,
+      '❯ first line of a long parked message that wraps across',
+      '  several visual rows inside the input box and would not',
+      '  submit on a bare Enter',
+      SEP,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n')
+    expect(parkedInputRowCount(multiRow)).toBe(3)
+  })
+})
+
+describe('submitLanded', () => {
+  // The exact text parked before the submit attempt.
+  const parkedSig = stuckInputSignature(TYPING_PARKED) as string
+
+  it('captures a non-empty signature from the parked fixture', () => {
+    expect(parkedSig).toBeTruthy()
+  })
+
+  it('is false when the identical signature is still parked', () => {
+    expect(submitLanded(parkedSig, TYPING_PARKED)).toBe(false)
+  })
+
+  it('is true when the box cleared (pane went idle)', () => {
+    expect(submitLanded(parkedSig, IDLE_BYPASS)).toBe(true)
+  })
+
+  it('is true when the agent started processing (pane went busy)', () => {
+    expect(submitLanded(parkedSig, BUSY_FULL_FOOTER)).toBe(true)
+  })
+
+  it('is true when different text is now parked', () => {
+    expect(submitLanded(parkedSig, PENDING_PASTE)).toBe(true)
+  })
+
+  it('is false when there is no after-capture (null)', () => {
+    expect(submitLanded(parkedSig, null)).toBe(false)
+  })
+})
+
+// Fresh-session / welcome-screen layout (Claude Code logo + model line + cwd,
+// the input box framed by two ──── rules, ❯ prefix, NO footer). Modelled on a
+// real captured stuck pane (store/qwen-welcome-stuck-fixture.txt) where a
+// delivered multi-row message parked before any footer rendered, and the whole
+// recovery stack went blind (liveInputBox null -> detectPaneState 'unknown').
+const WELCOME_STUCK = [
+  '',
+  ' ▐▛███▜▌   Claude Code v2.1.170',
+  '▝▜█████▛▘  qwen3.6:27b-192k with high effort · API Usage Billing',
+  '  ▘▘ ▝▝    ~/ClaudeClaw/agents/qwen',
+  '',
+  '',
+  SEP,
+  '❯ kepet: /Users/marvin/workspace/aahe486-screenshot.png',
+  '  Olvasd be a Read tool-lal a kepfajlt, majd mondd meg: (1) mi ez az',
+  '  alkalmazas, (2) a tablazat konkret ertekei. Roviden a vegeredmenyt.',
+  '  </trusted-peer>',
+  SEP,
+  '',
+].join('\n')
+
+describe('footer-less welcome-screen parked input', () => {
+  it('classifies the parked box as typing (not unknown)', () => {
+    expect(detectPaneState(WELCOME_STUCK)).toBe('typing')
+  })
+
+  it('mergeTypingAsBusy folds the footer-less parked box into busy', () => {
+    expect(detectPaneState(WELCOME_STUCK, { mergeTypingAsBusy: true })).toBe('busy')
+  })
+
+  it('stuckInputSignature recovers a non-null signature', () => {
+    const sig = stuckInputSignature(WELCOME_STUCK)
+    expect(sig).not.toBeNull()
+    expect(sig).toContain('kepet')
+  })
+
+  it('parkedInputText returns the collapsed multi-row message (not empty)', () => {
+    const t = parkedInputText(WELCOME_STUCK)
+    expect(t).not.toBeNull()
+    expect(t).not.toBe('')
+    expect(t).toContain('Olvasd be')
+  })
+
+  it('parkedInputRowCount counts every wrapped row (> 1 on a real wedge)', () => {
+    expect(parkedInputRowCount(WELCOME_STUCK)).toBe(4)
+    expect(parkedInputRowCount(WELCOME_STUCK)).toBeGreaterThan(1)
+  })
+
+  it('submitLanded fires once the welcome wedge clears to an idle pane', () => {
+    // Full P1 -> P2 chain on the real wedge: detection sees the footer-less
+    // parked box (sig != null), and after the message submits the pane is no
+    // longer that signature -> submitLanded true. This is what tells the
+    // recovery ladder the resubmit actually landed.
+    const sig = stuckInputSignature(WELCOME_STUCK)
+    expect(sig).not.toBeNull()
+    expect(submitLanded(sig as string, IDLE_BYPASS)).toBe(true)
+  })
+
+  it('does NOT mistake a scrollback ──── pair without a ❯ box for input', () => {
+    const noBox = ['some scrollback line', SEP, 'plain text, no prompt glyph', SEP, ''].join('\n')
+    expect(detectPaneState(noBox)).toBe('unknown')
+    expect(parkedInputRowCount(noBox)).toBe(0)
+  })
+})
+
+describe('paneShowsContextSaturation', () => {
+  // Real capture shape observed live: an idle, ready-looking footer with the
+  // saturation banner one line above it — the combination that lets a
+  // saturated session keep silently accepting new dispatches.
+  const CTX_SAT_IDLE = [
+    '  some prior assistant output',
+    '',
+    '✻ Cooked for 3m 7s',
+    '                                                              100% context used',
+    SEP,
+    '❯ ',
+    SEP,
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+  ].join('\n')
+
+  it('detects the saturation banner on an otherwise-idle pane', () => {
+    expect(detectPaneState(CTX_SAT_IDLE)).toBe('idle') // sanity: still reads as idle
+    expect(paneShowsContextSaturation(CTX_SAT_IDLE)).toBe(true)
+  })
+
+  it('is false on a normal idle pane', () => {
+    expect(paneShowsContextSaturation(IDLE_BYPASS)).toBe(false)
+    expect(paneShowsContextSaturation(IDLE_STRICT)).toBe(false)
+  })
+
+  it('is false on a normal busy pane (no false alarm mid-turn)', () => {
+    expect(paneShowsContextSaturation(BUSY_FULL_FOOTER)).toBe(false)
+  })
+
+  it('does NOT misfire on a scrollback quote of the same phrase', () => {
+    const quoted = [
+      '  QA report: the watchdog now greps for "100% context used" in the footer.',
+      '  This is a scrollback quote, not the live indicator.',
+      ...Array.from({ length: 10 }, () => '  more scrollback padding'),
+      SEP,
+      '❯ ',
+      SEP,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n')
+    expect(paneShowsContextSaturation(quoted)).toBe(false)
+  })
+
+  it('is false on empty/null-ish input', () => {
+    expect(paneShowsContextSaturation('')).toBe(false)
+    expect(paneShowsContextSaturation('   \n  ')).toBe(false)
+  })
+})
+
+describe('parkedPasteSignature (stuck [Pasted text #N] recovery)', () => {
+  it('returns a stable signature for a parked placeholder (current build, idle footer)', () => {
+    const sig = parkedPasteSignature(PENDING_PASTE)
+    expect(sig).not.toBeNull()
+    expect(sig).toContain('[Pasted text #1')
+  })
+
+  it('recovers the older build shape too (paste again to expand, no idle footer)', () => {
+    // The 'typing'-gated stuckInputSignature is null here (placeholder reads as
+    // busy), which is exactly the gap this function fills.
+    expect(stuckInputSignature(PENDING_PASTE_REALISTIC)).toBeNull()
+    expect(parkedPasteSignature(PENDING_PASTE_REALISTIC)).not.toBeNull()
+  })
+
+  it('recovers the real wrapped-stub production shape', () => {
+    expect(parkedPasteSignature(PENDING_PASTE_WRAPPED_REAL_SHAPE)).not.toBeNull()
+    expect(parkedPasteSignature(PENDING_PASTE_WRAPPED_DIGIT_SPLIT)).not.toBeNull()
+  })
+
+  it('is null when NO placeholder is parked (plain typing / idle / empty)', () => {
+    expect(parkedPasteSignature(TYPING_PARKED)).toBeNull()
+    expect(parkedPasteSignature('')).toBeNull()
+    expect(parkedPasteSignature('   \n  ')).toBeNull()
+  })
+
+  it('does NOT misfire on a placeholder quoted only in scrollback', () => {
+    expect(parkedPasteSignature(PASTE_ECHO_IN_SCROLLBACK_ONLY)).toBeNull()
+  })
+
+  it('is null while a live busy indicator is present (genuine in-progress paste)', () => {
+    // Placeholder in the box AND a live spinner/token line just above it: the
+    // turn is actually running, so recovery must NOT pre-empt it.
+    const busyPaste = [
+      '  Beaming… (12s · ↓ 3.1k tokens · esc to interrupt)',
+      SEP,
+      '❯ [Pasted text #7 +512 chars]',
+      SEP,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n')
+    expect(parkedPasteSignature(busyPaste)).toBeNull()
+  })
+
+  it('is null when a token-counter busy tail is present without a spinner label', () => {
+    const busyTail = [
+      '  (52s · ↓ 2.6k tokens · esc to interrupt)',
+      SEP,
+      '❯ [Pasted text #9]',
+      SEP,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n')
+    expect(parkedPasteSignature(busyTail)).toBeNull()
+  })
+
+  it('sanitized real incident shape: finished turn + parked paste -> recoverable', () => {
+    // Mirrors the observed Aura capture: a past-tense "Baked for Ns" stamp (NOT
+    // a live busy indicator) above the idle hint, with the scheduled-task notice
+    // collapsed into a paste stub in the box.
+    const auraShape = [
+      '● Kihagytam a delelotti nudge-ot, mert ma mar boven volt interakcio.',
+      '',
+      '✻ Baked for 33s',
+      '                    new task? /clear to save 108.3k tokens',
+      SEP,
+      '❯ SCHEDULED TASK NOTICE -- the next <scheduled-task source="..."> [Pasted text',
+      '  #2 +1 lines]',
+      SEP,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n')
+    expect(stuckInputSignature(auraShape)).toBeNull()
+    expect(parkedPasteSignature(auraShape)).not.toBeNull()
   })
 })

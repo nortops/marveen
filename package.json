@@ -1,6 +1,6 @@
 {
   "name": "marveen",
-  "version": "1.12.5",
+  "version": "1.26.0",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -9,7 +9,8 @@
     "dev": "tsx src/index.ts",
     "setup": "tsx scripts/setup.ts",
     "status": "tsx scripts/status.ts",
-    "schedule": "tsx src/schedule-cli.ts",
+    "remote-enroll": "tsx scripts/remote-access-enroll.ts",
+    "dashboard-user": "tsx scripts/dashboard-user.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "syntax-check": "node --check web/app.js web/sw.js",

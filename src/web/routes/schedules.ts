@@ -3,14 +3,14 @@ import { join } from 'node:path'
 import {
   listPendingTaskRetries, deletePendingTaskRetryById, listTaskRunHistory,
 } from '../../db.js'
-import { MAIN_AGENT_ID, BOT_NAME } from '../../config.js'
+import { MAIN_AGENT_ID, currentBotName } from '../../config.js'
 import { runAgent } from '../../agent.js'
 import { logger } from '../../logger.js'
 import { toPendingRetryView } from '../../pending-retries.js'
 import { atomicWriteFileSync } from '../atomic-write.js'
 import { isValidCronShape } from '../cron.js'
 import { readBody, json, RequestBodyTooLargeError } from '../http-helpers.js'
-import { sanitizeScheduleName } from '../sanitize.js'
+import { sanitizeScheduleName, safeJoin } from '../sanitize.js'
 import { listAgentNames } from '../agent-config.js'
 import { readFileOr } from '../agent-config.js'
 import {
@@ -20,13 +20,28 @@ import {
 import { runScheduledTaskNow } from '../schedule-runner.js'
 import type { RouteContext } from './types.js'
 
+// Resolve a URL-supplied schedule name to an on-disk dir, blocking path
+// traversal. sanitizeScheduleName strips everything outside [a-z0-9-] (so no
+// "." or "/" survives), the empty check rejects a name that sanitized away
+// (which would otherwise resolve to the tasks root and delete/overwrite it),
+// and safeJoin is a belt-and-suspenders guard against escaping the base.
+function resolveScheduleDir(rawName: string): { name: string; dir: string } | null {
+  let decoded: string
+  try { decoded = decodeURIComponent(rawName) } catch { return null }
+  const name = sanitizeScheduleName(decoded)
+  if (!name) return null
+  try {
+    return { name, dir: safeJoin(SCHEDULED_TASKS_DIR, name) }
+  } catch { return null }
+}
+
 export async function tryHandleSchedules(ctx: RouteContext): Promise<boolean> {
   const { req, res, path, method } = ctx
 
   if (path === '/api/schedules/agents' && method === 'GET') {
     const agentNames = listAgentNames()
     const agents = [
-      { name: MAIN_AGENT_ID, label: BOT_NAME, avatar: '/api/marveen/avatar' },
+      { name: MAIN_AGENT_ID, label: currentBotName(), avatar: '/api/marveen/avatar' },
       ...agentNames.map(n => ({ name: n, label: n, avatar: `/api/agents/${encodeURIComponent(n)}/avatar` }))
     ]
     json(res, agents)
@@ -146,8 +161,9 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
 
   const scheduleUpdateMatch = path.match(/^\/api\/schedules\/([^/]+)$/)
   if (scheduleUpdateMatch && method === 'PUT') {
-    const name = decodeURIComponent(scheduleUpdateMatch[1])
-    const dir = join(SCHEDULED_TASKS_DIR, name)
+    const resolved = resolveScheduleDir(scheduleUpdateMatch[1])
+    if (!resolved) { json(res, { error: 'Schedule not found' }, 404); return true }
+    const { name, dir } = resolved
     if (!existsSync(dir)) { json(res, { error: 'Schedule not found' }, 404); return true }
 
     let body: Buffer
@@ -180,8 +196,9 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
   }
 
   if (scheduleUpdateMatch && method === 'DELETE') {
-    const name = decodeURIComponent(scheduleUpdateMatch[1])
-    const dir = join(SCHEDULED_TASKS_DIR, name)
+    const resolved = resolveScheduleDir(scheduleUpdateMatch[1])
+    if (!resolved) { json(res, { error: 'Schedule not found' }, 404); return true }
+    const { name, dir } = resolved
     if (!existsSync(dir)) { json(res, { error: 'Schedule not found' }, 404); return true }
     rmSync(dir, { recursive: true, force: true })
     logger.info({ name }, 'Scheduled task deleted')
@@ -191,8 +208,9 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
 
   const scheduleToggleMatch = path.match(/^\/api\/schedules\/([^/]+)\/toggle$/)
   if (scheduleToggleMatch && method === 'POST') {
-    const name = decodeURIComponent(scheduleToggleMatch[1])
-    const dir = join(SCHEDULED_TASKS_DIR, name)
+    const resolved = resolveScheduleDir(scheduleToggleMatch[1])
+    if (!resolved) { json(res, { error: 'Schedule not found' }, 404); return true }
+    const { name, dir } = resolved
     if (!existsSync(dir)) { json(res, { error: 'Schedule not found' }, 404); return true }
 
     const configPath = join(dir, 'task-config.json')
@@ -208,10 +226,11 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
 
   const scheduleRunMatch = path.match(/^\/api\/schedules\/([^/]+)\/run$/)
   if (scheduleRunMatch && method === 'POST') {
-    const name = decodeURIComponent(scheduleRunMatch[1])
-    const dir = join(SCHEDULED_TASKS_DIR, name)
+    const resolved = resolveScheduleDir(scheduleRunMatch[1])
+    if (!resolved) { json(res, { error: 'Schedule not found' }, 404); return true }
+    const { name, dir } = resolved
     if (!existsSync(dir)) { json(res, { error: 'Schedule not found' }, 404); return true }
-    const result = runScheduledTaskNow(name)
+    const result = await runScheduledTaskNow(name)
     if (!result.ok) { json(res, { error: result.error }, 400); return true }
     logger.info({ name, result: result.result }, 'Scheduled task run-now fired')
     json(res, { ok: true, result: result.result })
@@ -227,8 +246,9 @@ Az eredmeny CSAK a kibovitett prompt szovege legyen, semmi mas. Ne hasznalj code
 
   const scheduleRunsMatch = path.match(/^\/api\/schedules\/([^/]+)\/runs$/)
   if (scheduleRunsMatch && method === 'GET') {
-    const name = decodeURIComponent(scheduleRunsMatch[1])
-    const dir = join(SCHEDULED_TASKS_DIR, name)
+    const resolved = resolveScheduleDir(scheduleRunsMatch[1])
+    if (!resolved) { json(res, { error: 'Schedule not found' }, 404); return true }
+    const { name, dir } = resolved
     if (!existsSync(dir)) { json(res, { error: 'Schedule not found' }, 404); return true }
     const runs = listTaskRunHistory(name, 10)
     json(res, runs)

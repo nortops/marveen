@@ -11,6 +11,7 @@ Ezek a fájlok a dashboard által kezelt, futásidőben módosuló konfiguráci�
 | Fájl | Módosítható | Leírás |
 |------|-------------|--------|
 | `store/.dashboard-token` | nem | Dashboard Bearer token -- minden `/api/*` híváshoz kell |
+| `store/federation.json` | dashboard UI (Föderáció menü) | Föderáció-konfiguráció: enabled, systemId, peers[] társankénti inbound/outbound tokenekkel (0600) -- ld. docs/federation.md |
 | `store/autonomy-config.json` | dashboard UI | Heartbeat autonómia-szintek kategóriánként (1=jelz, 2=javasol, 3=autonóm) |
 | `store/dashboard-settings.json` | dashboard UI | GitHub repo integráció, frissítési beállítások |
 | `store/agents-desired.json` | dashboard UI | Melyik sub-ágenseket kell életben tartani (auto-restart lista) |
@@ -20,6 +21,7 @@ Ezek a fájlok a dashboard által kezelt, futásidőben módosuló konfiguráci�
 | `store/schedule-last-run.json` | automatikus | Ütemezett feladatok utolsó futási időbélyege (crash-safe skip) |
 | `store/kanban-audit-state.json` | automatikus | Kanban audit utolsó futása |
 | `store/claudeclaw.db` | nem direktben | SQLite adatbázis -- memória, kanban, üzenetek, token-log, stb. |
+| `store/custom-providers.json` | dashboard UI (Beállítások > Provider-ok) | Egyéni Anthropic Messages API-kompatibilis végpontok listája -- ld. docs/custom-providers.md |
 | `store/config-overrides.json` | dashboard UI | Beállítások-oldal által mentett felülbírálatok (plain értékek, sosem tartalmaz titkokat) |
 | `store/update.pid` | automatikus | Frissítési folyamat PID fájl (concurrency lock) |
 
@@ -108,7 +110,7 @@ Minden dashboard-szerkeszthető beállítás egy bejegyzésként szerepel a regi
 | Mező | Típus | Leírás |
 |------|-------|--------|
 | `key` | string | ENV-kompatibilis kulcs (pl. `KANBAN_WIP_PLANNED`) |
-| `type` | `int` / `color` / `string` | Érték típusa (validáció + UI widget) |
+| `type` | `int` / `color` / `string` / `boolean` | Érték típusa (validáció + UI widget). A `boolean` ki/be kapcsoló (checkbox), kanonikus `"1"`/`"0"` értékkel |
 | `default` | any | Fallback érték, ha nincs override és nincs .env |
 | `description` | string | Felhasználói leírás (UI-ban megjelenik) |
 | `module` | string | Csoportosítás a Beállítások oldalon (pl. `kanban`) |
@@ -160,6 +162,51 @@ Minden dashboard-szerkeszthető beállítás egy bejegyzésként szerepel a regi
 |-------|-------|-----------|--------|-------------|
 | `IDEA_BREAKDOWN_MAX_SUBTASKS` | int | 10 | min 2, max 20 | nem |
 | `IDEA_STALE_DAYS` | int | 7 | min 1, max 365 | nem |
+
+**Registry -- Csatornák modul:**
+
+| Kulcs | Típus | Alapérték | Platform | Újraindítás |
+|-------|-------|-----------|----------|-------------|
+| `MAIN_AGENT_ISOLATED_CONFIG` | boolean | `0` (ki) | csak macOS | igen |
+
+#### `MAIN_AGENT_ISOLATED_CONFIG` -- a fő agent config-izolációja (macOS)
+
+**Mire szolgál.** Ki-be kapcsolható javítás a fő channels-agent macOS-en jelentkező
+periodikus `401 Invalid authentication credentials` / „Please run /login" hibájára.
+A tünet: a fő bot időnként elnémul, kézi `/login` kell, pár nap múlva megismétlődik --
+miközben a sub-agentek sosem esnek ki.
+
+**A gyökérok.** A fő channels-agent alapból a közös `~/.claude` config dir-t
+használja. macOS-en ez a **rotálódó Keychain OAuth-sessionből** hitelesít, ami
+periodikusan lejár → 401. A sub-agentek ezzel szemben saját, izolált
+`CLAUDE_CONFIG_DIR`-rel és a hosszú élettartamú fleet setup-tokennel
+(`store/.claude-oauth-token`) futnak, ezért ők stabilak.
+
+**Mit csinál bekapcsolva.** A fő agent is megkapja a sub-agentekével AZONOS izolált
+config dir-t (`<install>/.channels-config`, symlinkelt megosztott résekkel, de saját
+`settings.json`/`plugins/` állapottal és `.credentials.json` NÉLKÜL). Így a fő agent
+a stabil `CLAUDE_CODE_OAUTH_TOKEN`-ből hitelesít, nem a lejáró Keychainből.
+
+**Egységes kapu.** A be/ki döntést egyetlen helper (`ensureMainAgentIsolatedConfigDir`)
+hozza, ami az effektív beállítást olvassa (feloldás: `config-overrides.json` >
+`.env` > default `0`). Ezt a helpert hívja MINDHÁROM fő-agent indítási út, így a
+kapcsoló egységesen vezérli az összeset:
+1. a `scripts/channels.sh` boot (indító helper),
+2. a dashboard channel-monitor `--continue` resume respawn-ja,
+3. a dashboard channel-monitor fresh hard-restart respawn-ja.
+
+**Kapuk (mikor no-op).** Nincs hatása (marad a közös `~/.claude`), ha: nem macOS a
+gép; nincs érvényes fleet setup-token; vagy nincs build-elt `dist/`. Linuxon a
+rotálódó `credentials.json`-t ehelyett a külön credentials-guard kezeli.
+
+**Bekapcsolás.** Dashboard: *Beállítások → Csatornák → `MAIN_AGENT_ISOLATED_CONFIG`*
+(a kapcsoló a `store/config-overrides.json`-ba ír). Vagy kézzel: `.env`-ben
+`MAIN_AGENT_ISOLATED_CONFIG=1`. A módosítás a channels session újraindításakor lép
+életbe (a `requiresRestart` badge is ezt jelzi).
+
+**Visszaállítás.** Kapcsold KI (dashboard) vagy `MAIN_AGENT_ISOLATED_CONFIG=0`
+(`.env`), majd indítsd újra a channels sessiont -- mindhárom indítási út visszaáll
+a közös `~/.claude` viselkedésre.
 
 **API végpontok:**
 
@@ -234,8 +281,9 @@ Minden sub-ágens mappája gitignore-olt (`agents/` mappa), így a titkos kulcso
 
 ```json
 {
-  "model": "claude-sonnet-4-6",
+  "model": "claude-sonnet-5",
   "profileId": "developer-senior",
+  "memoryIsolation": false,
   "team": {
     "role": "member",
     "reportsTo": "marveen",
@@ -245,6 +293,25 @@ Minden sub-ágens mappája gitignore-olt (`agents/` mappa), így a titkos kulcso
   }
 }
 ```
+
+A `memoryIsolation` mező (opcionális, alapértelmezés: kikapcsolva) az ágens fájl-alapú auto-memóriáját választja le a közös, telepítés-szintű memóriáról. Bekapcsolva az ágens indításkor saját git-gyökeret kap (stub .git az agents/<név> alatt), így a Claude Code auto-memory a saját projekt-kulcsa alá kerül, és az ágens nem látja a közös MEMORY.md-t. A megosztott SQLite-emlékek és a CLAUDE.md továbbra is elérnek hozzá.
+
+Mikor kapcsold be: több-felhasználós (több megbízós) telepítésen, ágensenként, hogy az egyes megbízók memóriái ne szivárogjanak át egymáshoz. Egy-felhasználós telepítésen hagyd kikapcsolva: ott a közös MEMORY.md a flotta-szabályok szándékolt terítő-csatornája. Életbe lépés: az ágens következő (újra)indítása. Visszavonás: a mező törlése és az `agents/<név>/.git` stub eltávolítása. A fő ágensre nem alkalmazható (a dashboard el is rejti ott a kapcsolót).
+
+---
+
+## Linux OAuth-token race + CLAUDE_CREDENTIALS_GUARD
+
+Linuxon a `~/.claude/.credentials.json` egy rövid életű, magától rotálódó OAuth tokent tárol, OS-szintű fájlzárolás nélkül. Ha több agent egyszerre ér a token lejáratához (jellemzően éjjel), a frissítő írásaik egymásra futnak és elrontják a fájlt, ezért reggelente minden agent `/login`-t kér. macOS-en a Keychain sorbarendezi az írásokat, ott nincs ez a hiba.
+
+A megoldás: egy 1 éves, nem rotálódó setup-token (`claude setup-token`) a `store/.claude-oauth-token` fájlban, amit az agent-indító `CLAUDE_CODE_OAUTH_TOKEN`-ként exportál minden lokális agentnek. Ezzel a Claude Code-nak nincs szüksége a rotálódó `credentials.json`-ra. A `CLAUDE_CREDENTIALS_GUARD=1` flag bekapcsolja, hogy az indító a rotálódó `credentials.json`-t félretegye (`.credentials.json.bak`), így megszűnik a verseny.
+
+- **Alapértelmezés: KIKAPCSOLVA.** A flag nélkül semmi nem történik (a jelenlegi viselkedés bájtra változatlan). Egy pilot-hoston kapcsold be a `.env`-ben (`CLAUDE_CREDENTIALS_GUARD=1`), ne mindenhol egyszerre.
+- **Csak Linux**, macOS-en no-op (ott nincs is credentials.json).
+- **Guardolt**: a rename CSAK akkor fut, ha van érvényes setup-token (formátum-ellenőrzés + egyszeri éles teszthívás, token-értékhez kötött cache-sel). Érvénytelen/hiányzó token esetén a credentials.json érintetlen marad, hogy egyetlen agent se essen ki.
+- **Idempotens és visszaállítható**: a rename `.bak`-ra megy, visszavonás `mv .credentials.json.bak .credentials.json`.
+- **Fontos install-konzisztencia**: a fő channels-agent a `.env` `CLAUDE_CODE_OAUTH_TOKEN`-jét használja, a sub-agentek a `store/.claude-oauth-token`-t. Bekapcsolás előtt győződj meg róla, hogy a kettő UGYANAZ az érvényes token, különben a fő agent kieshet.
+- A token SOHA nem kerül logba, commitba vagy chatbe.
 
 ---
 
@@ -332,7 +399,7 @@ A főbb konfigurációs változók a launchd plist-ben (`~/Library/LaunchAgents/
 | `ALLOWED_CHAT_ID` | Az egyetlen engedélyezett Telegram chat ID |
 | `SLACK_BOT_TOKEN` | Slack bot token (ha Slack provider) |
 | `SLACK_CHANNEL_ID` | Slack csatorna ID |
-| `WEB_PORT` | Dashboard port (alapértelmezett: 3420) |
+| `WEB_PORT` | Dashboard port (alapértelmezett: 3420). Telepítéskor megadható a `--port <N>` CLI flaggel (`./install-linux.sh --port 3421`) vagy env-változóként (`WEB_PORT=3421 ./install.sh`). |
 | `ANTHROPIC_API_KEY` | Claude API kulcs |
 | `OWNER_NAME` | A tulajdonos neve (pl. "Jónás Gergő") |
 | `BOT_NAME` | A főágens neve (pl. "Jarvis") |

@@ -1,14 +1,19 @@
 import http from 'node:http'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { execSync, execFileSync } from 'node:child_process'
-import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS } from './config.js'
-import { loadOrCreateDashboardToken, checkBearerToken } from './web/dashboard-auth.js'
-import { isBlockedCrossOriginWrite } from './web/csrf-origin.js'
+import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID } from './config.js'
+import { loadOrCreateDashboardToken } from './web/dashboard-auth.js'
+import { resolveAuth, requiresAuth, isFederationWireEndpoint, type AuthResult } from './web/auth-gate.js'
+import { sweepExpiredSessions } from './web/auth-sessions.js'
+import { sweepExpiredDeviceKeys } from './web/auth-device-keys.js'
+import { isBlockedCrossOriginWrite, originMatchesServedHost } from './web/csrf-origin.js'
 import { json } from './web/http-helpers.js'
 import { detectLanIp } from './web/network-info.js'
 import { AGENTS_BASE_DIR, listAgentNames } from './web/agent-config.js'
-import { ensureAgentHooks, ensureDefaultScheduledTasks } from './web/agent-scaffold.js'
+import { ensureAgentHooks, ensureAgentStalenessHook, ensureEgressGate, ensureQuarantineReader, ensureDefaultScheduledTasks, agentSettingsPath, ensureAutonomySection } from './web/agent-scaffold.js'
+import { shouldRegisterHooks, pruneStaleHooksFromSettingsFile } from './web/hook-registration-guard.js'
 import { refreshMarveenBotUsername } from './web/telegram.js'
 import { startMessageRouter } from './web/message-router.js'
 import { startUpdateChecker } from './web/update-checker.js'
@@ -17,13 +22,22 @@ import { startChannelPluginMonitor } from './web/channel-monitor.js'
 import { startInboundProber } from './web/inbound-probe.js'
 import { startChannelHealthMonitor } from './web/channel-health-monitor.js'
 import { startStuckInputWatcher } from './web/stuck-input-watcher.js'
+import { startInboxNudgeWatcher } from './web/inbox-nudge-watcher.js'
 import { startStuckToolCallWatcher } from './web/stuck-tool-call-watcher.js'
 import { startReauthHealer } from './web/reauth-healer.js'
 import { startAutoRestartRunner } from './web/auto-restart-runner.js'
+import { startModelFallbackRunner } from './web/model-fallback-runner.js'
+import { startContextGuardRunner } from './web/context-guard-runner.js'
 import { collectTokenUsage } from './web/token-usage.js'
 import { logger } from './logger.js'
+import { tryHandleAuth } from './web/routes/auth.js'
+import { tryHandleSecurity } from './web/routes/security.js'
 import { tryHandleProfiles } from './web/routes/profiles.js'
 import { tryHandleMessages } from './web/routes/messages.js'
+import { tryHandleFederation } from './web/routes/federation.js'
+import { startFederationPoller } from './web/federation/poller.js'
+import { startCapabilitySummaryRunner } from './web/federation/capability-runner.js'
+import { ensureFederationClaudeMdSection } from './web/federation/onboarding.js'
 import { tryHandleAgentTerminal } from './web/routes/agent-terminal.js'
 import { tryHandleAgentConversation } from './web/routes/agent-conversation.js'
 import { tryHandleAgentTaskState } from './web/routes/agent-taskstate.js'
@@ -35,6 +49,7 @@ import { tryHandleKanban } from './web/routes/kanban.js'
 import { tryHandleSchedules } from './web/routes/schedules.js'
 import { tryHandleConnectors } from './web/routes/connectors.js'
 import { tryHandleDocs } from './web/routes/docs.js'
+import { tryHandleResearch } from './web/routes/research.js'
 import { tryHandleConnectorsHu } from './web/routes/connectors-hu.js'
 import { tryHandleAgentsSkills } from './web/routes/agents-skills.js'
 import { tryHandleSkills } from './web/routes/skills.js'
@@ -44,14 +59,25 @@ import { tryHandleRecall } from './web/routes/recall.js'
 import { tryHandleBackgroundTasks, sweepOrphanedBackgroundTasks } from './web/routes/background-tasks.js'
 import { tryHandleOverview } from './web/routes/overview.js'
 import { tryHandleUpdates } from './web/routes/updates.js'
+import { tryHandleOnboarding } from './web/routes/onboarding.js'
 import { tryHandleStatus } from './web/routes/status.js'
 import { tryHandleAutonomy } from './web/routes/autonomy.js'
+import { tryHandleApprovals, startApprovalTimeoutSweeper } from './web/routes/approvals.js'
 import { tryHandleTokenUsage } from './web/routes/token-usage.js'
+import { tryHandleCosts, startCostsSyncTask } from './web/routes/costs.js'
 import { tryHandleIdeas } from './web/routes/ideas.js'
 import { tryHandleToolLog } from './web/routes/tool-log.js'
+import { tryHandleSpans } from './web/routes/spans.js'
+import { tryHandleSkillUsage } from './web/routes/skill-usage.js'
 import { tryHandleSettings } from './web/routes/settings.js'
 import { tryHandleAuditLog } from './web/routes/audit-log.js'
+import { tryHandleFleetQ } from './web/routes/fleet-q.js'
 import { tryHandleStatic } from './web/routes/static.js'
+import { tryHandleVoice } from './web/routes/voice.js'
+import { tryHandleVaultSsh } from './web/routes/vault-ssh.js'
+import { tryHandleFleet } from './web/routes/fleet.js'
+import { tryHandleVaultSshKeys } from './web/routes/vault-ssh-keys.js'
+import { tryHandleCustomProviders } from './web/routes/custom-providers.js'
 import type { RouteContext } from './web/routes/types.js'
 
 const WEB_DIR = join(PROJECT_ROOT, 'web')
@@ -81,11 +107,19 @@ export function startWebServer(port = 3420): http.Server {
     const method = req.method || 'GET'
 
     const origin = req.headers.origin
-    if (origin && allowedOrigins.has(origin)) {
+    // Emit CORS headers for allowlisted origins AND for genuinely same-origin
+    // requests reached via a reverse proxy (e.g. Tailscale Serve's ts.net host,
+    // where the Origin host matches Host / X-Forwarded-Host). Without this, an
+    // iOS Safari preflight for an Authorization-bearing /api/ fetch over the
+    // proxy gets a 204 with no Access-Control-* headers and the browser blocks
+    // the request -- the page shell loads but no data does. Authorization must be
+    // in Allow-Headers or the preflight rejects the Bearer header.
+    if (origin && (allowedOrigins.has(origin) ||
+        originMatchesServedHost(origin, req.headers.host, req.headers['x-forwarded-host'] as string | undefined))) {
       res.setHeader('Access-Control-Allow-Origin', origin)
       res.setHeader('Vary', 'Origin')
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
     }
     if (method === 'OPTIONS') { res.writeHead(204); res.end(); return }
 
@@ -100,34 +134,30 @@ export function startWebServer(port = 3420): http.Server {
       return
     }
 
-    // Auth gate: every /api/* route requires a bearer token in the Authorization
-    // header. Exceptions: the auth-status probe (so the client can tell whether
-    // it needs to prompt the user), and GET requests for avatar images (loaded
-    // via <img src> which can't carry headers -- these are non-sensitive assets).
-    const isPublicApi =
-      (path === '/api/auth/status' && method === 'GET') ||
-      (method === 'GET' && (
-        path === '/api/marveen/avatar' ||
-        /^\/api\/agents\/[^/]+\/avatar$/.test(path)
-      ))
-    if (path === '/api/auth/status' && method === 'GET') {
-      const ok = checkBearerToken(req.headers.authorization, DASHBOARD_TOKEN)
-      return json(res, { authenticated: ok })
-    }
-    // The live pane SSE stream is consumed via EventSource, which cannot set an
-    // Authorization header -- accept the token via ?token= for this one GET
-    // path, validated with the same constant-time check. Everything else stays
-    // header-only.
-    const isSseStream = method === 'GET' && /^\/api\/agents\/[^/]+\/pane\/stream$/.test(path)
-    if (path.startsWith('/api/') && !isPublicApi) {
-      const headerOk = checkBearerToken(req.headers.authorization, DASHBOARD_TOKEN)
-      const queryOk = isSseStream && checkBearerToken(`Bearer ${url.searchParams.get('token') ?? ''}`, DASHBOARD_TOKEN)
-      if (!headerOk && !queryOk) {
-        res.writeHead(401, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Unauthorized' }))
-        return
+    // Auth gate: resolve the request's principal once via the extracted gate
+    // (bearer -> SSE ?token= -> endpoint-scoped federation token -> mv_session
+    // cookie). Bearer stays highest precedence and byte-identical, so every
+    // fleet curl call keeps working with users present or absent. requiresAuth()
+    // decides whether a missing principal is a 401 (gated /api/* + fleet
+    // manifest) or a public probe (auth status/login, avatars).
+    const auth: AuthResult = resolveAuth(req, url, path, method, DASHBOARD_TOKEN)
+    if (requiresAuth(path, method) && auth.kind === 'none') {
+      if (isFederationWireEndpoint(path, method)) {
+        // 401s are otherwise silent; federation-endpoint auth failures are the
+        // brute-force surface -- make them visible (round-2 scoped-token gate).
+        logger.warn({ path, method }, 'federation: rejected wire-endpoint auth')
       }
+      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Unauthorized' }))
+      return
     }
+    const fedPeerForCtx: string | null = auth.kind === 'federation' ? auth.peer : null
+    const ctxAuth =
+      auth.kind === 'token' ? { kind: 'token' as const }
+      : auth.kind === 'device' ? { kind: 'device' as const, device: auth.device }
+      : auth.kind === 'session' ? { kind: 'session' as const, user: auth.user }
+      : auth.kind === 'federation' ? { kind: 'federation' as const, peer: auth.peer }
+      : undefined
 
     // The mobile-login QR needs a URL the phone can actually reach. When the
     // desktop opens the dashboard on localhost, window.location.origin is
@@ -139,10 +169,13 @@ export function startWebServer(port = 3420): http.Server {
     }
 
     try {
-      const routeCtx: RouteContext = { req, res, path, method, url }
+      const routeCtx: RouteContext = { req, res, path, method, url, fedPeer: fedPeerForCtx, auth: ctxAuth }
 
+      if (await tryHandleAuth(routeCtx)) return
+      if (await tryHandleSecurity(routeCtx)) return
       if (await tryHandleProfiles(routeCtx)) return
       if (await tryHandleMessages(routeCtx)) return
+      if (await tryHandleFederation(routeCtx)) return
       if (await tryHandleDailyLog(routeCtx)) return
       if (await tryHandleMemories(routeCtx)) return
       if (await tryHandleMigrate(routeCtx)) return
@@ -151,6 +184,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleConnectorsHu(routeCtx)) return
       if (await tryHandleConnectors(routeCtx)) return
       if (await tryHandleDocs(routeCtx)) return
+      if (await tryHandleResearch(routeCtx)) return
       if (await tryHandleAgentsSkills(routeCtx)) return
       if (await tryHandleSkills(routeCtx)) return
       if (await tryHandleAgentTerminal(routeCtx)) return
@@ -162,13 +196,24 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleRecall(routeCtx)) return
       if (await tryHandleOverview(routeCtx)) return
       if (await tryHandleUpdates(routeCtx)) return
+      if (await tryHandleOnboarding(routeCtx)) return
       if (await tryHandleStatus(routeCtx)) return
       if (await tryHandleAutonomy(routeCtx)) return
+      if (await tryHandleApprovals(routeCtx)) return
       if (await tryHandleTokenUsage(routeCtx)) return
+      if (await tryHandleCosts(routeCtx)) return
       if (await tryHandleIdeas(routeCtx)) return
+      if (await tryHandleSpans(routeCtx)) return
       if (await tryHandleToolLog(routeCtx)) return
+      if (await tryHandleSkillUsage(routeCtx)) return
       if (await tryHandleSettings(routeCtx)) return
+      if (await tryHandleVoice(routeCtx)) return
+      if (await tryHandleVaultSshKeys(routeCtx)) return
+      if (await tryHandleVaultSsh(routeCtx)) return
+      if (await tryHandleCustomProviders(routeCtx)) return
       if (await tryHandleAuditLog(routeCtx)) return
+      if (await tryHandleFleetQ(routeCtx)) return
+      if (await tryHandleFleet(routeCtx)) return
       if (await tryHandleStatic(routeCtx, WEB_DIR)) return
 
       res.writeHead(404)
@@ -220,7 +265,9 @@ export function startWebServer(port = 3420): http.Server {
                 try { process.kill(pid, 'SIGKILL') } catch { /* gone */ }
               } catch { /* gone */ }
             }
-            server.listen(port)
+            server.listen(port, WEB_HOST, () => {
+              logger.info({ port }, `Web dashboard: re-listen bound after port reclaim`)
+            })
           }, 1500)
         } else {
           logger.error({ port }, 'Port foglalt de nem talaltunk felszabadithato node processt -- kilepes')
@@ -246,59 +293,157 @@ export function startWebServer(port = 3420): http.Server {
     )
   })
 
-  const routerInterval = startMessageRouter()
-  logger.info('Agent message router started (5s poll)')
+  // Self-heal a SILENT listener failure. Under launchd, a `kickstart -k` can
+  // race the dying predecessor's lingering socket: the EADDRINUSE reclaim +
+  // re-listen path can leave this process ALIVE but not actually listening, with
+  // no error (observed 2026-06-27 -- the success log above fired yet nothing was
+  // bound, and the background loops started below kept running, so the dashboard
+  // was deaf until a manual restart, which bound cleanly). A clean restart binds
+  // reliably, so if the listener is not up we exit(1) and let launchd restart us
+  // fresh rather than linger un-servable. Runs regardless of WEB_ONLY -- it is
+  // about the HTTP listener, not the background services.
+  //
+  // The grace must comfortably exceed a SLOW-but-valid bind: restarting OVER a
+  // wedged predecessor, the EADDRINUSE reclaim retries every ~1500ms until the
+  // old socket finally releases -- observed up to ~5 MINUTES (2026-06-27). An
+  // 8s grace would exit MID-bind and loop, so wait STARTUP_GRACE first. After
+  // that, poll periodically so a mid-life listener drop is caught too, not just
+  // a startup failure.
+  const STARTUP_GRACE_MS = 7 * 60 * 1000
+  const RELISTEN_POLL_MS = 60 * 1000
+  setTimeout(() => {
+    setInterval(() => {
+      if (!server.listening) {
+        logger.error({ port }, 'Web server not listening -- exiting(1) for a clean launchd restart')
+        process.exit(1)
+      }
+    }, RELISTEN_POLL_MS).unref()
+  }, STARTUP_GRACE_MS).unref()
 
-  const scheduleInterval = startScheduleRunner()
-  logger.info('Schedule runner started (60s poll)')
+  // WEB_ONLY=true disables all background services (scheduler, pollers, monitors).
+  // Used for staging preview instances that must not conflict with the live fleet
+  // (duplicate schedule execution, Telegram 409, tmux manipulation, etc.).
+  const webOnly = process.env['WEB_ONLY'] === 'true'
+  if (webOnly) {
+    logger.info('[staging] WEB_ONLY mode: background services disabled')
+  }
+
+  const routerInterval = webOnly ? undefined : startMessageRouter()
+  if (!webOnly) logger.info('Agent message router started (5s poll)')
+
+  const scheduleInterval = webOnly ? undefined : startScheduleRunner()
+  if (!webOnly) logger.info('Schedule runner started (60s poll)')
 
   // Pre-start the interactive agent worker (subscription backend) so the first
   // heartbeat / scheduled generation after boot does not pay the cold-boot
   // latency. runViaWorker still lazy-starts + restarts it on demand, so this is
   // a warm-up, not a hard dependency. Skipped on the SDK rollback backend.
-  if ((process.env.MARVEEN_AGENT_BACKEND || 'worker').toLowerCase() !== 'sdk') {
+  if (!webOnly && (process.env.MARVEEN_AGENT_BACKEND || 'worker').toLowerCase() !== 'sdk') {
     import('./web/agent-worker.js')
       .then(m => { m.startWorkerSession(); logger.info('Interactive agent worker pre-started') })
       .catch(err => logger.warn({ err }, 'Failed to pre-start agent worker (will lazy-start on first use)'))
   }
 
-  const pluginMonitorInterval = startChannelPluginMonitor()
-  logger.info('Channel plugin health monitor started (60s poll)')
+  // WORKERBOOT1: nothing watched the worker sessions, so a death left no trace
+  // and the cause stayed unknowable. This only notices and logs -- it does not
+  // restart (the next request already re-creates the session) and does not try
+  // to explain the death; that is what the log is for.
+  let workerLivenessInterval: NodeJS.Timeout | undefined
+  // The handle is assigned inside an async .then(), so a shutdown that runs
+  // BEFORE the dynamic import resolves would clear an undefined and then the
+  // import would start an interval nobody owns. A live setInterval keeps the
+  // event loop alive, so that is not just a leak: the process would never exit.
+  // The other monitors are synchronous calls and cannot hit this.
+  let workerLivenessCancelled = false
+  if (!webOnly && (process.env.MARVEEN_AGENT_BACKEND || 'worker').toLowerCase() !== 'sdk') {
+    import('./web/worker-liveness.js')
+      .then(m => {
+        if (workerLivenessCancelled) return
+        workerLivenessInterval = m.startWorkerLivenessMonitor()
+        logger.info('Worker liveness monitor started (60s poll)')
+      })
+      .catch(err => logger.warn({ err }, 'Failed to start the worker liveness monitor'))
+  }
+
+  const pluginMonitorInterval = webOnly ? undefined : startChannelPluginMonitor()
+  if (!webOnly) logger.info('Channel plugin health monitor started (60s poll)')
 
   // Userbot inbound-probe (gold-standard deafness detector). Safe no-op until
   // the prober session file + allowlist are configured. Wrapped so a failure
   // never crashes server startup.
-  try {
-    startInboundProber()
-  } catch (err) {
-    logger.warn({ err }, 'Inbound prober failed to start')
+  if (!webOnly) {
+    try {
+      startInboundProber()
+    } catch (err) {
+      logger.warn({ err }, 'Inbound prober failed to start')
+    }
   }
 
-  const channelHealthInterval = startChannelHealthMonitor()
-  logger.info('Channel MCP health monitor started (60s poll, 45s offset)')
+  const channelHealthInterval = webOnly ? undefined : startChannelHealthMonitor()
+  if (!webOnly) logger.info('Channel MCP health monitor started (60s poll, 45s offset)')
 
-  const stuckInputInterval = startStuckInputWatcher()
-  logger.info('Stuck-input watcher started (15s poll, 20s offset)')
+  // CostOps: reflect the local config's fixed costs into the ledger once at boot + every
+  // 10 minutes. Deliberately NOT done inside the GET /api/costs/summary handler -- a read
+  // endpoint must not write (was flagged in review); this is the one place that does.
+  const costsSyncInterval = webOnly ? undefined : startCostsSyncTask()
+  if (!webOnly) logger.info('CostOps fixed-cost sync started (10min poll + startup)')
 
-  const stuckToolCallInterval = startStuckToolCallWatcher()
-  logger.info('Stuck-tool-call watcher started (30s poll, 35s offset)')
+  const stuckInputInterval = webOnly ? undefined : startStuckInputWatcher()
+  if (!webOnly) logger.info('Stuck-input watcher started (15s poll, 20s offset)')
 
-  const reauthHealerInterval = startReauthHealer()
-  if (reauthHealerInterval) logger.info('Reauth healer started (3min poll, 90s offset)')
+  const stuckToolCallInterval = webOnly ? undefined : startStuckToolCallWatcher()
+  if (!webOnly) logger.info('Stuck-tool-call watcher started (30s poll, 35s offset)')
 
-  const autoRestartInterval = startAutoRestartRunner()
-  logger.info('Auto-restart runner started (60s poll, 40s offset)')
+  const inboxNudgeInterval = webOnly ? undefined : startInboxNudgeWatcher()
+  if (!webOnly) logger.info('Inbox nudge watcher started (20s poll, 55s offset)')
 
-  const updateCheckerInterval = startUpdateChecker()
-  logger.info('Update checker started (15min poll)')
+  const reauthHealerInterval = webOnly ? undefined : startReauthHealer()
+  if (!webOnly && reauthHealerInterval) logger.info('Reauth healer started (3min poll, 90s offset)')
+
+  const autoRestartInterval = webOnly ? undefined : startAutoRestartRunner()
+  if (!webOnly) logger.info('Auto-restart runner started (60s poll, 40s offset)')
+
+  const modelFallbackInterval = webOnly ? undefined : startModelFallbackRunner()
+  if (!webOnly) logger.info('Model-fallback runner started (60s poll, 50s offset)')
+
+  const contextGuardInterval = webOnly ? undefined : startContextGuardRunner()
+  if (!webOnly) logger.info('Context-guard runner started (5min poll, 4.5min initial delay)')
+
+  const updateCheckerInterval = webOnly ? undefined : startUpdateChecker()
+  if (!webOnly) logger.info('Update checker started (15min poll)')
+
+  const federationPollerInterval = webOnly ? undefined : startFederationPoller()
+  if (!webOnly) logger.info('Federation manifest poller started (10min poll, 25s offset)')
+
+  const capabilityRunnerInterval = webOnly ? undefined : startCapabilitySummaryRunner()
+  if (!webOnly) logger.info('Capability summary runner started (5min poll, 65s offset; idle while federation is off)')
 
   // Collect token usage from JSONL transcripts every hour so the run-history
   // token estimates stay fresh without requiring a manual dashboard visit.
-  const tokenCollectInterval = setInterval(() => {
+  // Sweep timed-out pending approvals every minute
+  const approvalTimeoutInterval = startApprovalTimeoutSweeper()
+
+  // Hourly sweep of expired browser-login sessions (7d idle / 30d absolute).
+  // Runs regardless of WEB_ONLY -- it is a cheap indexed delete on the shared DB
+  // and keeps auth_sessions from growing unboundedly on any instance.
+  const authSessionSweepInterval = setInterval(() => {
+    try {
+      const swept = sweepExpiredSessions()
+      if (swept > 0) logger.info({ swept }, 'Expired auth sessions swept')
+      const sweptKeys = sweepExpiredDeviceKeys()
+      if (sweptKeys > 0) logger.info({ swept: sweptKeys }, 'Expired device keys swept')
+    } catch (err) {
+      logger.warn({ err }, 'Auth session sweep failed')
+    }
+  }, 60 * 60 * 1000)
+
+  const tokenCollectInterval = webOnly ? undefined : setInterval(() => {
     collectTokenUsage().catch(err => logger.warn({ err }, 'Periodic token usage collection failed'))
   }, 60 * 60 * 1000)
-  collectTokenUsage().catch(err => logger.warn({ err }, 'Startup token usage collection failed'))
-  logger.info('Token usage auto-collect started (1h poll + startup)')
+  if (!webOnly) {
+    collectTokenUsage().catch(err => logger.warn({ err }, 'Startup token usage collection failed'))
+    logger.info('Token usage auto-collect started (1h poll + startup)')
+  }
 
   // NOTE: startMcpListChecker() is intentionally NOT called here.
   //
@@ -320,17 +465,54 @@ export function startWebServer(port = 3420): http.Server {
   // the first dashboard load. Re-fetched lazily otherwise.
   refreshMarveenBotUsername().catch(() => {})
 
+  // Reconcile the federation onboarding block in the main agent's CLAUDE.md
+  // EARLY (before the channels session may read the file) and only on live
+  // instances: a WEB_ONLY staging copy must never rewrite the persona file
+  // (do NOT copy the hook backfill's ungated placement). The ensure heals
+  // the two known loss vectors: update.sh --regen-claudemd and a stale
+  // dashboard-editor buffer PUT.
+  if (!webOnly) {
+    ensureFederationClaudeMdSection()
+    ensureAutonomySection(MAIN_AGENT_ID)
+  }
+
   // Backfill the PreCompact hook into existing agents' settings.json so the
   // auto-skill / auto-memory flow runs on context compaction. No-op if the
   // agent already has its own hooks block.
-  try {
-    const patched: string[] = []
-    for (const agentName of listAgentNames()) {
-      if (ensureAgentHooks(agentName)) patched.push(agentName)
+  //
+  // Guarded: a worktree checkout or a WEB_ONLY staging instance must NEVER
+  // register hooks -- its PROJECT_ROOT is temporary, and baking it into the
+  // user-global ~/.claude/settings.json leaves stale absolute paths behind
+  // once the worktree is deleted. A failing (exit 2) UserPromptSubmit hook
+  // then BLOCKS every prompt and deafens the main agent (2026-07-11 incident).
+  const hookDecision = shouldRegisterHooks({ projectRoot: PROJECT_ROOT, webOnly, tmpDir: tmpdir() })
+  if (!hookDecision.register) {
+    logger.info({ reason: hookDecision.reason, projectRoot: PROJECT_ROOT }, 'Hook registration skipped')
+  } else {
+    try {
+      const patched: string[] = []
+      const stalePatched: string[] = []
+      const egressPatched: string[] = []
+      const pruned: string[] = []
+      // Include the main agent (MAIN_AGENT_ID) so the voice hook is also seeded
+      // into ~/.claude/settings.json alongside existing hooks (e.g. telegram_progress.py).
+      for (const agentName of [MAIN_AGENT_ID, ...listAgentNames()]) {
+        // Self-heal FIRST: drop entries this app previously wrote whose script
+        // file no longer exists (e.g. a deleted worktree instance's paths), so
+        // the re-registration below lands on a clean, unblocked settings file.
+        pruned.push(...pruneStaleHooksFromSettingsFile(agentSettingsPath(agentName)))
+        if (ensureAgentHooks(agentName)) patched.push(agentName)
+        if (ensureAgentStalenessHook(agentName)) stalePatched.push(agentName)
+        if (ensureEgressGate(agentName)) egressPatched.push(agentName)
+        ensureQuarantineReader(agentName)
+      }
+      if (pruned.length) logger.info({ pruned }, 'Stale hook entries pruned from agent settings.json')
+      if (patched.length) logger.info({ patched }, 'PreCompact hook backfilled into agent settings.json')
+      if (stalePatched.length) logger.info({ patched: stalePatched }, 'staleness-guard UserPromptSubmit hook backfilled into agent settings.json')
+      if (egressPatched.length) logger.info({ patched: egressPatched }, 'egress-gate WebFetch hook backfilled into agent settings.json')
+    } catch (err) {
+      logger.warn({ err }, 'Agent hook backfill skipped')
     }
-    if (patched.length) logger.info({ patched }, 'PreCompact hook backfilled into agent settings.json')
-  } catch (err) {
-    logger.warn({ err }, 'Agent hook backfill skipped')
   }
 
   try {
@@ -358,12 +540,22 @@ export function startWebServer(port = 3420): http.Server {
     clearInterval(routerInterval)
     clearInterval(scheduleInterval)
     if (pluginMonitorInterval) clearInterval(pluginMonitorInterval)
+    workerLivenessCancelled = true
+    if (workerLivenessInterval) clearInterval(workerLivenessInterval)
     clearInterval(channelHealthInterval)
+    if (costsSyncInterval) clearInterval(costsSyncInterval)
     clearInterval(stuckInputInterval)
     clearInterval(stuckToolCallInterval)
+    if (inboxNudgeInterval) clearInterval(inboxNudgeInterval)
     if (reauthHealerInterval) clearInterval(reauthHealerInterval)
     clearInterval(autoRestartInterval)
+    clearInterval(modelFallbackInterval)
+    clearInterval(contextGuardInterval)
+    clearInterval(approvalTimeoutInterval)
+    clearInterval(authSessionSweepInterval)
     clearInterval(updateCheckerInterval)
+    if (federationPollerInterval) clearInterval(federationPollerInterval)
+    if (capabilityRunnerInterval) clearInterval(capabilityRunnerInterval)
     clearInterval(tokenCollectInterval)
     return origClose(cb)
   }

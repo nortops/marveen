@@ -13,12 +13,49 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# CLI flag parsing -- runs before the interactive wizard.
+# WEB_PORT can also be set as an env var (env var wins if --port is not given).
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --port|--web-port)
+      if [[ -z "${2:-}" || "${2}" == --* ]]; then
+        echo "Error: --port requires a numeric argument (e.g. --port 3421)" >&2; exit 1
+      fi
+      WEB_PORT="$2"; shift 2 ;;
+    --help|-h)
+      echo "Usage: $0 [--port <N>]"
+      echo "  --port <N>   Dashboard port (default: 3420). Also settable via WEB_PORT env var."
+      exit 0 ;;
+    *) echo "Unknown option: $1 (use --help for usage)" >&2; exit 1 ;;
+  esac
+done
+WEB_PORT="${WEB_PORT:-3420}"
+
 INSTALL_STEP="init"
 
 # shellcheck source=install-lang.sh
 source "$(dirname "$0")/install-lang.sh"
 
+# Error-translation layer (NPMPERM1 kor): minden stderr egy log-fajlba is
+# megy, hogy hibanal a trap ne csak sorszamot mondjon, hanem le tudja
+# forditani az upstream hibat (explain_install_error, install-lang.sh).
+INSTALL_ERRLOG=$(mktemp "${TMPDIR:-/tmp}/marveen-install-stderr.XXXXXX")
+exec 2> >(tee -a "$INSTALL_ERRLOG" >&2)
+
 ok() { echo -e "  ${GREEN}✓${NC} $*"; }
+
+# Does the INSTALL carry an auth credential the SERVICES can read?
+# NOT the same question as `claude auth status` / a Keychain login: the launchd
+# units read ONLY <install>/.env and <install>/store/.claude-oauth-token. On
+# macOS `claude auth login` fills the KEYCHAIN and nothing else, so before this
+# change the services were never given a credential at all -- the operator's
+# terminal worked and the agents sat at "Not logged in".
+service_auth_present() {
+  grep -qE '^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=.+' "$INSTALL_DIR/.env" 2>/dev/null && return 0
+  [ -s "$INSTALL_DIR/store/.claude-oauth-token" ] && return 0
+  return 1
+}
 warn() { echo -e "  ${ORANGE}!${NC} $*"; }
 
 offer_claude_fallback() {
@@ -43,6 +80,7 @@ offer_claude_fallback() {
 
 fail() {
   echo -e "  ${RED}✗${NC} $*"
+  explain_install_error "${INSTALL_ERRLOG:-}"
   offer_claude_fallback "$INSTALL_STEP" "$*" "${BASH_LINENO[0]}"
   exit 1
 }
@@ -50,6 +88,7 @@ fail() {
 on_error() {
   echo ""
   echo -e "${RED}Varatlan hiba a(z) '${INSTALL_STEP}' lepesben (sor: $1).${NC}"
+  explain_install_error "${INSTALL_ERRLOG:-}"
   offer_claude_fallback "$INSTALL_STEP" "Unexpected error at line $1" "$1"
   exit 1
 }
@@ -75,6 +114,58 @@ echo ""
 # Step 1: Check prerequisites
 INSTALL_STEP="prerequisites"
 echo -e "${BOLD}$(_t section_1)${NC}"
+
+# ── macOS verzio pre-flight (MACOSOLD1) ──────────────────────────────
+# A fuggosegeket a Homebrew-ra bizzuk, a brew-nak viszont sajat macOS-
+# minimumai vannak. Regi gepen a brew portable-ruby-ja dyld-hibaval hal
+# (____chkstk_darwin, "your system version is too old"), es a felhasznalo
+# egy Ruby-linker hibat lat egy sorszammal (2026-07-30, eles workshop).
+# Itt, a legelso lepesben derul ki, ERTHETO mondattal es KIUTTAL.
+#
+# A kuszobok a Homebrew SAJAT deklaralt minimumai (brew.sh, Homebrew
+# 6.0.13, kiolvasva 2026-07-30):
+#   HOMEBREW_MACOS_OLDEST_ALLOWED="10.15"  -- ez alatt a brew el sem indul
+#   HOMEBREW_MACOS_OLDEST_SUPPORTED="14"   -- ez alatt "unsupported/best effort"
+# Uj brew-kiadasnal ezek valtozhatnak; a forras a brew repo brew.sh fajlja.
+BREW_OLDEST_ALLOWED="10.15"
+BREW_OLDEST_SUPPORTED="14"
+
+# major[.minor] numerikus osszehasonlitas: 0 ha $1 < $2 (sort -V nelkul,
+# a BSD sort -V viselkedesere nem epitunk).
+macos_version_lt() {
+  local a1 b1 a2 b2
+  a1=${1%%.*}; b1=${2%%.*}
+  a2=${1#*.}; [ "$a2" = "$1" ] && a2=0; a2=${a2%%.*}
+  b2=${2#*.}; [ "$b2" = "$2" ] && b2=0; b2=${b2%%.*}
+  [ "$a1" -lt "$b1" ] || { [ "$a1" -eq "$b1" ] && [ "$a2" -lt "$b2" ]; }
+}
+
+MACOS_VER=$(sw_vers -productVersion 2>/dev/null || echo "")
+if [ -z "$MACOS_VER" ]; then
+  # Ismeretlen allapot: kimondjuk, nem talalgatunk -- a telepites megy
+  # tovabb, es ha a brew bukik, a hibauzenete legalabb valodi lesz.
+  echo -e "  ${DIM}$(_t macos.ver_unknown)${NC}"
+elif macos_version_lt "$MACOS_VER" "$BREW_OLDEST_ALLOWED"; then
+  # VEGLEGES akadaly ezen a gepen: a Homebrew el sem indul ilyen regi
+  # macOS-en -- azonnal, ertheto mondattal allunk meg, kiuttal.
+  echo -e "${RED}$(_t macos.ver_too_old_head) ${MACOS_VER}${NC}"
+  echo -e "  $(_t macos.ver_too_old_body1)"
+  echo -e "  $(_t macos.ver_too_old_body2)"
+  fail "$(_t macos.ver_too_old_fail)"
+elif macos_version_lt "$MACOS_VER" "$BREW_OLDEST_SUPPORTED"; then
+  # Szurke sav: a brew "unsupported / best effort" -- tipikusan mukodik,
+  # de torhet. Nem hazudunk sem sikert, sem bukast: figyelmeztetunk, es a
+  # felhasznalo dont.
+  warn "$(_t macos.ver_unsupported_head) ${MACOS_VER}"
+  echo -e "  $(_t macos.ver_unsupported_body)"
+  read -rp "$(_t macos.ver_unsupported_prompt)" CONT_OLD_MACOS
+  CONT_OLD_MACOS=${CONT_OLD_MACOS:-i}
+  # hu prompt: i/n, en prompt: y/n -- mindket igen-alak elfogadva.
+  case "$CONT_OLD_MACOS" in
+    i|I|y|Y) : ;;
+    *) fail "$(_t macos.ver_unsupported_abort)" ;;
+  esac
+fi
 
 check_cmd() {
   if command -v "$1" &>/dev/null; then
@@ -146,9 +237,22 @@ if ! command -v claude &>/dev/null; then
   echo -e "${ORANGE}$(_t macos.install_claude_hint)${NC}"
   read -rp "$(_t prompt_install_claude)" INSTALL_CLAUDE
   if [[ "$INSTALL_CLAUDE" == "i" || "$INSTALL_CLAUDE" == "y" ]]; then
-    npm install -g @anthropic-ai/claude-code
+    # NPMPERM1: hivatalos nodejs.org .pkg-s (vagy Intel) gepen a globalis
+    # node_modules root-tulajdonu -- EACCES-szel halna. Pre-flight + kiut.
+    if ! ensure_global_npm_writable; then
+      fail "$(_t npm.aborted)"
+    fi
+    if [ "${NPM_NEEDS_SUDO:-}" = "1" ]; then
+      sudo npm install -g @anthropic-ai/claude-code
+    else
+      npm install -g @anthropic-ai/claude-code
+    fi
   else
-    fail "Claude Code CLI szukseges a futtatashoz. Telepitsd: npm install -g @anthropic-ai/claude-code"
+    # A javasolt parancs KULON, masolhato sorban -- egy workshop-resztvevo
+    # kezzel gepelte at es egyetlen karakteren (@ = AltGr) elbukott.
+    echo -e "  ${DIM}Telepitsd (masold ki az alabbi sort):${NC}"
+    echo "    npm install -g @anthropic-ai/claude-code"
+    fail "Claude Code CLI szukseges a futtatashoz."
   fi
 fi
 echo -e "  ${GREEN}✓${NC} Claude Code CLI"
@@ -220,6 +324,32 @@ if [[ "$DO_AUTH" == "i" || "$DO_AUTH" == "y" ]]; then
 fi
 echo -e "  ${GREEN}✓${NC} $(_t macos.firstrun_done)"
 
+# Service-side credential. `claude auth login` above authenticates the OPERATOR
+# (Keychain); the launchd units cannot use that. They read .env and
+# store/.claude-oauth-token, so ask for a setup-token unless this install
+# already carries one (re-run, or the dashboard wizard got there first).
+MACOS_OAUTH_TOKEN_INPUT=""
+if service_auth_present; then
+  ok "A telepites mar hordoz auth kulcsot (.env / store/.claude-oauth-token)"
+else
+  echo ""
+  echo -e "  ${BOLD}Az ugynokok kulon hitelesitot igenyelnek.${NC}"
+  echo -e "  ${DIM}A fenti bejelentkezes a Te termnaljadnak szol (Keychain);${NC}"
+  echo -e "  ${DIM}a hatterszolgaltatasok ahhoz nem ferenek hozza.${NC}"
+  echo -e "  ${BOLD}1.${NC} Futtasd egy terminalban: ${BLUE}claude setup-token${NC}"
+  echo -e "  ${BOLD}2.${NC} Masold ide a kiirt tokent (Enter = kihagyas):"
+  read -rp "  OAuth token: " MACOS_OAUTH_TOKEN_INPUT
+  if [ -n "$MACOS_OAUTH_TOKEN_INPUT" ]; then
+    if printf '%s' "$MACOS_OAUTH_TOKEN_INPUT" | grep -Eq '^sk-ant-oat01-[A-Za-z0-9_-]{40,}$'; then
+      ok "Token formailag rendben, elmentjuk a szolgaltatasoknak"
+    else
+      warn "A beirt ertek nem setup-token alaku (sk-ant-oat01-...). Elmentjuk, de ellenorizd."
+    fi
+  else
+    warn "Token nem lett megadva -- az ugynokok igy nem fognak elindulni."
+  fi
+fi
+
 # Pre-flight headless probe — Issue #179.
 # `claude auth login` may exit 0 even when the resulting token is unusable for
 # headless queries (browser flow interrupted, stale cached state, etc.). The
@@ -228,8 +358,14 @@ echo -e "  ${GREEN}✓${NC} $(_t macos.firstrun_done)"
 echo ""
 echo -e "  ${DIM}$(_t macos.headless_test)${NC}"
 set +e
-CLAUDE_PROBE_OUT=$(claude --print "ping" 2>&1 | head -c 200)
+# The exit status here used to be `head`'s, not claude's: `VAR=$(cmd | head)`
+# reports the LAST pipeline element, so a failing claude looked like success.
+# PIPESTATUS does NOT help either -- after an assignment it describes the
+# assignment, not the pipeline inside the substitution (measured). Dropping the
+# pipe entirely is the only form that reports claude's own status.
+CLAUDE_PROBE_OUT=$(claude --print "ping" 2>&1)
 CLAUDE_PROBE_EXIT=$?
+CLAUDE_PROBE_OUT=${CLAUDE_PROBE_OUT:0:200}
 set -e
 if [ "$CLAUDE_PROBE_EXIT" -eq 0 ] && [ -n "$CLAUDE_PROBE_OUT" ]; then
   echo -e "  ${GREEN}✓${NC} $(_t macos.headless_ok)"
@@ -300,18 +436,26 @@ else
   MANAGED_FILE="$MANAGED_DIR/managed-settings.json"
   SLACK_ENTRY='{"plugin":"slack-channel","marketplace":"marveen-marketplace"}'
   TELEGRAM_ENTRY='{"plugin":"telegram","marketplace":"claude-plugins-official"}'
-  REQUIRED_JSON="{\"allowedChannelPlugins\":[$SLACK_ENTRY,$TELEGRAM_ENTRY]}"
+  TEAMS_ENTRY='{"plugin":"teams","marketplace":"marveen-marketplace"}'
+  REQUIRED_JSON="{\"allowedChannelPlugins\":[$SLACK_ENTRY,$TELEGRAM_ENTRY,$TEAMS_ENTRY]}"
 
   if [ -f "$MANAGED_FILE" ]; then
-    HAS_SLACK=$(sudo python3 -c "
+    # Gate on ALL required plugins being present (not just slack) -- otherwise an
+    # install that already has slack/telegram but not teams skips the merge and
+    # the Teams bot is silently dropped (online but never replies). This is the
+    # per-customer sudo-elimination: the installer (already sudo) allows teams
+    # at install time, so no manual managed-settings edit is needed later.
+    HAS_ALL=$(sudo python3 -c "
 import json, sys
+required = [('slack-channel','marveen-marketplace'),('telegram','claude-plugins-official'),('teams','marveen-marketplace')]
 try:
   d = json.load(open('$MANAGED_FILE'))
   plugins = d.get('allowedChannelPlugins', [])
-  sys.exit(0 if any(p.get('plugin')=='slack-channel' and p.get('marketplace')=='marveen-marketplace' for p in plugins) else 1)
+  have = {(p.get('plugin'),p.get('marketplace')) for p in plugins}
+  sys.exit(0 if all(r in have for r in required) else 1)
 except: sys.exit(1)
 " 2>/dev/null && echo "yes" || echo "no")
-    if [ "$HAS_SLACK" = "no" ]; then
+    if [ "$HAS_ALL" = "no" ]; then
       echo -e "  ${ORANGE}⚠${NC} $(_t macos.managed_update)"
       echo "$REQUIRED_JSON" | sudo python3 -c "
 import json, sys
@@ -336,6 +480,16 @@ print(json.dumps(existing, indent=2))
     echo "$REQUIRED_JSON" | python3 -c "import json,sys; print(json.dumps(json.loads(sys.stdin.read()),indent=2))" | sudo tee "$MANAGED_FILE" > /dev/null
     echo -e "  ${GREEN}✓${NC} $(_t macos.managed_created)"
   fi
+fi
+
+# Channel inbound org-policy gate: ensure the system managed-settings enable
+# channels (runs unconditionally, not only in the Slack branch above). claude-code
+# >= 2.1.205 silently drops channel-plugin INBOUND notifications on a team/
+# enterprise org unless managed-settings has channelsEnabled:true (harmless /
+# no-op on a personal org). Idempotent + preserves existing managed keys.
+if [ -f "$INSTALL_DIR/scripts/ensure-managed-channels-enabled.sh" ]; then
+  echo -e "  Managed-settings channel-kapu ellenorzese..."
+  bash "$INSTALL_DIR/scripts/ensure-managed-channels-enabled.sh" || true
 fi
 
 read -rp "$(_t prompt_bot_name)" BOT_NAME
@@ -383,29 +537,68 @@ if ! npm run build --loglevel warn; then
 fi
 ok "$(_t macos.ts_built)"
 
+# Stamp the build-marker after a successful fresh-install build, mirroring the
+# update.sh self-heal (dist/.built-commit records the commit dist was built
+# from). On a build abort, fail()/the ERR-trap exit 1 BEFORE this line, so the
+# marker is only ever written for a complete dist -- it can never falsely
+# report a stale/partial dist as healthy. Stamping it here also keeps a later
+# update.sh run from a needless first-adoption self-healing rebuild (marker ==
+# HEAD on a fresh install). A failed rev-parse just leaves the marker absent,
+# which the update.sh self-heal then handles exactly as before (no regression).
+if [ -d "$INSTALL_DIR/dist" ]; then
+  _built_commit="$(git -C "$INSTALL_DIR" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$_built_commit" ] && printf '%s\n' "$_built_commit" > "$INSTALL_DIR/dist/.built-commit"
+fi
+
 INSTALL_STEP="configuration"
 # Step 6: Configuration
 echo ""
 echo -e "${BOLD}$(_t section_6_macos)${NC}"
 
-# Create .env
-(umask 077 && cat > "$INSTALL_DIR/.env" << ENVEOF
-# Main agent konfiguracio
-CHANNEL_PROVIDER=${CHANNEL_PROVIDER}
-OWNER_NAME=${OWNER_NAME}
-BOT_NAME=${BOT_NAME}
-BRAND_NAME=${BRAND_NAME}
-MAIN_AGENT_ID=${MAIN_AGENT_ID}
-SERVICE_ID=${SERVICE_ID}
-ENVEOF
-)
-# Append provider-specific tokens
+# Create or UPDATE .env -- MERGE, never replace (card 8290FF71). The old
+# cat> heredoc regenerated the file on every run, silently dropping every
+# line the installer does not own: wizard-saved credentials
+# (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY), operator-added keys
+# (WEB_HOST, GOOGLE_API_KEY, MAIN_AGENT_ISOLATED_CONFIG, ...) and a live
+# pairing (ALLOWED_CHAT_ID) -- so a re-run over a working install broke it.
+# Critical toggles should additionally live in store/config-overrides.json
+# (two-layer store), which install/update never touches.
+env_merge_key() {
+  # env_merge_key KEY VALUE -- drop any existing KEY= line, append KEY=VALUE.
+  _emk_tmp="$INSTALL_DIR/.env.tmp.$$"
+  grep -v "^$1=" "$INSTALL_DIR/.env" > "$_emk_tmp" 2>/dev/null || true
+  printf '%s=%s\n' "$1" "$2" >> "$_emk_tmp"
+  mv "$_emk_tmp" "$INSTALL_DIR/.env"
+  chmod 600 "$INSTALL_DIR/.env"
+}
+env_keep_or_set() {
+  # env_keep_or_set KEY VALUE -- like env_merge_key, but an EMPTY new value
+  # never clobbers an existing non-empty one (re-run with a skipped prompt).
+  _eks_existing="$(grep "^$1=" "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+  if [ -z "$2" ] && [ -n "$_eks_existing" ]; then return 0; fi
+  env_merge_key "$1" "$2"
+}
+(umask 077 && touch "$INSTALL_DIR/.env")
+chmod 600 "$INSTALL_DIR/.env"
+[ -s "$INSTALL_DIR/.env" ] || printf '# Main agent konfiguracio\n' >> "$INSTALL_DIR/.env"
+env_merge_key CHANNEL_PROVIDER "${CHANNEL_PROVIDER}"
+env_merge_key OWNER_NAME "${OWNER_NAME}"
+env_merge_key BOT_NAME "${BOT_NAME}"
+env_merge_key BRAND_NAME "${BRAND_NAME}"
+env_merge_key MAIN_AGENT_ID "${MAIN_AGENT_ID}"
+env_merge_key SERVICE_ID "${SERVICE_ID}"
+env_merge_key WEB_PORT "${WEB_PORT:-3420}"
 if [ "$CHANNEL_PROVIDER" = "telegram" ]; then
-  echo "TELEGRAM_BOT_TOKEN=${BOT_TOKEN}" >> "$INSTALL_DIR/.env"
-  echo "ALLOWED_CHAT_ID=${CHAT_ID}" >> "$INSTALL_DIR/.env"
+  env_keep_or_set TELEGRAM_BOT_TOKEN "${BOT_TOKEN}"
+  # Never demote a paired install: CHAT_ID=0 means pairing was skipped THIS
+  # run -- it must not overwrite a real chat id from a previous run.
+  _existing_chat="$(grep '^ALLOWED_CHAT_ID=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+  if [ "${CHAT_ID}" != "0" ] || [ -z "$_existing_chat" ]; then
+    env_merge_key ALLOWED_CHAT_ID "${CHAT_ID}"
+  fi
 else
-  echo "SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}" >> "$INSTALL_DIR/.env"
-  echo "SLACK_APP_TOKEN=${SLACK_APP_TOKEN}" >> "$INSTALL_DIR/.env"
+  env_keep_or_set SLACK_BOT_TOKEN "${SLACK_BOT_TOKEN}"
+  env_keep_or_set SLACK_APP_TOKEN "${SLACK_APP_TOKEN}"
 fi
 chmod 600 "$INSTALL_DIR/.env"
 echo -e "  ${GREEN}✓${NC} $(_t macos.env_created)"
@@ -413,6 +606,75 @@ echo -e "  ${GREEN}✓${NC} $(_t macos.env_created)"
 # Create store directory
 mkdir -p "$INSTALL_DIR/store"
 mkdir -p "$INSTALL_DIR/agents"
+
+# Persist the service-side credential captured in the auth step. Both sinks are
+# needed: .env is what channels.sh exports for the MAIN agent, and the fleet
+# token file is what per-agent config-dir isolation reads for SUB-agents.
+if [ -n "${MACOS_OAUTH_TOKEN_INPUT:-}" ]; then
+  env_merge_key CLAUDE_CODE_OAUTH_TOKEN "$MACOS_OAUTH_TOKEN_INPUT"
+  chmod 600 "$INSTALL_DIR/.env"
+  if printf '%s' "$MACOS_OAUTH_TOKEN_INPUT" | grep -Eq '^sk-ant-oat01-[A-Za-z0-9_-]{40,}$'; then
+    (umask 077 && printf '%s' "$MACOS_OAUTH_TOKEN_INPUT" > "$INSTALL_DIR/store/.claude-oauth-token")
+    ok "Fleet setup-token eltarolva (store/.claude-oauth-token) -- per-agent izolacio aktiv"
+  fi
+fi
+
+# ── Fail-closed auth gate ────────────────────────────────────────────────────
+# Three states; the failure branches must never print the success text.
+INSTALL_AUTH_STATE="BROKEN"
+_svc_token=""
+if [ -s "$INSTALL_DIR/store/.claude-oauth-token" ]; then
+  _svc_token="$(cat "$INSTALL_DIR/store/.claude-oauth-token" 2>/dev/null || true)"
+fi
+if [ -z "$_svc_token" ]; then
+  _svc_token="$(grep -E '^CLAUDE_CODE_OAUTH_TOKEN=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+fi
+_svc_apikey="$(grep -E '^ANTHROPIC_API_KEY=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+
+if ! service_auth_present; then
+  INSTALL_AUTH_STATE="BROKEN"
+elif ! command -v claude >/dev/null 2>&1; then
+  INSTALL_AUTH_STATE="UNKNOWN"
+else
+  # Probe the way a SERVICE runs: isolated config dir (so the Keychain and the
+  # operator's shell cannot make a broken install look healthy) carrying ONLY
+  # the credential the launchd units will get.
+  _probe_cfg="$(mktemp -d 2>/dev/null || echo /tmp/marveen-authprobe.$$)"
+  if [ -n "$_svc_token" ]; then
+    _probe_out="$(env -i PATH="$PATH" HOME="$HOME" CLAUDE_CONFIG_DIR="$_probe_cfg" \
+      CLAUDE_CODE_OAUTH_TOKEN="$_svc_token" claude --print "ping" 2>&1)"
+  else
+    _probe_out="$(env -i PATH="$PATH" HOME="$HOME" CLAUDE_CONFIG_DIR="$_probe_cfg" \
+      ANTHROPIC_API_KEY="$_svc_apikey" claude --print "ping" 2>&1)"
+  fi
+  _probe_rc=$?
+  _probe_out=${_probe_out:0:200}
+  if [ "$_probe_rc" -eq 0 ] && [ -n "$_probe_out" ]; then
+    INSTALL_AUTH_STATE="OK"
+  else
+    INSTALL_AUTH_STATE="BROKEN"
+  fi
+  rm -rf "$_probe_cfg" 2>/dev/null || true
+fi
+unset _svc_token _svc_apikey
+
+case "$INSTALL_AUTH_STATE" in
+  OK)
+    ok "Auth ellenorizve a SZOLGALTATASOK utjan (izolalt konfig + a unitok hitelesitoje)"
+    ;;
+  UNKNOWN)
+    warn "Az auth-ot NEM tudtam ellenorizni (nincs futtathato claude vagy nincs halozat)."
+    echo -e "    ${DIM}A telepites folytatodik, de az ugynokok indulasa nincs igazolva.${NC}"
+    ;;
+  *)
+    warn "AZ UGYNOKOK IGY NEM FOGNAK ELINDULNI: a telepites nem hordoz mukodo auth kulcsot."
+    echo -e "    ${DIM}A szolgaltatasok CSAK ezt a ket helyet olvassak:${NC}"
+    echo -e "    ${DIM}  - $INSTALL_DIR/.env  (CLAUDE_CODE_OAUTH_TOKEN vagy ANTHROPIC_API_KEY)${NC}"
+    echo -e "    ${DIM}  - $INSTALL_DIR/store/.claude-oauth-token${NC}"
+    echo -e "    ${DIM}A Keychain-bejelentkezes (claude auth login) ehhez NEM eleg.${NC}"
+    echo -e "    ${BOLD}Javitas most: ${BLUE}bash \"$INSTALL_DIR/scripts/auth.sh\"${NC}"
+    ;;
+esac
 echo -e "  ${GREEN}✓${NC} $(_t macos.dirs_created)"
 
 # Generate CLAUDE.md from template
@@ -422,6 +684,7 @@ if [ -f "$INSTALL_DIR/templates/CLAUDE.md.template" ]; then
       -e "s/{{CHAT_ID}}/$CHAT_ID/g" \
       -e "s/{{BOT_NAME}}/$BOT_NAME/g" \
       -e "s/{{MAIN_AGENT_ID}}/$MAIN_AGENT_ID/g" \
+      -e "s/{{WEB_PORT}}/${WEB_PORT:-3420}/g" \
       "$INSTALL_DIR/templates/CLAUDE.md.template" > "$INSTALL_DIR/CLAUDE.md"
   echo -e "  ${GREEN}✓${NC} $(_t macos.claude_md_generated)"
 else
@@ -757,7 +1020,27 @@ echo -e "${BOLD}$(_t section_7)${NC}"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 mkdir -p "$PLIST_DIR"
 
-NODE_PATH="$(which node)"
+# Pin launchd services to a stable Node 22 (brew node@22). Homebrew's generic
+# `node` symlink auto-upgrades to new majors (e.g. 26) whose ABI breaks the
+# prebuilt better-sqlite3 binary, preventing the dashboard from starting and the
+# dashboard token from ever being created. node@22 is keg-only, so a generic
+# `node` of any major can coexist -- we ensure node@22 is present and pin the
+# services directly to its keg path.
+NODE22_PREFIX="$(brew --prefix node@22 2>/dev/null || true)"
+if { [ -z "$NODE22_PREFIX" ] || [ ! -x "$NODE22_PREFIX/bin/node" ]; } && command -v brew &>/dev/null; then
+  echo -e "  ${ORANGE}node@22 telepitese a launchd szolgaltatasokhoz (ABI-stabil better-sqlite3)...${NC}"
+  brew install node@22 || true
+  NODE22_PREFIX="$(brew --prefix node@22 2>/dev/null || true)"
+fi
+if [ -n "$NODE22_PREFIX" ] && [ -x "$NODE22_PREFIX/bin/node" ]; then
+  NODE_PATH="$NODE22_PREFIX/bin/node"
+else
+  # Last-resort fallback: node@22 could not be installed (e.g. no brew). The
+  # services may still break on an ABI-incompatible node -- warn loudly.
+  NODE_PATH="$(which node)"
+  echo -e "  ${RED}Figyelem:${NC} node@22 nem elerheto, a szolgaltatasok ${NODE_PATH}-ra allnak. ABI-hiba eseten telepitsd: brew install node@22"
+fi
+NODE_BIN_DIR="$(dirname "$NODE_PATH")"
 # Launchd labels key off SERVICE_ID. SERVICE_ID == MAIN_AGENT_ID for a
 # brand-unaware (default) install, so these labels are unchanged unless the
 # operator picked a distinct brand above.
@@ -790,9 +1073,19 @@ cat > "$PLIST_DIR/${DASHBOARD_PLIST}.plist" << PLISTEOF
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>${HOME}/.local/bin:/opt/homebrew/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>${NODE_BIN_DIR}:${HOME}/.local/bin:/opt/homebrew/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key>
     <string>${HOME}</string>
+  </dict>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>16384</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>32768</integer>
   </dict>
 </dict>
 </plist>
@@ -825,7 +1118,7 @@ cat > "$PLIST_DIR/${CHANNELS_PLIST}.plist" << PLISTEOF
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>${HOME}/.local/bin:/opt/homebrew/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>${NODE_BIN_DIR}:${HOME}/.local/bin:/opt/homebrew/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key>
     <string>${HOME}</string>
     <key>USER</key>
@@ -963,10 +1256,10 @@ if [ -f "$INSTALL_DIR/store/.dashboard-token" ]; then
   DASH_TOKEN=$(cat "$INSTALL_DIR/store/.dashboard-token")
 fi
 if [ -n "$DASH_TOKEN" ]; then
-  echo -e "  ${BOLD}Dashboard:${NC} ${BLUE}http://localhost:3420/?token=${DASH_TOKEN}${NC}"
+  echo -e "  ${BOLD}Dashboard:${NC} ${BLUE}http://localhost:${WEB_PORT:-3420}/?token=${DASH_TOKEN}${NC}"
   echo -e "  ${DIM}$(_t dash.token_hint)${NC}"
 else
-  echo -e "  ${BOLD}Dashboard:${NC} http://localhost:3420"
+  echo -e "  ${BOLD}Dashboard:${NC} http://localhost:${WEB_PORT:-3420}"
   echo -e "  ${DIM}$(_t dash.no_token_hint)${NC}"
 fi
 echo -e "  ${BOLD}Telegram:${NC} $(_t telegram.write_hint)"
@@ -980,3 +1273,16 @@ echo -e "  ${DIM}Frissites: ./update.sh${NC}"
 echo -e "  ${DIM}Leallitas: ./scripts/stop.sh${NC}"
 echo ""
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+# The auth verdict is repeated LAST: the closing "next steps" tell the user the
+# bot will answer, which is false when the services have no working credential.
+if [ "${INSTALL_AUTH_STATE:-UNKNOWN}" != "OK" ]; then
+  echo ""
+  if [ "${INSTALL_AUTH_STATE:-}" = "UNKNOWN" ]; then
+    echo -e "  ${ORANGE}! FIGYELEM: az auth-ot nem sikerult ellenoriznunk.${NC}"
+  else
+    echo -e "  ${RED}✗ AZ UGYNOKOK MEG NEM FOGNAK VALASZOLNI: hianyzik a mukodo auth kulcs.${NC}"
+  fi
+  echo -e "  ${BOLD}  Javitas: ${BLUE}bash \"$INSTALL_DIR/scripts/auth.sh\"${NC}${BOLD} majd ${BLUE}bash \"$INSTALL_DIR/scripts/channels.sh\" restart${NC}"
+  echo ""
+fi

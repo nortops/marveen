@@ -3,21 +3,23 @@ import { join } from 'node:path'
 import {
   listKanbanCards, createKanbanCard, updateKanbanCard,
   deleteKanbanCard, moveKanbanCard, archiveKanbanCard, unarchiveKanbanCard,
-  getKanbanComments, addKanbanComment, listKanbanProjects,
+  getKanbanComments, addKanbanComment, getKanbanCardEvents, listKanbanProjects,
   getKanbanCard, getChildCards, getDb,
   createAgentMessage, markKanbanCardDispatched,
+  getKanbanSeqByIdPrefix,
   listLabels, getLabel, createLabel, updateLabel, deleteLabel,
   addLabelToCard, removeLabelFromCard, getLabelsForAllCards, getLabelsForCard,
   listArchivedKanbanCards,
   revertIdeaFromKanban,
 } from '../../db.js'
+import { normalizeKanbanRefs } from '../kanban-ref-normalize.js'
 import { OWNER_NAME, BOT_NAME, MAIN_AGENT_ID, STORE_DIR, WEB_HOST, WEB_PORT, KANBAN_LABEL_COLORS } from '../../config.js'
 import { listAgentNames, readAgentDisplayName } from '../agent-config.js'
 import { isAgentRunning } from '../agent-process.js'
 import { resolveKanbanDispatchTarget } from '../../kanban-dispatch.js'
 import { generateBreakdown } from '../llm-breakdown.js'
 import { logger } from '../../logger.js'
-import { readBody, json } from '../http-helpers.js'
+import { readBody, json, jsonMaybeGzip } from '../http-helpers.js'
 import { getEffectiveSettingValue } from '../../settings-store.js'
 import type { RouteContext } from './types.js'
 
@@ -34,6 +36,16 @@ export function kanbanMoveInstructions(id: string, target: string): string {
   const auth = `-H "Authorization: Bearer $(cat ${tokenPath})"`
   const moveUrl = `${base}/api/kanban/${id}/move`
   const commentUrl = `${base}/api/kanban/${id}/comments`
+  const cardUrl = `${base}/api/kanban/${id}`
+  // Escalation target when blocked: sub-agents hand back to the main agent
+  // (their delegator), who triages and only escalates to the operator when
+  // the block genuinely needs a human decision. Only the main agent itself
+  // escalates directly to OWNER_NAME -- sub-agent completions/blocks route
+  // through the main agent, not straight to the operator (operator feedback,
+  // 2026-07-02: a finished/blocked delegated card goes back to the delegator,
+  // not to the human).
+  const isMainAgent = target === MAIN_AGENT_ID
+  const escalateTo = isMainAgent ? OWNER_NAME : MAIN_AGENT_ID
   return [
     'A kártyát in_progress-re húzták. Amikor VÉGEZTÉL, két lépés (mindkettő a kártyára kerül, a web UI-ban látszik):',
     '',
@@ -49,7 +61,17 @@ export function kanbanMoveInstructions(id: string, target: string): string {
     `    -H 'Content-Type: application/json' \\`,
     `    -d '{"status":"done"}'`,
     '',
-    'Ha elakadtál / inputra vársz: a 2) helyett status="waiting".',
+    `Ha elakadtál / ${escalateTo} döntésére/lépésére vársz: NE csak status="waiting"-et állíts be. HÁROM lépés kell EGYÜTT:`,
+    `  a) Írj egy kommentet ami KÖZVETLENÜL ${escalateTo}-hez szól, egyértelműen megfogalmazva mit kell eldöntenie/megtennie (NE a saját belső elemzésedet írd oda) -- ugyanaz a comments hívás mint fent, "content" mezőben.`,
+    `  b) Told át a kártyát ${escalateTo}-re, hogy egyértelmű legyen a felelősség (a te neved NE maradjon rajta, ha nem te vagy a blokkoló):`,
+    `     curl -s -X PUT ${cardUrl} \\`,
+    `       ${auth} \\`,
+    `       -H 'Content-Type: application/json' \\`,
+    `       -d '{"assignee":"${escalateTo}"}'`,
+    `  c) Csak EZUTÁN állítsd a kártyát status="waiting"-re (a fenti move-hívással, "waiting" értékkel "done" helyett).`,
+    isMainAgent
+      ? `Ez azért kritikus, mert ${OWNER_NAME} nem tudja kitalálni a dashboardon hogy egy nála maradt/rossz-assignee-jű, homályos kártya rá vár -- explicit átadás + explicit kérdés nélkül a felelősség-váltás elvész.`
+      : `FONTOS: ${OWNER_NAME}-hez (az operátorhoz) EGYENESEN NE told át a kártyát, még ha a blokk végül tőle igényel is döntést -- ${MAIN_AGENT_ID} a delegálód, ő triázsol és ő dönti el, hogy tovább kell-e ${OWNER_NAME}-hez eszkalálnia. Ez azért kritikus, mert ${MAIN_AGENT_ID} nem tudja kitalálni a dashboardon hogy egy nála maradt/rossz-assignee-jű kártya rá vár -- explicit átadás + explicit kérdés nélkül a felelősség-váltás elvész.`,
     'A "done"-t mindenképp te jelezd — a dashboard csak az in_progress/waiting állapotot követi automatikusan a session aktivitásából. Az eredmény-kommentet (1) ne hagyd ki: az a kártyán a látható eredmény.',
   ].join('\n')
 }
@@ -89,7 +111,7 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
     // everything it needs in a single round trip.
     const labelsByCard = getLabelsForAllCards()
     const cards = listKanbanCards().map((card) => ({ ...card, labels: labelsByCard.get(card.id) ?? [] }))
-    json(res, cards)
+    jsonMaybeGzip(req, res, cards)
     return true
   }
 
@@ -146,8 +168,23 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
     const cardId = decodeURIComponent(cardLabelsMatch[1])
     if (!getKanbanCard(cardId)) { json(res, { error: 'Kártya nem található' }, 404); return true }
     const body = await readBody(req)
-    const { labelId } = JSON.parse(body.toString()) as { labelId?: string }
-    if (!labelId || !getLabel(labelId)) { json(res, { error: 'Címke nem található' }, 404); return true }
+    // Accept `id` as an alias for `labelId` -- API callers reasonably send either,
+    // since GET /api/kanban/labels returns objects keyed by `id`, not `labelId`.
+    const parsed = JSON.parse(body.toString()) as { labelId?: string; id?: string }
+    const labelId = parsed.labelId ?? parsed.id
+    if (!labelId) { json(res, { error: 'labelId mező kötelező' }, 400); return true }
+    if (!getLabel(labelId)) {
+      // Common mistake: sending the label's `name` where an `id` is expected -- GET
+      // /api/kanban/labels lists both, so this is an easy mix-up. Point at the real id
+      // instead of a bare "not found" that reads as if the label doesn't exist at all.
+      const byName = listLabels().find((l) => l.name === labelId)
+      if (byName) {
+        json(res, { error: `Címke nem található id alapján -- a "${labelId}" egy név, nem id. Használd az id-t: ${byName.id}` }, 404)
+        return true
+      }
+      json(res, { error: 'Címke nem található' }, 404)
+      return true
+    }
     addLabelToCard(cardId, labelId)
     json(res, { ok: true })
     return true
@@ -208,8 +245,8 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
   if (kanbanMoveMatch && method === 'POST') {
     const id = decodeURIComponent(kanbanMoveMatch[1])
     const body = await readBody(req)
-    const { status, sort_order } = JSON.parse(body.toString())
-    if (moveKanbanCard(id, status, sort_order ?? 0)) {
+    const { status, sort_order, actor } = JSON.parse(body.toString())
+    if (moveKanbanCard(id, status, sort_order ?? 0, actor)) {
       // Wake the assigned agent once when the card enters in_progress.
       if (status === 'in_progress') fireKanbanDispatch(id)
       json(res, { ok: true })
@@ -262,7 +299,18 @@ export async function tryHandleKanban(ctx: RouteContext): Promise<boolean> {
     const body = await readBody(req)
     const { author, content } = JSON.parse(body.toString())
     if (!author || !content) { json(res, { error: 'Szerző és tartalom kötelező' }, 400); return true }
-    json(res, addKanbanComment(cardId, author, content))
+    // Code-side kanban-ref enforcement: rewrite `#<hex8>` references that map
+    // to a real card into the human-facing `#<seq>` form before persistence
+    // (#75 Cuzcoo dispatch). Random hex / non-matching tokens pass through.
+    const normalizedContent = normalizeKanbanRefs(content, getKanbanSeqByIdPrefix)
+    json(res, addKanbanComment(cardId, author, normalizedContent))
+    return true
+  }
+
+  const kanbanEventsMatch = path.match(/^\/api\/kanban\/([^/]+)\/events$/)
+  if (kanbanEventsMatch && method === 'GET') {
+    const cardId = decodeURIComponent(kanbanEventsMatch[1])
+    json(res, getKanbanCardEvents(cardId))
     return true
   }
 

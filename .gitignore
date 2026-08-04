@@ -35,6 +35,9 @@ test-results/
 # Generated from template (personal config)
 CLAUDE.md
 
+# Agent persona / soul (per-operator personality; never ship upstream)
+SOUL.md
+
 # Custom MCP servers and config (user-specific)
 mcp-servers/
 .mcp.json
@@ -56,17 +59,36 @@ backups/
 # GitNexus knowledge-graph index (local, per-clone; auto-rebuilt by the post-commit hook)
 .gitnexus/
 
+# Context-guard runtime handoff document (auto-written by agents at ~90% context;
+# per-session state, never source).
+HANDOFF.md
+
 # Local one-off artifacts (brainstorm docs, runtime state, rebuild prompts) --
 # never committed; ignored to prevent accidental `git add -A` bloat.
 DREAM.md
 .external-ops-last-run
 REBUILD_PROMPT_V3.1.md
 
+# Main agent's runtime voice config (responseMode/voiceModel). Sub-agents store
+# theirs under agents/ (already ignored); the main agent's lives at the repo root
+# and is per-install runtime state, never source.
+/agent-config.json
+
 # Operator's branded support auto-reply. The shipped support-mail tooling is a
 # generic IMAP/SMTP CLI (no operator data); each operator keeps their own
 # branded auto-reply here locally. Ignored so it never ships to other installs.
 scripts/support-mail/no-support-reply.html
 
+# M365 / Graph mail credentials (client secret, tenant/client IDs). Plaintext
+# secret -- never commit. Operator keeps this locally per install.
+marveen-mail-ugyfelkod
+*.secret
+.mail-credentials*
+
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# Claude Code Channels runtime config/session dir (sessions, history, tokens,
+# plugins, skills). Per-install runtime state -- never source, never commit.
+.channels-config/

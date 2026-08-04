@@ -36,7 +36,10 @@ Először döntsd el az alábbi 3 kérdéssel:
 **Ha A vagy B vagy C IGEN: KÖTELEZŐ skill akció, nem kihagyható.**
 
 Lépések:
-1. Nézd meg `ls ~/.claude/skills/`-szel hogy van-e már lefedő skill (a `.skill-index.md`-ben szöveges keresés)
+1. Keress meglévő skillt a globális és az ágensspecifikus indexben egyaránt:
+   - Globális: `~/.claude/skills/.skill-index.md` (szöveges keresés)
+   - Ágensspecifikus (ha van): `./.claude/skills/.skill-index.md` a munkamappádban (szöveges keresés)
+   - Az ágensspecifikus index mindkét szintet tartalmazza, tehát ha az létezik, elég azt nézegetni.
 2. Ha van releváns skill: PATCH (csak a megváltozott rész cseréje, ne az egész fájl).
    - A `## Buktatók` szekciót preferáld ha hiba/recovery volt.
    - A `## Eljárás` szekciót ha a folyamat változott.
@@ -63,7 +66,11 @@ Lépések:
    - ...
    EOF
    ```
-4. Index regen: `bash {{INSTALL_DIR}}/scripts/skill-index.sh`
+4. Index regen (mindkét szint):
+   ```bash
+   bash {{INSTALL_DIR}}/scripts/skill-index.sh          # globális index frissítése
+   bash {{INSTALL_DIR}}/scripts/skill-index.sh "$(pwd)" # ágensspecifikus merged index frissítése
+   ```
 
 **Ha kihagytad a skill akciót, pedig A/B/C valamelyike IGEN volt:** kötelezően írj `hot` tier memóriát "skip-skill: <konkrét ok>" tartalommal, hogy később lássuk miért. Ne csendben hagyd ki.
 
@@ -75,4 +82,6 @@ Ha NINCS komplex feladat / hiba / korrekció (A=B=C=NEM), ÉS nincs várakozó T
 - Ne ments memóriát feleslegesen
 - Ne generálj skill-t
 - Ne küldj üzenetet a csatornára
-- Maradj csendben (egy rövid "csendes heartbeat" sor a transzkriptbe elég)
+- Maradj csendben: egyszerűen FEJEZD BE a kört, akció nélkül.
+
+**KRITIKUS (felügyelet nélküli stabilitás):** SOHA ne gépelj semmit az input-boxba (a `❯` prompt-sorba) és ne hagyj ott parkolt, el-nem-küldött szöveget -- még a "csendes heartbeat" szót sem. Ha jelezni akarod a csendes kört, az KIZÁRÓLAG a normál válasz-szövegedben (transzkript) lehet, EGYETLEN rövid sorral, majd a köröd azonnal érjen véget. Parkolt input-szöveg blokkolja a következő üzenet kézbesítését (a router `busy`-nak látja a sessiont) -> a csatorna NÉMUL felügyelet nélkül.

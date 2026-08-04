@@ -4,8 +4,9 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { logger } from './logger.js'
 import { formatForTelegram, splitMessage } from './format.js'
+import { markIfTestRun } from './test-run-marker.js'
 
-export type ChannelProviderType = 'telegram' | 'slack' | 'discord' | 'googlechat'
+export type ChannelProviderType = 'telegram' | 'slack' | 'discord' | 'googlechat' | 'teams'
 
 export interface ChannelProvider {
   readonly type: ChannelProviderType
@@ -348,6 +349,47 @@ const googlechatProvider: ChannelProvider = {
   splitMessage: (text) => splitMessage(text, GOOGLECHAT_MAX_MESSAGE_LENGTH),
 }
 
+// -- Microsoft Teams implementation --
+//
+// Teams (Azure Bot Service) has no single bot token: the channel plugin
+// authenticates with an app id + client secret + tenant id (TEAMS_BOT_*) and
+// receives Activities over an inbound webhook (JWT-validated). So the
+// token-based dashboard helpers below are minimal -- actual delivery happens
+// through the plugin's MCP tools, not these direct-send methods (same shape as
+// the Google Chat stub). "Configured" is detected via TEAMS_BOT_APP_ID in the
+// agent's channel .env (see readChannelToken), standing in for the token.
+
+const TEAMS_MAX_MESSAGE_LENGTH = 28000
+
+const teamsProvider: ChannelProvider = {
+  type: 'teams',
+  pluginId: 'teams@marveen-marketplace',
+  pluginPaneId: 'plugin:teams:marveen-marketplace',
+  envKeys: ['TEAMS_BOT_APP_ID', 'TEAMS_BOT_APP_PASSWORD', 'TEAMS_BOT_TENANT_ID'],
+  stateDir: 'teams',
+  chatIdFormat: 'Teams conversation id (managed by the plugin per pairing)',
+
+  async sendMessage() {
+    // Direct dashboard send is not supported for Teams; the agent delivers via
+    // the plugin's reply tool inside its own session (Bot Framework outbound
+    // needs the per-conversation serviceUrl + a client_credentials token).
+    throw new Error('teams: direct dashboard send not supported (delivery via plugin MCP tools)')
+  },
+
+  async sendPhoto() {
+    throw new Error('teams: direct dashboard send not supported (delivery via plugin MCP tools)')
+  },
+
+  async validateToken() {
+    // No simple token model; real validation happens in the plugin (app id +
+    // secret + tenant, JWT). Report ok so channel-config flows don't false-negative.
+    return { ok: true, botName: 'Microsoft Teams' }
+  },
+
+  formatMessage: (text) => text,
+  splitMessage: (text) => splitMessage(text, TEAMS_MAX_MESSAGE_LENGTH),
+}
+
 // -- Slack App manifest --
 
 const SLACK_BOT_SCOPES = [
@@ -418,6 +460,7 @@ export function getChannelToken(provider: ChannelProviderType, env: Record<strin
   if (provider === 'slack') return env['SLACK_BOT_TOKEN'] ?? ''
   if (provider === 'discord') return env['DISCORD_BOT_TOKEN'] ?? ''
   if (provider === 'googlechat') return env['GOOGLECHAT_PROJECT_ID'] ?? ''
+  if (provider === 'teams') return env['TEAMS_BOT_APP_ID'] ?? ''
   return env['TELEGRAM_BOT_TOKEN'] ?? ''
 }
 
@@ -425,6 +468,7 @@ export function getChannelChatId(provider: ChannelProviderType, env: Record<stri
   if (provider === 'slack') return env['SLACK_CHANNEL_ID'] ?? ''
   if (provider === 'discord') return env['DISCORD_CHANNEL_ID'] ?? ''
   if (provider === 'googlechat') return env['GOOGLECHAT_SPACE_ID'] ?? ''
+  if (provider === 'teams') return env['TEAMS_ALLOWED_CONVERSATION_ID'] ?? ''
   return env['ALLOWED_CHAT_ID'] ?? ''
 }
 
@@ -435,16 +479,41 @@ const providers: Record<ChannelProviderType, ChannelProvider> = {
   slack: slackProvider,
   discord: discordProvider,
   googlechat: googlechatProvider,
+  teams: teamsProvider,
+}
+
+// Every provider send is routed through the test-run marker: getProvider has
+// many callers beyond notifyChannel (agent-process, channel-monitor, agent
+// routes), and any of them reached from a test run must label its outbound
+// message. markIfTestRun is a no-op in production and idempotent, so the
+// wrapper is safe to layer under callers that already mark.
+function withTestRunMarking(provider: ChannelProvider): ChannelProvider {
+  return {
+    ...provider,
+    sendMessage: (token, chatId, text, parseMode) =>
+      provider.sendMessage(token, chatId, markIfTestRun(text), parseMode),
+    sendPhoto: (token, chatId, photoPath, caption) =>
+      provider.sendPhoto(token, chatId, photoPath, markIfTestRun(caption)),
+  }
+}
+
+const markedProviders: Record<ChannelProviderType, ChannelProvider> = {
+  telegram: withTestRunMarking(telegramProvider),
+  slack: withTestRunMarking(slackProvider),
+  discord: withTestRunMarking(discordProvider),
+  googlechat: withTestRunMarking(googlechatProvider),
+  teams: withTestRunMarking(teamsProvider),
 }
 
 export function getProvider(type: ChannelProviderType): ChannelProvider {
-  return providers[type]
+  return markedProviders[type]
 }
 
 export function getProviderType(envValue: string | undefined): ChannelProviderType {
   if (envValue === 'slack') return 'slack'
   if (envValue === 'discord') return 'discord'
   if (envValue === 'googlechat') return 'googlechat'
+  if (envValue === 'teams') return 'teams'
   return 'telegram'
 }
 
@@ -456,6 +525,7 @@ export function channelStateDir(provider: ChannelProviderType, agentDir?: string
     provider === 'slack' ? 'slack'
     : provider === 'discord' ? 'discord'
     : provider === 'googlechat' ? 'googlechat'
+    : provider === 'teams' ? 'teams'
     : 'telegram'
   return join(base, subdir)
 }
@@ -474,6 +544,7 @@ export function readChannelToken(provider: ChannelProviderType, envFilePath: str
     provider === 'slack' ? 'SLACK_BOT_TOKEN'
     : provider === 'discord' ? 'DISCORD_BOT_TOKEN'
     : provider === 'googlechat' ? 'GOOGLECHAT_PROJECT_ID'
+    : provider === 'teams' ? 'TEAMS_BOT_APP_ID'
     : 'TELEGRAM_BOT_TOKEN'
   const match = content.match(new RegExp(`${key}=(.+)`))
   return match ? match[1].trim() : null

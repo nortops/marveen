@@ -1,12 +1,12 @@
 import {
   saveAgentMemory, getAgentMemories, searchAgentMemories, getMemoryStats, updateMemory,
-  hybridSearch, backfillEmbeddings,
-  searchMemories, getMemoriesForChat, getDb,
+  hybridSearch, backfillEmbeddings, clearMemoryCache,
+  searchMemories, getMemoriesForChat, getDb, touchMemoriesAccessed,
   type Memory,
 } from '../../db.js'
-import { MAIN_AGENT_ID, ALLOWED_CHAT_ID, OLLAMA_URL } from '../../config.js'
+import { MAIN_AGENT_ID, ALLOWED_CHAT_ID, OLLAMA_URL, APP_TZ } from '../../config.js'
 import { logger } from '../../logger.js'
-import { readBody, json } from '../http-helpers.js'
+import { readBody, json, jsonMaybeGzip } from '../http-helpers.js'
 import type { RouteContext } from './types.js'
 
 // Canonical memory categories. Kept in sync with the DB CHECK constraint in
@@ -63,7 +63,11 @@ export async function tryHandleMemories(ctx: RouteContext): Promise<boolean> {
 
   if (path === '/api/memories' && method === 'GET') {
     const q = url.searchParams.get('q')?.trim() || ''
-    const agentId = url.searchParams.get('agent') || ''
+    const agentIdAlias = url.searchParams.get('agent_id')
+    if (agentIdAlias && !url.searchParams.get('agent')) {
+      logger.warn({ agent_id: agentIdAlias }, '[DEPRECATED] GET /api/memories: use "agent" instead of "agent_id"')
+    }
+    const agentId = url.searchParams.get('agent') || agentIdAlias || ''
     const tier = url.searchParams.get('tier') || url.searchParams.get('category') || ''
     const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200)
     const mode = url.searchParams.get('mode') || 'fts'
@@ -85,20 +89,31 @@ export async function tryHandleMemories(ctx: RouteContext): Promise<boolean> {
         results = db2.prepare('SELECT * FROM memories WHERE content LIKE ? ORDER BY accessed_at DESC LIMIT ?').all(`%${q}%`, limit) as Memory[]
       }
     } else if (agentId) {
-      results = getAgentMemories(agentId, limit)
+      // Category goes into the query, not a post-filter: see getAgentMemories.
+      results = getAgentMemories(agentId, limit, tier || undefined)
     } else {
       results = getMemoriesForChat(ALLOWED_CHAT_ID, limit)
     }
 
+    // Still needed for the search branches above, which rank by relevance and
+    // cannot push the category down into their own LIMIT. A no-op for the
+    // plain agent listing, which already filtered in SQL.
     if (tier) results = results.filter(m => m.category === tier)
+
+    // A search query (q) is a genuine recall: stamp the surfaced memories as
+    // just-accessed so accessed_at reflects real usage. Plain listing (no q,
+    // e.g. the dashboard browsing all memories) is NOT a recall and must not
+    // refresh accessed_at -- otherwise every poll would keep everything "fresh"
+    // and defeat staleness detection.
+    if (q && results.length) touchMemoriesAccessed(results.map(m => m.id))
 
     const formatted = results.map(m => ({
       ...m,
       embedding: undefined,
-      created_label: new Date(m.created_at * 1000).toLocaleString('hu-HU', { timeZone: 'Europe/Budapest' }),
-      accessed_label: new Date(m.accessed_at * 1000).toLocaleString('hu-HU', { timeZone: 'Europe/Budapest' }),
+      created_label: new Date(m.created_at * 1000).toLocaleString('hu-HU', { timeZone: APP_TZ }),
+      accessed_label: new Date(m.accessed_at * 1000).toLocaleString('hu-HU', { timeZone: APP_TZ }),
     }))
-    json(res, formatted)
+    jsonMaybeGzip(req, res, formatted)
     return true
   }
 
@@ -233,6 +248,9 @@ Respond ONLY with JSON, nothing else:
     const id = parseInt(memUpdateMatch[1], 10)
     const db2 = getDb()
     const changes = db2.prepare('DELETE FROM memories WHERE id = ?').run(id).changes
+    // Invalidate the in-process TTL cache so a deleted memory does not
+    // resurface in the agent-filtered list for the cache lifetime.
+    if (changes > 0) clearMemoryCache()
     if (changes > 0) { json(res, { ok: true }); return true }
     json(res, { error: 'Memory not found' }, 404)
     return true

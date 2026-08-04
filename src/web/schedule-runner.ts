@@ -1,11 +1,16 @@
-import { join } from 'node:path'
-import { readFileSync } from 'node:fs'
+import { join, isAbsolute } from 'node:path'
+import { homedir } from 'node:os'
+import { checkTaskMcpRequirements } from './schedule-mcp-precheck.js'
+import { existsSync, readFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { logger } from '../logger.js'
 import {
   PROJECT_ROOT,
   MAIN_AGENT_ID,
   ALLOWED_CHAT_ID,
+  BOT_NAME,
+  APP_TZ_INVALID,
 } from '../config.js'
 import {
   appendTaskRun,
@@ -15,18 +20,21 @@ import {
   insertPendingTaskRetryIfNew,
   markPendingTaskRetryAlert,
   clearPendingTaskRetryAlert,
+  markScheduledTaskKanbanWaiting,
 } from '../db.js'
 import { toPendingRetryView, classifyTelegramSendError, type PendingRetryView } from '../pending-retries.js'
 import {
   SCHEDULED_TASK_PREAMBLE,
   wrapScheduledTask,
 } from '../prompt-safety.js'
-import { cronMatchesNow } from './cron.js'
+import { cronPrevOccurrence, effectiveCronTz } from './cron.js'
 import {
   listScheduledTasks,
+  SCHEDULED_TASKS_DIR,
   type ScheduledTask,
 } from './scheduled-tasks-io.js'
-import { listAgentNames, readFileOr, readAgentRemoteHost } from './agent-config.js'
+import { listAgentNames, readFileOr, readAgentRemoteHost, agentDir } from './agent-config.js'
+import { channelStateDir } from '../channel-provider.js'
 import {
   agentSessionName,
   isAgentRunning,
@@ -36,10 +44,173 @@ import {
   sessionExistsOnHost,
   capturePane,
   sendEnterToSession,
+  clearStaleParkedInput,
 } from './agent-process.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { sendTelegramMessage } from './telegram.js'
 import { runCommandTask } from './command-task.js'
+import { paneShowsContextSaturation, detectsFirstRunGate, detectPaneState, type PaneState } from '../pane-state.js'
+
+// How many bare-Enter attempts the post-send resubmit tries before escalating
+// to a clear + re-inject, and the hard cap after which it gives up.
+const RESUBMIT_BARE_ENTER_ATTEMPTS = 2
+const RESUBMIT_MAX_ATTEMPTS = 6
+
+// --- Post-fire timeout watchdog ---
+// After a task/heartbeat injection, we track the target session to detect the
+// case where the agent got stuck processing the injected prompt. This closes
+// the gap in the pending_task_retries path: that path only fires when a NEW
+// task tries to inject into a busy session; if no new task arrives, a stuck
+// agent can sit undetected indefinitely.
+//
+// The design is a fire-and-monitor pattern rather than Promise.race: tmux
+// injection is fire-and-forget (no callback when the agent finishes), so we
+// poll the pane state on every scheduler tick instead.
+//
+// Grace period: the agent takes a few seconds to pick up the injected prompt.
+// We skip checking until TASK_FIRE_GRACE_MS have elapsed to avoid a false
+// clear before the agent even starts.
+//
+// Timeout: if the session is STILL busy TASK_FIRE_TIMEOUT_MS after injection,
+// we send a one-shot Telegram alert. 'busy' is the specific signal -- 'unknown'
+// and 'error' are handled by the context-guard / stuck-tool-call-watcher so we
+// leave them alone here.
+//
+// Idle clear: if the pane returns to idle at any point, the task completed (or
+// the session was restarted) and the entry is cleared.
+//
+// Maximum tracking age: entries that age past TASK_FIRE_MAX_TRACK_MS are
+// evicted regardless, so a permanently stuck agent does not accumulate entries.
+export const TASK_FIRE_GRACE_MS = 30_000
+export const TASK_FIRE_TIMEOUT_MS = 300_000
+const TASK_FIRE_MAX_TRACK_MS = 6 * 60 * 60_000
+
+export interface TaskInflightEntry {
+  taskName: string
+  agentName: string
+  session: string
+  host: string | null
+  injectedAt: number
+  alerted: boolean
+  // Per-task stuck threshold, resolved at injection time from the task config
+  // (see resolveStuckTimeoutMs). Captured on the entry rather than looked up
+  // during the sweep so an edit to the schedule mid-run cannot move the
+  // goalposts under an already-running injection.
+  timeoutMs: number
+}
+
+// How long a fired task may stay busy before the watchdog calls it stuck.
+// TASK_FIRE_TIMEOUT_MS is the right default for the common case -- a
+// short-cadence heartbeat still running after 5 minutes is a real signal --
+// but it is wrong for a task whose whole job is to think for a while. The
+// nightly analysis run tripped it at 02:12 on 2026-07-30 while working
+// normally and finished fine six minutes later: a false "possible hang" alert
+// on a task doing exactly what it was written to do. Per-task override:
+//
+//   stuckAfterMinutes unset / malformed -> TASK_FIRE_TIMEOUT_MS
+//   positive                            -> that many minutes
+//
+// Clamped at both ends. Below one minute the alert would fire inside the
+// normal startup noise; above TASK_FIRE_MAX_TRACK_MS the entry is evicted
+// before the threshold could ever be reached, so a larger value would silently
+// mean "never alert" -- exactly the kind of quiet disable this codebase keeps
+// getting bitten by. An operator who truly wants no alert should say so in a
+// way that is visible, not by writing a big number.
+export function resolveStuckTimeoutMs(
+  task: Pick<ScheduledTask, 'stuckAfterMinutes'>,
+  defaultMs: number = TASK_FIRE_TIMEOUT_MS,
+  maxMs: number = TASK_FIRE_MAX_TRACK_MS,
+): number {
+  const configured = task.stuckAfterMinutes
+  if (typeof configured !== 'number' || !Number.isFinite(configured) || configured <= 0) return defaultMs
+  return Math.min(Math.max(configured * 60_000, 60_000), maxMs)
+}
+
+// Active task/heartbeat injections keyed by `${taskName}@${agentName}`.
+const taskInflightMap = new Map<string, TaskInflightEntry>()
+
+export type TaskTimeoutDecision = 'clear' | 'alert' | 'hold'
+
+// Pure: decide what the watchdog should do for a single in-flight entry this
+// tick. Exported so it can be unit-tested without tmux I/O.
+//
+// clear -- remove the entry (session idle = task done, or entry too stale)
+// alert -- send a one-shot Telegram alert (session busy past timeout threshold)
+// hold  -- no action this tick
+//
+// Rationale for non-busy states returning 'hold' instead of 'clear':
+//   - null (capture failed): no signal, conservative.
+//   - 'unknown': session may be restarting -- other watchdogs handle it.
+//   - 'error': thinking-block API error, channel-monitor owns that alert path.
+//   - 'typing': post-send resubmit loop is already active.
+// Clearing on these states would drop the entry before the 300s timeout can
+// fire, producing false-negative coverage for genuinely stuck tasks.
+export function decideTaskTimeout(
+  entry: Pick<TaskInflightEntry, 'injectedAt' | 'alerted'>,
+  paneState: PaneState | null,
+  now: number,
+  opts: { graceMs: number; timeoutMs: number; maxTrackMs: number },
+): TaskTimeoutDecision {
+  const elapsed = now - entry.injectedAt
+  if (elapsed >= opts.maxTrackMs) return 'clear'
+  if (paneState === 'idle') return 'clear'
+  if (entry.alerted) return 'hold'
+  if (elapsed < opts.graceMs) return 'hold'
+  if (paneState === 'busy' && elapsed >= opts.timeoutMs) return 'alert'
+  return 'hold'
+}
+
+export type ResubmitAction = 'none' | 'enter' | 'reinject' | 'giveup'
+
+// Decide what the post-send resubmit loop should do on a given attempt. Pure
+// so the escalation ladder is unit-tested without tmux I/O.
+//
+// A scheduled prompt's closing Enter is occasionally swallowed by the Claude
+// TUI in raw mode, leaving the prompt parked in the input box. A parked box
+// reads 'typing' (not idle), so isSessionReadyForPrompt() stays false and
+// EVERY subsequent scheduled task is deferred -- the session pins itself busy
+// for hours on a single stranded prompt (observed 2026-07-01: 3223 deferrals
+// and 0/96 heartbeats fired in 24h, while the b7bda8f region-scope fix only
+// covered the spinner/busy path, not this typing/parked-input path). Bare
+// Enter alone loses to a persistently swallowed Enter, so after
+// RESUBMIT_BARE_ENTER_ATTEMPTS Enters we escalate to a real clear + re-inject
+// of the prompt. Re-injecting is safe here: the scheduled prompt is locally
+// authored (SKILL.md / bearer-gated editor), not the ghost-suggestion text
+// that gates the MAIN plain-text re-inject path in stuck-input-watcher.
+export function decideScheduledResubmitAction(
+  attempt: number,
+  stuck: boolean,
+): ResubmitAction {
+  if (!stuck) return 'none'
+  if (attempt >= RESUBMIT_MAX_ATTEMPTS) return 'giveup'
+  return attempt < RESUBMIT_BARE_ENTER_ATTEMPTS ? 'enter' : 'reinject'
+}
+
+// SCHEDDUP1: is OUR scheduled prompt actually parked in the input box? The
+// previous inline check (`/❯\s+\S/.test(pane) && pane.includes(marker)`) was
+// busy-blind and matched the marker ANYWHERE in the pane -- so a session that
+// had already submitted the prompt and was ACTIVELY WORKING on it (marker
+// visible in the transcript echo, anything on the input line) was judged
+// stuck, and the recovery ladder pressed keystrokes into a working session
+// (measured 2026-07-28 12:00: 20 s after injection, mid-WebSearch, task
+// completed fine). Two narrowings, both invariants pinned by unit tests:
+//   1. BUSY EXCLUSION: a busy pane is never stuck -- the prompt is running,
+//      not parked. Same identify-before-act rule as the FABLEFALL1 guards.
+//   2. MARKER IN THE INPUT REGION ONLY: the marker must sit at/after the LAST
+//      prompt box (❯), i.e. be the parked text itself -- a marker in the
+//      scrollback above is the running/finished case. This also makes the
+//      ladder's bare Enter safe by construction: it can only ever submit OUR
+//      OWN scheduled prompt, never an unrelated message that happened to park
+//      (an unrelated parked message has no marker in the input region, so no
+//      keystroke fires at all).
+export function isScheduledPromptStuck(pane: string | null, marker: string): boolean {
+  if (!pane || !pane.trim()) return false
+  if (detectPaneState(pane) === 'busy') return false
+  const idx = pane.lastIndexOf('❯')
+  if (idx < 0) return false
+  const inputRegion = pane.slice(idx)
+  return /❯\s+\S/.test(inputRegion) && inputRegion.includes(marker)
+}
 
 // --- Schedule Runner ---
 // Checks every minute if any scheduled task is due and injects the prompt
@@ -83,10 +254,243 @@ function persistScheduleLastRun(): void {
   }
 }
 
+// --- Downtime catch-up ---
+//
+// The scan window's left edge used to be a flat `now - 30 min` on startup, so
+// anything the scheduler missed while the process was down for longer than
+// that was lost WITHOUT A TRACE: no fire, no retry row, no alert (2026-07-29,
+// a dawn host crash swallowed the weekly research task, Ford's research run
+// and the morning briefing; nobody learned of it until the operator asked).
+// Rather than widening the flat window -- which would re-fire day-old crons at
+// random hours -- the runner now records when it was last alive, so the window
+// covers the ACTUAL downtime, and each missed occurrence is decided on its own
+// staleness (decideCatchUp): still-useful ones are executed as catch-ups, the
+// rest are recorded as 'missed' runs and reported. The one thing that never
+// happens again is silence.
+const SCHEDULE_TICK_STATE_PATH = join(PROJECT_ROOT, 'store', 'schedule-tick-state.json')
+
+// Hard ceiling on the catch-up window. Beyond this the downtime is an outage,
+// not a hiccup: replaying a week of crons on boot would be a burst of stale
+// work, so the window is capped and everything older is simply out of scope.
+export const SCHEDULE_MAX_CATCHUP_MS = 24 * 60 * 60_000
+// Used when no liveness stamp exists (fresh install, or the store file was
+// wiped). Same value the runner has always used, so first-boot behaviour is
+// unchanged.
+export const SCHEDULE_COLD_START_CATCHUP_MS = 30 * 60_000
+// Writing the stamp on every 15 s tick would be 5.7k atomic writes a day for
+// no benefit; at 60 s the worst case is a 60 s-too-wide window on the next
+// boot, and a too-wide window is harmless (the per-task lastRun guard rejects
+// occurrences that already fired).
+const TICK_STATE_PERSIST_INTERVAL_MS = 60_000
+// An occurrence younger than this was scanned by the tick it belongs to --
+// normal operation. Anything older means the tick that should have caught it
+// never ran (process down, dropped tick), i.e. this is a catch-up.
+export const LATE_CATCHUP_THRESHOLD_MS = 90_000
+
+// Per-type staleness defaults, in minutes, for a MISSED occurrence:
+//   task      -- operator-facing work (briefings, reports). Useful for a few
+//                hours, absurd the next evening.
+//   heartbeat -- short-cadence background checks. The next tick is already on
+//                its way, so only a very recent miss is worth replaying.
+//   command   -- cheap, idempotent shell monitors (token refresh, disk check).
+//                Running one late costs nothing and NOT running it is exactly
+//                how the Gmail token refresher died silently for four days.
+// Custom types exist in the wild: task-config.json's `type` is cast, not
+// validated, so the live install runs a `type: "dream-engine"` task. An unknown
+// key must fall back to the 'task' budget -- an undefined lookup would make the
+// comparison NaN and silently declare EVERY occurrence of that task stale,
+// which is the exact failure this whole path exists to remove.
+export const DEFAULT_CATCHUP_MAX_AGE_MIN: Record<'task' | 'heartbeat' | 'command', number> = {
+  task: 180,
+  heartbeat: 30,
+  command: 1440,
+}
+
+export type CatchUpDecision = 'on-time' | 'catch-up' | 'stale'
+
+/** Resolved staleness budget for a task, in ms (Infinity = always catch up). */
+export function catchUpMaxAgeMs(task: Pick<ScheduledTask, 'type' | 'catchUpMaxAgeMinutes'>): number {
+  const configured = task.catchUpMaxAgeMinutes
+  if (typeof configured === 'number' && Number.isFinite(configured)) {
+    return configured < 0 ? Infinity : configured * 60_000
+  }
+  const perType = DEFAULT_CATCHUP_MAX_AGE_MIN[task.type as 'task'] ?? DEFAULT_CATCHUP_MAX_AGE_MIN.task
+  return perType * 60_000
+}
+
+// Pure: given how late a due occurrence is, decide whether to run it normally,
+// run it as a catch-up, or record it as missed. Exported so the policy is unit-
+// tested without touching cron, tmux or the clock.
+export function decideCatchUp(
+  task: Pick<ScheduledTask, 'type' | 'catchUpMaxAgeMinutes'>,
+  ageMs: number,
+  lateThresholdMs: number = LATE_CATCHUP_THRESHOLD_MS,
+): CatchUpDecision {
+  if (ageMs <= lateThresholdMs) return 'on-time'
+  return ageMs <= catchUpMaxAgeMs(task) ? 'catch-up' : 'stale'
+}
+
+/** Pure: where the first post-start scan window begins. */
+export function computeCatchUpStart(
+  persistedTickMs: number | null,
+  now: number,
+  maxCatchUpMs: number = SCHEDULE_MAX_CATCHUP_MS,
+  coldStartMs: number = SCHEDULE_COLD_START_CATCHUP_MS,
+): number {
+  // No stamp, or a stamp from the future (the host clock jumped backwards --
+  // trusting it would produce a negative-length window and scan nothing):
+  // fall back to the historical cold-start window.
+  if (persistedTickMs == null || !Number.isFinite(persistedTickMs) || persistedTickMs > now) {
+    return now - coldStartMs
+  }
+  return Math.max(persistedTickMs, now - maxCatchUpMs)
+}
+
+function loadLastTickMs(): number | null {
+  try {
+    const raw = JSON.parse(readFileSync(SCHEDULE_TICK_STATE_PATH, 'utf-8')) as { lastTickMs?: unknown }
+    return typeof raw?.lastTickMs === 'number' && Number.isFinite(raw.lastTickMs) ? raw.lastTickMs : null
+  } catch { return null }
+}
+
+function persistLastTickMs(nowMs: number): void {
+  try {
+    atomicWriteFileSync(SCHEDULE_TICK_STATE_PATH, JSON.stringify({ lastTickMs: nowMs }, null, 2))
+  } catch (err) {
+    logger.warn({ err }, 'schedule-runner: failed to persist tick liveness stamp')
+  }
+}
+
+// Run the task's pre-check script (if configured) and return whether to skip
+// this LLM invocation and an optional context prefix to prepend to the prompt.
+//
+// Protocol (stdout + exit code):
+//   exit 0, stdout = "SKIP"  → skip the LLM entirely (nothing actionable)
+//   exit 0, stdout non-empty → run LLM with stdout as context prefix
+//   exit 0, stdout empty     → run LLM normally
+//   non-zero exit            → log warning, run LLM anyway (fail-open)
+// --- Bound-channel chat id resolution for scheduled-task prompts ---
+//
+// The prompt prefix used to carry a "chat_id: 0" sentinel meaning "the running
+// agent's own bound channel". The convention belonged to an earlier channel
+// implementation; the official Telegram plugin (0.0.6) knows nothing about it:
+// its reply tool calls assertAllowedChat(chat_id) first, "0" is never on the
+// allowlist, so every non-heartbeat scheduled task threw at delivery time
+// (Zara, 2026-07-27; all 32 task-configs affected -- none carries a chat_id).
+// The sentinel's INTENT stays correct (a sub-agent's result must go to its own
+// owner, never the boss's chat), so the fix resolves the concrete chat id at
+// prompt-build time from the same place the plugin enforces it: the agent's
+// own channel access.json allowlist.
+
+/** Pure core: first DM allowlist entry, else first allowed group, else null. */
+export function chatIdFromAccessConfig(raw: unknown): string | null {
+  if (!raw || typeof raw !== 'object') return null
+  const o = raw as Record<string, unknown>
+  if (Array.isArray(o.allowFrom) && o.allowFrom.length > 0) {
+    const first = o.allowFrom[0]
+    if (typeof first === 'string' && first.trim()) return first.trim()
+    if (typeof first === 'number') return String(first)
+  }
+  if (o.groups && typeof o.groups === 'object') {
+    const keys = Object.keys(o.groups as Record<string, unknown>)
+    if (keys.length > 0) return keys[0]
+  }
+  return null
+}
+
+/** The agent's own bound Telegram chat, or null when no binding exists.
+ *  Reads <agent channels dir>/telegram/access.json -- the exact file the
+ *  plugin's assertAllowedChat enforces, so a resolved id is deliverable by
+ *  construction. Deliberately NOT falling back to ALLOWED_CHAT_ID: that is
+ *  the boss's chat, and pointing a sub-agent's result there is the precise
+ *  bug the old sentinel existed to avoid. */
+export function resolveBoundChatId(agentName: string): string | null {
+  const dir = agentName === MAIN_AGENT_ID
+    ? channelStateDir('telegram')
+    : channelStateDir('telegram', agentDir(agentName))
+  try {
+    const raw = JSON.parse(readFileSync(join(dir, 'access.json'), 'utf-8')) as Record<string, unknown>
+    const chosen = chatIdFromAccessConfig(raw)
+    // "First allowlist entry" is a HEURISTIC, not a stated fact: access.json
+    // has no owner field, so with 2+ entries (zara/iris today) a reordering
+    // would silently redirect scheduled-task results to another person -- the
+    // exact failure class the old sentinel guarded against, now throw-free and
+    // thus invisible. The warn turns a silent misdirection into a searchable
+    // log line; behaviour is unchanged (Marveen, msg 7002).
+    const candidates = Array.isArray(raw?.allowFrom) ? raw.allowFrom.length : 0
+    if (chosen && candidates > 1) {
+      logger.warn({ agent: agentName, candidates, chosen }, 'bound-chat resolution is ambiguous: multiple DM allowlist entries, using the first')
+    }
+    return chosen
+  } catch { return null }
+}
+
+export function runPreCheck(task: ScheduledTask): { skip: boolean; prefix?: string } {
+  if (!task.preCheck) return { skip: false }
+  const scriptPath = isAbsolute(task.preCheck)
+    ? task.preCheck
+    : join(SCHEDULED_TASKS_DIR, task.name, task.preCheck)
+  if (!existsSync(scriptPath)) {
+    logger.warn({ task: task.name, scriptPath }, 'pre-check script not found, running LLM anyway')
+    return { skip: false }
+  }
+  try {
+    const r = spawnSync('bash', [scriptPath], { timeout: 10_000, encoding: 'utf-8' })
+    if (r.error) {
+      logger.warn({ task: task.name, error: r.error.message }, 'pre-check script spawn error, running LLM anyway')
+      return { skip: false }
+    }
+    if (r.status !== 0) {
+      logger.warn({ task: task.name, status: r.status, stderr: (r.stderr || '').trim().slice(0, 200) }, 'pre-check script exited non-zero, running LLM anyway')
+      return { skip: false }
+    }
+    const out = (r.stdout || '').trim()
+    if (out === 'SKIP') {
+      logger.info({ task: task.name }, 'pre-check: nothing actionable, skipping LLM')
+      return { skip: true }
+    }
+    if (out) return { skip: false, prefix: out }
+    return { skip: false }
+  } catch (err) {
+    logger.warn({ err, task: task.name }, 'pre-check script threw, running LLM anyway')
+    return { skip: false }
+  }
+}
+
 // Try to fire a task at a single target agent. Returns the outcome so the
 // caller can decide whether to queue a retry. Splitting this out means the
 // pendingTaskRetries loop and the normal cron loop share one code path.
-function attemptFireTask(task: ScheduledTask, agentName: string, now: number): 'fired' | 'busy' | 'missing' | 'starting' | 'error' {
+// Missing MCP server names from the last failed pre-check, keyed by
+// task@agent, so the retry-row reason and the alert can name the servers.
+const lastMcpMissing = new Map<string, string[]>()
+
+function mcpMissingReason(taskName: string, agentName: string): string {
+  const missing = lastMcpMissing.get(`${taskName}@${agentName}`) ?? []
+  return missing.length ? `mcp-missing:${missing.join(',')}` : 'mcp-missing'
+}
+
+// Two pre-check gates coexist here:
+//   1. the operator preCheck SCRIPT (business gate) runs in the callers via
+//      runPreCheck() -- it can SKIP the whole tick (no LLM) or inject context
+//      via preCheckPrefix;
+//   2. the MCP manifest check (infra gate, requires.mcp_servers) runs below,
+//      after the busy check, and defers delivery ('mcp-missing') when a
+//      required server is dead.
+// Both are fail-open: a broken script or an unreadable MCP state never
+// blocks the task.
+//
+// lateCatchUpMs is set by the caller when this tick only matched because of
+// the enlarged restart catch-up window (see startScheduleRunner) -- i.e. the
+// task missed its normal tick and is only firing now as a catch-up; it is
+// recorded as a distinct 'fired_late' run status further down instead of
+// silently folding into 'fired'.
+async function attemptFireTask(
+  task: ScheduledTask,
+  agentName: string,
+  now: number,
+  preCheckPrefix?: string,
+  lateCatchUpMs?: number,
+): Promise<'fired' | 'busy' | 'missing' | 'starting' | 'error' | 'mcp-missing' | 'first-run'> {
   const isMainAgent = agentName === MAIN_AGENT_ID
   // Allow per-task session override via targetSession config field.
   // Falls back to the standard agent session name derivation.
@@ -127,13 +531,73 @@ function attemptFireTask(task: ScheduledTask, agentName: string, now: number): '
   // will process it at the next idle slot. This prevents the infinite
   // retry loop observed when the target session stays busy for hours
   // (275 retries overnight in production).
-  if (!task.forceSend && !isSessionReadyForPrompt(session, host)) {
+  if (!task.forceSend && !(await isSessionReadyForPrompt(session, host))) {
+    // Distinguish a first-run gate (fresh-install folder-trust / login picker
+    // parked forever) from an ordinary busy turn: the retry row's reason then
+    // drives a first-run-specific operator alert instead of a generic
+    // "varakozik" -- and 'first-run' is exempt from skipIfBusy in the caller,
+    // because a gated session never frees up on its own the way a busy one
+    // does (recovery is the channel-monitor's dialog answering).
+    const notReadyPane = capturePane(session, host)
+    const gate = notReadyPane != null ? detectsFirstRunGate(notReadyPane) : null
+    if (gate) {
+      logger.warn({ task: task.name, agent: agentName, session, gate }, 'Schedule target session parked on a Claude Code first-run dialog, deferring to retry queue')
+      return 'first-run'
+    }
     logger.warn({ task: task.name, agent: agentName, session }, 'Schedule target session busy or has pending input, will retry')
     return 'busy'
   }
 
   if (task.forceSend) {
+    // forceSend's contract is "always eventually land, never silently drop" --
+    // but injecting into a 100%-context session IS a silent drop with extra
+    // steps: the pane accepts the keystrokes and the wedged session never acts
+    // on them, and the context-guard's rescue restart then discards the queued
+    // input (2026-07-17: reggeli-napindito force-injected into a saturated
+    // marveen-channels and vanished without a trace). Closes the KNOWN
+    // FOLLOW-UP that previously lived here: saturation is the one busy-state
+    // forceSend must respect. Defer via the pending-retry queue (the caller
+    // maps 'busy' to a retry row, exempt from skipIfBusy for forceSend); the
+    // retry lands on the first tick after the session has been rescued. All
+    // other busy states keep the bypass.
+    const pane = capturePane(session, host)
+    if (pane != null && paneShowsContextSaturation(pane)) {
+      logger.warn({ task: task.name, agent: agentName, session }, 'forceSend target session is context-saturated (100%) -- deferring to retry queue instead of injecting into a wedged session')
+      return 'busy'
+    }
+    // Same non-negotiable for a first-run gate: a fresh install's agent parked
+    // on the folder-trust dialog / login picker has no input box at all, so a
+    // force-injected prompt is typed blindly into the DIALOG (digits select
+    // options, Enter confirms them) and the prompt is lost -- a silent drop
+    // with extra steps, plus keystroke roulette on a consent dialog. Defer to
+    // the retry queue; the channel-monitor answers the dialogs (or alerts on
+    // the login picker) and the retry lands on the first tick after.
+    const forceGate = pane != null ? detectsFirstRunGate(pane) : null
+    if (forceGate) {
+      logger.warn({ task: task.name, agent: agentName, session, gate: forceGate }, 'forceSend target session is parked on a Claude Code first-run dialog -- deferring to retry queue instead of typing into the dialog')
+      return 'first-run'
+    }
     logger.info({ task: task.name, agent: agentName, session }, 'forceSend=true, bypassing busy-state check')
+  }
+
+  // MCP manifest pre-check (requires.mcp_servers, Roitman 22.5): a required
+  // server with no live process under the target session defers the task with
+  // a reasoned alert instead of letting the prompt fail at runtime INSIDE the
+  // session (2026-07-08: morning briefing ran against a silently dead gmail
+  // MCP). Runs after the busy check so a busy session stays a plain 'busy'.
+  // forceSend keeps its "always eventually land" contract: it logs the gap
+  // loudly but still delivers.
+  if (task.type !== 'command' && task.requires?.mcp_servers?.length) {
+    const check = checkTaskMcpRequirements(task.requires.mcp_servers, agentName, session, host)
+    if (!check.ok) {
+      if (task.forceSend) {
+        logger.warn({ task: task.name, agent: agentName, session, missing: check.missing }, 'MCP pre-check failed but forceSend=true -- delivering anyway')
+      } else {
+        lastMcpMissing.set(`${task.name}@${agentName}`, check.missing)
+        logger.warn({ task: task.name, agent: agentName, session, missing: check.missing }, 'Required MCP server(s) not running in target session -- deferring task')
+        return 'mcp-missing'
+      }
+    }
   }
 
   try {
@@ -159,7 +623,24 @@ function attemptFireTask(task: ScheduledTask, agentName: string, now: number): '
       // heartbeat prompts.
       prefix = `[Heartbeat: ${task.name}] `
     } else {
-      prefix = `[Utemezett feladat: ${task.name}] Az eredmenyt kuldd el Telegramon (chat_id: ${ALLOWED_CHAT_ID}, reply tool). `
+      // Target the RUNNING agent's own bound channel, NOT the global
+      // ALLOWED_CHAT_ID. The latter is the main/admin chat; injecting it here
+      // pointed every sub-agent's task result at the boss's chat instead of its
+      // own owner (e.g. attilamarveenja -> Papp Attila). The old "chat_id: 0"
+      // sentinel encoded the same intent, but the official Telegram plugin
+      // rejects it (assertAllowedChat: "0" is never allowlisted), so the
+      // binding is resolved to a CONCRETE id here at prompt-build time. No
+      // binding -> no Telegram instruction at all: better to skip delivery
+      // than to deliver to the wrong chat, and the warn below makes the
+      // config gap visible. The system-level pending-retry alert further
+      // down still uses ALLOWED_CHAT_ID by design.
+      const boundChatId = resolveBoundChatId(agentName)
+      if (boundChatId) {
+        prefix = `[Utemezett feladat: ${task.name}] Az eredmenyt kuldd el Telegramon (chat_id: ${boundChatId}, reply tool). `
+      } else {
+        logger.warn({ task: task.name, agent: agentName }, 'scheduled task: agent has no bound telegram chat (access.json missing/empty) -- prompt omits the Telegram delivery instruction')
+        prefix = `[Utemezett feladat: ${task.name}] `
+      }
     }
     // A scheduled task body is the agent's OWN task, authored by the operator
     // (SKILL.md on disk, or the bearer-gated /api/schedules editor -- both
@@ -170,20 +651,56 @@ function attemptFireTask(task: ScheduledTask, agentName: string, now: number): '
     // Use the scheduled-task framing instead: tags are still scrubbed (so a
     // poisoned body cannot smuggle a fake security tag) but the preamble marks
     // it as a task-to-execute with the standard escalate-if-dangerous guard.
+    const taskBody = preCheckPrefix
+      ? `[Pre-check eredmeny]\n${preCheckPrefix}\n\n[Feladat]\n${task.prompt}`
+      : task.prompt
     const fullPrompt =
       SCHEDULED_TASK_PREAMBLE + '\n' +
       prefix.trimEnd() + '\n\n' +
-      wrapScheduledTask(`scheduled-task:${task.name}`, task.prompt)
+      wrapScheduledTask(`scheduled-task:${task.name}`, taskBody)
     // forceSend skips the busy-state check above; it must also skip the
     // pre-flight wait-until-idle gate inside sendPromptToSession, otherwise a
     // task aimed at a long-busy session would block on the 12s idle wait every
     // tick -- defeating the very purpose of forceSend (inject regardless, let
     // Claude Code queue it). All non-forceSend tasks keep the gate ON.
-    sendPromptToSession(session, fullPrompt, host, { waitForIdle: !task.forceSend })
+    await sendPromptToSession(session, fullPrompt, host, { waitForIdle: !task.forceSend })
     scheduleLastRun.set(task.name, now)
     persistScheduleLastRun()
-    appendTaskRun(task.name, agentName, 'fired')
+    // A lateCatchUpMs value means this tick only matched because of the
+    // enlarged first-run catch-up window (see startScheduleRunner), i.e. the
+    // task missed its normal tick (e.g. the process was down/restarting at
+    // the scheduled minute) and is only firing now as a catch-up. Recording
+    // a distinct status -- instead of silently folding it into 'fired' --
+    // means the existing per-task run-history view (dashboard schedule
+    // history) surfaces exactly which tasks were missed and had to be
+    // caught up, without any new alert/polling path that could race other
+    // running tasks. Read-only w.r.t. everything else in this function.
+    if (lateCatchUpMs != null) {
+      appendTaskRun(task.name, agentName, 'fired_late')
+      logger.warn(
+        { task: task.name, agent: agentName, session, lateCatchUpMinutes: Math.round(lateCatchUpMs / 60000) },
+        'Scheduled task fired via restart catch-up window -- missed its normal tick',
+      )
+    } else {
+      appendTaskRun(task.name, agentName, 'fired')
+    }
     logger.info({ task: task.name, agent: agentName, session }, 'Scheduled task fired')
+
+    // Register the injection in the post-fire timeout watchdog. The watchdog
+    // polls the target pane on each tick and alerts if the session stays busy
+    // past TASK_FIRE_TIMEOUT_MS. A new injection on the same key replaces the
+    // previous entry (task re-fired before the prior one completed -- e.g. a
+    // manual "run now" overlapping a cron tick; track the latest injection
+    // because the agent is processing that one).
+    taskInflightMap.set(`${task.name}@${agentName}`, {
+      taskName: task.name,
+      agentName,
+      session,
+      host,
+      injectedAt: now,
+      alerted: false,
+      timeoutMs: resolveStuckTimeoutMs(task),
+    })
 
     // Post-send verify: if the agent started a new turn during our chunk
     // stream, the Enter from sendPromptToSession might have landed while
@@ -194,24 +711,40 @@ function attemptFireTask(task: ScheduledTask, agentName: string, now: number): '
     const marker = task.type === 'heartbeat'
       ? `[Heartbeat: ${task.name}]`
       : `[Utemezett feladat: ${task.name}]`
-    const resubmit = (attempt: number) => {
+    const resubmit = async (attempt: number): Promise<void> => {
       try {
         // Host-aware so a remote agent's post-send stuck-check + recovery Enter
         // hit the laptop session, not a (nonexistent) local one.
         const pane = capturePane(session, host)
-        const stuck = pane != null && /❯\s+\S/.test(pane) && pane.includes(marker)
-        if (!stuck) return
-        if (attempt >= 5) {
-          logger.warn({ task: task.name, session }, 'Scheduled prompt still stuck after 5 Enter retries -- giving up')
+        const stuck = isScheduledPromptStuck(pane, marker)
+        const action = decideScheduledResubmitAction(attempt, stuck)
+        if (action === 'none') return
+        if (action === 'giveup') {
+          logger.warn({ task: task.name, session }, 'Scheduled prompt still stuck after Enter + re-inject retries -- giving up')
           return
         }
-        sendEnterToSession(session, host)
-        setTimeout(() => resubmit(attempt + 1), 3000)
+        if (action === 'reinject') {
+          // The Enter is being swallowed persistently. Clear the parked prompt
+          // and re-type it. clearStaleParkedInput verifies the box is empty
+          // before returning true; if it can't clear (box changed under us, or
+          // its cooldown fired), fall back to one more bare Enter. waitForIdle
+          // is off because the box is 'typing', not idle -- the pre-flight gate
+          // would otherwise burn its whole budget and time out every attempt.
+          if (await clearStaleParkedInput(session, host)) {
+            await sendPromptToSession(session, fullPrompt, host, { waitForIdle: false })
+            logger.info({ task: task.name, session, attempt }, 'Scheduled prompt re-injected after swallowed Enter')
+          } else {
+            sendEnterToSession(session, host)
+          }
+        } else {
+          sendEnterToSession(session, host)
+        }
+        setTimeout(() => { void resubmit(attempt + 1) }, 3000)
       } catch (err) {
         logger.warn({ err, task: task.name }, 'Post-send resubmit failed')
       }
     }
-    setTimeout(() => resubmit(0), 2000)
+    setTimeout(() => { void resubmit(0) }, 2000)
     return 'fired'
   } catch (err) {
     logger.warn({ err, task: task.name }, 'Failed to fire scheduled task')
@@ -220,15 +753,37 @@ function attemptFireTask(task: ScheduledTask, agentName: string, now: number): '
   }
 }
 
+// Injection priority within one tick: when several tasks are due in the same
+// scan window, the order of attemptFireTask calls decides who gets the target
+// session first -- and an injection takes seconds to a minute (readiness
+// double-sample, waitForIdle gate, chunked typing, post-send verify), so the
+// first task can push every later one well past its scheduled minute.
+// listScheduledTasks() returns directory (alphabetical) order, which let a
+// routine 30-min heartbeat outrank the operator-facing morning briefing every
+// day (2026-07-20: alkuszoktatas-feedback-figyelo injected first at 07:30 and
+// reggeli-napindito starved behind it). Rank: forceSend tasks (operator-marked
+// must-deliver) first, plain tasks next, heartbeats (short-cadence, typically
+// skipIfBusy) last. The sort is stable, so name order is kept within a rank.
+export function taskInjectionRank(t: Pick<ScheduledTask, 'forceSend' | 'type'>): number {
+  if (t.forceSend) return 0
+  return t.type === 'heartbeat' ? 2 : 1
+}
+
 // Manual "Run now": fire a scheduled task immediately, bypassing the cron
 // match + lastRun catch-up + skipIfBusy guards (the operator explicitly asked
 // for it). Reuses attemptFireTask, so a stopped agent is auto-started and the
 // prompt is queued for delivery exactly like a real cron fire. Returns a
 // per-target summary string for the API/UI.
-export function runScheduledTaskNow(taskName: string): { ok: boolean; result?: string; error?: string } {
+export async function runScheduledTaskNow(
+  taskName: string,
+  opts: { allowDisabled?: boolean } = {},
+): Promise<{ ok: boolean; result?: string; error?: string }> {
   const task = listScheduledTasks().find(t => t.name === taskName)
   if (!task) return { ok: false, error: 'Schedule not found' }
-  if (!task.enabled) return { ok: false, error: 'Schedule is disabled' }
+  // allowDisabled: for on-demand-only tasks that are intentionally kept
+  // enabled:false so the cron never fires them, but a guarded endpoint can
+  // still trigger them (e.g. the post-rollback diagnosis, PR-D).
+  if (!task.enabled && !opts.allowDisabled) return { ok: false, error: 'Schedule is disabled' }
 
   const now = Date.now()
   const targets = task.agent === 'all'
@@ -237,13 +792,14 @@ export function runScheduledTaskNow(taskName: string): { ok: boolean; result?: s
 
   const summary: string[] = []
   for (const agentName of targets) {
-    const result = attemptFireTask(task, agentName, now)
+    const result = await attemptFireTask(task, agentName, now)
     // A manual run ALWAYS wants delivery: an auto-started ('starting') or a
     // busy session both get a queued retry that lands once the session is
     // ready. We deliberately do NOT consult skipIfBusy here -- that flag trims
     // redundant cron ticks, but an explicit run-now must not be dropped.
-    if (result === 'starting' || result === 'busy') {
-      insertPendingTaskRetryIfNew(task.name, agentName, now, result)
+    if (result === 'starting' || result === 'busy' || result === 'mcp-missing' || result === 'first-run') {
+      const reason = result === 'mcp-missing' ? mcpMissingReason(task.name, agentName) : result
+      insertPendingTaskRetryIfNew(task.name, agentName, now, reason)
     }
     summary.push(`${agentName}: ${result}`)
   }
@@ -258,6 +814,61 @@ export function runScheduledTaskNow(taskName: string): { ok: boolean; result?: s
 // silently suppress every future alert on this row. Net semantics:
 // exactly-one stamp per delivery attempt, at-least-once delivery with a
 // 60s retry cadence until success.
+// Bot token for the system-level scheduler alerts (pending-retry, task-timeout,
+// catch-up summary). Since the channels migration the token lives in the
+// telegram plugin's env, not marveen/.env (2026-07-08: every scheduler alert
+// was silently suppressed on such hosts), so both locations are tried -- same
+// fallback order as scripts/notify.sh.
+function resolveSchedulerAlertToken(): string | undefined {
+  const envContent = readFileOr(join(PROJECT_ROOT, '.env'), '')
+  const token = envContent.match(/TELEGRAM_BOT_TOKEN=(.+)/)?.[1]?.trim()
+  if (token) return token
+  const channelEnv = readFileOr(join(homedir(), '.claude', 'channels', 'telegram', '.env'), '')
+  return channelEnv.match(/TELEGRAM_BOT_TOKEN=(.+)/)?.[1]?.trim()
+}
+
+// One line about what the scheduler missed while it was down: which tasks it
+// caught up, and which were too stale to be worth running. Sent once per tick
+// that produced any such entry -- in normal operation that is never, so the
+// channel stays quiet. This is the reporting half of the catch-up policy: a
+// missed occurrence either runs or gets named, never both and never neither.
+function sendCatchUpSummary(
+  caughtUp: Array<{ task: string; ageMs: number }>,
+  stale: Array<{ task: string; ageMs: number }>,
+  gapMs: number,
+): void {
+  const token = resolveSchedulerAlertToken()
+  if (!token) {
+    logger.warn('catch-up summary suppressed: no TELEGRAM_BOT_TOKEN (config error)')
+    return
+  }
+  if (!ALLOWED_CHAT_ID.trim()) {
+    logger.warn('catch-up summary suppressed: empty ALLOWED_CHAT_ID (config error)')
+    return
+  }
+  const mins = (ms: number) => `${Math.round(ms / 60000)} perc`
+  const lines = [`[${BOT_NAME} scheduler] Kimaradt ütemezés (${mins(gapMs)} kiesés).`]
+  if (caughtUp.length) {
+    // "elindítva", not "lefutott": a catch-up injection can still land in the
+    // pending-retry queue if the target session is busy. It will run; it may
+    // not have run yet at the moment this line is sent.
+    lines.push(`Pótlás elindítva: ${caughtUp.map(e => `${e.task} (${mins(e.ageMs)} késés)`).join(', ')}`)
+  }
+  if (stale.length) {
+    lines.push(`Nem pótolva, mert elavult: ${stale.map(e => `${e.task} (${mins(e.ageMs)})`).join(', ')}`)
+    lines.push('Ezek a dashboard /Ütemezések oldalán kézzel indíthatók.')
+  }
+  const text = lines.join('\n')
+  ;(async () => {
+    try {
+      await sendTelegramMessage(token, ALLOWED_CHAT_ID, text)
+      logger.info({ caughtUp: caughtUp.length, stale: stale.length }, 'catch-up summary Telegram alert sent')
+    } catch (err) {
+      logger.warn({ err }, 'catch-up summary delivery failed')
+    }
+  })()
+}
+
 function sendPendingRetryAlert(view: PendingRetryView, nowMs: number): void {
   // Stamp first. If another tick raced us, markPendingTaskRetryAlert
   // returns false (the WHERE alert_sent_at IS NULL guards it) and we
@@ -274,10 +885,7 @@ function sendPendingRetryAlert(view: PendingRetryView, nowMs: number): void {
   // the stamp in place (it acts as the throttle) and log once so the
   // operator sees the config gap without the spin. The scheduled task
   // itself keeps retrying regardless -- only this alert is suppressed.
-  const envPath = join(PROJECT_ROOT, '.env')
-  const envContent = readFileOr(envPath, '')
-  const tokenMatch = envContent.match(/TELEGRAM_BOT_TOKEN=(.+)/)
-  const token = tokenMatch?.[1]?.trim()
+  const token = resolveSchedulerAlertToken()
   if (!token) {
     logger.warn({ task: view.taskName, agent: view.agentName }, 'Pending-retry alert suppressed: no TELEGRAM_BOT_TOKEN (config error, stamp kept to avoid 60s spin)')
     return
@@ -289,11 +897,33 @@ function sendPendingRetryAlert(view: PendingRetryView, nowMs: number): void {
 
   const ageMinutes = Math.floor(view.ageMs / 60000)
   const firstAttempt = new Date(view.firstAttempt).toLocaleString('hu-HU')
-  const text = [
-    `[Marveen scheduler] A(z) "${view.taskName}" (${view.agentName}) utemezett feladat ${ageMinutes} perce varakozik.`,
-    `Elso probalkozas: ${firstAttempt}.`,
-    'A rendszer tovabb probalkozik; a dashboard /Utemezesek oldalan visszavonhato.',
-  ].join('\n')
+  // A retry stuck on a dead required MCP names the server(s): the operator's
+  // fix is restarting an MCP, not freeing up a busy session.
+  const mcpMissing = view.lastReason?.startsWith('mcp-missing')
+    ? view.lastReason.slice('mcp-missing:'.length) || 'ismeretlen'
+    : null
+  // A first-run-gated session (fresh install: mappa-trust dialog / belépés-
+  // választó) needs the operator to know the ACTUAL blocker: the fix is a
+  // one-time login/consent on the agent session, not waiting for a busy
+  // session to free up.
+  const firstRunStuck = view.lastReason === 'first-run'
+  const text = (mcpMissing
+    ? [
+        `[${BOT_NAME} scheduler] A(z) "${view.taskName}" (${view.agentName}) feladat NEM tud lefutni: a szükséges MCP szerver(ek) nem futnak a cél-sessionben: ${mcpMissing}.`,
+        `Első próbálkozás: ${firstAttempt} (${ageMinutes} perce).`,
+        'Amint az MCP szerver újra elérhető, a feladat magától lefut; a dashboard /Ütemezések oldalán visszavonható.',
+      ]
+    : firstRunStuck
+    ? [
+        `[${BOT_NAME} scheduler] A(z) "${view.taskName}" (${view.agentName}) feladat NEM tud lefutni: az agent session a Claude Code első-indítási képernyőjén áll (mappa-jóváhagyás vagy belépés szükséges).`,
+        `Első próbálkozás: ${firstAttempt} (${ageMinutes} perce).`,
+        `A rendszer a jóváhagyás-dialogokat magától továbblépteti; ha belépés kell: tmux attach -t agent-${view.agentName}, majd válaszd ki a belépési módot. Utána a feladat magától lefut.`,
+      ]
+    : [
+        `[${BOT_NAME} scheduler] A(z) "${view.taskName}" (${view.agentName}) ütemezett feladat ${ageMinutes} perce várakozik.`,
+        `Első próbálkozás: ${firstAttempt}.`,
+        'A rendszer tovább próbálkozik; a dashboard /Ütemezések oldalán visszavonható.',
+      ]).join('\n')
   ;(async () => {
     try {
       await sendTelegramMessage(token, ALLOWED_CHAT_ID, text)
@@ -315,25 +945,159 @@ function sendPendingRetryAlert(view: PendingRetryView, nowMs: number): void {
   })()
 }
 
+// One-shot Telegram alert when a fired task/heartbeat has been continuously
+// busy past TASK_FIRE_TIMEOUT_MS. Follows the same token-resolution and
+// ALLOWED_CHAT_ID path as sendPendingRetryAlert: this is a system-level
+// scheduler alert, not a per-agent channel notification.
+function sendTaskTimeoutAlert(entry: TaskInflightEntry, elapsedMs: number): void {
+  const ageMinutes = Math.floor(elapsedMs / 60000)
+  const token = resolveSchedulerAlertToken()
+  if (!token) {
+    logger.warn({ task: entry.taskName, agent: entry.agentName }, 'task-timeout alert suppressed: no TELEGRAM_BOT_TOKEN (config error)')
+    return
+  }
+  if (!ALLOWED_CHAT_ID.trim()) {
+    logger.warn({ task: entry.taskName, agent: entry.agentName }, 'task-timeout alert suppressed: empty ALLOWED_CHAT_ID (config error)')
+    return
+  }
+  // If there is an active kanban card whose title matches the task name, move it
+  // to 'waiting' so the board reflects the stuck state. No-op when no matching
+  // card exists (the task was never on the board, or has already been archived).
+  const movedCardId = markScheduledTaskKanbanWaiting(entry.taskName)
+  if (movedCardId) {
+    logger.info({ task: entry.taskName, agent: entry.agentName, cardId: movedCardId }, 'task-timeout: matching kanban card moved to waiting')
+  }
+
+  // Naming the threshold turns "possible hang" into something the operator can
+  // judge: a long-running analysis task that legitimately needs more time is
+  // then one config line away, instead of a recurring 3am mystery.
+  const thresholdMinutes = Math.round(entry.timeoutMs / 60000)
+  const text = [
+    `[${BOT_NAME} scheduler] A(z) "${entry.taskName}" (${entry.agentName}) ütemezett feladat ${ageMinutes} perce fut -- lehetséges beakadás.`,
+    `A riasztási küszöb ennél a feladatnál ${thresholdMinutes} perc; ha ez a feladat jogosan fut ennél tovább, allitsd a task-config.json "stuckAfterMinutes" mezojet.`,
+    'Az ágensben megtekintheted; a dashboard /Ütemezések oldalán visszavonható ha kell.',
+  ].join('\n')
+  ;(async () => {
+    try {
+      await sendTelegramMessage(token, ALLOWED_CHAT_ID, text)
+      logger.info({ task: entry.taskName, agent: entry.agentName, ageMinutes }, 'task-timeout Telegram alert sent')
+    } catch (err) {
+      logger.warn({ err, task: entry.taskName, agent: entry.agentName }, 'task-timeout alert delivery failed')
+    }
+  })()
+}
+
+// Tick interval for the schedule runner. 15 s gives 4x faster inter-agent
+// message delivery and scheduled-task triggering; each tick is a cheap
+// SQLite SELECT so the load is negligible.
+export const SCHEDULE_TICK_MS = 15_000
+
 export function startScheduleRunner(): NodeJS.Timeout {
   // Reload the persisted last-run times so a restart inside a task's catch-up
   // window does not re-fire an already-run task.
   loadScheduleLastRun()
-  let firstRun = true
 
-  function runCheck() {
+  // Surface the effective cron timezone at startup. A silent UTC fallback (no
+  // SCHEDULER_TZ/TZ in the env) shifts every fixed-time cron off its intended
+  // minute so daily tasks never fire while interval tasks still do -- a partial
+  // outage that is otherwise invisible until someone notices the missing
+  // briefing (2026-07-13..15). Logging the source turns it into a grep-able
+  // signal; the warn fires only on the actively-dangerous UTC-by-default case.
+  const { tz: cronTz, source: cronTzSource } = effectiveCronTz()
+  logger.info({ cronTz, cronTzSource }, 'schedule-runner: cron timezone in effect')
+  if (cronTzSource === 'system-default' && cronTz === 'UTC') {
+    logger.warn(
+      { cronTz },
+      'schedule-runner: cron timezone fell back to UTC (no SCHEDULER_TZ/TZ set) -- ' +
+        'fixed-time crons like "30 7 * * *" match at UTC wall-clock, not the operator zone, ' +
+        'so daily tasks may silently never fire while interval tasks still do. Set SCHEDULER_TZ or TZ.',
+    )
+  }
+  // A configured-but-unparseable zone is the failure mode BELOW the one above:
+  // cron-parser throws on every expression, the throw is caught as "not due",
+  // and the outage is total and silent rather than partial. config.ts already
+  // dropped back to the process zone so the scheduler keeps running -- say so
+  // loudly, with the rejected value, because nothing else in the system will.
+  if (APP_TZ_INVALID) {
+    logger.warn(
+      { rejectedTz: APP_TZ_INVALID, cronTz },
+      `schedule-runner: SCHEDULER_TZ="${APP_TZ_INVALID}" is not a usable timezone -- ` +
+        `ignored, scheduling on "${cronTz}" instead. Fix the value (e.g. "Europe/Budapest") ` +
+        'and restart, or every fixed-time cron runs on the wrong wall clock.',
+    )
+  }
+
+  // Start of the window the next tick will scan. Seeded from the liveness stamp
+  // the previous run left behind, so the first tick after a (re)start scans the
+  // ACTUAL downtime instead of a flat 30 min (capped, see computeCatchUpStart);
+  // thereafter each tick advances it to its own `now`, so the scan windows are
+  // contiguous and non-overlapping -- see cronDueBetween.
+  const persistedTickMs = loadLastTickMs()
+  let lastCheckMs = computeCatchUpStart(persistedTickMs, Date.now())
+  const startupGapMs = Date.now() - lastCheckMs
+  if (persistedTickMs != null && startupGapMs > SCHEDULE_COLD_START_CATCHUP_MS) {
+    logger.warn(
+      { downtimeMinutes: Math.round(startupGapMs / 60000), cappedAtHours: SCHEDULE_MAX_CATCHUP_MS / 3_600_000 },
+      'schedule-runner: scheduler was down longer than a tick -- scanning the downtime window for missed occurrences',
+    )
+  }
+  // The window the FIRST tick scans, so that tick can report its catch-ups as
+  // downtime recovery. Zeroed after the first tick; later gaps (a dropped tick)
+  // are reported against the tick interval instead.
+  let pendingStartupGapMs = persistedTickMs != null ? startupGapMs : 0
+  let lastPersistedTickMs = 0
+
+  let tickRunning = false
+  async function runCheck() {
+    // Re-entrancy guard: runCheck is now async (it awaits the tmux-driving
+    // sends), and setInterval fires on a fixed cadence regardless of whether the
+    // previous invocation has resolved. Without this guard two ticks could
+    // overlap and double-fire a task (or double-advance lastCheckMs). Skip a
+    // tick that lands while the prior one is still in flight; the next tick's
+    // scan window is contiguous so nothing is missed.
+    if (tickRunning) {
+      logger.debug('schedule-runner: previous tick still running, skipping this tick')
+      return
+    }
+    tickRunning = true
+    try {
     const tasks = listScheduledTasks()
     const now = Date.now()
-    // On first run after restart, catch up missed tasks from last 30 min
-    const catchUp = firstRun ? 30 * 60000 : 60000
-    firstRun = false
+    // Scan the real interval elapsed since the previous tick (30 min on the
+    // first tick), not a fixed 60s window -- a late/dropped tick must not let a
+    // sparse daily cron's single occurrence slip through a gap unscanned (#621).
+    const fromMs = lastCheckMs
+    // Catch-up bookkeeping for this tick's one-line report (see below). Empty
+    // on every normal tick, so the operator only ever hears about real gaps.
+    const caughtUpThisTick: Array<{ task: string; ageMs: number }> = []
+    const staleThisTick: Array<{ task: string; ageMs: number }> = []
+
+    // Post-fire timeout watchdog sweep: check every tracked in-flight injection
+    // to see if the target session is still busy. If so past TASK_FIRE_TIMEOUT_MS,
+    // send a one-shot alert. Clear entries when the session goes idle (task done)
+    // or the maximum tracking age is reached.
+    for (const [key, entry] of taskInflightMap) {
+      const pane = capturePane(entry.session, entry.host)
+      const state = pane != null ? detectPaneState(pane) : null
+      const decision = decideTaskTimeout(entry, state, now, {
+        graceMs: TASK_FIRE_GRACE_MS,
+        timeoutMs: entry.timeoutMs,
+        maxTrackMs: TASK_FIRE_MAX_TRACK_MS,
+      })
+      if (decision === 'clear') {
+        taskInflightMap.delete(key)
+      } else if (decision === 'alert') {
+        sendTaskTimeoutAlert(entry, now - entry.injectedAt)
+        entry.alerted = true
+      }
+    }
 
     // Retry tasks that were busy-skipped on earlier ticks (persisted in
-    // pending_task_retries so they survive dashboard restart). cronMatchesNow
-    // only fires on an exact minute boundary, so without this the noon
-    // check skipped because the session was busy at 12:00:50 would never
-    // run that day. We NEVER abandon -- the operator can cancel from the
-    // UI if a retry has become obsolete.
+    // pending_task_retries so they survive dashboard restart). Each occurrence
+    // is scanned by exactly one tick's (fromMs, now] window, so once the noon
+    // occurrence's window has passed a busy-at-noon task would never run that
+    // day without this queue. We NEVER abandon -- the operator can cancel from
+    // the UI if a retry has become obsolete.
     const pendingRows = listPendingTaskRetries()
     const pendingKeys = new Set<string>()
     for (const row of pendingRows) {
@@ -357,8 +1121,17 @@ export function startScheduleRunner(): NodeJS.Timeout {
       const key = `${row.task_name}@${row.agent_name}`
       pendingKeys.add(key)
 
+      // Re-run pre-check on retry: state may have changed since the task
+      // was first scheduled (e.g. kanban cards already processed).
+      const retryPc = runPreCheck(taskDef)
+      if (retryPc.skip) {
+        deletePendingTaskRetry(row.task_name, row.agent_name)
+        appendTaskRun(row.task_name, row.agent_name, 'skipped')
+        continue
+      }
+
       const view = toPendingRetryView(row, now)
-      const result = attemptFireTask(taskDef, row.agent_name, now)
+      const result = await attemptFireTask(taskDef, row.agent_name, now, retryPc.prefix)
       if (result === 'fired' || result === 'missing') {
         deletePendingTaskRetry(row.task_name, row.agent_name)
         continue
@@ -368,17 +1141,51 @@ export function startScheduleRunner(): NodeJS.Timeout {
       // false when the row has been cancelled between load and now --
       // in that case, do not re-insert (the operator's cancel wins) and
       // do not alert.
-      const stillPresent = updatePendingTaskRetry(row.task_name, row.agent_name, now, result)
+      const reason = result === 'mcp-missing' ? mcpMissingReason(row.task_name, row.agent_name) : result
+      const stillPresent = updatePendingTaskRetry(row.task_name, row.agent_name, now, reason)
       if (stillPresent && view.alertDue) sendPendingRetryAlert(view, now)
     }
 
+    // Fire in injection-priority order, not directory order: with several
+    // tasks due in one window, each injection delays the next by seconds to a
+    // minute, so forceSend/task entries must reach the session before the
+    // routine heartbeats (see taskInjectionRank). listScheduledTasks() builds
+    // a fresh array every tick, so the in-place sort leaks nowhere.
+    tasks.sort((a, b) => taskInjectionRank(a) - taskInjectionRank(b))
     for (const task of tasks) {
       if (!task.enabled) continue
-      if (!cronMatchesNow(task.schedule, catchUp)) continue
+      const occurrenceMs = cronPrevOccurrence(task.schedule, fromMs, now)
+      if (occurrenceMs == null) continue
 
-      // Prevent double-firing: skip if already ran within the catch-up window
+      // Prevent double-firing across a restart: skip if the task already ran at
+      // or after the start of this scan window (its occurrence is already
+      // recorded, so re-scanning the catch-up window must not fire it again).
       const lastRun = scheduleLastRun.get(task.name) || 0
-      if (now - lastRun < catchUp) continue
+      if (lastRun >= fromMs) continue
+
+      // How late is this occurrence, and is it still worth running? An
+      // occurrence the owning tick never scanned (process down, dropped tick)
+      // is executed as a catch-up while it is still useful, and recorded as
+      // 'missed' + reported once it is not -- the previous code fired anything
+      // inside the flat window regardless of age and dropped everything older
+      // without a word. Age is measured from the tick's own `now`, captured
+      // before any injection, so a slow tick cannot inflate it.
+      const ageMs = now - occurrenceMs
+      const decision = decideCatchUp(task, ageMs)
+      if (decision === 'stale') {
+        logger.warn(
+          { task: task.name, ageMinutes: Math.round(ageMs / 60000), maxAgeMinutes: catchUpMaxAgeMs(task) / 60000 },
+          'Scheduled occurrence missed while the scheduler was down and is too stale to catch up -- recording as missed',
+        )
+        staleThisTick.push({ task: task.name, ageMs })
+        const missedTargets = task.agent === 'all'
+          ? [MAIN_AGENT_ID, ...listAgentNames().filter(a => isAgentRunning(a))]
+          : [task.agent || MAIN_AGENT_ID]
+        for (const agentName of missedTargets) appendTaskRun(task.name, agentName, 'missed')
+        continue
+      }
+      const lateCatchUpMs = decision === 'catch-up' ? ageMs : undefined
+      if (lateCatchUpMs != null) caughtUpThisTick.push({ task: task.name, ageMs })
 
       // type='command' tasks run a raw shell command directly -- no LLM, no
       // tmux, no target agent. They self-manage failure streaks + Telegram
@@ -401,12 +1208,24 @@ export function startScheduleRunner(): NodeJS.Timeout {
         targetAgents = [task.agent || MAIN_AGENT_ID]
       }
 
+      // Run pre-check once per task (not per agent) since it queries shared
+      // state (DB, filesystem) that does not vary by target agent.
+      const cronPc = runPreCheck(task)
+      if (cronPc.skip) {
+        scheduleLastRun.set(task.name, now)
+        persistScheduleLastRun()
+        for (const agentName of targetAgents) {
+          appendTaskRun(task.name, agentName, 'skipped')
+        }
+        continue
+      }
+
       for (const agentName of targetAgents) {
         const key = `${task.name}@${agentName}`
         // If already queued for retry from an earlier tick, leave it to
         // the retry handler -- don't re-queue or double-fire.
         if (pendingKeys.has(key)) continue
-        const result = attemptFireTask(task, agentName, now)
+        const result = await attemptFireTask(task, agentName, now, cronPc.prefix, lateCatchUpMs)
         if (result === 'starting') {
           // Agent was auto-started this tick. ALWAYS enqueue the retry that
           // delivers the prompt once the session is ready -- skipIfBusy must
@@ -415,7 +1234,12 @@ export function startScheduleRunner(): NodeJS.Timeout {
           // pending-retry loop then sends as soon as Claude has booted.
           insertPendingTaskRetryIfNew(task.name, agentName, now, 'starting')
         } else if (result === 'busy') {
-          if (task.skipIfBusy) {
+          // A forceSend task only ever reports 'busy' from the context-
+          // saturation deferral inside attemptFireTask -- every other busy
+          // state is bypassed. Dropping that on skipIfBusy would turn the
+          // deferral into a silent loss, so forceSend is exempt from the
+          // skip and always queues the retry.
+          if (task.skipIfBusy && !task.forceSend) {
             // Opt-in skip for short-cadence tasks (e.g. 30-min heartbeats):
             // a single missed tick is harmless because the next one is
             // already on the way, and queueing them produces spurious
@@ -431,12 +1255,49 @@ export function startScheduleRunner(): NodeJS.Timeout {
           // row already exists (race with a just-cancelled retry), do
           // nothing so the cancel wins the tiebreak.
           insertPendingTaskRetryIfNew(task.name, agentName, now, 'busy')
+        } else if (result === 'mcp-missing') {
+          // Deliberately NOT honoring skipIfBusy here: dropping a tick because
+          // a required MCP is dead would be exactly the silent starvation this
+          // pre-check exists to eliminate. The retry row keeps the task alive
+          // until the server returns, and the alert names the dead server.
+          insertPendingTaskRetryIfNew(task.name, agentName, now, mcpMissingReason(task.name, agentName))
+        } else if (result === 'first-run') {
+          // Also exempt from skipIfBusy: a session parked on a first-run
+          // dialog (fresh install) never frees up between ticks the way a
+          // busy one does, so dropping ticks would starve the task with no
+          // trace. The retry row keeps it alive and the aged alert names the
+          // actual blocker instead of a generic "busy".
+          insertPendingTaskRetryIfNew(task.name, agentName, now, 'first-run')
         }
       }
+    }
+
+    // Tell the operator, in one line, what the gap cost. Only fires when this
+    // tick actually caught something up or declared something too stale, which
+    // in steady state is never.
+    if (caughtUpThisTick.length || staleThisTick.length) {
+      sendCatchUpSummary(caughtUpThisTick, staleThisTick, pendingStartupGapMs || (now - fromMs))
+    }
+    pendingStartupGapMs = 0
+
+    // Advance the scan window so the next tick starts exactly where this one
+    // ended. Unconditional (even on busy-skip/error, which the pending-retry
+    // queue owns) so the windows stay contiguous and no occurrence is scanned
+    // twice or skipped.
+    lastCheckMs = now
+    // Liveness stamp for the NEXT process start's catch-up window. Written
+    // after the scan so a crash mid-tick leaves the older (wider) stamp behind
+    // and the occurrences of the crashed tick get re-scanned rather than lost.
+    if (now - lastPersistedTickMs >= TICK_STATE_PERSIST_INTERVAL_MS) {
+      persistLastTickMs(now)
+      lastPersistedTickMs = now
+    }
+    } finally {
+      tickRunning = false
     }
   }
 
   // Run immediately on start (catches missed tasks)
-  setTimeout(runCheck, 5000)
-  return setInterval(runCheck, 60000)
+  setTimeout(() => { void runCheck() }, 5000)
+  return setInterval(() => { void runCheck() }, SCHEDULE_TICK_MS)
 }

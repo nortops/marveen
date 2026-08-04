@@ -1,3 +1,13 @@
+// === Avatar cache-busting epoch ===
+// Avatar URLs used to carry ?t=Date.now() on every render, which defeated the
+// browser cache and re-downloaded ~1MB per avatar on each rerender (brutal on
+// slow remote links). Instead the URLs are stable (server sends max-age +
+// ETag) until an avatar is actually changed in THIS session, which bumps the
+// epoch and re-busts every avatar URL rendered afterwards.
+let _avatarEpoch = 0
+function bumpAvatarEpoch() { _avatarEpoch = Date.now() }
+function avatarBust() { return _avatarEpoch ? `?t=${_avatarEpoch}` : '' }
+
 // === i18n runtime ===
 // Priority: localStorage['marveen.lang'] > DASHBOARD_LANG (server default, read
 // from /api/settings on init) > 'hu' (hardcoded fallback).
@@ -6,6 +16,12 @@
 ;(() => {
   const LS_KEY = 'marveen.lang'
   const VALID = new Set(['hu', 'en'])
+
+  // Brand tokens ({brand} = product/brand name, {bot} = main agent display
+  // name, {agentId} = canonical slug) are filled from /api/marveen once it
+  // resolves (see initSidebarBrand). Until then these defaults keep a stock
+  // install byte-identical. Explicit params passed to t() still win over them.
+  window._brandTokens = window._brandTokens || { brand: 'Marveen', bot: 'Marveen', agentId: 'marveen' }
 
   window.t = function t(key, params = {}) {
     const lang = window._lang || 'hu'
@@ -16,7 +32,8 @@
     if (str === key && localStorage.getItem('marveen.dev') === '1') {
       console.warn('[i18n] missing key:', key)
     }
-    return str.replace(/\{(\w+)\}/g, (_, k) => (params[k] != null ? params[k] : `{${k}}`))
+    const vals = { ...window._brandTokens, ...params }
+    return str.replace(/\{(\w+)\}/g, (_, k) => (vals[k] != null ? vals[k] : `{${k}}`))
   }
 
   function applyLang(lang) {
@@ -26,15 +43,31 @@
   // Initialise from localStorage; server default fetched async below.
   applyLang(localStorage.getItem(LS_KEY) || 'hu')
 
-  // Fetch server default (DASHBOARD_LANG) and apply only if localStorage not set.
-  fetch('/api/settings')
-    .then(r => r.ok ? r.json() : null)
-    .then(data => {
-      if (!data || localStorage.getItem(LS_KEY)) return
-      const entry = (data.settings || []).find(s => s.key === 'DASHBOARD_LANG')
-      if (entry && VALID.has(entry.value)) applyLang(entry.value)
-    })
-    .catch(() => {})
+  // Fetch server default (DASHBOARD_LANG) and apply only if localStorage not
+  // set. Deferred to a MICROTASK: this IIFE evaluates before the fetch-wrapper
+  // IIFE installs the Bearer-injecting window.fetch, so an eager call here
+  // went out with the native fetch, got 401 from the /api gate, and the
+  // server default was silently dead code. Microtasks run after the whole
+  // classic script has evaluated, when window.fetch is the wrapped version.
+  queueMicrotask(() => {
+    fetch('/api/settings')
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (!data || localStorage.getItem(LS_KEY)) return
+        const entry = (data.settings || []).find(s => s.key === 'DASHBOARD_LANG')
+        if (!entry || !VALID.has(entry.value) || entry.value === window._lang) return
+        // Apply WITHOUT persisting (localStorage must keep overriding the
+        // server default), and re-run the render dance: the initial
+        // DOMContentLoaded render almost always beats this response, so a
+        // plain applyLang would leave the page painted in the old language.
+        applyLang(entry.value)
+        if (typeof renderNav === 'function') renderNav()
+        if (typeof renderStaticI18n === 'function') renderStaticI18n()
+        const activeLink = document.querySelector('.sb-link.active[data-page]')
+        if (activeLink && typeof switchPage === 'function') switchPage(activeLink.dataset.page)
+      })
+      .catch(() => {})
+  })
 
   window.setLang = function setLang(lang) {
     if (!VALID.has(lang)) return
@@ -73,11 +106,18 @@ function mainAgentId() {
   const TOKEN_KEY = 'marveen-dashboard-token'
   const urlParams = new URLSearchParams(window.location.search)
   const urlToken = urlParams.get('token')
+  // Keep the token in memory for the whole session in addition to localStorage.
+  // Some iOS/Safari privacy modes purge or block localStorage (especially over
+  // plain http / non-primary origins); an in-memory copy keeps the session
+  // authenticated even when the persisted copy is unavailable.
+  let sessionToken = urlToken || ''
   if (urlToken) {
-    localStorage.setItem(TOKEN_KEY, urlToken)
+    try { localStorage.setItem(TOKEN_KEY, urlToken) } catch { /* storage blocked */ }
     urlParams.delete('token')
     const clean = window.location.pathname + (urlParams.toString() ? '?' + urlParams : '') + window.location.hash
     window.history.replaceState({}, '', clean)
+  } else {
+    try { sessionToken = localStorage.getItem(TOKEN_KEY) || '' } catch { /* storage blocked */ }
   }
 
   const originalFetch = window.fetch.bind(window)
@@ -89,7 +129,8 @@ function mainAgentId() {
       url.startsWith('/api/') ||
       (url.startsWith(window.location.origin + '/api/'))
     if (isSameOriginApi) {
-      const token = localStorage.getItem(TOKEN_KEY)
+      let token = sessionToken
+      if (!token) { try { token = localStorage.getItem(TOKEN_KEY) } catch { token = '' } }
       if (token) {
         init = init || {}
         const headers = new Headers(init.headers || (input instanceof Request ? input.headers : undefined))
@@ -100,27 +141,99 @@ function mainAgentId() {
     const res = await originalFetch(input, init)
     if (res.status === 401 && isSameOriginApi) {
       // Token missing, wrong, or revoked. Wipe and prompt once per page load.
-      localStorage.removeItem(TOKEN_KEY)
+      // Keep a URL-provided session token so a transient 401 does not lock out
+      // a session whose localStorage copy was purged.
+      try { localStorage.removeItem(TOKEN_KEY) } catch { /* storage blocked */ }
+      if (!urlToken) sessionToken = ''
       if (!window.__marveenAuthPrompted) {
         window.__marveenAuthPrompted = true
-        // An installed (home-screen) PWA has its own localStorage, separate from
-        // Safari's, and the manifest start_url has no ?token=, so the very first
-        // standalone launch is token-less and 401s. There is no address bar to
-        // paste a ?token= URL into either. Offer an in-app paste field that
-        // writes the token to the app's own storage, then reload.
-        const isStandalone = window.navigator.standalone === true ||
-          (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches)
-        if (isStandalone) {
-          showStandaloneTokenPrompt(TOKEN_KEY)
-        } else {
-          alert(
-            'Dashboard authentication failed. Check the server log for the access URL ' +
-            '(look for "Dashboard access URL" with ?token=...), then reopen it in your browser.'
-          )
-        }
+        handleAuthFailure()
       }
     }
     return res
+  }
+
+  // On a 401, ask the public status probe whether a username+password login is
+  // available on this instance. If so, show the login overlay; otherwise fall
+  // back to the existing token flows (PWA paste field or the console-URL alert).
+  async function handleAuthFailure() {
+    let status = null
+    try {
+      const r = await originalFetch('/api/auth/status')
+      if (r.ok) status = await r.json()
+    } catch { /* offline or probe failed -- fall through to token flows */ }
+    if (status && status.login_available) {
+      showLoginOverlay()
+      return
+    }
+    // An installed (home-screen) PWA has its own localStorage, separate from
+    // Safari's, and the manifest start_url has no ?token=, so the very first
+    // standalone launch is token-less and 401s. There is no address bar to paste
+    // a ?token= URL into either. Offer an in-app paste field that writes the
+    // token to the app's own storage, then reload.
+    const isStandalone = window.navigator.standalone === true ||
+      (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches)
+    if (isStandalone) {
+      showStandaloneTokenPrompt(TOKEN_KEY)
+    } else {
+      alert(
+        'Dashboard authentication failed. Check the server log for the access URL ' +
+        '(look for "Dashboard access URL" with ?token=...), then reopen it in your browser.'
+      )
+    }
+  }
+
+  // Full-screen username+password login overlay. Posts to /api/auth/login; on
+  // success the browser has the mv_session cookie and we reload authenticated.
+  function showLoginOverlay() {
+    if (document.getElementById('mv-login-overlay')) return
+    const tr = (k, fallback) => (typeof window.t === 'function' ? window.t(k) : fallback) || fallback
+    const overlay = document.createElement('div')
+    overlay.id = 'mv-login-overlay'
+    overlay.className = 'mv-auth-overlay'
+    overlay.innerHTML =
+      '<form class="mv-auth-card" id="mv-login-form">' +
+        '<h2>' + tr('auth.login.title', 'Sign in') + '</h2>' +
+        '<p class="mv-auth-desc">' + tr('auth.login.desc', 'Enter your dashboard username and password.') + '</p>' +
+        '<input id="mv-login-user" type="text" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="' + tr('auth.login.username', 'Username') + '">' +
+        '<input id="mv-login-pass" type="password" autocomplete="current-password" placeholder="' + tr('auth.login.password', 'Password') + '">' +
+        '<button type="submit" id="mv-login-submit">' + tr('auth.login.submit', 'Sign in') + '</button>' +
+        '<div class="mv-auth-err" id="mv-login-err"></div>' +
+      '</form>'
+    document.body.appendChild(overlay)
+    const form = overlay.querySelector('#mv-login-form')
+    const userEl = overlay.querySelector('#mv-login-user')
+    const passEl = overlay.querySelector('#mv-login-pass')
+    const errEl = overlay.querySelector('#mv-login-err')
+    const submitEl = overlay.querySelector('#mv-login-submit')
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault()
+      errEl.textContent = ''
+      const username = (userEl.value || '').trim()
+      const password = passEl.value || ''
+      if (!username || !password) { errEl.textContent = tr('auth.login.err_empty', 'Enter a username and password.'); return }
+      submitEl.disabled = true
+      try {
+        const r = await originalFetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password }),
+        })
+        if (r.ok) { window.location.reload(); return }
+        if (r.status === 429) {
+          let retry = 0
+          try { retry = (await r.json()).retry_after_s || 0 } catch { /* ignore */ }
+          errEl.textContent = tr('auth.login.err_throttled', 'Too many attempts. Try again later.') + (retry ? ' (' + retry + 's)' : '')
+        } else {
+          errEl.textContent = tr('auth.login.err_invalid', 'Invalid credentials.')
+        }
+      } catch {
+        errEl.textContent = tr('auth.login.err_network', 'Network error.')
+      } finally {
+        submitEl.disabled = false
+      }
+    })
+    setTimeout(() => userEl.focus(), 50)
   }
 
   // Full-screen, one-time token paste for installed PWAs (see the 401 handler).
@@ -238,39 +351,48 @@ function confirmSettingsLeave() {
 }
 
 function switchPage(pageId) {
+  // 'team' is merged into 'agents'; any internal call still passing 'team' redirects.
+  if (pageId === 'team') { _agentsActiveView = 'tree'; pageId = 'agents' }
   // Guard unsaved settings before leaving the settings page
   if (!document.getElementById('settingsPage').hidden && pageId !== 'settings' && !confirmSettingsLeave()) return
   pages.forEach((p) => (p.hidden = p.id !== pageId + 'Page'))
   navLinks.forEach((l) => l.classList.toggle('active', l.dataset.page === pageId))
+  openSidebarGroupForPage(pageId)
   // Kanban needs full-width layout (overrides main's max-width: 1200px)
   document.querySelector('main').classList.toggle('kanban-active', pageId === 'kanban')
   // Activity page runs a live poll; stop it whenever we navigate away.
   if (pageId !== 'activity') stopActivityPoll()
   if (pageId === 'activity') startActivityPoll()
+  // Agents page tints each Terminal button green while that agent is working;
+  // same 3s poll + source as Activity. Stop it when we leave the page.
+  if (pageId !== 'agents') stopAgentsBusyPoll()
   // Kanban auto-refresh: start on enter, stop on leave.
   if (pageId !== 'kanban') stopKanbanRefresh()
   if (pageId === 'overview') loadOverview()
-  if (pageId === 'kanban') { loadKanban(); startKanbanRefresh() }
+  if (pageId === 'kanban') { if (typeof _initGanttViewSwitcher === 'function') _initGanttViewSwitcher(); loadKanban(); startKanbanRefresh() }
   if (pageId === 'tasks') loadSchedules()
-  if (pageId === 'agents') loadAgents()
+  if (pageId === 'agents') { loadAgents().then(() => _setAgentsView(_agentsActiveView || 'grid')); startAgentsBusyPoll() }
   if (pageId === 'memories') { loadMemAgents(); loadMemStats(); loadMemories() }
   if (pageId === 'skills') loadGlobalSkills()
   if (pageId === 'connectors') loadConnectors()
   if (pageId === 'migrate') loadMigrateAgents()
   if (pageId === 'docs') loadDocs()
+  if (pageId === 'research') loadResearch()
   if (pageId === 'status') loadStatus()
   if (pageId === 'recall') loadRecallPage()
   if (pageId === 'bgTasks') loadBgTasksPage()
   if (pageId === 'vault') loadVaultPage()
-  if (pageId === 'autonomy') loadAutonomy()
+  if (pageId === 'approvals') loadApprovalsPage()
   if (pageId === 'settings') loadSettings()
   if (pageId === 'updates') loadUpdates()
-  if (pageId === 'team') { loadTeamGraph() }
+  // 'team' page is merged into 'agents' -- redirect for any lingering deep-links
   if (pageId === 'messages') loadMessagesPage()
   if (pageId === 'tokenUsage') loadTokenUsage()
+  if (pageId === 'costs') loadCosts()
   if (pageId === 'ideas') loadIdeasPage()
   if (pageId === 'archived') loadArchivedPage()
   if (pageId === 'naplo') loadNaplo()
+  if (pageId === 'federation') loadFederationPage()
 }
 
 // Mobile off-canvas sidebar toggle. No-op visual effect on desktop (the
@@ -299,6 +421,82 @@ navLinks.forEach((link) => {
   })
 })
 
+// === Collapsible sidebar groups ===
+// Open/closed state lives in localStorage (marveen.sidebarGroups) as a JSON
+// array of open group keys. Missing or corrupt state means everything starts
+// collapsed -- that is the designed default, not an error.
+const SIDEBAR_GROUPS_LS_KEY = 'marveen.sidebarGroups'
+// Declarative single source of truth for the group -> pages mapping. The markup
+// order is only the default snapshot: at boot the static links are re-parented
+// into their group containers per this map, so regrouping a page (say, moving
+// naplo under system) or relabeling a group is a one-line change right here.
+const SIDEBAR_GROUPS = [
+  { key: 'team',        labelKey: 'nav.group.team',        pages: ['agents', 'activity', 'messages', 'tasks', 'bgTasks'] },
+  { key: 'knowledge',   labelKey: 'nav.group.knowledge',   pages: ['memories', 'skills', 'research', 'ideas'] },
+  { key: 'stats',       labelKey: 'nav.group.stats',       pages: ['costs', 'tokenUsage'] },
+  { key: 'system',      labelKey: 'nav.group.system',      pages: ['status', 'naplo', 'updates', 'settings', 'vault'] },
+  { key: 'connections', labelKey: 'nav.group.connections', pages: ['connectors', 'federation', 'migrate'] },
+]
+const sidebarGroupEls = document.querySelectorAll('.sb-group[data-group]')
+// data-page -> group key, derived from the map (not the DOM) so the map wins.
+const PAGE_SIDEBAR_GROUP = {}
+SIDEBAR_GROUPS.forEach((def) => def.pages.forEach((p) => { PAGE_SIDEBAR_GROUP[p] = def.key }))
+// Re-parent the 23 static links to match the map. Moving an existing DOM node
+// does not invalidate the navLinks refs captured by querySelectorAll at boot.
+SIDEBAR_GROUPS.forEach((def) => {
+  const group = document.querySelector(`.sb-group[data-group="${def.key}"]`)
+  if (!group) return
+  const label = group.querySelector('.sb-group-label')
+  if (label) label.dataset.i18n = def.labelKey
+  const items = group.querySelector('.sb-group-items')
+  if (!items) return
+  def.pages.forEach((p) => {
+    const link = document.querySelector(`.sb-link[data-page="${p}"]`)
+    if (link) items.appendChild(link)
+  })
+})
+
+function loadSidebarGroupState() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(SIDEBAR_GROUPS_LS_KEY))
+    return Array.isArray(arr) ? arr.filter((k) => typeof k === 'string') : []
+  } catch { return [] }
+}
+
+function setSidebarGroupOpen(groupEl, open, persist = true) {
+  groupEl.classList.toggle('open', open)
+  const btn = groupEl.querySelector('.sb-group-header')
+  if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false')
+  if (persist) {
+    const key = groupEl.dataset.group
+    const state = loadSidebarGroupState().filter((k) => k !== key)
+    if (open) state.push(key)
+    try { localStorage.setItem(SIDEBAR_GROUPS_LS_KEY, JSON.stringify(state)) } catch {}
+  }
+}
+
+// Called from switchPage: the active page's group must always be visible so the
+// "where am I" highlight is never hidden inside a collapsed group.
+function openSidebarGroupForPage(pageId) {
+  const key = PAGE_SIDEBAR_GROUP[pageId]
+  if (!key) return
+  sidebarGroupEls.forEach((g) => {
+    // persist=false: only user clicks may be remembered. Persisting the
+    // auto-open would let everyday navigation accumulate all 5 groups as
+    // saved-open and quietly bring back the flat 23-item menu.
+    if (g.dataset.group === key && !g.classList.contains('open')) setSidebarGroupOpen(g, true, false)
+  })
+}
+
+{
+  const openKeys = loadSidebarGroupState()
+  sidebarGroupEls.forEach((g) => setSidebarGroupOpen(g, openKeys.includes(g.dataset.group), false))
+}
+sidebarGroupEls.forEach((g) => {
+  const btn = g.querySelector('.sb-group-header')
+  if (btn) btn.addEventListener('click', () => setSidebarGroupOpen(g, !g.classList.contains('open')))
+})
+
 
 // ============================================================
 // === i18n nav + static element rendering ===
@@ -311,9 +509,10 @@ const NAV_I18N = {
   messages: 'nav.messages', tasks: 'nav.tasks', memories: 'nav.memories',
   recall: 'nav.recall', naplo: 'nav.recall', bgTasks: 'nav.bgTasks',
   skills: 'nav.skills', connectors: 'nav.connectors', migrate: 'nav.migrate',
-  docs: 'nav.docs', status: 'nav.status', autonomy: 'nav.autonomy',
+  approvals: 'nav.approvals',
+  docs: 'nav.docs', research: 'nav.research', status: 'nav.status',
   settings: 'nav.settings', vault: 'nav.vault', tokenUsage: 'nav.tokenUsage',
-  ideas: 'nav.ideas', updates: 'nav.updates',
+  ideas: 'nav.ideas', federation: 'nav.federation', updates: 'nav.updates', costs: 'nav.costs',
 }
 
 function renderNav() {
@@ -346,16 +545,19 @@ const PAGE_HEADER_I18N = {
   connectorsPage: { title: 'connectors.page_title',  sub: 'connectors.page_subtitle' },
   migratePage:    { title: 'migrate.page_title',     sub: 'migrate.page_subtitle' },
   docsPage:       { title: 'docs.page_title',        sub: 'docs.page_subtitle' },
+  researchPage:   { title: 'research.page_title',    sub: 'research.page_subtitle' },
   statusPage:     { title: 'status.page_title',      sub: 'status.page_subtitle' },
   teamPage:       { title: 'team.page_title',        sub: 'team.page_subtitle' },
   messagesPage:   { title: 'messages.page_title',    sub: 'messages.page_subtitle' },
-  autonomyPage:   { title: 'autonomy.page_title',    sub: 'autonomy.page_subtitle' },
   settingsPage:   { title: 'settings.page_title',    sub: 'settings.page_subtitle' },
   ideasPage:      { title: 'ideas.page_title',       sub: 'ideas.page_subtitle' },
   vaultPage:      { title: 'vault.page_title',       sub: 'vault.page_subtitle' },
   tokenUsagePage: { title: 'tokenUsage.page_title',  sub: 'tokenUsage.page_subtitle' },
   updatesPage:    { title: 'updates.page_title',     sub: null },
   naploPage:      { title: 'naplo.page_title',       sub: 'naplo.page_subtitle' },
+  costsPage:      { title: 'costs.page_title',       sub: 'costs.page_subtitle' },
+  federationPage: { title: 'federation.page_title',  sub: 'federation.page_subtitle' },
+  approvalsPage:  { title: 'approvals.page_title',   sub: 'approvals.page_subtitle' },
 }
 
 function renderStaticI18n() {
@@ -370,8 +572,8 @@ function renderStaticI18n() {
   }
   // Kanban column titles
   const colTitles = document.querySelectorAll('.kanban-col-title')
-  const statusKeys = ['kanban.col.planned', 'kanban.col.in_progress', 'kanban.col.waiting', 'kanban.col.done']
-  const statuses = ['planned', 'in_progress', 'waiting', 'done']
+  const statusKeys = ['kanban.col.planned', 'kanban.col.in_progress', 'kanban.col.waiting', 'kanban.col.testing', 'kanban.col.done']
+  const statuses = ['planned', 'in_progress', 'waiting', 'testing', 'done']
   colTitles.forEach((el) => {
     const status = el.closest('[data-status]')?.dataset?.status
     if (status) {
@@ -409,11 +611,6 @@ function renderStaticI18n() {
   if (overviewTeamMeta) overviewTeamMeta.textContent = t('overview.meta.live')
   const overviewActivityH3 = document.querySelector('#overviewPage .overview-grid .overview-card:nth-child(2) h3')
   if (overviewActivityH3) overviewActivityH3.textContent = t('overview.card.activity')
-  const overviewAgentH3 = document.querySelector('#overviewPage .overview-grid .overview-card:nth-child(3) h3')
-  if (overviewAgentH3) overviewAgentH3.textContent = t('overview.card.agent_activity')
-  const overviewAgentMeta = document.querySelector('#overviewPage .overview-grid .overview-card:nth-child(3) .overview-card-meta')
-  if (overviewAgentMeta) overviewAgentMeta.textContent = t('overview.meta.messages')
-
   // Kanban filter labels
   const kanbanProjectLabel = document.querySelector('label[for="kanbanProjectFilter"]')
   if (kanbanProjectLabel) kanbanProjectLabel.textContent = t('kanban.filter.project_label')
@@ -551,6 +748,16 @@ function renderActivity(entries) {
     const meta = { ...metaRaw, label: typeof metaRaw.label === 'function' ? metaRaw.label() : metaRaw.label }
     const tail = (a.tail || []).map((l) => escapeHtml(l)).join('\n')
     const mainBadge = a.isMain ? '<span class="act-main-badge">' + t('activity.badge.main') + '</span>' : ''
+    // Permission-mode chip. Shown for every mode EXCEPT the ones that let the
+    // agent work on its own -- inverted on purpose: an unfamiliar mode is
+    // exactly the one worth surfacing, so a future Claude Code mode shows up
+    // here instead of hiding behind a list nobody remembered to extend.
+    // Without this an agent parked in an ask-first mode renders as plain
+    // 'idle', which is how one sat unusable for hours on 2026-07-27.
+    const AUTONOMOUS_MODES = ['bypass permissions', 'accept edits', 'auto mode']
+    const modeChip = a.mode && !AUTONOMOUS_MODES.includes(a.mode)
+      ? '<span class="act-mode-badge" title="' + escapeHtml(t('activity.tooltip.mode', { mode: a.mode })) + '">' + escapeHtml(a.mode) + '</span>'
+      : ''
     const canOpen = !!a.running
     const termIcon = canOpen
       ? '<svg class="act-term-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" title="' + t('activity.tooltip.terminal') + '"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>'
@@ -560,6 +767,7 @@ function renderActivity(entries) {
         '<div class="activity-card-head">' +
           '<span class="activity-name">' + escapeHtml(a.name) + mainBadge + '</span>' +
           '<span style="display:flex;align-items:center;gap:8px">' +
+            modeChip +
             termIcon +
             '<span class="activity-badge ' + meta.cls + '" title="' + escapeHtml(meta.tip || '') + '">' + meta.label + '</span>' +
           '</span>' +
@@ -615,6 +823,9 @@ let kanbanGroupByInitialized = false
 // Which swimlane keys (assignee name or priority value) are collapsed. Lives
 // for the page session only -- intentionally not persisted across reloads.
 const kanbanCollapsedLanes = new Set()
+// Set of status column keys that are hidden from the board view.
+// Empty = all columns visible. Persisted in localStorage.
+let kanbanHiddenColumns = new Set()
 
 const cardModalOverlay = document.getElementById('cardModalOverlay')
 const cardDetailOverlay = document.getElementById('cardDetailOverlay')
@@ -670,6 +881,10 @@ async function loadKanban() {
         const storedLabels = JSON.parse(localStorage.getItem('marveen.kanbanLabelFilter') || '[]')
         if (Array.isArray(storedLabels)) kanbanLabelFilter = new Set(storedLabels)
       } catch { /* ignore malformed storage */ }
+      try {
+        const storedHiddenCols = JSON.parse(localStorage.getItem('marveen.kanbanHiddenColumns') || '[]')
+        if (Array.isArray(storedHiddenCols)) kanbanHiddenColumns = new Set(storedHiddenCols)
+      } catch { /* ignore malformed storage */ }
     }
     const [cardsRes, assigneesRes, projectsRes, labelsRes] = await Promise.all([
       fetch('/api/kanban'),
@@ -708,6 +923,27 @@ function populateProjectFilter() {
     sel.appendChild(opt)
   }
   if (prev && !kanbanProjects.includes(prev)) kanbanProjectFilter = ''
+}
+
+function renderKanbanColumnChips() {
+  const container = document.getElementById('kanbanColumnChips')
+  if (!container) return
+  container.innerHTML = ''
+  for (const def of KANBAN_STATUS_DEFS) {
+    const hidden = kanbanHiddenColumns.has(def.status)
+    const label = typeof def.title === 'function' ? def.title() : def.title
+    const chip = document.createElement('span')
+    chip.className = 'kanban-col-chip' + (hidden ? ' hidden' : '')
+    chip.title = hidden ? t('kanban.filter.column_show') : t('kanban.filter.column_hide')
+    chip.textContent = label
+    chip.addEventListener('click', () => {
+      if (kanbanHiddenColumns.has(def.status)) kanbanHiddenColumns.delete(def.status)
+      else kanbanHiddenColumns.add(def.status)
+      localStorage.setItem('marveen.kanbanHiddenColumns', JSON.stringify([...kanbanHiddenColumns]))
+      renderKanban()
+    })
+    container.appendChild(chip)
+  }
 }
 
 function populateProjectSuggestions() {
@@ -885,6 +1121,7 @@ function renderKanbanQuickFilters() {
 function renderKanban() {
   const cardById = new Map(kanbanCards.map(c => [c.id, c]))
 
+  renderKanbanColumnChips()
   renderKanbanQuickFilters()
 
   // Determine which top-level cards are visible under current filters.
@@ -907,7 +1144,7 @@ function renderKanban() {
     if (parent.status === card.status) embeddedSubtaskIds.add(card.id)
   }
 
-  const grouped = { planned: [], in_progress: [], waiting: [], done: [] }
+  const grouped = { planned: [], in_progress: [], waiting: [], testing: [], done: [] }
   for (const card of kanbanCards) {
     if (embeddedSubtaskIds.has(card.id)) continue
     if (!visibleCardIds.has(card.id)) continue
@@ -917,6 +1154,7 @@ function renderKanban() {
   // Update counts (embedded subtasks don't count as separate cards)
   document.getElementById('countPlanned').textContent = grouped.planned.length
   document.getElementById('countInProgress').textContent = grouped.in_progress.length
+  document.getElementById('countTesting').textContent = grouped.testing.length
   document.getElementById('countWaiting').textContent = grouped.waiting.length
   document.getElementById('countDone').textContent = grouped.done.length
 
@@ -938,6 +1176,25 @@ function renderKanban() {
         col.appendChild(createCardEl(card, embeddedChildren))
       }
     }
+    // Hide/show flat-board columns based on visibility set
+    const allColsHidden = KANBAN_STATUS_DEFS.every(d => kanbanHiddenColumns.has(d.status))
+    for (const def of KANBAN_STATUS_DEFS) {
+      const colEl = flatBoard.querySelector(`.kanban-col[data-status="${def.status}"]`)
+      if (colEl) colEl.hidden = kanbanHiddenColumns.has(def.status)
+    }
+    // "All columns hidden" hint
+    let allHiddenMsg = document.getElementById('kanbanAllHiddenMsg')
+    if (allColsHidden) {
+      if (!allHiddenMsg) {
+        allHiddenMsg = document.createElement('p')
+        allHiddenMsg.id = 'kanbanAllHiddenMsg'
+        allHiddenMsg.style.cssText = 'color:var(--muted);font-size:13px;padding:24px 0;text-align:center;width:100%;'
+        flatBoard.appendChild(allHiddenMsg)
+      }
+      allHiddenMsg.textContent = t('kanban.filter.all_cols_hidden')
+    } else {
+      allHiddenMsg?.remove()
+    }
     // Badge: only count subtasks that are in a different column (not embedded here)
     updateSubtaskBadges(embeddedSubtaskIds)
     // WIP limit badges (count/limit + colour) on the flat board too -- previously
@@ -955,6 +1212,7 @@ const KANBAN_STATUS_DEFS = [
   { status: 'planned', title: () => t('kanban.col.planned') },
   { status: 'in_progress', title: () => t('kanban.col.in_progress') },
   { status: 'waiting', title: () => t('kanban.col.waiting') },
+  { status: 'testing', title: () => t('kanban.col.testing') },
   { status: 'done', title: () => t('kanban.col.done') },
 ]
 const KANBAN_PRIORITY_LABELS = { urgent: () => t('kanban.priority.urgent'), high: () => t('kanban.priority.high'), normal: () => t('kanban.priority.normal'), low: () => t('kanban.priority.low') }
@@ -1010,7 +1268,7 @@ function renderSwimlaneBoard(grouped, embeddedSubtaskIds) {
     for (const def of KANBAN_STATUS_DEFS) {
       const cards = grouped[def.status].filter(c => kanbanSwimlaneKeyFor(c) === key)
       laneCardsByStatus[def.status] = cards
-      totalCount += cards.length
+      if (!kanbanHiddenColumns.has(def.status)) totalCount += cards.length
     }
 
     const lane = document.createElement('div')
@@ -1037,6 +1295,7 @@ function renderSwimlaneBoard(grouped, embeddedSubtaskIds) {
     const body = document.createElement('div')
     body.className = 'kanban-swimlane-body'
     for (const def of KANBAN_STATUS_DEFS) {
+      if (kanbanHiddenColumns.has(def.status)) continue
       const col = document.createElement('div')
       col.className = 'kanban-swimlane-col'
 
@@ -1075,6 +1334,7 @@ function renderSwimlaneBoard(grouped, embeddedSubtaskIds) {
 const WIP_COUNT_IDS = {
   planned: 'countPlanned',
   in_progress: 'countInProgress',
+  testing: 'countTesting',
   waiting: 'countWaiting',
   done: 'countDone',
 }
@@ -1273,6 +1533,11 @@ function createCardEl(card, embeddedChildren = []) {
   })
   el.addEventListener('dragend', () => el.classList.remove('dragging'))
 
+  // Touch equivalent of the above -- see wireKanbanCardTouchDnD. Wired before
+  // the click listener so its capture-phase guard can swallow the tap that
+  // ends a drag.
+  wireKanbanCardTouchDnD(el, card)
+
   // Click -> detail
   el.addEventListener('click', () => showCardDetail(card))
 
@@ -1329,6 +1594,198 @@ function wireKanbanColumnDnD(col) {
   })
 }
 columns.forEach(wireKanbanColumnDnD)
+
+// === Touch drag & drop (mobile) ===
+// HTML5 drag & drop above never fires on a touch screen -- no dragstart, no
+// drop -- so on a phone the board could only be read, never rearranged. This
+// is a parallel touch path over the same /move call.
+//
+// Why touch events and not Pointer Events + touch-action: a card fills most of
+// the column, so making it permanently untouchable for scrolling (touch-action:
+// none) would break scrolling the board. Instead the gesture stays ambiguous
+// until it resolves: a long press (250ms) means "drag", any earlier movement
+// means "scroll" and hands the gesture straight back to the browser. Only once
+// dragging is committed does touchmove call preventDefault() to hold the page
+// still -- which is why that listener MUST be non-passive.
+const TOUCH_DRAG_DELAY_MS = 250
+const TOUCH_DRAG_SLOP_PX = 10
+let touchDrag = null
+
+function kanbanColBodyAt(x, y) {
+  const el = document.elementFromPoint(x, y)
+  return el ? el.closest('.kanban-col-body') : null
+}
+
+// On a phone the columns stack vertically, so the next column starts ~2000px
+// below the fold -- dragging a card "one column over" would mean dragging it
+// at an invisible target while the page auto-scrolls for several seconds.
+// Instead, committing to a drag raises a fixed bar of status targets over the
+// bottom of the screen: the same gesture, with somewhere to drop. Column
+// hit-testing stays active for viewports where the target column IS visible.
+const KANBAN_TOUCH_STATUSES = ['planned', 'in_progress', 'waiting', 'testing', 'done']
+
+function buildTouchDropBar(currentStatus) {
+  const bar = document.createElement('div')
+  bar.className = 'kanban-touch-dropbar'
+  for (const s of KANBAN_TOUCH_STATUSES) {
+    const chip = document.createElement('div')
+    chip.className = 'kanban-drop-target'
+    chip.dataset.status = s
+    if (s === currentStatus) chip.classList.add('is-current')
+    chip.textContent = t(`kanban.status.${s}`)
+    bar.appendChild(chip)
+  }
+  document.body.appendChild(bar)
+  return bar
+}
+
+function kanbanDropTargetAt(x, y) {
+  const el = document.elementFromPoint(x, y)
+  return el ? el.closest('.kanban-drop-target') : null
+}
+
+function clearTouchDragHighlight() {
+  document.querySelectorAll('.kanban-col-body.drag-over, .kanban-drop-target.drag-over')
+    .forEach((c) => c.classList.remove('drag-over'))
+}
+
+function endTouchDrag() {
+  if (!touchDrag) return
+  clearTimeout(touchDrag.timer)
+  touchDrag.ghost?.remove()
+  touchDrag.dropBar?.remove()
+  touchDrag.el.classList.remove('dragging')
+  clearTouchDragHighlight()
+  document.removeEventListener('touchmove', kanbanTouchMove)
+  document.removeEventListener('touchend', kanbanTouchEnd)
+  document.removeEventListener('touchcancel', endTouchDrag)
+  touchDrag = null
+}
+
+// The ghost is deliberately NOT a full-size copy of the card: at full width it
+// covered three of the five drop targets, so the user could not see what they
+// were aiming at. It rides ABOVE the fingertip (see positionTouchGhost) for the
+// same reason -- the target under the finger has to stay visible.
+const TOUCH_GHOST_MAX_W = 200
+const TOUCH_GHOST_LIFT = 28
+
+function positionTouchGhost(x, y) {
+  const g = touchDrag.ghost
+  const gx = x - g.offsetWidth / 2
+  const gy = y - g.offsetHeight - TOUCH_GHOST_LIFT
+  g.style.transform = `translate(${Math.max(4, gx)}px, ${Math.max(4, gy)}px) rotate(2deg)`
+}
+
+function beginTouchDrag(x, y) {
+  if (!touchDrag) return
+  const el = touchDrag.el
+  const box = el.getBoundingClientRect()
+  const ghost = document.createElement('div')
+  ghost.className = 'kanban-card kanban-card-ghost'
+  ghost.textContent = touchDrag.card.title
+  ghost.style.cssText = `position:fixed; left:0; top:0; width:${Math.min(box.width, TOUCH_GHOST_MAX_W)}px; pointer-events:none; z-index:9999; opacity:.95; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; box-shadow:0 8px 24px rgba(0,0,0,.35)`
+  document.body.appendChild(ghost)
+  touchDrag.ghost = ghost
+  positionTouchGhost(x, y)
+  touchDrag.active = true
+  touchDrag.dropBar = buildTouchDropBar(touchDrag.card.status)
+  el.classList.add('dragging')
+  // Confirm the mode switch on devices that support it -- without a cursor,
+  // the only other signal that a long press "took" is the ghost appearing.
+  navigator.vibrate?.(10)
+}
+
+function kanbanTouchMove(e) {
+  if (!touchDrag || e.touches.length !== 1) return
+  const p = e.touches[0]
+  if (!touchDrag.active) {
+    // Still ambiguous: movement beyond the slop means the user is scrolling.
+    if (Math.abs(p.clientX - touchDrag.startX) > TOUCH_DRAG_SLOP_PX ||
+        Math.abs(p.clientY - touchDrag.startY) > TOUCH_DRAG_SLOP_PX) {
+      endTouchDrag()
+    }
+    return
+  }
+  e.preventDefault()
+  positionTouchGhost(p.clientX, p.clientY)
+  clearTouchDragHighlight()
+  // The drop bar sits above everything, so test it first -- a chip and a
+  // column body can overlap on screen.
+  const chip = kanbanDropTargetAt(p.clientX, p.clientY)
+  if (chip) { chip.classList.add('drag-over'); return }
+  const col = kanbanColBodyAt(p.clientX, p.clientY)
+  if (col) col.classList.add('drag-over')
+}
+
+async function kanbanTouchEnd(e) {
+  if (!touchDrag) return
+  if (!touchDrag.active) { endTouchDrag(); return }
+  const p = e.changedTouches[0]
+  const chip = kanbanDropTargetAt(p.clientX, p.clientY)
+  const col = chip ? null : kanbanColBodyAt(p.clientX, p.clientY)
+  const cardId = touchDrag.card.id
+  // The release that ends a drag would otherwise also register as a tap and
+  // open the detail modal on top of the board the user just rearranged.
+  touchDrag.el.dataset.suppressClick = '1'
+  // Read the drop position BEFORE endTouchDrag drops the .dragging class --
+  // getDragAfterElement excludes .dragging, which is what keeps the card from
+  // counting itself when it is dropped back into its own column.
+  let sortOrder = 0
+  let newStatus = null
+  if (chip) {
+    // Dropped on the status bar: no position information, so append.
+    newStatus = chip.dataset.status
+    sortOrder = document.querySelectorAll(`.kanban-col-body[data-status="${newStatus}"] .kanban-card`).length
+  } else if (col) {
+    newStatus = col.dataset.status
+    const after = getDragAfterElement(col, p.clientY)
+    const others = [...col.querySelectorAll('.kanban-card:not(.dragging)')]
+    sortOrder = after ? others.indexOf(after) : others.length
+  }
+  endTouchDrag()
+  // Released outside any target: treat as a cancelled drag, not a move.
+  // A drop inside a column always posts, even when the status is unchanged --
+  // that is a reorder within the column, which is just as valid a move.
+  if (!newStatus) return
+  try {
+    const r = await fetch(`/api/kanban/${encodeURIComponent(cardId)}/move`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: newStatus, sort_order: sortOrder }),
+    })
+    if (!r.ok) throw new Error('move failed')
+    loadKanban()
+  } catch {
+    showToast(t('kanban.toast.move_error'))
+  }
+}
+
+function wireKanbanCardTouchDnD(el, card) {
+  el.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) return
+    const p = e.touches[0]
+    endTouchDrag()
+    touchDrag = {
+      card, el, ghost: null, active: false,
+      startX: p.clientX, startY: p.clientY,
+      timer: setTimeout(() => beginTouchDrag(p.clientX, p.clientY), TOUCH_DRAG_DELAY_MS),
+    }
+    document.addEventListener('touchmove', kanbanTouchMove, { passive: false })
+    document.addEventListener('touchend', kanbanTouchEnd)
+    document.addEventListener('touchcancel', endTouchDrag)
+  }, { passive: true })
+
+  // A long press that turned into a drag must not also open the detail modal
+  // on release. The click listener in createCardEl fires after touchend, so
+  // the guard flag is read there.
+  el.addEventListener('click', (e) => {
+    if (el.dataset.suppressClick === '1') {
+      delete el.dataset.suppressClick
+      e.stopImmediatePropagation()
+      e.preventDefault()
+    }
+  }, true)
+}
 
 function getDragAfterElement(col, y) {
   const els = [...col.querySelectorAll('.kanban-card:not(.dragging)')]
@@ -1532,7 +1989,7 @@ async function showCardDetail(card) {
     : null
   const assigneeDisplay = assignee ? (assignee.displayName || assignee.name) : (rawDetailAssignee || '-- nincs --')
   const priorityLabels = { low: t('kanban.priority.low'), normal: t('kanban.priority.normal'), high: t('kanban.priority.high'), urgent: t('kanban.priority.urgent') }
-  const statusLabels = { planned: t('kanban.status.planned'), in_progress: t('kanban.status.in_progress'), waiting: t('kanban.status.waiting'), done: t('kanban.status.done') }
+  const statusLabels = { planned: t('kanban.status.planned'), in_progress: t('kanban.status.in_progress'), testing: t('kanban.status.testing'), waiting: t('kanban.status.waiting'), done: t('kanban.status.done') }
 
   const meta = document.getElementById('cardDetailMeta')
   const idLabel = (card.seq != null ? `#${card.seq} · ` : '') + card.id
@@ -1543,7 +2000,7 @@ async function showCardDetail(card) {
     </div>
     <div class="meta-item">
       <span class="meta-label">${t('kanban.meta.status')}</span>
-      <span class="meta-value">${statusLabels[card.status] || card.status}</span>
+      <span class="meta-value meta-value-editable" id="metaStatusValue" data-card-id="${card.id}" title="${t('kanban.meta.edit_tooltip')}">${statusLabels[card.status] || card.status}</span>
     </div>
     <div class="meta-item">
       <span class="meta-label">${t('kanban.meta.assignee')}</span>
@@ -1562,6 +2019,55 @@ async function showCardDetail(card) {
       <span class="meta-value">${card.due_date ? new Date(card.due_date * 1000).toLocaleDateString(_lang === 'en' ? 'en-US' : 'hu-HU') : t('kanban.meta.none')}</span>
     </div>
   `
+
+  // Inline edit for status on detail view. HTML5 drag & drop is the only way to
+  // change a card's column, and it is dead on touch devices (no dragstart is
+  // ever fired), so on a phone the board was effectively read-only. This is the
+  // pointer-independent path: tap the card, pick the new status. Mirrors the
+  // assignee editor below, but POSTs to /move rather than PUT -- /move is what
+  // recomputes sort_order AND fires the in_progress agent dispatch, which a
+  // plain PUT would silently skip.
+  const statusValueEl = document.getElementById('metaStatusValue')
+  statusValueEl.addEventListener('click', () => {
+    if (statusValueEl.querySelector('select')) return
+    const current = card.status
+    const sel = document.createElement('select')
+    sel.style.cssText = 'padding:2px 6px; border-radius:4px; border:1px solid var(--border); background:var(--bg-card); color:var(--text); font-size:inherit'
+    for (const s of ['planned', 'in_progress', 'waiting', 'testing', 'done']) {
+      const opt = document.createElement('option')
+      opt.value = s
+      opt.textContent = statusLabels[s] || s
+      if (s === current) opt.selected = true
+      sel.appendChild(opt)
+    }
+    statusValueEl.innerHTML = ''
+    statusValueEl.appendChild(sel)
+    sel.focus()
+    const restore = (status) => { statusValueEl.textContent = statusLabels[status] || status }
+    const save = async () => {
+      const newVal = sel.value
+      if (newVal === current) { restore(current); return }
+      try {
+        const r = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/move`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: newVal, sort_order: 0 }),
+        })
+        if (!r.ok) throw new Error('move failed')
+        card.status = newVal
+        restore(newVal)
+        showToast(t('kanban.toast.status_updated'))
+        loadKanban && loadKanban()
+      } catch {
+        restore(current)
+        showToast(t('kanban.toast.move_error'))
+      }
+    }
+    sel.addEventListener('change', save)
+    sel.addEventListener('blur', () => {
+      if (statusValueEl.querySelector('select')) restore(card.status)
+    })
+  })
 
   // Inline edit for assignee on detail view
   const assigneeValueEl = document.getElementById('metaAssigneeValue')
@@ -1624,7 +2130,7 @@ async function showCardDetail(card) {
     parentSelect.innerHTML = `<option value="">${t('kanban.parent.empty')}</option>`
     const availableParents = kanbanCards.filter(c =>
       !c.parent_id && c.id !== card.id && !c.archived_at &&
-      (c.status === 'planned' || c.status === 'in_progress' || c.status === 'waiting')
+      (c.status === 'planned' || c.status === 'in_progress' || c.status === 'testing' || c.status === 'waiting')
     )
     for (const p of availableParents) {
       const opt = document.createElement('option')
@@ -1781,7 +2287,7 @@ async function showCardDetail(card) {
       addSubtaskSection.style.display = 'none'
     }
 
-    const statusLabelsShort = { planned: t('kanban.status.planned'), in_progress: t('kanban.status.in_progress'), waiting: t('kanban.status.waiting_short'), done: t('kanban.status.done') }
+    const statusLabelsShort = { planned: t('kanban.status.planned'), in_progress: t('kanban.status.in_progress'), testing: t('kanban.status.testing'), waiting: t('kanban.status.waiting_short'), done: t('kanban.status.done') }
     if (children.length > 0 || isTask) {
       section.style.display = ''
       list.innerHTML = ''
@@ -2087,6 +2593,51 @@ function populateProfileSelect(selectEl, descEl, selected) {
   })
 }
 
+// Populate the per-agent Claude subscription plan dropdown from the named
+// registry (/api/claude-plans). The empty value means "no named plan" -> the
+// agent keeps its raw config-dir / host default. The description line shows the
+// plan type + config dir and flags a Channels-forbidden plan so the operator
+// sees the guardrail context before saving.
+function populatePlanSelect(selectEl, descEl, selected) {
+  if (!selectEl) return
+  fetch('/api/claude-plans')
+    .then(res => (res.ok ? res.json() : []))
+    .catch(() => [])
+    .then((plans) => {
+      const known = plans.some(p => p.id === selected)
+      const opts = [`<option value="">${escapeHtml(t('agents.settings.plan_default'))}</option>`]
+      for (const p of plans) {
+        opts.push(`<option value="${escapeHtml(p.id)}">${escapeHtml(p.label)}</option>`)
+      }
+      // Preserve an already-assigned plan id that is NOT in the loaded registry
+      // (registry edited/renamed, OR /api/claude-plans transiently failed and
+      // returned []). Without this the dropdown would resolve to '' and a save
+      // would silently wipe the real assignment.
+      if (selected && !known) {
+        opts.push(`<option value="${escapeHtml(selected)}">${escapeHtml(selected)}${escapeHtml(t('agents.settings.plan_not_found_suffix'))}</option>`)
+      }
+      selectEl.innerHTML = opts.join('')
+      selectEl.value = selected || ''
+      const updateDesc = () => {
+        if (!descEl) return
+        const val = selectEl.value
+        if (!val) {
+          descEl.textContent = t('agents.settings.plan_default_desc')
+          return
+        }
+        const p = plans.find(x => x.id === val)
+        if (!p) {
+          descEl.textContent = t('agents.settings.plan_unresolved_desc', { id: val })
+          return
+        }
+        const warn = p.channelsAllowed ? '' : t('agents.settings.plan_no_channels')
+        descEl.textContent = `${p.planType} · ${p.configDir}${warn}`
+      }
+      selectEl.onchange = updateDesc
+      updateDesc()
+    })
+}
+
 function resetWizard() {
   wizardStep = 1
   agentName.value = ''
@@ -2263,11 +2814,16 @@ function showToast(msg, duration = 3000) {
 // === Agents API ===
 async function loadAgents() {
   try {
-    const [agentsRes, marveenRes] = await Promise.all([
+    // The federation status fetch is deliberately failure-proof (.catch ->
+    // null): it must NEVER take down the Agents page -- including on an
+    // older backend where the route 404s.
+    const [agentsRes, marveenRes, fedStatus] = await Promise.all([
       fetch('/api/agents'),
       fetch('/api/marveen'),
+      fetch('/api/federation/status').then((r) => (r.ok ? r.json() : null)).catch(() => null),
     ])
     agents = await agentsRes.json()
+    if (fedStatus && Array.isArray(fedStatus.peers)) federatedPeerStatus = fedStatus.peers
     if (marveenRes.ok) {
       window._marveen = await marveenRes.json()
       // A backend CHANNEL_PROVIDER-éhez igazitsuk a kliens-default-ot,
@@ -2343,7 +2899,7 @@ async function openMarveenDetail() {
   document.getElementById('agentDetailTitle').textContent = displayName
   const avatar = document.getElementById('agentDetailAvatar')
   avatar.className = 'detail-avatar gradient-1'
-  avatar.innerHTML = `<img src="/api/marveen/avatar?t=${Date.now()}" alt="${escapeHtml(displayName)}">`
+  avatar.innerHTML = `<img src="/api/marveen/avatar${avatarBust()}" alt="${escapeHtml(displayName)}">`
   document.getElementById('agentDetailName').textContent = displayName
   document.getElementById('agentDetailDesc').textContent = m.description || ''
   document.getElementById('agentDetailModel').textContent = m.model || '-'
@@ -2363,7 +2919,27 @@ async function openMarveenDetail() {
   // Sync the settings tab model select with Marveen's actual model so it
   // doesn't carry over the previously opened sub-agent's selection.
   const marveenModelSelect = document.getElementById('editAgentModel')
-  if (marveenModelSelect) marveenModelSelect.value = m.activeModel || m.model || ''
+  if (marveenModelSelect) {
+    // The main agent's real model (e.g. 'claude-opus-4-8') may not match any
+    // static option verbatim (the option is 'claude-opus-4-8[1m]'), so a plain
+    // .value assignment finds no match and the select silently displays the
+    // first option (Fable 5), misrepresenting what the agent actually runs.
+    // Inject the real id as an option so the (read-only) select shows the truth
+    // -- same trick as the sub-agent panel's dynamic-model-opt.
+    const mv = m.activeModel || m.model || ''
+    Array.from(marveenModelSelect.querySelectorAll('option.dynamic-model-opt')).forEach(o => o.remove())
+    if (mv && !Array.from(marveenModelSelect.options).some(o => o.value === mv)) {
+      const opt = document.createElement('option')
+      opt.value = mv
+      opt.className = 'dynamic-model-opt'
+      opt.textContent = mv
+      marveenModelSelect.appendChild(opt)
+    }
+    marveenModelSelect.value = mv
+  }
+  // Populate the model dropdown groups (auto/manual) AND surface the OpenRouter
+  // curation button -- this is the main agent, the only place curation lives.
+  loadAvailableModels()
   // Surface the "channels restart" button -- destructive, but mobile-safe
   // when the Telegram plugin wedges and you're away from a terminal.
   document.getElementById('marveenRestartBtn').hidden = false
@@ -2404,7 +2980,24 @@ async function openMarveenDetail() {
   openModal(agentDetailOverlay)
 }
 
+// `readOnly` is really "this modal is showing the MAIN agent" -- it is called
+// with true from openMarveenDetail and false from openAgentDetail, which makes
+// it the one hook both open-paths share. Anything that must differ for the main
+// agent belongs here; putting it in openAgentDetail alone silently no-ops for
+// the main agent, whose panel never runs that function.
 function applyMarveenReadonlyMode(readOnly) {
+  // The Team tab describes a SUB-agent's place in the hierarchy: role
+  // (leader | member), who it reports to, who it delegates to. None of it
+  // applies to the main agent, which has no team record and cannot have one.
+  // Its role is 'main', a tier ABOVE leader, and it is an implicit trusted peer
+  // of every agent (see isTrustedPeer), so there is nothing to configure. Shown
+  // anyway, the tab printed the literal fallback "member" and invited the
+  // operator to promote the main agent to 'leader' -- a demotion, and one that
+  // cannot be saved either way: the PUT targets /api/agents/<main>/team, which
+  // 404s because no agents/<main>/ directory exists. Hide the whole tab, same
+  // reasoning as claudePlanGroup.
+  const teamTabBtn = document.querySelector('#agentTabNav .tab-btn[data-tab="team"]')
+  if (teamTabBtn) teamTabBtn.hidden = readOnly
   const textareaIds = ['editClaudeMd', 'editSoulMd', 'editMcpJson']
   // saveModelBtn stays VISIBLE but disabled for Marveen, so the settings tab
   // doesn't look like the row is missing -- the other save buttons (tied to
@@ -2430,6 +3023,8 @@ function applyMarveenReadonlyMode(readOnly) {
   }
   const authModeGroup = document.getElementById('authModeGroup')
   if (authModeGroup) authModeGroup.hidden = readOnly
+  const memoryIsolationGroup = document.getElementById('memoryIsolationGroup')
+  if (memoryIsolationGroup) memoryIsolationGroup.hidden = readOnly
   const note = document.getElementById('marveenReadonlyNote')
   if (note) note.hidden = !readOnly
 }
@@ -2507,7 +3102,7 @@ function renderAgents() {
     mCard.className = 'agent-card marveen-card'
     mCard.innerHTML = `
       <div class="agent-card-top">
-        <div class="agent-avatar gradient-1"><img src="/api/marveen/avatar?t=${Date.now()}" alt="${escapeHtml(displayName)}"></div>
+        <div class="agent-avatar gradient-1"><img src="/api/marveen/avatar${avatarBust()}" alt="${escapeHtml(displayName)}"></div>
         <div class="agent-card-info">
           <div class="agent-name">${escapeHtml(displayName)} <span class="marveen-badge">${t('agents.main_badge')}</span></div>
           <div class="agent-desc">${escapeHtml(m.description || '')}</div>
@@ -2549,7 +3144,7 @@ function renderAgents() {
     const initial = label.charAt(0).toUpperCase()
     const gradientClass = getAvatarGradient(agent.name)
     const avatarHtml = (agent.hasImage || agent.hasAvatar)
-      ? `<img src="/api/agents/${encodeURIComponent(agent.name)}/avatar?t=${Date.now()}" alt="${escapeHtml(label)}">`
+      ? `<img src="/api/agents/${encodeURIComponent(agent.name)}/avatar${avatarBust()}" alt="${escapeHtml(label)}">`
       : initial
 
     const modelClass = agent.model && agent.model !== 'inherit' ? agent.model : ''
@@ -2608,10 +3203,116 @@ function renderAgents() {
     if (isRunning) attachTmuxCopyButtons(card, agent)
     agentsGrid.insertBefore(card, addBtn)
   }
+  renderFederatedAgentCards(agentsGrid, addBtn)
+  // Re-apply the live busy tint right after a re-render (renderAgents rebuilds
+  // the cards from scratch, dropping the class), so it never blinks off while
+  // the page is open.
+  if (agentsBusyTimer) refreshAgentTerminalBusy()
+}
+
+// === Agents: live "working" tint on Terminal buttons ===
+// Reuse the Activity page's data source (/api/agents/activity, same 3s poll,
+// same working/idle state derived from the tmux pane) to turn an agent card's
+// Terminal button green while that agent is actively working, and clear it when
+// it goes idle or stops. No new backend -- just a second consumer of the same
+// endpoint. The main (Marveen) card matches on mainAgentId(); sub-agent cards
+// match on their data-name.
+let agentsBusyTimer = null
+function startAgentsBusyPoll() {
+  refreshAgentTerminalBusy()
+  if (agentsBusyTimer) clearInterval(agentsBusyTimer)
+  agentsBusyTimer = setInterval(refreshAgentTerminalBusy, 3000)
+}
+function stopAgentsBusyPoll() {
+  if (agentsBusyTimer) { clearInterval(agentsBusyTimer); agentsBusyTimer = null }
+}
+async function refreshAgentTerminalBusy() {
+  if (!agentsGrid) return
+  let entries
+  try {
+    const res = await fetch('/api/agents/activity')
+    if (!res.ok) return
+    entries = await res.json()
+  } catch { return }
+  if (!Array.isArray(entries)) return
+  const stateByName = new Map(entries.map((e) => [e.name, e.state]))
+  const mainId = mainAgentId()
+  agentsGrid.querySelectorAll('.agent-card:not(.add-card)').forEach((card) => {
+    const btn = card.querySelector('.agent-terminal-btn')
+    if (!btn) return
+    const id = card.classList.contains('marveen-card') ? mainId : card.dataset.name
+    const working = !!id && stateByName.get(id) === 'working'
+    btn.classList.toggle('agent-terminal-btn--busy', working)
+  })
+}
+
+// Federated (remote-system) agents from the manifest-poller cache. Kept in a
+// SEPARATE array from `agents`: that global feeds the team editor and the
+// create-wizard, where qualified ids would be selectable-and-invalid.
+// "remote" already means SSH agents in this codebase -- these are FEDERATED.
+let federatedPeerStatus = []
+
+// System/plumbing agent names never shown as message targets.
+const FEDERATED_HIDDEN_AGENTS = new Set(['heartbeat', 'telegram-coordinator', 'channel-coordinator'])
+
+function federatedAgentEntries() {
+  const out = []
+  for (const peer of federatedPeerStatus) {
+    const manifest = peer && peer.manifest
+    if (!manifest || !Array.isArray(manifest.agents)) continue
+    for (const a of manifest.agents) {
+      if (!a || typeof a.id !== 'string' || FEDERATED_HIDDEN_AGENTS.has(a.id.split('/').pop())) continue
+      out.push({ peer: peer.id, peerState: peer.state, qualified: `${peer.id}/${a.id}`, displayName: a.displayName || a.id, model: a.model || '' })
+    }
+  }
+  return out
+}
+
+function renderFederatedAgentCards(agentsGrid, addBtn) {
+  for (const fa of federatedAgentEntries()) {
+    const card = document.createElement('div')
+    card.className = 'agent-card federated-agent-card'
+    const reachable = fa.peerState === 'ok'
+    // SECURITY: every manifest-derived string is peer-controlled. Text nodes
+    // go through escapeHtml; NOTHING peer-controlled may land in an attribute
+    // (escapeHtml does not encode quotes). The model badge is a plain text
+    // span WITHOUT a model-derived class.
+    const gradientClass = 'gradient-' + ((fa.qualified.charCodeAt(0) % 3) + 1)
+    card.innerHTML = `
+      <div class="agent-card-top">
+        <div class="agent-avatar ${gradientClass}">${escapeHtml(fa.displayName.charAt(0).toUpperCase())}</div>
+        <div class="agent-card-info">
+          <div class="agent-name">${escapeHtml(fa.displayName)} <span class="federated-badge">${t('federation.badge', { peer: fa.peer })}</span></div>
+          <div class="agent-desc">${escapeHtml(fa.qualified)}</div>
+        </div>
+      </div>
+      <div class="agent-card-footer">
+        <span class="agent-model-badge">${escapeHtml(fa.model)}</span>
+        <span class="tg-status"><span class="tg-dot ${reachable ? 'connected' : 'disconnected'}"></span> ${reachable ? t('federation.peer_state.ok') : t('federation.peer_state.' + (fa.peerState || 'unknown'))}</span>
+      </div>
+      <div class="agent-card-actions">
+        <button class="btn-secondary btn-compact federated-message-btn">${t('federation.btn.message')}</button>
+      </div>`
+    card.querySelector('.federated-message-btn').addEventListener('click', (e) => {
+      e.stopPropagation()
+      openFederatedThread(fa.qualified)
+    })
+    agentsGrid.insertBefore(card, addBtn)
+  }
+}
+
+function openFederatedThread(qualifiedId) {
+  chatSelectedAgent = qualifiedId
+  if (location.hash === '#messages') switchPage('messages')
+  else location.hash = 'messages'
 }
 
 // === Agent Detail ===
 async function openAgentDetail(agentName) {
+  if (agentName === mainAgentId()) {
+    return openMarveenDetail()
+  }
+
   try {
     const res = await fetch(`/api/agents/${encodeURIComponent(agentName)}`)
     if (!res.ok) throw new Error('Not found')
@@ -2642,18 +3343,62 @@ async function openAgentDetail(agentName) {
   const chConnected = agentIsConnected(currentAgent)
   document.getElementById('agentDetailChStatus').innerHTML = `<span class="tg-status"><span class="tg-dot ${chConnected ? 'connected' : 'disconnected'}"></span>${chConnected ? t('agents.channel.connected') : t('agents.channel.disconnected')}</span>`
 
-  // Settings tab - load Ollama + DeepSeek models then set value
+  // Settings tab - load Ollama + DeepSeek + custom-provider models then set value
   loadAvailableModels()
   loadOllamaModels().then(() => {
-    document.getElementById('editAgentModel').value = currentAgent.activeModel || currentAgent.model || 'claude-opus-4-8[1m]'
+    const sel = document.getElementById('editAgentModel')
+    const mv = currentAgent.activeModel || currentAgent.model || 'claude-opus-4-8[1m]'
+    const customProviderId = currentAgent.customProvider || null
+    // The model <select> is one shared element reused per agent. A manual
+    // OpenRouter id (or openrouter-auto:tier, or custom model) may not be
+    // among the static/auto options, so setting .value would silently show
+    // nothing. Inject THIS agent's model as a selectable option (cleaning any
+    // stale injected ones first) so every agent always displays its own model.
+    Array.from(sel.querySelectorAll('option.dynamic-model-opt')).forEach(o => o.remove())
+    if (customProviderId) {
+      // Custom provider: select value is "custom:<providerId>"; model-id in the text input.
+      const cpVal = `custom:${customProviderId}`
+      if (!Array.from(sel.options).some(o => o.value === cpVal)) {
+        const opt = document.createElement('option')
+        opt.value = cpVal
+        opt.className = 'dynamic-model-opt'
+        opt.textContent = `🔧 ${customProviderId}`
+        sel.appendChild(opt)
+      }
+      sel.value = cpVal
+      const modelInput = document.getElementById('editAgentModelCustomModelId')
+      if (modelInput) modelInput.value = mv
+    } else {
+      if (!Array.from(sel.options).some(o => o.value === mv)) {
+        const opt = document.createElement('option')
+        opt.value = mv
+        opt.className = 'dynamic-model-opt'
+        opt.textContent = mv.startsWith('openrouter-auto:') ? `🔀 ${mv}` : `🔀 ${mv}`
+        sel.appendChild(opt)
+      }
+      sel.value = mv
+    }
+    updateCustomModelIdRow(sel)
   })
   populateProfileSelect(
     document.getElementById('editAgentProfile'),
     document.getElementById('editAgentProfileDesc'),
     currentAgent.securityProfile || 'default',
   )
+  // The main agent's Claude login is managed via channels.sh, not the per-agent
+  // config path, so plan selection does not apply to it. Hide the whole group.
+  const planGroup = document.getElementById('claudePlanGroup')
+  if (planGroup) planGroup.hidden = currentAgent.role === 'main'
+  populatePlanSelect(
+    document.getElementById('editAgentPlan'),
+    document.getElementById('editAgentPlanDesc'),
+    currentAgent.claudePlan || '',
+  )
   renderTeamEditor(currentAgent, agents)
   updateAuthModeUI(currentAgent.authMode || 'shared', currentAgent.hasApiKey || false)
+  const memIsoToggle = document.getElementById('memoryIsolationToggle')
+  if (memIsoToggle) memIsoToggle.checked = currentAgent.memoryIsolation === true
+  loadVoiceConfig(currentAgent.name)
   document.getElementById('editClaudeMd').value = currentAgent.claudeMd || currentAgent.content || ''
   document.getElementById('editSoulMd').value = currentAgent.soulMd || ''
   document.getElementById('editMcpJson').value = currentAgent.mcpJson || ''
@@ -2690,6 +3435,43 @@ async function openAgentDetail(agentName) {
     }
   }
 
+  // Export button: download a portable .tar.gz bundle of this agent. Offers to
+  // include channel tokens (off by default -- the safe-to-share variant).
+  // The download goes through the auth-wrapped fetch (the global fetch shim
+  // injects the Bearer header) and is turned into a Blob download, rather than
+  // a plain navigation -- a window.location download cannot carry the
+  // Authorization header and the API would 401 it.
+  document.getElementById('exportAgentBtn').onclick = async () => {
+    if (!currentAgent) return
+    const withSecrets = confirm(
+      'Belevegyük a titkokat (channel bot token, párosítási állapot)?\n\n' +
+      'OK = igen, csak saját gépek közötti átvitelhez.\n' +
+      'Mégse = nem, biztonságosan megosztható (csak identitás + viselkedés).'
+    )
+    const name = currentAgent.name
+    const url = `/api/agents/${encodeURIComponent(name)}/export${withSecrets ? '?secrets=1' : ''}`
+    try {
+      const res = await fetch(url)
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        showToast(data.error || 'Hiba az exportálás során')
+        return
+      }
+      const blob = await res.blob()
+      const objectUrl = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = objectUrl
+      a.download = `marveen-agent-${name}.tar.gz`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(objectUrl)
+      showToast(`Ügynök exportálva${withSecrets ? ' (titkokkal)' : ''}`)
+    } catch {
+      showToast('Hiba az exportálás során')
+    }
+  }
+
   // Reset to first tab, hide avatar gallery
   document.getElementById('detailAvatarGallery').hidden = true
   switchAgentTab('overview')
@@ -2717,8 +3499,9 @@ function populateDetailAvatarGrid() {
         })
         if (!res.ok) throw new Error()
         showToast(t('agents.toast.avatar_updated'))
+        bumpAvatarEpoch()
         // Update the detail avatar display
-        document.getElementById('agentDetailAvatar').innerHTML = `<img src="/api/agents/${encodeURIComponent(currentAgent.name)}/avatar?t=${Date.now()}" alt="">`
+        document.getElementById('agentDetailAvatar').innerHTML = `<img src="/api/agents/${encodeURIComponent(currentAgent.name)}/avatar${avatarBust()}" alt="">`
         document.getElementById('detailAvatarGallery').hidden = true
         loadAgents()
       } catch {
@@ -2751,7 +3534,8 @@ document.getElementById('avatarChangeBtn').addEventListener('click', () => {
           })
           if (!res.ok) throw new Error()
           showToast(t('agents.toast.avatar_updated'))
-          const imgUrl = isMarveen ? `/api/marveen/avatar?t=${Date.now()}` : `/api/agents/${encodeURIComponent(currentAgent.name)}/avatar?t=${Date.now()}`
+          bumpAvatarEpoch()
+          const imgUrl = isMarveen ? `/api/marveen/avatar${avatarBust()}` : `/api/agents/${encodeURIComponent(currentAgent.name)}/avatar${avatarBust()}`
           document.getElementById('agentDetailAvatar').innerHTML = `<img src="${imgUrl}" alt="">`
           gallery.hidden = true
           loadAgents()
@@ -2825,7 +3609,8 @@ document.getElementById('avatarChangeBtn').addEventListener('click', () => {
       const res = await fetch(endpoint, { method: 'POST', body: form })
       if (!res.ok) throw new Error()
       showToast(t('agents.toast.avatar_uploaded'))
-      const imgUrl = isMarveen ? `/api/marveen/avatar?t=${Date.now()}` : `/api/agents/${encodeURIComponent(currentAgent.name)}/avatar?t=${Date.now()}`
+      bumpAvatarEpoch()
+      const imgUrl = isMarveen ? `/api/marveen/avatar${avatarBust()}` : `/api/agents/${encodeURIComponent(currentAgent.name)}/avatar${avatarBust()}`
       document.getElementById('agentDetailAvatar').innerHTML = `<img src="${imgUrl}" alt="">`
       document.getElementById('detailAvatarGallery').hidden = true
       resetAvatarUpload()
@@ -3091,8 +3876,216 @@ async function loadAvailableModels() {
       }
     }
     if (hint) hint.style.display = deepseekModels.length === 0 ? 'block' : 'none'
+
+    // OpenRouter: two optgroups per select (Auto = weekly-fresh tier
+    // recommendation, value `openrouter-auto:<tier>`; Manual = the 2 concrete
+    // ids per tier). Backend gates the whole block behind the vault key, so a
+    // null payload means OpenRouter is not connected -> keep the groups hidden.
+    const or = data.openrouter
+    const orTiers = or && Array.isArray(or.tiers) ? or.tiers : []
+    // Auto = one entry per tier in the dropdown (weekly-fresh recommendation).
+    const autoGroups = [document.getElementById('openrouterAutoGroup'), document.getElementById('agentModelOpenrouterAutoGroup')]
+    for (const g of autoGroups) {
+      if (!g) continue
+      g.innerHTML = ''
+      if (orTiers.length === 0) { g.style.display = 'none'; continue }
+      g.style.display = ''
+      for (const t of orTiers) {
+        const opt = document.createElement('option')
+        opt.value = t.autoId
+        opt.textContent = `${t.label} - auto (${t.auto})`
+        g.appendChild(opt)
+      }
+    }
+    // Manual = the user-curated list -> "OpenRouter - kézi" optgroup in every
+    // select. Curated once (main agent's browse popup, checkboxes); assignable
+    // per agent here. Empty list -> group hidden.
+    const orManual = Array.isArray(data.openrouterManual) ? data.openrouterManual : []
+    openrouterCurated = new Set(orManual.map(m => m.id))
+    const manualGroups = [document.getElementById('openrouterManualGroup'), document.getElementById('agentModelOpenrouterManualGroup')]
+    for (const g of manualGroups) {
+      if (!g) continue
+      g.innerHTML = ''
+      if (orManual.length === 0) { g.style.display = 'none'; continue }
+      g.style.display = ''
+      for (const m of orManual) {
+        const opt = document.createElement('option')
+        opt.value = m.id
+        opt.textContent = `🔀 ${m.name || m.id}`
+        g.appendChild(opt)
+      }
+    }
+    // Browse popup = the curation UI (tick/untick which manual models exist).
+    // MAIN AGENT ONLY -- sub-agents just pick from the curated dropdown above.
+    // Keep the name checks for compatibility with legacy /api/marveen payloads
+    // that predate the explicit role field.
+    const mid = (typeof mainAgentId === 'function') ? mainAgentId() : ''
+    const isMainAgent = !!currentAgent && (
+      currentAgent.role === 'main' ||
+      currentAgent.name === mid ||
+      currentAgent.agentId === mid
+    )
+    const orBtn = document.getElementById('openrouterBrowseBtn')
+    if (orBtn) orBtn.style.display = (data.openrouterConfigured && isMainAgent) ? '' : 'none'
+
+    // Custom providers: one <option value="custom:<id>"> per defined provider.
+    const customProviders = Array.isArray(data.customProviders) ? data.customProviders : []
+    const cpGroupIds = ['editAgentModelCustomProviderGroup', 'agentModelCustomProviderGroup']
+    for (const gid of cpGroupIds) {
+      const g = document.getElementById(gid)
+      if (!g) continue
+      g.innerHTML = ''
+      if (customProviders.length === 0) { g.style.display = 'none'; continue }
+      g.style.display = ''
+      for (const p of customProviders) {
+        const opt = document.createElement('option')
+        opt.value = `custom:${p.id}`
+        opt.textContent = `🔧 ${p.label}`
+        g.appendChild(opt)
+      }
+    }
+    updateCustomModelIdRow(document.getElementById('editAgentModel'))
+    updateCustomModelIdRow(document.getElementById('agentModel'))
   } catch { /* dashboard not available */ }
 }
+
+function updateCustomModelIdRow(selectEl) {
+  if (!selectEl) return
+  const isEdit = selectEl.id === 'editAgentModel'
+  const rowId = isEdit ? 'editAgentModelCustomModelRow' : 'agentModelCustomModelRow'
+  const row = document.getElementById(rowId)
+  if (!row) return
+  row.style.display = (selectEl.value || '').startsWith('custom:') ? '' : 'none'
+}
+
+// --- OpenRouter manual-list curation (tick models into the shared dropdown) ---
+let openrouterAllModels = null
+let openrouterCurated = new Set()  // ids currently in the curated manual list
+
+async function openOpenrouterModal() {
+  const modal = document.getElementById('openrouterModal')
+  const listEl = document.getElementById('openrouterModalList')
+  const agentEl = document.getElementById('openrouterModalAgent')
+  const searchEl = document.getElementById('openrouterModalSearch')
+  const freeEl = document.getElementById('openrouterModalFreeOnly')
+  if (!modal || !listEl) return
+  // The modal markup lives inside the (hidden) connectors page; reparent it to
+  // <body> so it renders full-viewport regardless of which tab is active.
+  if (modal.parentElement !== document.body) document.body.appendChild(modal)
+  if (agentEl) agentEl.textContent = (currentAgent && (currentAgent.displayName || currentAgent.name)) || 'ágens'
+  // Two competing .modal-overlay CSS rules: one hides via [hidden], the other
+  // via opacity/visibility (toggled by .active). Set both so the modal shows
+  // regardless of which rule wins the cascade.
+  modal.hidden = false
+  modal.classList.add('active')
+  listEl.innerHTML = '<div style="padding:14px;color:var(--text-muted);font-size:13px">Modellek betöltése…</div>'
+  if (searchEl) searchEl.value = ''
+  if (freeEl) freeEl.checked = false
+  try {
+    // Load the full model list (cached) and the current curated set in parallel
+    // so the checkboxes render already ticked for the manual models in the list.
+    const [allRes, curRes] = await Promise.all([
+      openrouterAllModels ? Promise.resolve(null) : fetch('/api/openrouter/models'),
+      fetch('/api/openrouter/manual'),
+    ])
+    if (allRes) {
+      if (!allRes.ok) throw new Error('fetch failed')
+      const data = await allRes.json()
+      openrouterAllModels = Array.isArray(data.models) ? data.models : []
+    }
+    if (curRes && curRes.ok) {
+      const cur = await curRes.json()
+      openrouterCurated = new Set((Array.isArray(cur.models) ? cur.models : []).map(m => m.id))
+    }
+    renderOpenrouterList()
+  } catch {
+    listEl.innerHTML = '<div style="padding:14px;color:var(--danger,#dc2626);font-size:13px">Nem sikerült betölteni az OpenRouter modelleket.</div>'
+  }
+}
+
+function renderOpenrouterList() {
+  const listEl = document.getElementById('openrouterModalList')
+  const countEl = document.getElementById('openrouterModalCount')
+  const q = (document.getElementById('openrouterModalSearch')?.value || '').toLowerCase().trim()
+  const freeOnly = !!document.getElementById('openrouterModalFreeOnly')?.checked
+  if (!listEl || !openrouterAllModels) return
+  const rows = openrouterAllModels.filter(m => {
+    if (freeOnly && !m.free) return false
+    if (!q) return true
+    return (m.id + ' ' + m.name).toLowerCase().includes(q)
+  })
+  // Ticked (curated) models float to the top so the current selection is visible.
+  rows.sort((a, b) => {
+    const ca = openrouterCurated.has(a.id), cb = openrouterCurated.has(b.id)
+    if (ca !== cb) return ca ? -1 : 1
+    return a.id.localeCompare(b.id)
+  })
+  if (countEl) countEl.textContent = `${rows.length} modell · ${openrouterCurated.size} kézi listán`
+  listEl.innerHTML = ''
+  for (const m of rows.slice(0, 400)) {
+    const checked = openrouterCurated.has(m.id)
+    const row = document.createElement('label')
+    row.className = 'openrouter-model-row'
+    row.style.cssText = 'display:flex;align-items:flex-start;gap:10px;padding:8px 10px;border-bottom:1px solid var(--border);cursor:pointer;font-size:13px'
+    const price = m.free ? '<span style="color:var(--success,#16a34a);font-weight:600">ingyenes</span>'
+      : `$${m.promptPrice.toFixed(2)}/$${m.completionPrice.toFixed(2)} /M`
+    const ctx = m.contextLength ? ` · ${Math.round(m.contextLength / 1000)}k ctx` : ''
+    const cb = document.createElement('input')
+    cb.type = 'checkbox'
+    cb.checked = checked
+    cb.style.cssText = 'margin-top:3px;flex:0 0 auto'
+    cb.addEventListener('change', () => toggleCuratedModel(m.id, m.name, cb.checked))
+    const info = document.createElement('div')
+    info.style.cssText = 'flex:1 1 auto;min-width:0'
+    info.innerHTML = `<div style="font-weight:600">${escapeHtml(m.name)}</div>`
+      + `<div style="color:var(--text-muted);font-size:11.5px"><code>${escapeHtml(m.id)}</code> · ${price}${ctx}</div>`
+    row.appendChild(cb)
+    row.appendChild(info)
+    row.addEventListener('mouseenter', () => { row.style.background = 'var(--surface-hover, #f1f5f9)' })
+    row.addEventListener('mouseleave', () => { row.style.background = '' })
+    listEl.appendChild(row)
+  }
+  if (rows.length === 0) listEl.innerHTML = '<div style="padding:14px;color:var(--text-muted);font-size:13px">Nincs találat.</div>'
+}
+
+// Tick/untick a model into the curated manual list. Persists server-side, then
+// refreshes the shared dropdown so the "kézi" optgroup reflects the change.
+async function toggleCuratedModel(id, name, checked) {
+  // Optimistic local update so the checkbox + counter feel instant.
+  if (checked) openrouterCurated.add(id); else openrouterCurated.delete(id)
+  const countEl = document.getElementById('openrouterModalCount')
+  if (countEl) {
+    const total = countEl.textContent.split('·')[0].trim()
+    countEl.textContent = `${total} · ${openrouterCurated.size} kézi listán`
+  }
+  try {
+    const res = await fetch('/api/openrouter/manual', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, name, checked }),
+    })
+    if (!res.ok) throw new Error('save failed')
+    const data = await res.json()
+    openrouterCurated = new Set((Array.isArray(data.models) ? data.models : []).map(m => m.id))
+    // Repopulate the dropdown "kézi" optgroups without disturbing selections.
+    loadAvailableModels()
+  } catch {
+    // Roll back the optimistic change on failure.
+    if (checked) openrouterCurated.delete(id); else openrouterCurated.add(id)
+    renderOpenrouterList()
+  }
+}
+
+function closeOpenrouterModal() {
+  const modal = document.getElementById('openrouterModal')
+  if (modal) { modal.hidden = true; modal.classList.remove('active') }
+}
+
+document.getElementById('openrouterBrowseBtn')?.addEventListener('click', openOpenrouterModal)
+document.getElementById('openrouterModalClose')?.addEventListener('click', closeOpenrouterModal)
+document.getElementById('openrouterModalCancel')?.addEventListener('click', closeOpenrouterModal)
+document.getElementById('openrouterModalSearch')?.addEventListener('input', renderOpenrouterList)
+document.getElementById('openrouterModalFreeOnly')?.addEventListener('change', renderOpenrouterList)
 
 let modelRestartPollTimer = null
 let modelRestartPollName = null
@@ -3155,15 +4148,24 @@ function startModelRestartPolling(name, expectedModel, triggeredAt) {
   }, 2000)
 }
 
+document.getElementById('editAgentModel').addEventListener('change', () => {
+  updateCustomModelIdRow(document.getElementById('editAgentModel'))
+})
+
 document.getElementById('saveModelBtn').addEventListener('click', async () => {
   if (!currentAgent || currentAgent.role === 'main') return
-  const newModel = document.getElementById('editAgentModel').value
+  const selectVal = document.getElementById('editAgentModel').value
+  const isCustom = selectVal.startsWith('custom:')
+  const customProviderId = isCustom ? selectVal.slice('custom:'.length) : null
+  const newModel = isCustom
+    ? (document.getElementById('editAgentModelCustomModelId').value.trim() || selectVal)
+    : selectVal
   const name = currentAgent.name
   try {
     const res = await fetch(`/api/agents/${encodeURIComponent(name)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: newModel }),
+      body: JSON.stringify({ model: newModel, customProvider: customProviderId }),
     })
     if (!res.ok) throw new Error()
     currentAgent.model = newModel
@@ -3267,6 +4269,88 @@ document.getElementById('analyzeAllModelsBtn').addEventListener('click', async (
   } catch { panel.innerHTML = '<p style="color:var(--error);font-size:13px">' + t('agents.model.error') + '</p>' }
 })
 
+// === Export ALL agents (whole fleet) into one .tar.gz bundle ===
+const exportAllAgentsBtn = document.getElementById('exportAllAgentsBtn')
+if (exportAllAgentsBtn) {
+  exportAllAgentsBtn.addEventListener('click', async () => {
+    const withSecrets = confirm(
+      'Belevegyük a titkokat (channel bot tokenek, párosítási állapot) MINDEN ügynöknél?\n\n' +
+      'OK = igen, csak saját gépek közötti átvitelhez.\n' +
+      'Mégse = nem, biztonságosan megosztható (csak identitás + viselkedés).'
+    )
+    const url = `/api/agents/export-all${withSecrets ? '?secrets=1' : ''}`
+    try {
+      const res = await fetch(url)
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        showToast(data.error || 'Hiba az exportálás során')
+        return
+      }
+      const blob = await res.blob()
+      const objectUrl = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = objectUrl
+      a.download = 'marveen-fleet.tar.gz'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(objectUrl)
+      showToast(`Flotta exportálva${withSecrets ? ' (titkokkal)' : ''}`)
+    } catch {
+      showToast('Hiba az exportálás során')
+    }
+  })
+}
+
+// === Agent import (upload a .tar.gz bundle exported from another machine) ===
+// Accepts both a single-agent bundle and a whole-fleet bundle -- the backend
+// auto-detects the format from the manifest.
+const importAgentBtn = document.getElementById('importAgentBtn')
+const importAgentFile = document.getElementById('importAgentFile')
+if (importAgentBtn && importAgentFile) {
+  importAgentBtn.addEventListener('click', () => importAgentFile.click())
+  importAgentFile.addEventListener('change', async () => {
+    const file = importAgentFile.files && importAgentFile.files[0]
+    if (!file) return
+    // Reset the input so picking the same file again re-fires change.
+    const upload = async (overwrite) => {
+      const form = new FormData()
+      form.append('file', file)
+      if (overwrite) form.append('overwrite', '1')
+      const res = await fetch('/api/agents/import', { method: 'POST', body: form })
+      const data = await res.json().catch(() => ({}))
+      return { res, data }
+    }
+    try {
+      let { res, data } = await upload(false)
+      if (res.status === 409) {
+        const prompt = data.kind === 'fleet'
+          ? 'Néhány ügynök már létezik ezen a gépen. Felülírjuk az ütközőket?'
+          : `Már létezik "${data.name || ''}" nevű ügynök. Felülírjuk?`
+        if (confirm(prompt)) {
+          ;({ res, data } = await upload(true))
+        } else {
+          return
+        }
+      }
+      if (!res.ok) { showToast(data.error || 'Hiba az importálás során'); return }
+      const note = data.includedSecrets ? ' (titkokkal)' : ''
+      if (data.kind === 'fleet') {
+        const n = (data.imported || []).length
+        const skipped = (data.skipped || []).length
+        showToast(`Flotta importálva: ${n} ügynök${note}${skipped ? ` (${skipped} kihagyva)` : ''}`)
+      } else {
+        showToast(`Ügynök importálva: ${data.name}${note}${data.overwritten ? ' (felülírva)' : ''}`)
+      }
+      loadAgents()
+    } catch {
+      showToast('Hiba az importálás során')
+    } finally {
+      importAgentFile.value = ''
+    }
+  })
+}
+
 document.getElementById('saveAutoRestartBtn').addEventListener('click', async () => {
   if (!currentAgent) return
   // Auto-restart applies to the main session too, so (unlike model/profile) we
@@ -3294,6 +4378,126 @@ document.getElementById('saveAutoRestartBtn').addEventListener('click', async ()
   } catch { showToast(t('common.error_save')) }
 })
 
+// ---- voice config UI -------------------------------------------------------
+
+async function loadVoiceConfig(agentName) {
+  const voiceModelSel = document.getElementById('editAgentVoiceModel')
+  if (!voiceModelSel) return
+  const banner = document.getElementById('voiceNotInstalledBanner')
+  const controls = document.getElementById('voiceInstalledControls')
+  try {
+    // Check toolkit installation first
+    const statusR = await fetch('/api/voice/status')
+    if (!statusR.ok) return
+    const status = await statusR.json()
+
+    if (!status.installed) {
+      if (banner) banner.hidden = false
+      if (controls) controls.hidden = true
+      return
+    }
+    if (banner) banner.hidden = true
+    if (controls) controls.hidden = false
+
+    const r = await fetch(`/api/agents/${encodeURIComponent(agentName)}/voice-config`)
+    if (!r.ok) return
+    const cfg = await r.json()
+    voiceModelSel.innerHTML = (cfg.availableVoices || []).map(v =>
+      `<option value="${v}"${v === cfg.voiceModel ? ' selected' : ''}>${v}</option>`
+    ).join('')
+    const modeInput = document.querySelector(`input[name="voiceResponseMode"][value="${cfg.responseMode || 'text'}"]`)
+    if (modeInput) modeInput.checked = true
+  } catch { /* silent */ }
+}
+
+let _voiceInstallPollTimer = null
+
+document.getElementById('voiceInstallBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('voiceInstallBtn')
+  const sudoHint = document.getElementById('voiceInstallSudoHint')
+  const progress = document.getElementById('voiceInstallProgress')
+
+  if (sudoHint) sudoHint.hidden = true
+  btn.disabled = true
+  btn.textContent = 'Indítás...'
+
+  try {
+    const r = await fetch('/api/voice/install', { method: 'POST' })
+    if (!r.ok) throw new Error(await r.text())
+    const data = await r.json()
+
+    if (data.needsSudo) {
+      // Show sudo command -- user must run it then click again
+      if (sudoHint) {
+        sudoHint.hidden = false
+        sudoHint.innerHTML = 'A rendszercsomagok telepítéséhez futtasd terminálon:<br><code style="display:block;margin-top:4px;word-break:break-all">' + escapeHtml(data.sudoCommand) + '</code><br>Ezután kattints újra a Telepítés gombra.'
+      }
+      btn.disabled = false
+      btn.textContent = 'Telepítés'
+      return
+    }
+
+    if (data.alreadyInstalled) {
+      if (currentAgent) loadVoiceConfig(currentAgent.name)
+      return
+    }
+
+    // Install started -- poll /api/voice/status until installed=true.
+    // Max 4 minutes (80 × 3s); on timeout show a hint and re-enable the button
+    // so the user can retry (the only failure signal from a fire-and-forget spawn).
+    if (progress) progress.hidden = false
+    btn.textContent = 'Telepítés...'
+    clearInterval(_voiceInstallPollTimer)
+    let _voiceInstallPollCount = 0
+    const VOICE_INSTALL_MAX_POLLS = 80 // 80 × 3s = 4 min
+    _voiceInstallPollTimer = setInterval(async () => {
+      _voiceInstallPollCount++
+      try {
+        const sr = await fetch('/api/voice/status')
+        const s = await sr.json()
+        if (s.installed) {
+          clearInterval(_voiceInstallPollTimer)
+          _voiceInstallPollTimer = null
+          if (progress) progress.hidden = true
+          if (currentAgent) loadVoiceConfig(currentAgent.name)
+          return
+        }
+      } catch { /* keep polling */ }
+      if (_voiceInstallPollCount >= VOICE_INSTALL_MAX_POLLS) {
+        clearInterval(_voiceInstallPollTimer)
+        _voiceInstallPollTimer = null
+        if (progress) progress.hidden = true
+        if (sudoHint) {
+          sudoHint.hidden = false
+          sudoHint.textContent = 'A telepítés tovább tart vagy elakadt. Ellenőrizd a dashboard logjait, majd próbáld újra.'
+        }
+        btn.disabled = false
+        btn.textContent = 'Újrapróbálás'
+      }
+    }, 3000)
+  } catch {
+    btn.disabled = false
+    btn.textContent = 'Telepítés'
+    showToast('Hiba a telepítés során')
+  }
+})
+
+document.getElementById('saveVoiceConfigBtn').addEventListener('click', async () => {
+  if (!currentAgent) return
+  const modeEl = document.querySelector('input[name="voiceResponseMode"]:checked')
+  const modelEl = document.getElementById('editAgentVoiceModel')
+  if (!modeEl || !modelEl) return
+  try {
+    const r = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/voice-config`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ responseMode: modeEl.value, voiceModel: modelEl.value }),
+    })
+    if (!r.ok) throw new Error()
+    showToast('Hangbeállítás mentve')
+  } catch { showToast('Hiba a mentés során') }
+})
+
 document.getElementById('saveProfileBtn').addEventListener('click', async () => {
   if (!currentAgent || currentAgent.role === 'main') return
   const profile = document.getElementById('editAgentProfile').value
@@ -3308,6 +4512,24 @@ document.getElementById('saveProfileBtn').addEventListener('click', async () => 
     showToast(body.requiresRestart ? t('agents.toast.profile_saved_restart') : t('agents.toast.profile_saved'))
     loadAgents()
   } catch { showToast(t('agents.toast.profile_error')) }
+})
+
+document.getElementById('savePlanBtn').addEventListener('click', async () => {
+  // The main agent's login comes up via channels.sh, not this path, so its
+  // plan is not settable here (the selector is hidden for it anyway).
+  if (!currentAgent || currentAgent.role === 'main') return
+  const claudePlan = document.getElementById('editAgentPlan').value
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ claudePlan }),
+    })
+    if (!res.ok) throw new Error()
+    currentAgent.claudePlan = claudePlan || null
+    showToast(t('agents.toast.plan_saved'))
+    loadAgents()
+  } catch { showToast(t('agents.toast.plan_error')) }
 })
 
 // === Auth Mode ===
@@ -3431,6 +4653,24 @@ document.getElementById('authFlowCopyBtn').addEventListener('click', () => {
   navigator.clipboard.writeText(url).then(() => showToast('URL masolva'))
 })
 
+document.getElementById('memoryIsolationToggle').addEventListener('change', async (e) => {
+  if (!currentAgent || currentAgent.role === 'main') return
+  const enabled = e.target.checked
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ memoryIsolation: enabled }),
+    })
+    if (!res.ok) throw new Error()
+    currentAgent.memoryIsolation = enabled
+    showToast(t(enabled ? 'agents.toast.memory_isolation_on' : 'agents.toast.memory_isolation_off'))
+  } catch {
+    e.target.checked = !enabled
+    showToast(t('common.error_save'))
+  }
+})
+
 document.getElementById('saveAuthModeBtn').addEventListener('click', async () => {
   if (!currentAgent || currentAgent.role === 'main') return
   const mode = document.querySelector('input[name="authMode"]:checked')?.value || 'shared'
@@ -3504,12 +4744,14 @@ function agentIsConnected(agent) {
   if (!agent) return false
   if (currentChannelProvider === 'discord') return !!agent.hasDiscord
   if (currentChannelProvider === 'slack') return !!agent.hasSlack
+  if (currentChannelProvider === 'teams') return !!agent.hasTeams
   return !!agent.hasTelegram
 }
 
 function getProviderLabel() {
   if (currentChannelProvider === 'discord') return 'Discord'
   if (currentChannelProvider === 'slack') return 'Slack'
+  if (currentChannelProvider === 'teams') return 'Microsoft Teams'
   return 'Telegram'
 }
 
@@ -3520,6 +4762,7 @@ function getProviderLabel() {
 function buildHowtoHtml() {
   if (currentChannelProvider === 'discord') return t('channel.howto.discord')
   if (currentChannelProvider === 'slack') return t('channel.howto.slack')
+  if (currentChannelProvider === 'teams') return t('channel.howto.teams')
   return t('channel.howto.telegram')
 }
 
@@ -3536,6 +4779,10 @@ function updateProviderUI() {
   const howto = document.getElementById('chHowtoContent')
   const pairingInfo = document.getElementById('chPairingInfo')
   const discordChannelGroup = document.getElementById('chDiscordChannelIdGroup')
+  const tokenGroup = document.getElementById('chTokenGroup')
+  // Teams config is terminal-driven (creds land in the .env via setup-azure-bot.sh),
+  // not a dashboard token paste -- default the token field visible, hide it for teams.
+  if (tokenGroup) tokenGroup.hidden = false
 
   if (isTg) {
     if (title) title.textContent = t('channel.setup.tg_title')
@@ -3557,6 +4804,16 @@ function updateProviderUI() {
     if (smokeTestBtn) smokeTestBtn.hidden = true
     if (discordChannelGroup) discordChannelGroup.hidden = false
     if (pairingInfo) pairingInfo.textContent = t('channel.setup.discord_pairing')
+  } else if (currentChannelProvider === 'teams') {
+    if (title) title.textContent = t('channel.setup.teams_title')
+    if (steps) steps.innerHTML = t('channel.setup.teams_steps')
+    if (slackGroup) slackGroup.hidden = true
+    if (manifestBtnGroup) manifestBtnGroup.hidden = true
+    if (smokeTestBtn) smokeTestBtn.hidden = true
+    if (discordChannelGroup) discordChannelGroup.hidden = true
+    // No dashboard token entry for Teams -- creds come from the terminal setup.
+    if (tokenGroup) tokenGroup.hidden = true
+    if (pairingInfo) pairingInfo.textContent = t('channel.setup.teams_pairing')
   } else {
     if (title) title.textContent = t('channel.setup.slack_title')
     if (steps) steps.innerHTML = t('channel.setup.slack_steps')
@@ -4336,6 +5593,14 @@ document.getElementById('scheduleType').addEventListener('change', () => {
   }
 })
 
+// Resolved once at page load: the server's actual bind port (WEB_PORT), not
+// window.location.port which reflects the browser-side URL (e.g. 8443 for a
+// tailscale-serve HTTPS PWA) and would be wrong in agent curl prompts.
+let __serverPort = 3420
+fetch('/api/network-info').then(r => r.ok ? r.json() : {}).then(info => {
+  if (info.port) __serverPort = info.port
+}).catch(() => {})
+
 // Heartbeat templates
 const HEARTBEAT_TEMPLATES = {
   calendar: {
@@ -4350,7 +5615,7 @@ const HEARTBEAT_TEMPLATES = {
   },
   kanban: {
     desc: () => t('tasks.heartbeat.tpl.kanban'),
-    prompt: 'Ellenorizd a kanban tablat (curl -s http://localhost:3420/api/kanban). Ha van olyan kartya aminek ma jar le a hatrideje vagy urgent prioritasu es meg nincs done, szolj Telegramon. Ha minden rendben, ne irj semmit.',
+    prompt: () => `Ellenorizd a kanban tablat (curl -s http://localhost:${__serverPort}/api/kanban). Ha van olyan kartya aminek ma jar le a hatrideje vagy urgent prioritasu es meg nincs done, szolj Telegramon. Ha minden rendben, ne irj semmit.`,
     schedule: '0 */2 * * *',
   },
   full: {
@@ -4364,7 +5629,7 @@ document.getElementById('heartbeatTemplate').addEventListener('change', () => {
   const tpl = HEARTBEAT_TEMPLATES[document.getElementById('heartbeatTemplate').value]
   if (!tpl) return
   document.getElementById('scheduleDesc').value = typeof tpl.desc === 'function' ? tpl.desc() : tpl.desc
-  document.getElementById('schedulePrompt').value = tpl.prompt
+  document.getElementById('schedulePrompt').value = typeof tpl.prompt === 'function' ? tpl.prompt() : tpl.prompt
   document.getElementById('scheduleCustomCron').value = tpl.schedule
   scheduleFrequency.value = 'custom'
   customScheduleGroup.hidden = false
@@ -4654,7 +5919,7 @@ function makeScheduleRow(task) {
 
     row.innerHTML = `
       <div class="schedule-agent-avatar">
-        <img src="${agent.avatar}?t=${Date.now()}" alt="" onerror="this.style.display='none'">
+        <img src="${agent.avatar}${avatarBust()}" alt="" onerror="this.style.display='none'">
       </div>
       <div class="schedule-info">
         <div class="schedule-title">
@@ -4842,7 +6107,7 @@ function renderTimeline(tasks) {
     row.innerHTML = `
       <div class="timeline-agent">
         <div class="timeline-agent-avatar">
-          <img src="${agent.avatar}?t=${Date.now()}" alt="" onerror="this.style.display='none'">
+          <img src="${agent.avatar}${avatarBust()}" alt="" onerror="this.style.display='none'">
         </div>
         <span class="timeline-agent-name">${escapeHtml(agent.label || agent.name)}</span>
       </div>
@@ -4862,7 +6127,7 @@ function renderTimeline(tasks) {
         marker.className = 'timeline-marker' + (task.enabled ? '' : ' disabled')
         marker.style.left = `calc(${pct}% - 16px)`
         marker.innerHTML = `
-          <img src="${agent.avatar}?t=${Date.now()}" alt="" onerror="this.style.display='none'">
+          <img src="${agent.avatar}${avatarBust()}" alt="" onerror="this.style.display='none'">
           <div class="timeline-marker-tooltip">${escapeHtml(task.description || task.name)} - ${h.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}</div>
         `
         marker.addEventListener('click', () => openEditSchedule(task))
@@ -4996,7 +6261,7 @@ function renderWeekView(data) {
         }
 
         card.innerHTML = `
-          <div class="week-task-avatar"><img src="${agent.avatar}?t=${Date.now()}" alt=""></div>
+          <div class="week-task-avatar"><img src="${agent.avatar}${avatarBust()}" alt=""></div>
           <div class="week-task-info">
             <div class="week-task-time">${timeLabel}</div>
             <div class="week-task-name">${escapeHtml(task.description || task.name)}</div>
@@ -7081,6 +8346,580 @@ function showEnvVarModal(envVars) {
   })
 })()
 
+// --- SSH Vault ---
+let _sshServers = []
+let _sshKeys = []
+let _sshView = 'table'
+let _sshEditingId = null
+
+async function loadSshServers() {
+  try {
+    const res = await fetch('/api/vault/ssh-servers')
+    const data = await res.json()
+    _sshServers = data.servers || []
+    renderSshServers()
+  } catch { /* ignore */ }
+}
+
+async function loadSshKeys() {
+  try {
+    const res = await fetch('/api/vault/ssh-keys')
+    if (!res.ok) return
+    const data = await res.json()
+    _sshKeys = data.keys || []
+    renderSshKeys()
+    _refreshKeySelects()
+  } catch { /* ignore */ }
+}
+
+function renderSshKeys() {
+  const tbody = document.getElementById('sshKeysTableBody')
+  const keysView = document.getElementById('sshKeysView')
+  const emptyEl = document.getElementById('sshKeysEmpty')
+  if (!tbody) return
+  if (_sshKeys.length === 0) {
+    keysView.hidden = true
+    emptyEl.hidden = false
+    return
+  }
+  keysView.hidden = false
+  emptyEl.hidden = true
+  tbody.innerHTML = _sshKeys.map(k => `
+    <tr>
+      <td class="ssh-table-name">${escapeHtml(k.label || k.id)}</td>
+      <td class="ssh-table-mono">${escapeHtml(k.username || '')}</td>
+      <td class="ssh-table-mono">${escapeHtml(k.keyType || 'ed25519')}</td>
+      <td class="ssh-table-mono" style="font-size:11px">${k.fingerprint ? escapeHtml(k.fingerprint.slice(0,28)) + '…' : ''}</td>
+      <td class="ssh-table-mono">${k.createdAt ? new Date(k.createdAt).toLocaleDateString('hu-HU') : ''}</td>
+      <td><div class="ssh-table-actions">
+        <button class="btn-secondary btn-compact ssh-key-copy-btn" data-id="${escapeHtml(k.id)}" title="Publikus kulcs másolása">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        </button>
+        <button class="btn-secondary btn-compact ssh-key-delete-btn" data-id="${escapeHtml(k.id)}" title="Törlés">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+        </button>
+      </div></td>
+    </tr>
+  `).join('')
+  tbody.querySelectorAll('.ssh-key-copy-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const key = _sshKeys.find(k => k.id === btn.dataset.id)
+      if (!key) return
+      try {
+        const res = await fetch(`/api/vault/ssh-keys/${encodeURIComponent(btn.dataset.id)}/public-key`)
+        if (res.ok) {
+          const data = await res.json()
+          await navigator.clipboard.writeText(data.publicKey || '')
+          btn.textContent = '✓'
+          setTimeout(() => { btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' }, 1500)
+        }
+      } catch { /* ignore */ }
+    })
+  })
+  tbody.querySelectorAll('.ssh-key-delete-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (!confirm('Biztosan törlöd ezt a kulcsot?')) return
+      await fetch(`/api/vault/ssh-keys/${encodeURIComponent(btn.dataset.id)}`, { method: 'DELETE' })
+      await loadSshKeys()
+    })
+  })
+}
+
+function _refreshKeySelects() {
+  const opts = ['<option value="">-- Nincs kulcs --</option>',
+    ..._sshKeys.map(k => `<option value="${escapeHtml(k.id)}">${escapeHtml(k.label || k.id)} (${escapeHtml(k.username || '')})</option>`)
+  ].join('')
+  document.querySelectorAll('.ssh-key-select').forEach(sel => {
+    const prev = sel.value
+    sel.innerHTML = opts
+    sel.value = prev
+  })
+}
+
+function _sshKeyBadge(status) {
+  const labels = { ok: 'OK', missing: 'Hiányzó', expired: 'Lejárt' }
+  const icons = {
+    ok: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>',
+    missing: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
+    expired: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+  }
+  return `<span class="ssh-key-badge ${status}">${icons[status] || ''} ${labels[status] || status}</span>`
+}
+
+function _sshKeyAssignSelect(s) {
+  const currentKeyId = s.sshKeyId || s.assignedKeyId || s.vaultKeyId || ''
+  const opts = ['<option value="">-- Nincs kulcs --</option>',
+    ..._sshKeys.map(k => {
+      const sel = (currentKeyId && currentKeyId === k.id) ? ' selected' : ''
+      return `<option value="${escapeHtml(k.id)}"${sel}>${escapeHtml(k.label || k.id)}</option>`
+    })
+  ].join('')
+  return `<select class="ssh-key-assign ssh-key-select" data-id="${escapeHtml(s.id)}" title="Kulcs hozzárendelése">${opts}</select>`
+}
+
+function _sshInfoBtn(s) {
+  return `<button class="ssh-info-btn" data-id="${escapeHtml(s.id)}" data-user="${escapeHtml(s.user)}" title="Telepítési útmutató">i</button>`
+}
+
+function renderSshServers() {
+  const cardsEl = document.getElementById('sshCardsView')
+  const tableView = document.getElementById('sshTableView')
+  const tableBody = document.getElementById('sshTableBody')
+  const emptyEl = document.getElementById('sshEmpty')
+  if (!cardsEl || !tableBody || !emptyEl) return
+
+  // Sync view state with _sshView
+  const isTable = _sshView === 'table'
+  cardsEl.hidden = isTable
+  if (tableView) tableView.hidden = !isTable
+  document.getElementById('sshViewCards')?.classList.toggle('active', !isTable)
+  document.getElementById('sshViewTable')?.classList.toggle('active', isTable)
+
+  if (_sshServers.length === 0) {
+    cardsEl.innerHTML = ''
+    tableBody.innerHTML = ''
+    emptyEl.hidden = false
+    return
+  }
+  emptyEl.hidden = true
+
+  // Cards
+  cardsEl.innerHTML = _sshServers.map(s => `
+    <div class="ssh-card" data-id="${escapeHtml(s.id)}">
+      <div class="ssh-card-head">
+        <div class="ssh-card-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+        </div>
+        <div class="ssh-card-title">
+          <div class="ssh-card-name">${escapeHtml(s.name)}</div>
+          ${s.desc ? `<div class="ssh-card-desc">${escapeHtml(s.desc)}</div>` : ''}
+        </div>
+      </div>
+      <div class="ssh-card-meta">
+        <div class="ssh-card-row">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+          <span>${escapeHtml(s.host)}</span>
+        </div>
+        <div class="ssh-card-row">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          <span>${escapeHtml(s.user)}${s.port !== 22 ? ` :${s.port}` : ''}</span>
+        </div>
+        ${s.fingerprint ? `<div class="ssh-card-row"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg><span>${escapeHtml(s.keyType || '')} ${escapeHtml(s.fingerprint.slice(0,24))}…</span></div>` : ''}
+      </div>
+      <div class="ssh-card-footer">
+        <div style="display:flex;align-items:center;gap:4px;width:100%">
+          ${_sshKeyAssignSelect(s)}
+          <div class="ssh-card-actions">
+            <button class="btn-secondary btn-compact ssh-edit-btn" data-id="${escapeHtml(s.id)}" title="Szerkesztés">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+            </button>
+            <button class="btn-secondary btn-compact ssh-delete-btn" data-id="${escapeHtml(s.id)}" title="Törlés">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `).join('')
+
+  // Table
+  tableBody.innerHTML = _sshServers.map(s => `
+    <tr data-id="${escapeHtml(s.id)}">
+      <td class="ssh-table-name">${escapeHtml(s.name)}</td>
+      <td class="ssh-table-mono">${escapeHtml(s.host)}</td>
+      <td class="ssh-table-mono">${escapeHtml(s.user)}</td>
+      <td class="ssh-table-mono">${s.port}</td>
+      <td>${_sshKeyAssignSelect(s)}</td>
+      <td style="color:var(--text-muted)">${escapeHtml(s.desc || '')}</td>
+      <td><div class="ssh-table-actions">
+        <button class="btn-secondary btn-compact ssh-edit-btn" data-id="${escapeHtml(s.id)}" title="Szerkesztés">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+        </button>
+        <button class="btn-secondary btn-compact ssh-delete-btn" data-id="${escapeHtml(s.id)}" title="Törlés">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+        </button>
+      </div></td>
+    </tr>
+  `).join('')
+
+  // Delete handlers
+  document.querySelectorAll('.ssh-delete-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const id = btn.getAttribute('data-id')
+      if (!confirm(`Törlöd: ${id}?`)) return
+      try {
+        await fetch(`/api/vault/ssh-servers/${encodeURIComponent(id)}`, { method: 'DELETE' })
+        await loadSshServers()
+      } catch { showToast('Törlés sikertelen') }
+    })
+  })
+
+  // Edit handlers -- open the add-server panel pre-filled, switch it to edit mode
+  document.querySelectorAll('.ssh-edit-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.getAttribute('data-id')
+      const server = _sshServers.find(s => s.id === id)
+      if (!server) return
+      _sshEditingId = id
+
+      document.getElementById('sshNameInput').value = server.name || ''
+      document.getElementById('sshHostInput').value = server.host || ''
+      document.getElementById('sshUserInput').value = server.user || ''
+      document.getElementById('sshPortInput').value = server.port || 22
+      document.getElementById('sshDescInput').value = server.desc || ''
+      const keySel = document.getElementById('sshKeySelectInput')
+      if (keySel) keySel.value = server.sshKeyId || server.assignedKeyId || server.vaultKeyId || ''
+
+      const titleEl = document.getElementById('sshAddPanelTitle')
+      if (titleEl) titleEl.textContent = `Szerver szerkesztése – ${server.name}`
+
+      const panel = document.getElementById('sshAddPanel')
+      panel.hidden = false
+      document.getElementById('sshNameInput').focus()
+    })
+  })
+
+  // Key assign select handlers
+  document.querySelectorAll('.ssh-key-assign').forEach(sel => {
+    sel.addEventListener('change', async () => {
+      const id = sel.getAttribute('data-id')
+      const sshKeyId = sel.value || null
+      try {
+        await fetch(`/api/vault/ssh-servers/${encodeURIComponent(id)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sshKeyId }),
+        })
+        await loadSshServers()
+      } catch { /* ignore */ }
+    })
+  })
+
+}
+
+// --- SSH Keygen modal (standalone key creation for Kulcstároló) ---
+let _sshKeygenCallback = null  // called with new key after successful generation
+
+function openSshKeygenModal(callback) {
+  const overlay = document.getElementById('sshKeygenOverlay')
+  document.getElementById('sshKeygenLabelInput').value = ''
+  document.getElementById('sshKeygenUserInput').value = ''
+  document.getElementById('sshKeygenSpinner').hidden = true
+  document.getElementById('sshKeygenResult').hidden = true
+  document.getElementById('sshKeygenFooter').hidden = false
+  document.getElementById('sshKeygenForm').hidden = false
+  document.getElementById('sshKeygenPubkeyBox').value = ''
+  _sshKeygenCallback = callback || null
+  openModal(overlay)
+  document.getElementById('sshKeygenLabelInput').focus()
+}
+
+;(function wireSshKeygenModal() {
+  const overlay = document.getElementById('sshKeygenOverlay')
+  const closeBtn = document.getElementById('sshKeygenClose')
+  const submitBtn = document.getElementById('sshKeygenSubmitBtn')
+  const copyBtn = document.getElementById('sshKeygenCopyBtn')
+  if (!overlay) return
+
+  overlay.addEventListener('click', e => { if (e.target === overlay) closeModal(overlay) })
+  closeBtn.addEventListener('click', () => closeModal(overlay))
+
+  submitBtn.addEventListener('click', async () => {
+    const label = document.getElementById('sshKeygenLabelInput').value.trim()
+    const username = document.getElementById('sshKeygenUserInput').value.trim()
+    if (!label || !username) { showToast('Cimke és felhasználónév megadása kötelező'); return }
+
+    document.getElementById('sshKeygenForm').hidden = true
+    document.getElementById('sshKeygenSpinner').hidden = false
+    document.getElementById('sshKeygenResult').hidden = true
+    document.getElementById('sshKeygenFooter').hidden = true
+
+    try {
+      const res = await fetch('/api/vault/ssh-keys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label, username }),
+      })
+      const data = await res.json()
+      if (!res.ok) { showToast(data.error || 'Generálás sikertelen'); resetKeygenForm(); return }
+
+      const pubkey = data.publicKey || (data.key && data.key.publicKey) || ''
+      document.getElementById('sshKeygenPubkeyBox').value = pubkey
+      document.getElementById('sshKeygenSpinner').hidden = true
+      document.getElementById('sshKeygenResult').hidden = false
+
+      await loadSshKeys()
+      if (_sshKeygenCallback) _sshKeygenCallback(data.key || data)
+    } catch { showToast('Hálózati hiba'); resetKeygenForm() }
+  })
+
+  copyBtn?.addEventListener('click', () => {
+    const val = document.getElementById('sshKeygenPubkeyBox').value
+    navigator.clipboard.writeText(val).then(() => {
+      copyBtn.textContent = 'Másolva!'
+      setTimeout(() => { copyBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Másolás' }, 2000)
+    }).catch(() => {})
+  })
+
+  function resetKeygenForm() {
+    document.getElementById('sshKeygenForm').hidden = false
+    document.getElementById('sshKeygenSpinner').hidden = true
+    document.getElementById('sshKeygenResult').hidden = true
+    document.getElementById('sshKeygenFooter').hidden = false
+  }
+})()
+
+// --- SSH Info modal ---
+let _sshInfoServerId = null
+
+async function _sshInfoLoadKey(keyId, serverUser) {
+  const installSection = document.getElementById('sshInfoInstallSection')
+  const noKeyEl = document.getElementById('sshInfoNoKey')
+  if (!keyId) {
+    installSection.hidden = true
+    noKeyEl.hidden = false
+    return
+  }
+  installSection.hidden = false
+  noKeyEl.hidden = true
+
+  let pubkey = ''
+  try {
+    const res = await fetch(`/api/vault/ssh-keys/${encodeURIComponent(keyId)}/public-key`)
+    if (res.ok) { const d = await res.json(); pubkey = d.publicKey || '' }
+  } catch {}
+
+  const targetUser = serverUser || 'root'
+  document.getElementById('sshInfoUser').textContent = targetUser
+
+  // root always exists -- only show the "create user" step for a real,
+  // non-root target user (e.g. a fresh server that needs the account first).
+  const step0 = document.getElementById('sshInfoStep0')
+  if (targetUser === 'root') {
+    step0.hidden = true
+  } else {
+    step0.hidden = false
+    document.getElementById('sshInfoCmd0').textContent = `useradd -m -s /bin/bash ${targetUser}`
+  }
+
+  const cmd2text = pubkey
+    ? `echo "${pubkey}" >> ~/.ssh/authorized_keys`
+    : `echo "<publikus kulcs ide>" >> ~/.ssh/authorized_keys`
+  document.getElementById('sshInfoCmd2').textContent = cmd2text
+  document.getElementById('sshInfoPubkey').textContent = pubkey || '(kulcs nem elérhető)'
+
+  const overlay = document.getElementById('sshInfoOverlay')
+  overlay.querySelectorAll('.ssh-code-copy').forEach(btn => {
+    const clone = btn.cloneNode(true)
+    btn.parentNode.replaceChild(clone, btn)
+    clone.addEventListener('click', () => {
+      const text = document.getElementById(clone.getAttribute('data-target'))?.textContent || ''
+      navigator.clipboard.writeText(text).then(() => {
+        clone.classList.add('copied')
+        setTimeout(() => clone.classList.remove('copied'), 2000)
+      }).catch(() => {})
+    })
+  })
+}
+
+function _sshInfoLoadServer(serverId) {
+  _sshInfoServerId = serverId
+  const server = _sshServers.find(s => s.id === serverId)
+
+  document.getElementById('sshInfoServerName').textContent = server ? server.name : (serverId || '')
+
+  const keySel = document.getElementById('sshInfoKeySelect')
+  keySel.innerHTML = ['<option value="">-- Nincs kulcs --</option>',
+    ..._sshKeys.map(k => `<option value="${escapeHtml(k.id)}">${escapeHtml(k.label || k.id)} (${escapeHtml(k.username || '')})</option>`)
+  ].join('')
+  const assignedKeyId = (server && (server.sshKeyId || server.assignedKeyId || server.vaultKeyId)) || ''
+  keySel.value = assignedKeyId
+  return { server, assignedKeyId }
+}
+
+function openSshInfoModal(preselectedServerId, { keyOnly = false } = {}) {
+  const overlay = document.getElementById('sshInfoOverlay')
+  const serverSection = overlay.querySelector('.ssh-info-server-section')
+
+  if (keyOnly) {
+    // Key-only mode: hide server selector, reset server context
+    serverSection.hidden = true
+    _sshInfoServerId = null
+    document.getElementById('sshInfoServerName').textContent = 'Új szerver'
+
+    // Populate key selector without a pre-selected key
+    const keySel = document.getElementById('sshInfoKeySelect')
+    keySel.innerHTML = ['<option value="">-- Válassz kulcsot --</option>',
+      ..._sshKeys.map(k => `<option value="${escapeHtml(k.id)}">${escapeHtml(k.label || k.id)} (${escapeHtml(k.username || '')})</option>`)
+    ].join('')
+    // Pre-select whatever is chosen in the form's key dropdown
+    const formKeyId = document.getElementById('sshKeySelectInput')?.value || ''
+    keySel.value = formKeyId
+
+    // Use the username typed into the new-server form, not a hardcoded root
+    const formUser = document.getElementById('sshUserInput')?.value.trim() || 'root'
+
+    openModal(overlay)
+    _sshInfoLoadKey(formKeyId, formUser)
+  } else {
+    // Normal mode: show server selector, pick first server by default
+    serverSection.hidden = false
+    const serverSel = document.getElementById('sshInfoServerSelect')
+    serverSel.innerHTML = ['<option value="">-- Válassz szervert --</option>',
+      ..._sshServers.map(s => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name)} (${escapeHtml(s.host)})</option>`)
+    ].join('')
+
+    const firstId = preselectedServerId || (_sshServers[0] && _sshServers[0].id) || ''
+    serverSel.value = firstId
+
+    const { server, assignedKeyId } = _sshInfoLoadServer(firstId)
+    const targetUser = (server && server.user) || 'root'
+
+    openModal(overlay)
+    _sshInfoLoadKey(assignedKeyId, targetUser)
+  }
+}
+
+;(function wireSshInfoModal() {
+  const overlay = document.getElementById('sshInfoOverlay')
+  const closeBtn = document.getElementById('sshInfoClose')
+  const serverSel = document.getElementById('sshInfoServerSelect')
+  const keySel = document.getElementById('sshInfoKeySelect')
+  if (!overlay) return
+
+  overlay.addEventListener('click', e => { if (e.target === overlay) closeModal(overlay) })
+  closeBtn.addEventListener('click', () => closeModal(overlay))
+
+  serverSel?.addEventListener('change', () => {
+    const { server, assignedKeyId } = _sshInfoLoadServer(serverSel.value)
+    _sshInfoLoadKey(assignedKeyId, (server && server.user) || 'root')
+  })
+
+  keySel?.addEventListener('change', async () => {
+    const keyId = keySel.value || null
+    // Key-only mode (new-server flow) has no _sshInfoServerId -- read the
+    // username from the new-server form instead of falling back to root.
+    const targetUser = _sshInfoServerId
+      ? ((_sshServers.find(s => s.id === _sshInfoServerId) || {}).user || 'root')
+      : (document.getElementById('sshUserInput')?.value.trim() || 'root')
+
+    if (_sshInfoServerId) {
+      try {
+        await fetch(`/api/vault/ssh-servers/${encodeURIComponent(_sshInfoServerId)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sshKeyId: keyId }),
+        })
+        await loadSshServers()
+      } catch { /* ignore */ }
+    }
+    await _sshInfoLoadKey(keyId, targetUser)
+  })
+})()
+
+;(function wireSshSection() {
+  const newBtn = document.getElementById('sshNewBtn')
+  const panel = document.getElementById('sshAddPanel')
+  const closeBtn = document.getElementById('sshAddPanelClose')
+  const addBtn = document.getElementById('sshAddBtn')
+  const cardViewBtn = document.getElementById('sshViewCards')
+  const tableViewBtn = document.getElementById('sshViewTable')
+  const cardsView = document.getElementById('sshCardsView')
+  const tableView = document.getElementById('sshTableView')
+
+  if (!newBtn) return
+
+  function resetSshAddForm() {
+    _sshEditingId = null
+    const titleEl = document.getElementById('sshAddPanelTitle')
+    if (titleEl) titleEl.textContent = 'Szerver hozzáadása'
+    document.getElementById('sshNameInput').value = ''
+    document.getElementById('sshHostInput').value = ''
+    document.getElementById('sshUserInput').value = ''
+    document.getElementById('sshPortInput').value = '22'
+    document.getElementById('sshDescInput').value = ''
+    if (document.getElementById('sshKeySelectInput')) document.getElementById('sshKeySelectInput').value = ''
+  }
+
+  newBtn.addEventListener('click', () => {
+    if (panel.hidden) resetSshAddForm()
+    panel.hidden = !panel.hidden
+    if (!panel.hidden) document.getElementById('sshNameInput').focus()
+  })
+  closeBtn?.addEventListener('click', () => { panel.hidden = true; resetSshAddForm() })
+
+  // (i) install guide button inside the "new server" form -- key-only mode
+  document.getElementById('sshKeyInstallFromFormBtn')?.addEventListener('click', () => {
+    openSshInfoModal(null, { keyOnly: true })
+  })
+
+  // "+ Új kulcs" button inside the "new server" form
+  document.getElementById('sshKeyNewFromFormBtn')?.addEventListener('click', () => {
+    openSshKeygenModal(newKey => {
+      // After key created, select it in the form dropdown
+      if (newKey && newKey.id) {
+        const sel = document.getElementById('sshKeySelectInput')
+        if (sel) sel.value = newKey.id
+      }
+    })
+  })
+
+  addBtn?.addEventListener('click', async () => {
+    const name = document.getElementById('sshNameInput').value.trim()
+    const host = document.getElementById('sshHostInput').value.trim()
+    const user = document.getElementById('sshUserInput').value.trim()
+    const port = parseInt(document.getElementById('sshPortInput').value, 10) || 22
+    const desc = document.getElementById('sshDescInput').value.trim()
+    const sshKeyId = document.getElementById('sshKeySelectInput')?.value || null
+    if (!name || !host || !user) { showToast('Név, IP és felhasználó megadása kötelező'); return }
+    const isEdit = !!_sshEditingId
+    try {
+      const res = await fetch(
+        isEdit ? `/api/vault/ssh-servers/${encodeURIComponent(_sshEditingId)}` : '/api/vault/ssh-servers',
+        {
+          method: isEdit ? 'PUT' : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, host, user, port, desc, sshKeyId: sshKeyId || undefined }),
+        }
+      )
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        showToast(err.error || 'Hiba a mentéskor'); return
+      }
+      resetSshAddForm()
+      panel.hidden = true
+      await loadSshServers()
+      showToast(isEdit ? 'Szerver frissítve' : 'Szerver hozzáadva')
+    } catch { showToast('Hálózati hiba') }
+  })
+
+  cardViewBtn?.addEventListener('click', () => {
+    _sshView = 'cards'
+    cardViewBtn.classList.add('active')
+    tableViewBtn.classList.remove('active')
+    cardsView.hidden = false
+    tableView.hidden = true
+  })
+
+  tableViewBtn?.addEventListener('click', () => {
+    _sshView = 'table'
+    tableViewBtn.classList.add('active')
+    cardViewBtn.classList.remove('active')
+    cardsView.hidden = true
+    tableView.hidden = false
+  })
+
+  // Kulcstároló "Új kulcs generálása" button
+  document.getElementById('sshKeyNewBtn')?.addEventListener('click', () => {
+    openSshKeygenModal()
+  })
+
+  // Global (i) info button in section header
+  document.getElementById('sshInfoGlobalBtn')?.addEventListener('click', () => {
+    openSshInfoModal()
+  })
+})()
+
 // --- Vault Page ---
 let _vaultSecrets = []
 
@@ -7099,6 +8938,7 @@ async function loadVaultPage() {
     document.getElementById('vaultStatTotal').textContent = String(_vaultSecrets.length)
     document.getElementById('vaultStatBindings').textContent = String(_vaultBindings.length)
     renderVaultGrid(_vaultSecrets)
+    await Promise.all([loadSshKeys(), loadSshServers()])
   } catch { /* ignore */ }
 }
 
@@ -7763,7 +9603,11 @@ document.getElementById('saveConnectorBtn').addEventListener('click', async () =
 function escapeHtml(str) {
   const d = document.createElement('div')
   d.textContent = str
-  return d.innerHTML
+  // textContent->innerHTML escapes & < > but NOT quotes. Encode quotes too so
+  // the result is safe in ATTRIBUTE contexts as well as text nodes -- several
+  // renderers interpolate escapeHtml() output into data-*/title/value="..."
+  // attributes, where a surviving " would allow an attribute breakout.
+  return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;')
 }
 
 // ============================================================
@@ -7854,6 +9698,68 @@ async function loadStatus() {
   } catch (err) {
     overallEl.className = 'status-overall unknown'
     overallEl.textContent = 'Nem sikerult betolteni a statuszt'
+  }
+}
+
+// ============================================================
+// === CostOps (v0.1, PR #524): local cost ledger summary ===
+// ============================================================
+
+document.getElementById('refreshCostsBtn').addEventListener('click', loadCosts)
+
+async function loadCosts() {
+  const el = document.getElementById('costsContent')
+  const mutedStyle = 'color:var(--text-muted);font-size:13px'
+  el.innerHTML = `<div style="${mutedStyle}">${t('costs.loading')}</div>`
+  try {
+    const res = await fetch('/api/costs/summary')
+    const s = await res.json()
+    if (!res.ok) throw new Error(s?.error || 'request failed')
+
+    const fmtMoney = (n) => (typeof n === 'number' ? n.toLocaleString('hu-HU') : '—') + ' ' + escapeHtml(s.currency || '')
+
+    let html = ''
+
+    if (!s.config_present) {
+      html += `<div style="${mutedStyle};margin-bottom:12px">${t('costs.no_config')}</div>`
+    }
+
+    html += `<div class="overview-stats">
+      <div class="overview-stat"><div class="overview-stat-value">${fmtMoney(s.current_spend)}</div><div class="overview-stat-label">${t('costs.current_spend')}</div></div>
+      <div class="overview-stat"><div class="overview-stat-value">${fmtMoney(s.forecast_month_end)}</div><div class="overview-stat-label">${t('costs.forecast')}</div></div>
+      <div class="overview-stat"><div class="overview-stat-value">${escapeHtml(s.month || '—')}</div><div class="overview-stat-label">${t('costs.month')}</div></div>
+    </div>`
+
+    if (s.budget) {
+      const pct = Math.round((s.budget.used_pct || 0) * 100)
+      const color = s.budget.status === 'hard' ? 'var(--danger,#e74c3c)' : s.budget.status === 'warning' ? 'var(--warn,#e0a800)' : 'var(--text-muted)'
+      html += `<div style="margin-top:16px;padding:12px 16px;border:1px solid var(--border,#333);border-radius:8px">
+        <div style="font-weight:600;margin-bottom:6px">${t('costs.budget_title')}: ${escapeHtml(s.budget.id)} (${fmtMoney(s.budget.amount)})</div>
+        <div style="${mutedStyle}">${t('costs.budget_used')}: <strong style="color:${color}">${pct}%</strong></div>
+      </div>`
+    }
+
+    const sources = Array.isArray(s.all_sources) ? s.all_sources : []
+    if (sources.length === 0) {
+      html += `<div style="${mutedStyle};margin-top:12px">${t('costs.no_sources')}</div>`
+    } else {
+      html += `<div style="overflow-x:auto;margin-top:16px"><table style="width:100%;border-collapse:collapse">
+        <thead><tr style="text-align:left;border-bottom:1px solid var(--border,#333)">
+          <th style="padding:6px 8px">${t('costs.source_name')}</th><th style="padding:6px 8px">${t('costs.source_provider')}</th><th style="padding:6px 8px">${t('costs.source_spend')}</th>
+        </tr></thead>
+        <tbody>${sources.map((src) => `<tr style="border-bottom:1px solid var(--border,#222)">
+          <td style="padding:6px 8px">${escapeHtml(src.name)}</td>
+          <td style="padding:6px 8px;${mutedStyle}">${escapeHtml(src.provider)}</td>
+          <td style="padding:6px 8px">${fmtMoney(src.spend)}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>`
+    }
+
+    html += `<p style="${mutedStyle};margin-top:16px">${t('costs.token_usage_note')} (${(s.token_usage?.calls ?? 0)} ${t('costs.calls')}, ${(s.token_usage?.input_tokens ?? 0) + (s.token_usage?.output_tokens ?? 0)} tokens)</p>`
+
+    el.innerHTML = html
+  } catch (err) {
+    el.innerHTML = `<div style="${mutedStyle}">${t('costs.load_failed')}</div>`
   }
 }
 
@@ -8185,6 +10091,200 @@ document.getElementById('migrateNewBtn').addEventListener('click', () => {
 })
 
 // ============================================================
+// === Fleet Migration ===
+// ============================================================
+
+// Holds the last successfully parsed fleet JSON text (for apply after dry-run)
+let fleetLastBody = null
+
+document.getElementById('fleetExportBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('fleetExportBtn')
+  const password = document.getElementById('fleetExportPassword').value.trim()
+
+  btn.disabled = true
+  btn.querySelector('.btn-text').hidden = true
+  btn.querySelector('.btn-loading').hidden = false
+
+  try {
+    const headers = {}
+    if (password) headers['X-Vault-Password'] = password
+
+    const res = await fetch('/api/fleet/export', { headers })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      showToast(data.error || t('fleet.export.error'))
+      return
+    }
+
+    const blob = await res.blob()
+    const cd = res.headers.get('Content-Disposition') || ''
+    const nameMatch = cd.match(/filename="?([^";\s]+)"?/)
+    const filename = nameMatch ? nameMatch[1] : `fleet-export-${new Date().toISOString().slice(0, 10)}.json`
+
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+
+    showToast(t('fleet.export.success'))
+  } catch (err) {
+    showToast(`${t('fleet.export.error')}: ${err.message}`)
+  } finally {
+    btn.disabled = false
+    btn.querySelector('.btn-text').hidden = false
+    btn.querySelector('.btn-loading').hidden = true
+  }
+})
+
+document.getElementById('fleetDryRunBtn').addEventListener('click', async () => {
+  const fileInput = document.getElementById('fleetImportFile')
+  if (!fileInput.files.length) {
+    showToast(t('fleet.import.no_file'))
+    return
+  }
+
+  const btn = document.getElementById('fleetDryRunBtn')
+  btn.disabled = true
+  btn.querySelector('.btn-text').hidden = true
+  btn.querySelector('.btn-loading').hidden = false
+
+  const applyBtn = document.getElementById('fleetApplyBtn')
+  applyBtn.disabled = true
+  fleetLastBody = null
+
+  const resultEl = document.getElementById('fleetDryRunResult')
+  resultEl.hidden = true
+  resultEl.innerHTML = ''
+
+  try {
+    const text = await fileInput.files[0].text()
+    // Validate JSON client-side first
+    try { JSON.parse(text) } catch { showToast(t('fleet.import.invalid_json')); return }
+
+    const password = document.getElementById('fleetImportPassword').value.trim()
+    const headers = { 'Content-Type': 'application/json' }
+    if (password) headers['X-Vault-Password'] = password
+
+    const res = await fetch('/api/fleet/import', { method: 'POST', headers, body: text })
+    const data = await res.json()
+
+    const wc = data.wouldCreate || {}
+    const hasErrors = data.errors && data.errors.length > 0
+    const hasWarnings = data.warnings && data.warnings.length > 0
+
+    resultEl.className = `fleet-dry-run-result ${hasErrors ? 'has-errors' : 'ok'}`
+    resultEl.hidden = false
+
+    const agentNames = Array.isArray(wc.agents) ? wc.agents : []
+    const agentLabel = agentNames.length
+      ? `${agentNames.length} (${agentNames.join(', ')})`
+      : '0'
+
+    resultEl.innerHTML = `
+      <div class="fleet-dry-run-title">${hasErrors ? '❌ ' + t('fleet.import.dryrun_errors') : '✅ ' + t('fleet.import.dryrun_ok')}</div>
+      ${!hasErrors ? `
+      <div class="fleet-dry-run-grid">
+        <div class="fleet-dry-run-stat">
+          <div class="fleet-dry-run-stat-value">${wc.mainAgent ? '✓' : '—'}</div>
+          <div class="fleet-dry-run-stat-label">${t('fleet.stat.main_agent')}</div>
+        </div>
+        <div class="fleet-dry-run-stat">
+          <div class="fleet-dry-run-stat-value">${agentNames.length}</div>
+          <div class="fleet-dry-run-stat-label">${t('fleet.stat.agents')}</div>
+        </div>
+        <div class="fleet-dry-run-stat">
+          <div class="fleet-dry-run-stat-value">${wc.memories ?? 0}</div>
+          <div class="fleet-dry-run-stat-label">${t('fleet.stat.memories')}</div>
+        </div>
+        <div class="fleet-dry-run-stat">
+          <div class="fleet-dry-run-stat-value">${wc.kanbanCards ?? 0}</div>
+          <div class="fleet-dry-run-stat-label">${t('fleet.stat.kanban')}</div>
+        </div>
+        <div class="fleet-dry-run-stat">
+          <div class="fleet-dry-run-stat-value">${wc.globalSkills ?? 0}</div>
+          <div class="fleet-dry-run-stat-label">${t('fleet.stat.skills')}</div>
+        </div>
+        <div class="fleet-dry-run-stat">
+          <div class="fleet-dry-run-stat-value">${wc.scheduledTasks ?? 0}</div>
+          <div class="fleet-dry-run-stat-label">${t('fleet.stat.tasks')}</div>
+        </div>
+      </div>
+      ${agentNames.length ? `<div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">${t('fleet.stat.agent_names')}: ${escapeHtml(agentNames.join(', '))}</div>` : ''}
+      ` : ''}
+      ${hasErrors ? `<div class="fleet-dry-run-errors">${data.errors.map(e => escapeHtml(e)).join('<br>')}</div>` : ''}
+      ${hasWarnings ? `<div class="fleet-dry-run-warnings">⚠️ ${data.warnings.map(w => escapeHtml(w)).join('<br>')}</div>` : ''}
+    `
+
+    if (!hasErrors) {
+      fleetLastBody = text
+      applyBtn.disabled = false
+    }
+  } catch (err) {
+    showToast(`${t('fleet.import.error')}: ${err.message}`)
+  } finally {
+    btn.disabled = false
+    btn.querySelector('.btn-text').hidden = false
+    btn.querySelector('.btn-loading').hidden = true
+  }
+})
+
+document.getElementById('fleetApplyBtn').addEventListener('click', async () => {
+  if (!fleetLastBody) return
+
+  if (!confirm(t('fleet.import.apply_confirm'))) return
+
+  const btn = document.getElementById('fleetApplyBtn')
+  btn.disabled = true
+  btn.querySelector('.btn-text').hidden = true
+  btn.querySelector('.btn-loading').hidden = false
+
+  const resultEl = document.getElementById('fleetDryRunResult')
+
+  try {
+    const password = document.getElementById('fleetImportPassword').value.trim()
+    const headers = { 'Content-Type': 'application/json' }
+    if (password) headers['X-Vault-Password'] = password
+
+    const res = await fetch('/api/fleet/import?apply=true', { method: 'POST', headers, body: fleetLastBody })
+    const data = await res.json()
+
+    if (!res.ok) throw new Error(data.error || t('fleet.import.error'))
+
+    const imp = data.imported || {}
+    const agentNames = Array.isArray(imp.agents) ? imp.agents : []
+
+    resultEl.className = 'fleet-apply-result'
+    resultEl.hidden = false
+    resultEl.innerHTML = `
+      <div class="fleet-apply-result-title">✅ ${t('fleet.import.apply_success')}</div>
+      <div>
+        ${imp.mainAgent ? `<div>${t('fleet.stat.main_agent')}: ✓</div>` : ''}
+        ${agentNames.length ? `<div>${t('fleet.stat.agents')}: ${escapeHtml(agentNames.join(', '))}</div>` : ''}
+        <div>${t('fleet.stat.memories')}: ${imp.memories ?? 0}</div>
+        <div>${t('fleet.stat.kanban')}: ${imp.kanbanCards ?? 0}</div>
+        <div>${t('fleet.stat.skills')}: ${imp.globalSkills ?? 0}</div>
+        <div>${t('fleet.stat.tasks')}: ${imp.scheduledTasks ?? 0}</div>
+      </div>
+    `
+
+    fleetLastBody = null
+    btn.disabled = true
+  } catch (err) {
+    showToast(`${t('fleet.import.error')}: ${err.message}`)
+    btn.disabled = false
+    btn.querySelector('.btn-text').hidden = false
+    btn.querySelector('.btn-loading').hidden = true
+  } finally {
+    btn.querySelector('.btn-text').hidden = false
+    btn.querySelector('.btn-loading').hidden = true
+  }
+})
+
+// ============================================================
 // === Skills Page ===
 // ============================================================
 
@@ -8194,6 +10294,25 @@ const skillsEmpty = document.getElementById('skillsEmpty')
 const skillDetailOverlay = document.getElementById('skillDetailOverlay')
 
 let globalSkills = []
+let localAgentSkills = []
+let skillsActiveFilter = 'all'
+let skillsSearchQuery = ''
+let skillsActiveCategory = 'all'
+
+function deriveSkillCategory(name) {
+  // Use the first dash-separated segment as the category group.
+  // "fleet-dashboard-api" -> "fleet", "morning-chain" -> "morning",
+  // "handoff" -> "handoff"
+  const seg = name.split(':').pop() || name  // strip plugin prefix
+  return seg.split('-')[0] || seg
+}
+
+function formatMtime(ms) {
+  if (!ms) return ''
+  const d = new Date(ms)
+  const pad = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}.${pad(d.getMonth() + 1)}.${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
 
 document.getElementById('skillDetailClose').addEventListener('click', () => closeModal(skillDetailOverlay))
 skillDetailOverlay.addEventListener('click', (e) => { if (e.target === skillDetailOverlay) closeModal(skillDetailOverlay) })
@@ -8228,14 +10347,56 @@ async function loadGlobalSkills() {
   skillsGrid.innerHTML = `<div class="connector-loading"><span class="spinner"></span> ${t('skills.loading')}</div>`
   skillsStats.innerHTML = ''
   try {
-    const res = await fetch('/api/skills')
-    globalSkills = await res.json()
+    const [globalRes, localRes] = await Promise.all([
+      fetch('/api/skills'),
+      fetch('/api/skills/local'),
+    ])
+    globalSkills = await globalRes.json()
+    localAgentSkills = localRes.ok ? await localRes.json() : []
     renderGlobalSkills()
   } catch (err) {
     console.error('Skills betoltes hiba:', err)
     skillsGrid.innerHTML = `<div class="connector-loading">${t('skills.error')}</div>`
   }
 }
+
+// Wire search, filter, and export controls once DOM is ready
+;(() => {
+  const searchEl = document.getElementById('skillsSearch')
+  if (searchEl) {
+    searchEl.addEventListener('input', () => {
+      skillsSearchQuery = searchEl.value.toLowerCase().trim()
+      renderSkillsSidebar()
+      renderGlobalSkillsGrid()
+    })
+  }
+
+  const filterBtns = document.getElementById('skillsFilterBtns')
+  if (filterBtns) {
+    filterBtns.addEventListener('click', (e) => {
+      const btn = e.target.closest('.skills-filter-btn')
+      if (!btn) return
+      filterBtns.querySelectorAll('.skills-filter-btn').forEach(b => b.classList.remove('active'))
+      btn.classList.add('active')
+      skillsActiveFilter = btn.dataset.filter || 'all'
+      skillsActiveCategory = 'all'
+      renderSkillsSidebar()
+      renderGlobalSkillsGrid()
+    })
+  }
+
+  const exportBtn = document.getElementById('skillsExportBtn')
+  if (exportBtn) {
+    exportBtn.addEventListener('click', () => {
+      const a = document.createElement('a')
+      a.href = '/api/skills/export'
+      a.download = 'skills-export.zip'
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+    })
+  }
+})()
 
 function getSkillIcon(name) {
   if (name.includes('factory') || name.includes('creator')) return '\u{1F3ED}'
@@ -8249,10 +10410,48 @@ function getSkillIcon(name) {
   return '\u2699\uFE0F'
 }
 
-function renderGlobalSkills() {
-  skillsGrid.innerHTML = ''
+function renderSkillsSidebar() {
+  const sidebar = document.getElementById('skillsCategorySidebar')
+  if (!sidebar) return
 
-  const withSkillMd = globalSkills.filter(s => s.description)
+  // For the 'agent' filter, category counts come from localAgentSkills so the
+  // sidebar stays populated. All other filters draw from globalSkills as before.
+  const sourceFiltered = skillsActiveFilter === 'agent'
+    ? localAgentSkills
+    : skillsActiveFilter === 'all'
+      ? globalSkills
+      : globalSkills.filter(s => s.source === skillsActiveFilter)
+
+  const catCounts = new Map()
+  for (const s of sourceFiltered) {
+    const cat = deriveSkillCategory(s.name)
+    catCounts.set(cat, (catCounts.get(cat) || 0) + 1)
+  }
+
+  const cats = [...catCounts.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+
+  sidebar.innerHTML = `
+    <div class="skills-cat-title">${t('skills.category.title')}</div>
+    <button class="skills-cat-btn${skillsActiveCategory === 'all' ? ' active' : ''}" data-cat="all">
+      ${t('skills.filter.all')} <span class="skills-cat-count">${sourceFiltered.length}</span>
+    </button>
+    ${cats.map(([cat, count]) => `
+      <button class="skills-cat-btn${skillsActiveCategory === cat ? ' active' : ''}" data-cat="${escapeHtml(cat)}">
+        ${escapeHtml(cat)} <span class="skills-cat-count">${count}</span>
+      </button>
+    `).join('')}
+  `
+
+  sidebar.addEventListener('click', (e) => {
+    const btn = e.target.closest('.skills-cat-btn')
+    if (!btn) return
+    skillsActiveCategory = btn.dataset.cat || 'all'
+    renderSkillsSidebar()
+    renderGlobalSkillsGrid()
+  })
+}
+
+function renderGlobalSkills() {
   const userCount = globalSkills.filter(s => s.source === 'user').length
   const pluginCount = globalSkills.filter(s => s.source === 'plugin').length
 
@@ -8260,55 +10459,140 @@ function renderGlobalSkills() {
     <div class="stat-card"><div class="stat-value">${globalSkills.length}</div><div class="stat-label">${t('skills.stat.total')}</div></div>
     <div class="stat-card"><div class="stat-value" style="color:var(--info)">${userCount}</div><div class="stat-label">${t('skills.stat.user')}</div></div>
     ${pluginCount ? `<div class="stat-card"><div class="stat-value" style="color:var(--accent)">${pluginCount}</div><div class="stat-label">${t('skills.stat.plugin')}</div></div>` : ''}
-    <div class="stat-card"><div class="stat-value" style="color:var(--success)">${withSkillMd.length}</div><div class="stat-label">${t('skills.stat.documented')}</div></div>
+    ${localAgentSkills.length ? `<div class="stat-card"><div class="stat-value" style="color:var(--warning)">${localAgentSkills.length}</div><div class="stat-label">${t('skills.stat.agent_local')}</div></div>` : ''}
   `
 
-  if (globalSkills.length === 0) {
+  skillsActiveCategory = 'all'
+  renderSkillsSidebar()
+  renderGlobalSkillsGrid()
+}
+
+function renderGlobalSkillsGrid() {
+  skillsGrid.innerHTML = ''
+
+  const isAgentFilter = skillsActiveFilter === 'agent'
+
+  // When 'agent' filter is active, show only local agent skills; otherwise show global/plugin.
+  const filteredGlobal = isAgentFilter ? [] : globalSkills.filter(s => {
+    if (skillsActiveFilter !== 'all' && s.source !== skillsActiveFilter) return false
+    if (skillsActiveCategory !== 'all' && deriveSkillCategory(s.name) !== skillsActiveCategory) return false
+    if (!skillsSearchQuery) return true
+    const haystack = [s.name, s.label, s.description, ...(s.keywords || [])].join(' ').toLowerCase()
+    return haystack.includes(skillsSearchQuery)
+  })
+
+  // Local agent skills: always merged in for 'all' or filtered to 'agent'.
+  const filteredLocal = (skillsActiveFilter === 'all' || isAgentFilter) ? localAgentSkills.filter(s => {
+    if (skillsActiveCategory !== 'all' && deriveSkillCategory(s.name) !== skillsActiveCategory) return false
+    if (!skillsSearchQuery) return true
+    const haystack = [s.name, s.label, s.description, s.agentId, ...(s.keywords || [])].join(' ').toLowerCase()
+    return haystack.includes(skillsSearchQuery)
+  }) : []
+
+  const allFiltered = [...filteredGlobal, ...filteredLocal]
+
+  if (allFiltered.length === 0) {
     skillsEmpty.hidden = false
     return
   }
   skillsEmpty.hidden = true
 
-  const sourceLabels = { user: 'user', plugin: 'plugin' }
+  const sourceLabels = { user: 'user', plugin: 'plugin', agent: t('skills.filter.agent') }
 
-  for (const skill of globalSkills) {
+  const renderCard = (skill, isLocal) => {
     const card = document.createElement('div')
-    card.className = 'skills-card'
+    card.className = isLocal ? 'skills-card skills-card--local' : 'skills-card'
     const icon = getSkillIcon(skill.name)
-    const sourceBadge = skill.source
-      ? `<span class="connector-source-badge">${escapeHtml(sourceLabels[skill.source] || skill.source)}</span>`
+    const sourceBadge = isLocal
+      ? `<span class="connector-source-badge skills-badge--agent">${escapeHtml(skill.agentId)}</span>`
+      : (skill.source ? `<span class="connector-source-badge">${escapeHtml(sourceLabels[skill.source] || skill.source)}</span>` : '')
+
+    const hasDesc = !!skill.description
+    const healthClass = hasDesc ? 'skill-health-ok' : 'skill-health-warn'
+    const healthTitle = hasDesc ? t('skills.health.ok') : t('skills.health.nodesc')
+
+    const kws = (skill.keywords || []).slice(0, 3)
+    const kwTags = kws.map(k => `<span class="skill-keyword-tag">${escapeHtml(k)}</span>`).join('')
+
+    const agents = skill.agents || []
+    const agentBadges = agents.length > 0
+      ? `<span class="skills-agent-badge skill-agent-count" title="${escapeHtml(agents.join(', '))}">&#x1F916; ${agents.length} ${t('skills.agents.count')}</span>`
       : ''
+
+    const mtimeStr = skill.mtime ? formatMtime(skill.mtime) : ''
 
     const displayName = skill.label || skill.name
     card.innerHTML = `
       <div class="skills-card-header">
         <div class="skills-card-icon">${icon}</div>
         <div class="skills-card-info">
-          <div class="skills-card-name">${escapeHtml(displayName)} ${sourceBadge}</div>
+          <div class="skills-card-name">
+            ${escapeHtml(displayName)} ${sourceBadge}
+            <span class="skill-health-dot ${healthClass}" title="${escapeHtml(healthTitle)}"></span>
+          </div>
           <div class="skills-card-desc">${escapeHtml(skill.description || t('skills.no_description'))}</div>
         </div>
       </div>
+      ${(kwTags || agentBadges || mtimeStr) ? `
+      <div class="skills-card-footer">
+        ${kwTags}
+        ${agentBadges}
+        ${mtimeStr ? `<span class="skill-card-mtime" title="${t('skills.mtime.title')}">${escapeHtml(mtimeStr)}</span>` : ''}
+      </div>` : ''}
     `
-    card.addEventListener('click', () => openSkillDetail(skill.name, skill.label))
+    card.addEventListener('click', () => openSkillDetail(skill.name, skill.label, skill.agentId || null))
     skillsGrid.appendChild(card)
   }
+
+  for (const skill of filteredGlobal) renderCard(skill, false)
+  for (const skill of filteredLocal) renderCard(skill, true)
 }
 
-async function openSkillDetail(skillName, displayLabel) {
+let _skillDetailCurrentName = null
+let _skillDetailCurrentAgentId = null
+let _skillDetailIsPlugin = false
+
+function _skillDetailExitEdit() {
+  const editor = document.getElementById('skillDetailEditor')
+  const contentEl = document.getElementById('skillDetailContent')
+  const editActions = document.getElementById('skillDetailEditActions')
+  const editBtn = document.getElementById('skillDetailEditBtn')
+  editor.hidden = true
+  contentEl.hidden = false
+  editActions.hidden = true
+  editBtn.disabled = false
+}
+
+async function openSkillDetail(skillName, displayLabel, agentId = null) {
+  _skillDetailCurrentName = skillName
+  _skillDetailCurrentAgentId = agentId
+  _skillDetailExitEdit()
+
   document.getElementById('skillDetailTitle').textContent = displayLabel || skillName
 
+  const editBtn = document.getElementById('skillDetailEditBtn')
+  if (editBtn) {
+    editBtn.hidden = false
+    editBtn.disabled = false
+  }
+
   try {
-    const res = await fetch(`/api/skills/${encodeURIComponent(skillName)}`)
+    const detailUrl = agentId
+      ? `/api/skills/${encodeURIComponent(skillName)}?agent=${encodeURIComponent(agentId)}`
+      : `/api/skills/${encodeURIComponent(skillName)}`
+    const res = await fetch(detailUrl)
     if (!res.ok) throw new Error('Failed to fetch skill detail')
     const detail = await res.json()
+    _skillDetailIsPlugin = detail.source === 'plugin'
+
+    // Hide edit button for plugin skills
+    if (editBtn) editBtn.hidden = _skillDetailIsPlugin
 
     // Description
     const descEl = document.getElementById('skillDetailDesc')
     descEl.textContent = detail.description || t('skills.no_description')
 
-    // Meta line: source + path. Replaces the old per-agent assignment
-    // UI -- sub-agents share the caller's HOME, so the skill is already
-    // available to every agent without any copy-to-agent action.
+    // Meta: source + mtime
     const metaEl = document.getElementById('skillDetailMeta')
     if (metaEl) {
       const sourceLabel = detail.source === 'plugin'
@@ -8316,28 +10600,132 @@ async function openSkillDetail(skillName, displayLabel) {
         : detail.source === 'user'
         ? t('skills.source.user')
         : t('skills.source.unknown')
+      const mtimeStr = detail.mtime ? formatMtime(detail.mtime) : ''
       metaEl.innerHTML = `
-        <div class="skill-detail-source">${t('skills.detail.source_label')} <strong>${sourceLabel}</strong></div>
+        <div class="skill-detail-source">${t('skills.detail.source_label')} <strong>${sourceLabel}</strong>${mtimeStr ? ` &middot; <span title="${escapeHtml(t('skills.mtime.title'))}">${escapeHtml(mtimeStr)}</span>` : ''}</div>
         <div class="skill-detail-note">${t('skills.detail.auto_available')}</div>
       `
     }
 
-    // Content
+    // Keywords
+    const kwEl = document.getElementById('skillDetailKeywords')
+    if (kwEl) {
+      const kws = detail.keywords || []
+      if (kws.length > 0) {
+        kwEl.hidden = false
+        kwEl.innerHTML = `<span class="skill-kw-label">${t('skills.keywords.label')}</span> ` +
+          kws.map(k => `<span class="skill-keyword-tag">${escapeHtml(k)}</span>`).join(' ')
+      } else {
+        kwEl.hidden = true
+      }
+    }
+
+    // Agent coverage
+    const agentsEl = document.getElementById('skillDetailAgentsCoverage')
+    if (agentsEl) {
+      const agents = detail.agents || []
+      if (agents.length > 0) {
+        agentsEl.hidden = false
+        agentsEl.innerHTML = `<span class="skill-kw-label">${t('skills.agents.label')}</span> ` +
+          agents.map(a => `<span class="skills-agent-badge">${escapeHtml(a)}</span>`).join(' ')
+      } else {
+        agentsEl.hidden = true
+      }
+    }
+
+    // Health indicator
+    const healthEl = document.getElementById('skillDetailHealth')
+    if (healthEl) {
+      const hasDesc = !!detail.description
+      const hasContent = !!detail.content
+      if (hasDesc && hasContent) {
+        healthEl.className = 'skill-health-label skill-health-ok'
+        healthEl.textContent = t('skills.health.ok')
+      } else if (hasContent) {
+        healthEl.className = 'skill-health-label skill-health-warn'
+        healthEl.textContent = t('skills.health.nodesc')
+      } else {
+        healthEl.className = 'skill-health-label skill-health-err'
+        healthEl.textContent = t('skills.health.empty')
+      }
+    }
+
+    // Content: render as markdown
     const contentEl = document.getElementById('skillDetailContent')
-    contentEl.textContent = detail.content || t('skills.content_not_found')
+    const rawContent = detail.content || t('skills.content_not_found')
+    contentEl.innerHTML = renderMarkdown(rawContent)
+
+    // Prefill editor
+    const editor = document.getElementById('skillDetailEditor')
+    if (editor) editor.value = rawContent
 
   } catch (err) {
     console.error('Skill detail hiba:', err)
     document.getElementById('skillDetailDesc').textContent = t('connectors.error_list')
-    document.getElementById('skillDetailContent').textContent = ''
+    document.getElementById('skillDetailContent').innerHTML = ''
     const metaEl = document.getElementById('skillDetailMeta')
     if (metaEl) metaEl.innerHTML = ''
+    if (editBtn) editBtn.hidden = true
   }
 
   openModal(skillDetailOverlay)
 }
 
-// === Team page ===
+// Inline edit wiring
+;(() => {
+  const editBtn = document.getElementById('skillDetailEditBtn')
+  const saveBtn = document.getElementById('skillDetailSaveBtn')
+  const cancelBtn = document.getElementById('skillDetailCancelEditBtn')
+  const editor = document.getElementById('skillDetailEditor')
+  const contentEl = document.getElementById('skillDetailContent')
+  const editActions = document.getElementById('skillDetailEditActions')
+
+  if (editBtn) {
+    editBtn.addEventListener('click', () => {
+      if (_skillDetailIsPlugin) return
+      contentEl.hidden = true
+      editor.hidden = false
+      editActions.hidden = false
+      editBtn.disabled = true
+      editor.focus()
+    })
+  }
+
+  if (cancelBtn) {
+    cancelBtn.addEventListener('click', _skillDetailExitEdit)
+  }
+
+  if (saveBtn) {
+    saveBtn.addEventListener('click', async () => {
+      if (!_skillDetailCurrentName || _skillDetailIsPlugin) return
+      const newContent = editor.value
+      saveBtn.disabled = true
+      try {
+        const putUrl = _skillDetailCurrentAgentId
+          ? `/api/skills/${encodeURIComponent(_skillDetailCurrentName)}?agent=${encodeURIComponent(_skillDetailCurrentAgentId)}`
+          : `/api/skills/${encodeURIComponent(_skillDetailCurrentName)}`
+        const res = await fetch(putUrl, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: newContent }),
+        })
+        if (!res.ok) throw new Error('PUT failed: ' + res.status)
+        contentEl.innerHTML = renderMarkdown(newContent)
+        _skillDetailExitEdit()
+        showToast(t('skills.toast.saved'))
+        // Refresh list to pick up new description/keywords
+        loadGlobalSkills()
+      } catch (err) {
+        console.error('Skill mentés hiba:', err)
+        showToast(t('skills.toast.save_error'))
+      } finally {
+        saveBtn.disabled = false
+      }
+    })
+  }
+})()
+
+// === Team org-chart (now embedded in Agents page, tree view) ===
 async function loadTeamGraph() {
   const container = document.getElementById('teamGraph')
   if (!container) return
@@ -8346,21 +10734,65 @@ async function loadTeamGraph() {
     const res = await fetch('/api/team/graph')
     if (!res.ok) throw new Error('HTTP ' + res.status)
     const data = await res.json()
-    renderTeamGraph(container, data)
+    renderTeamGraph(container, data, { editable: true })
   } catch (err) {
     container.innerHTML = `<div class="team-empty">${t('team.error', { msg: err.message || err })}</div>`
   }
 }
 
-function renderTeamGraph(container, data) {
+// Persist a drag-and-drop reporting change: `childId` now reports to `parentId`.
+// Guards (also enforced server-side) keep the caller from creating a cycle or
+// writing a no-op. On success the graph is reloaded so the tree re-lays-out.
+async function saveTeamReportsTo(childId, parentId, ctx) {
+  const { byId, parentOf, descendantsOf, mainAgentId } = ctx
+  if (!childId || childId === parentId || childId === mainAgentId) return
+  if (parentOf.get(childId) === parentId) return  // already the parent
+  if (descendantsOf(childId).has(parentId)) { showToast(t('team.drop.cycle')); return }
+  try {
+    const r = await fetch(`/api/agents/${encodeURIComponent(childId)}/team`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reportsTo: parentId }),
+    })
+    if (!r.ok) throw new Error('HTTP ' + r.status)
+    const result = await r.json().catch(() => ({}))
+    if (result.cycleRejected) { showToast(t('team.drop.cycle')); return }
+    const childLabel = (byId.get(childId) || {}).label || childId
+    const parentLabel = (byId.get(parentId) || {}).label || parentId
+    showToast(t('team.drop.saved', { child: childLabel, parent: parentLabel }))
+    loadTeamGraph()
+  } catch {
+    showToast(t('team.drop.error'))
+  }
+}
+
+function renderTeamGraph(container, data, opts = {}) {
+  const editable = !!opts.editable
   const { nodes, edges, mainAgentId } = data
   container.innerHTML = ''
   const byId = new Map(nodes.map(n => [n.id, n]))
   const childrenOf = new Map()
+  const parentOf = new Map()
   for (const n of nodes) childrenOf.set(n.id, [])
   for (const e of edges) {
     if (childrenOf.has(e.from)) childrenOf.get(e.from).push(e.to)
+    parentOf.set(e.to, e.from)
   }
+  // Transitive reports of `id` (its whole subtree). Used to reject dropping a
+  // manager onto one of its own reports, which would orphan the subtree.
+  const descendantsOf = (id) => {
+    const out = new Set()
+    const walk = (x) => {
+      for (const c of (childrenOf.get(x) || [])) {
+        if (!out.has(c)) { out.add(c); walk(c) }
+      }
+    }
+    walk(id)
+    return out
+  }
+  const dropCtx = { byId, parentOf, descendantsOf, mainAgentId }
+  // A single dragged id shared across all nodes' dragover handlers so they can
+  // validate the target (dataTransfer payload is unreadable during dragover).
+  let draggingId = null
   const renderNode = (node) => {
     const div = document.createElement('div')
     div.className = 'team-node'
@@ -8369,8 +10801,8 @@ function renderTeamGraph(container, data) {
     const roleLabel = node.role === 'main' ? t('team.role.main') : (node.role === 'leader' ? t('team.role.leader') : t('team.role.member'))
     const running = node.running ? t('team.running') : t('team.stopped')
     const avatarUrl = node.id === mainAgentId
-      ? `/api/marveen/avatar?t=${Date.now()}`
-      : `/api/agents/${encodeURIComponent(node.id)}/avatar?t=${Date.now()}`
+      ? `/api/marveen/avatar${avatarBust()}`
+      : `/api/agents/${encodeURIComponent(node.id)}/avatar${avatarBust()}`
     div.innerHTML = `
       <div class="team-node-avatar"><img src="${avatarUrl}" alt="${escapeHtml(node.label || node.id)}" onerror="this.style.display='none'"></div>
       <div class="team-node-name">${escapeHtml(node.label || node.id)}</div>
@@ -8379,6 +10811,42 @@ function renderTeamGraph(container, data) {
     `
     if (node.id !== mainAgentId) {
       div.addEventListener('click', () => openAgentDetail(node.id))
+    }
+    // Drag-and-drop reporting edit (Team page only). Any agent except the main
+    // one can be dragged; any node can be a drop target (dropping onto the main
+    // agent makes the report a direct report of it).
+    if (editable) {
+      if (node.id !== mainAgentId) {
+        div.draggable = true
+        div.classList.add('team-draggable')
+        div.addEventListener('dragstart', (e) => {
+          draggingId = node.id
+          e.dataTransfer.setData('text/plain', node.id)
+          e.dataTransfer.effectAllowed = 'move'
+          div.classList.add('team-dragging')
+        })
+        div.addEventListener('dragend', () => {
+          draggingId = null
+          div.classList.remove('team-dragging')
+        })
+      }
+      const isValidTarget = () =>
+        draggingId && draggingId !== node.id &&
+        parentOf.get(draggingId) !== node.id &&
+        !descendantsOf(draggingId).has(node.id)
+      div.addEventListener('dragover', (e) => {
+        if (!isValidTarget()) return  // no preventDefault -> shows "no drop"
+        e.preventDefault()
+        e.dataTransfer.dropEffect = 'move'
+        div.classList.add('team-drop-target')
+      })
+      div.addEventListener('dragleave', () => div.classList.remove('team-drop-target'))
+      div.addEventListener('drop', (e) => {
+        e.preventDefault()
+        div.classList.remove('team-drop-target')
+        const childId = e.dataTransfer.getData('text/plain') || draggingId
+        saveTeamReportsTo(childId, node.id, dropCtx)
+      })
     }
     return div
   }
@@ -8448,8 +10916,30 @@ function renderTeamGraph(container, data) {
   }
 }
 
-const refreshTeamBtn = document.getElementById('refreshTeamBtn')
-if (refreshTeamBtn) refreshTeamBtn.addEventListener('click', loadTeamGraph)
+// === Agents page: grid / org-chart view toggle ===
+// Persists the chosen view for the session so navigating away and back keeps
+// the last selection. Defaults to 'grid'.
+let _agentsActiveView = 'grid'
+
+function _setAgentsView(view) {
+  _agentsActiveView = view
+  const gridView = document.getElementById('agentsGridView')
+  const treeView = document.getElementById('agentsTreeView')
+  const gridBtn  = document.getElementById('agentsViewGrid')
+  const treeBtn  = document.getElementById('agentsViewTree')
+  if (!gridView || !treeView) return
+  const showGrid = view === 'grid'
+  gridView.hidden = !showGrid
+  treeView.hidden = showGrid
+  if (gridBtn) gridBtn.classList.toggle('active', showGrid)
+  if (treeBtn) treeBtn.classList.toggle('active', !showGrid)
+  if (!showGrid) loadTeamGraph()
+}
+
+const _agentsViewGridBtn = document.getElementById('agentsViewGrid')
+const _agentsViewTreeBtn = document.getElementById('agentsViewTree')
+if (_agentsViewGridBtn) _agentsViewGridBtn.addEventListener('click', () => _setAgentsView('grid'))
+if (_agentsViewTreeBtn) _agentsViewTreeBtn.addEventListener('click', () => _setAgentsView('tree'))
 
 // === Team: inter-agent message log + compose ===
 // View the /api/messages queue and let the operator send a message to an agent
@@ -8507,12 +10997,27 @@ function chatAvatarHtml(agentName, size = 32) {
   const hasAvatar = chatAgentHasAvatar.get(lower)
   if (!hasAvatar) return chatMonogramEl(agentName, size)
   const src = lower === mainAgentId().toLowerCase()
-    ? `/api/marveen/avatar?t=${Date.now()}`
-    : `/api/agents/${encodeURIComponent(lower)}/avatar?t=${Date.now()}`
+    ? `/api/marveen/avatar${avatarBust()}`
+    : `/api/agents/${encodeURIComponent(lower)}/avatar${avatarBust()}`
   return `<img class="chat-avatar" src="${src}" width="${size}" height="${size}" alt="${escapeHtml(agentName)}" data-agent-name="${escapeHtml(agentName)}" onerror="chatImgError(this)">`
 }
 
+// Guard against the boot race: the Messages page can be opened before the
+// initial /api/marveen fetch resolves window._marveen. Until it does,
+// mainAgentId() returns the literal 'marveen' FALLBACK, which is a real agent
+// id on no install here -- composing to it creates a phantom "marveen" thread
+// that sits pending forever and shows up as a duplicate of the true main agent
+// (torpapa). Resolve _marveen before rendering any chat target.
+async function ensureMarveenLoaded() {
+  if (window._marveen?.agentId) return
+  try {
+    const r = await fetch('/api/marveen')
+    if (r.ok) window._marveen = { ...(window._marveen || {}), ...(await r.json()) }
+  } catch { /* sidebar falls back to the literal id -- best effort */ }
+}
+
 async function loadMessagesPage() {
+  await ensureMarveenLoaded()
   await loadChatAgentList()
 }
 
@@ -8522,6 +11027,24 @@ const CHAT_SYSTEM_AGENTS = new Set(['heartbeat','telegram-coordinator','channel-
 // window._marveen.ownerName), not a hardcoded literal, so a renamed install
 // recognizes its real owner. Empty until _marveen resolves (no false match).
 function chatOwnerName() { return window._marveen?.ownerName || '' }
+
+// The main agent's display name (BOT_NAME). mainAgentId() is the routing id
+// (e.g. "marveen") used for matching, avatar lookups and API calls; this is
+// what the user should SEE. Sourced from the backend (/api/marveen -> name,
+// mirrored into _brandTokens.bot by initSidebarBrand), so a renamed install
+// shows its real bot name. Falls back to the id before _marveen resolves.
+// Regression #519/#520: keep the four Messages-view display points routing the
+// main agent id through chatDisplayName -- a later refactor once stripped this
+// and leaked the raw routing id again. Guarded by messages-view-display-name.test.ts.
+function mainAgentDisplayName() {
+  return window._marveen?.name || window._brandTokens?.bot || mainAgentId()
+}
+// Map a routing agent id to its user-facing label: the main agent's id becomes
+// its BOT_NAME display name; every other agent already carries a human name as
+// its id, so it passes through unchanged.
+function chatDisplayName(name) {
+  return name === mainAgentId() ? mainAgentDisplayName() : name
+}
 
 function chatLastSeenKey(agentName) { return 'chat_last_seen_' + agentName }
 function chatGetLastSeen(agentName) { return parseInt(localStorage.getItem(chatLastSeenKey(agentName)) || '0', 10) }
@@ -8539,18 +11062,29 @@ async function loadChatAgentList() {
   const sidebar = document.getElementById('chatAgentList')
   if (!sidebar) return
   try {
-    // Load fleet agents + threads in parallel
-    const [agentsRes, threadsRes] = await Promise.all([
+    // Load fleet agents + threads in parallel (the federation status fetch is
+    // failure-proof: it must never take down the Messages page)
+    const [agentsRes, threadsRes, fedStatus] = await Promise.all([
       fetch('/api/agents'),
       fetch('/api/messages/threads'),
+      fetch('/api/federation/status').then((r) => (r.ok ? r.json() : null)).catch(() => null),
     ])
     const agentsRaw = agentsRes.ok ? await agentsRes.json() : []
     const threads = threadsRes.ok ? await threadsRes.json() : []
+    if (fedStatus && Array.isArray(fedStatus.peers)) federatedPeerStatus = fedStatus.peers
 
-    // Build fleet list: API agents + marveen, minus system agents
+    // Build fleet list: API agents + marveen, minus system agents; plus
+    // federated agents from the poller cache so a remote conversation can be
+    // STARTED without prior history. The system-agent filter runs on the
+    // unqualified segment too ('teodor/heartbeat' is just as much noise).
     const fleetNames = [mainAgentId(), ...agentsRaw.map(a => a.name || a)]
       .filter(n => !CHAT_SYSTEM_AGENTS.has(n))
       .filter((n, i, arr) => arr.indexOf(n) === i)
+    for (const fa of federatedAgentEntries()) {
+      if (!fleetNames.includes(fa.qualified) && !CHAT_SYSTEM_AGENTS.has(fa.qualified.split('/').pop())) {
+        fleetNames.push(fa.qualified)
+      }
+    }
 
     // Populate avatar map from API data
     chatAgentHasAvatar.clear()
@@ -8564,8 +11098,12 @@ async function loadChatAgentList() {
     for (const t of threads) {
       if (t.agent) threadIndex.set(t.agent, { lastMsg: t.lastMessage, count: t.count || 0 })
     }
-    // Also include thread agents not in fleet (e.g. the owner's own direct msgs)
+    // Also include thread agents not in fleet (e.g. the owner's own direct msgs).
+    // Suppress the literal 'marveen' fallback id when it is NOT the real main
+    // agent: a stale phantom thread (from the boot-race bug) would otherwise
+    // render as a duplicate of the true main agent.
     for (const t of threads) {
+      if (t.agent === 'marveen' && mainAgentId() !== 'marveen') continue
       if (t.agent && !fleetNames.includes(t.agent) && !CHAT_SYSTEM_AGENTS.has(t.agent)) {
         fleetNames.push(t.agent)
       }
@@ -8595,7 +11133,7 @@ async function loadChatAgentList() {
       const isSelected = name === chatSelectedAgent ? ' selected' : ''
       const dimmed = info ? '' : ' style="opacity:0.5"'
       const unread = chatIsUnread(name, info)
-      const displayName = owner && name === owner ? owner + ' (te)' : name
+      const displayName = owner && name === owner ? owner + ' (te)' : chatDisplayName(name)
       return `<div class="chat-agent-item${isSelected}${unread ? ' unread' : ''}" data-agent="${escapeHtml(name)}"${dimmed}>
         <div class="chat-agent-avatar">${chatAvatarHtml(name, 40)}</div>
         <div class="chat-agent-info">
@@ -8615,7 +11153,14 @@ async function loadChatAgentList() {
       })
     })
 
-    if (!chatSelectedAgent) {
+    if (chatSelectedAgent && chatThreadState.agent !== chatSelectedAgent) {
+      // Preselected target (e.g. the federated card's message button): open
+      // its thread. Direct loadChatThread fallback covers targets with no
+      // sidebar entry yet (composer + history render for any id).
+      const el = sidebar.querySelector(`.chat-agent-item[data-agent="${CSS.escape(chatSelectedAgent)}"]`)
+      if (el) el.click()
+      else loadChatThread(chatSelectedAgent)
+    } else if (!chatSelectedAgent) {
       const first = sidebar.querySelector('.chat-agent-item')
       if (first) first.click()
     }
@@ -8639,7 +11184,7 @@ async function loadChatThread(agentName) {
   chatThreadState.loading = false
 
   const owner = chatOwnerName()
-  const threadDisplayName = owner && agentName === owner ? owner + ' (te)' : agentName
+  const threadDisplayName = owner && agentName === owner ? owner + ' (te)' : chatDisplayName(agentName)
 
   panel.innerHTML = `
     <div class="chat-thread-header">
@@ -8652,7 +11197,7 @@ async function loadChatThread(agentName) {
     <div class="chat-bubbles" id="chatBubbles"><div class="chat-loading-indicator" id="chatLoadingTop" style="display:none;text-align:center;padding:8px;font-size:11px;color:var(--text-muted)">${t('messages.loading')}</div></div>
     <div class="chat-compose">
       <div class="chat-compose-row">
-        <textarea id="chatComposeText" class="chat-compose-input" rows="2" placeholder="${t('messages.placeholder', { agent: escapeHtml(agentName) })}"></textarea>
+        <textarea id="chatComposeText" class="chat-compose-input" rows="2" placeholder="${t('messages.placeholder', { agent: escapeHtml(chatDisplayName(agentName)) })}"></textarea>
         <button class="btn-primary btn-compact chat-send-btn" id="chatSendBtn">${t('messages.send_btn')}</button>
       </div>
     </div>
@@ -8692,7 +11237,10 @@ async function loadChatThread(agentName) {
 
 function buildBubbleHtml(m) {
   const isOutgoing = m.from_agent === mainAgentId()
+  // senderName stays the routing id (avatar lookup keys off it); senderLabel is
+  // what the user sees, so the main agent reads as its BOT_NAME, not "marveen".
   const senderName = isOutgoing ? mainAgentId() : m.from_agent
+  const senderLabel = chatDisplayName(senderName)
   const when = m.created_at ? new Date(m.created_at * 1000).toLocaleString('hu-HU', {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : ''
   const statusMetaRaw = MSG_STATUS_META[m.status] || { label: m.status || '', cls: 'badge' }
   const statusMeta = { ...statusMetaRaw, label: typeof statusMetaRaw.label === 'function' ? statusMetaRaw.label() : statusMetaRaw.label }
@@ -8700,9 +11248,11 @@ function buildBubbleHtml(m) {
     ${!isOutgoing ? `<div class="chat-bubble-avatar">${chatAvatarHtml(senderName, 28)}</div>` : ''}
     <div class="chat-bubble ${isOutgoing ? 'bubble-out' : 'bubble-in'}">
       <div class="bubble-meta">
-        ${!isOutgoing ? `<span class="bubble-sender">${escapeHtml(senderName)}</span>` : ''}
+        ${!isOutgoing ? `<span class="bubble-sender">${escapeHtml(senderLabel)}</span>` : ''}
         <span class="bubble-id-chip">#${m.id}</span>
         <span class="badge ${statusMeta.cls}" style="font-size:10px">${escapeHtml(statusMeta.label)}</span>
+        ${m.status === 'pending' && m.to_agent === mainAgentId() ? `<span style="font-size:10px;color:var(--text-muted)">${escapeHtml(t('messages.pending_main_hint'))}</span>` : ''}
+        ${m.origin_note ? `<span class="badge" style="font-size:10px" title="Self-declared by the sender, not verified (card 06f062e4)">origin: ${escapeHtml(m.origin_note)}</span>` : ''}
       </div>
       <div class="bubble-text">${escapeHtml(m.content || '')}</div>
       <div class="bubble-time">${when}</div>
@@ -8982,7 +11532,7 @@ async function loadOverview() {
 async function initSidebarBrand() {
   try {
     const img = document.createElement('img')
-    img.src = '/api/marveen/avatar?t=' + Date.now()
+    img.src = '/api/marveen/avatar' + avatarBust()
     img.onload = () => {
       const mark = document.getElementById('sidebarBrandMark')
       if (mark) { mark.textContent = ''; mark.appendChild(img) }
@@ -8991,8 +11541,19 @@ async function initSidebarBrand() {
     if (res.ok) {
       const m = await res.json()
       const brand = m.brandName || m.name
+      // Publish the brand tokens so every t() call ({brand}/{bot}/{agentId})
+      // renders the configured names, then re-apply the static i18n so any
+      // label painted before this fetch resolved picks up the real brand.
+      window._brandTokens = {
+        brand: brand || 'Marveen',
+        bot: m.name || brand || 'Marveen',
+        agentId: m.agentId || 'marveen',
+      }
+      if (typeof renderStaticI18n === 'function') renderStaticI18n()
       if (brand) {
         document.title = brand
+        const appleTitle = document.querySelector('meta[name="apple-mobile-web-app-title"]')
+        if (appleTitle) appleTitle.setAttribute('content', brand)
         const topbar = document.getElementById('mobileTopbarTitle')
         if (topbar) topbar.textContent = brand
         const name = document.getElementById('sidebarBrandName')
@@ -9005,6 +11566,15 @@ async function initSidebarBrand() {
 }
 initSidebarBrand()
 
+// In an installed (standalone) PWA, lock the zoom: iOS otherwise auto-zooms when
+// a small-text input is focused and allows stray pinch-zoom, neither of which
+// suits an app-like control panel. Left untouched in a normal browser tab so
+// page zoom / accessibility still work there.
+if (window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone) {
+  const vp = document.querySelector('meta[name="viewport"]')
+  if (vp) vp.setAttribute('content', 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover')
+}
+
 // === Updates page ===
 function escapeHtmlUpdates(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
@@ -9013,19 +11583,89 @@ function escapeHtmlUpdates(s) {
 function renderUpdatesBadge(status) {
   const badge = document.getElementById('updatesBadge')
   if (!badge) return
-  if (status && status.behind && status.behind > 0) {
-    badge.textContent = String(status.behind)
+  // Version-centric: show the number of NEW VERSIONS, not raw commits. Fall back
+  // to the behind count only in the rare pre-release state (unreleased commits
+  // but no new version tag yet).
+  const versionCount = status && Array.isArray(status.releases)
+    ? status.releases.filter((r) => r.version).length : 0
+  const count = versionCount > 0 ? versionCount : ((status && status.behind) || 0)
+  if (count > 0) {
+    badge.textContent = String(count)
     badge.hidden = false
   } else {
     badge.hidden = true
   }
 }
 
+// === Branch-drift warning ===
+// Installs that landed on a non-main branch (e.g. a branchless clone before
+// the --branch main pin) keep receiving unreleased code from update.sh, which
+// pulls the tracked branch. Two surfaces, both non-blocking: a dismissible
+// top banner (dismissal persists per browser AND per branch, so a later switch
+// to yet another branch re-warns) and a permanent notice on the Updates page.
+// Dev machines follow develop on purpose; one dismissal silences the banner
+// for them while the Updates-page notice stays as the quiet ground truth.
+const BRANCH_DRIFT_DISMISS_PREFIX = 'marveen.branch-drift-dismissed.'
+const BRANCH_HEAL_COMMAND = 'git checkout main && bash update.sh'
+
+function branchDriftDismissed(branch) {
+  try { return localStorage.getItem(BRANCH_DRIFT_DISMISS_PREFIX + branch) === '1' } catch { return false }
+}
+
+function updateBranchDriftUI(status) {
+  const banner = document.getElementById('branchDriftBanner')
+  if (!banner) return
+  const branch = status && status.branch
+  const drifted = !!branch && branch !== 'main'
+  if (!drifted || branchDriftDismissed(branch)) {
+    banner.hidden = true
+    return
+  }
+  const textEl = document.getElementById('branchDriftBannerText')
+  if (textEl) {
+    textEl.innerHTML =
+      `${t('branch_drift.banner.text', { branch: `<strong>${escapeHtmlUpdates(branch)}</strong>` })} ` +
+      `<code>${BRANCH_HEAL_COMMAND}</code>`
+  }
+  banner.hidden = false
+}
+
+function wireBranchDriftBanner() {
+  const dismiss = document.getElementById('branchDriftDismiss')
+  if (!dismiss) return
+  dismiss.addEventListener('click', () => {
+    const banner = document.getElementById('branchDriftBanner')
+    const branch = (window._updatesStatus && window._updatesStatus.branch) || ''
+    try { if (branch) localStorage.setItem(BRANCH_DRIFT_DISMISS_PREFIX + branch, '1') } catch { /* storage blocked */ }
+    if (banner) banner.hidden = true
+  })
+}
+
+function renderBranchNotice(status) {
+  const el = document.getElementById('updatesBranchNotice')
+  if (!el) return
+  const branch = status && status.branch
+  if (!branch) { el.hidden = true; return }
+  if (branch === 'main') {
+    el.className = 'updates-branch-notice ok'
+    el.innerHTML = `${t('branch_drift.notice.on_main')} (<code>main</code>)`
+  } else {
+    el.className = 'updates-branch-notice warn'
+    el.innerHTML =
+      `${t('branch_drift.notice.off_main', { branch: `<code>${escapeHtmlUpdates(branch)}</code>` })}<br>` +
+      `${t('branch_drift.notice.heal')} <code>${BRANCH_HEAL_COMMAND}</code>`
+  }
+  el.hidden = false
+}
+
 async function pollUpdatesBadge() {
   try {
     const res = await fetch('/api/updates')
     if (!res.ok) return
-    renderUpdatesBadge(await res.json())
+    const data = await res.json()
+    window._updatesStatus = data
+    renderUpdatesBadge(data)
+    updateBranchDriftUI(data)
   } catch {}
 }
 
@@ -9040,7 +11680,10 @@ async function loadUpdates() {
     const res = await fetch('/api/updates')
     if (!res.ok) throw new Error('HTTP ' + res.status)
     const data = await res.json()
+    window._updatesStatus = data
     renderUpdatesBadge(data)
+    updateBranchDriftUI(data)
+    renderBranchNotice(data)
     const cur = (data.current || '').slice(0, 7) || '–'
     const lat = (data.latest || '').slice(0, 7) || '–'
     if (data.error) {
@@ -9053,19 +11696,47 @@ async function loadUpdates() {
       applyBtn.hidden = true
     } else {
       summary.className = 'updates-summary behind'
-      summary.innerHTML = `<strong>${t('updates.behind', { n: data.behind })}</strong> ${t('updates.available_on', { remote: `<code>${escapeHtmlUpdates(data.remote)}</code>` })}<br>${t('updates.current_label')} <code>${cur}</code> → ${t('updates.latest_label')} <code>${lat}</code>`
+      const versions = (data.releases || []).filter((r) => r.version)
+      if (versions.length > 0) {
+        // Version-centric: "N uj verzio elerheto (v1.21.0)".
+        summary.innerHTML = `<strong>${t('updates.versions_available', { n: versions.length })}</strong> <code>${escapeHtmlUpdates(versions[0].version)}</code>`
+      } else {
+        // Pre-release: unreleased commits but no new version tag yet.
+        summary.innerHTML = `<strong>${t('updates.changes_available')}</strong> ${t('updates.available_on', { remote: `<code>${escapeHtmlUpdates(data.remote)}</code>` })}`
+      }
       applyBtn.hidden = false
     }
-    if (data.commits && data.commits.length) {
-      list.innerHTML = data.commits.map(c => `
+    const commitCard = (c) => `
         <div class="updates-commit">
           <div class="updates-commit-head">
             <span>${escapeHtmlUpdates(c.short)} · ${escapeHtmlUpdates(c.author)}</span>
             <span>${escapeHtmlUpdates((c.date || '').slice(0, 10))}</span>
           </div>
           <div class="updates-commit-msg">${escapeHtmlUpdates(c.message)}</div>
-        </div>
-      `).join('')
+        </div>`
+    if (data.releases && data.releases.length) {
+      // Version-centric: the human-language summary per version is the primary
+      // content; the raw commit list (SHAs, conventional-commit prefixes, author
+      // names) is tucked behind a collapsed "details" so it is never the first
+      // thing the operator sees.
+      list.innerHTML = data.releases.map((rel) => {
+        const isUpcoming = !rel.version
+        const label = isUpcoming ? t('updates.group.upcoming') : escapeHtmlUpdates(rel.version)
+        const human = rel.summary
+          ? escapeHtmlUpdates(rel.summary)
+          : (isUpcoming ? t('updates.upcoming_note') : '')
+        return `
+        <div class="updates-version">
+          <div class="updates-version-tag">${label}</div>
+          ${human ? `<div class="updates-version-summary">${human}</div>` : ''}
+          <details class="updates-version-details">
+            <summary>${t('updates.details', { n: rel.commits.length })}</summary>
+            <div class="updates-commit-list">${rel.commits.map(commitCard).join('')}</div>
+          </details>
+        </div>`
+      }).join('')
+    } else if (data.commits && data.commits.length) {
+      list.innerHTML = data.commits.map(commitCard).join('')
     } else if (data.behind === 0) {
       list.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('updates.no_changes')}</p>`
     }
@@ -9073,6 +11744,50 @@ async function loadUpdates() {
     summary.className = 'updates-summary error'
     summary.textContent = 'Hiba: ' + (err.message || err)
     applyBtn.hidden = true
+  }
+  renderDiagnoseOffer()
+}
+
+// Post-rollback diagnosis offer (PR-D). Reads /api/updates/status: if the last
+// update failed/rolled-back and this host can run a Claude agent, offer the
+// opt-in fixer; if it cannot (AVX), show a manual-intervention note instead.
+async function renderDiagnoseOffer() {
+  const box = document.getElementById('updatesDiagnose')
+  if (!box) return
+  let data
+  try { data = await (await fetch('/api/updates/status')).json() } catch { box.hidden = true; return }
+  if (data.needsHuman) {
+    box.hidden = false
+    box.className = 'updates-diagnose needs-human'
+    box.innerHTML = `<strong>${escapeHtmlUpdates(t('updates.diagnose.title'))}</strong><p>${escapeHtmlUpdates(t('updates.diagnose.needs_human'))}</p>`
+    return
+  }
+  if (!data.canDiagnose) { box.hidden = true; box.innerHTML = ''; return }
+  box.hidden = false
+  box.className = 'updates-diagnose'
+  box.innerHTML = `<strong>${escapeHtmlUpdates(t('updates.diagnose.title'))}</strong>`
+    + `<p>${escapeHtmlUpdates(t('updates.diagnose.body'))}</p>`
+    + `<button class="btn-secondary btn-compact" id="updatesDiagnoseBtn">${escapeHtmlUpdates(t('updates.diagnose.btn'))}</button>`
+  document.getElementById('updatesDiagnoseBtn').addEventListener('click', runDiagnose)
+}
+
+async function runDiagnose() {
+  if (!confirm(t('updates.diagnose.consent'))) return
+  const btn = document.getElementById('updatesDiagnoseBtn')
+  if (btn) btn.disabled = true
+  try {
+    const res = await fetch('/api/updates/diagnose', { method: 'POST' })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      if (btn) btn.disabled = false
+      showToast(t('updates.diagnose.failed', { msg: data.error || ('HTTP ' + res.status) }))
+      return
+    }
+    showToast(data.already ? t('updates.diagnose.already') : t('updates.diagnose.started'))
+    if (btn) { btn.hidden = true }
+  } catch (err) {
+    if (btn) btn.disabled = false
+    showToast(t('updates.diagnose.failed', { msg: err.message || err }))
   }
 }
 
@@ -9116,12 +11831,57 @@ async function runUpdate(autoStash) {
       showToast(t('updates.toast.not_started', { msg: data.error || ('HTTP ' + res.status) }))
       return
     }
-    showToast(t('updates.toast.started'))
-    setTimeout(() => window.location.reload(), 30000)
+    showToast(t('updates.toast.applying'))
+    // Poll the real outcome instead of a blind timed reload. update.sh (and its
+    // detached finalizer) write store/update.last-result on exit, so we surface
+    // success / rolled-back / failed rather than a false "done" that reloads
+    // into an unchanged (or dead) dashboard.
+    await pollUpdateOutcome(resetBtn)
   } catch (err) {
     resetBtn()
     showToast(t('updates.toast.error', {msg: err.message || err}))
   }
+}
+
+// Poll /api/updates/status until the run finishes (pidfile gone AND a fresh
+// result is present), then show the true outcome. Reload only on success.
+async function pollUpdateOutcome(resetBtn) {
+  const startedAt = Date.now()
+  const deadline = startedAt + 5 * 60_000   // hard cap: 5 min
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 3000))
+    let data
+    try {
+      const res = await fetch('/api/updates/status')
+      data = await res.json()
+    } catch {
+      // Dashboard is mid-restart (expected): keep polling.
+      continue
+    }
+    const result = data && data.result
+    const fresh = result && typeof result.ts === 'number' && result.ts * 1000 >= startedAt - 5000
+    if (data && !data.running && fresh) {
+      const st = result.status
+      if (st === 'success') {
+        showToast(t('updates.toast.success', { old: result.old || '', new: result.new || '' }))
+        setTimeout(() => window.location.reload(), 2000)
+        return
+      }
+      if (st === 'rolled-back') {
+        if (resetBtn) resetBtn()
+        showToast(t('updates.toast.rolled_back', { old: result.old || '', msg: result.message || '' }))
+        renderDiagnoseOffer()
+        return
+      }
+      // failed
+      if (resetBtn) resetBtn()
+      showToast(t('updates.toast.failed', { phase: result.phase || '?', msg: result.message || ('code ' + result.code) }))
+      renderDiagnoseOffer()
+      return
+    }
+  }
+  if (resetBtn) resetBtn()
+  showToast(t('updates.toast.status_timeout'))
 }
 
 document.getElementById('updatesApplyBtn').addEventListener('click', async () => {
@@ -9134,11 +11894,288 @@ document.getElementById('updatesApplyBtn').addEventListener('click', async () =>
 pollUpdatesBadge()
 setInterval(pollUpdatesBadge, 5 * 60_000)
 
+// === First-run onboarding wizard ===
+// Full-screen overlay shown when /api/onboarding/status reports the install
+// still needs setup (pre-install-now / configure-later flow). Steps 2-3 reuse
+// the existing channel-setup + pairing backend endpoints.
+async function fetchOnboardingStatus() {
+  try { return await (await fetch('/api/onboarding/status')).json() } catch { return null }
+}
+function onboardingCurrentStep(s) {
+  if (!s.identityConfirmed) return 1
+  if (!s.claudeAuthPresent || !s.agentsRunning) return 2
+  if (!s.channelConfigured) return 3
+  if (!s.paired) return 4
+  return 0
+}
+// Operator can dismiss the wizard (skip/close). A false positive must never
+// lock the dashboard, so the choice persists across reloads; normal UI still
+// covers any real setup that remains.
+const ONBOARDING_DISMISS_KEY = 'mvOnboardingDismissed'
+function onboardingDismissed() {
+  try { return localStorage.getItem(ONBOARDING_DISMISS_KEY) === '1' } catch { return false }
+}
+function dismissOnboarding() {
+  try { localStorage.setItem(ONBOARDING_DISMISS_KEY, '1') } catch { /* private mode */ }
+  const overlay = document.getElementById('onboardingOverlay')
+  if (overlay) { overlay.classList.remove('active'); overlay.hidden = true }
+  document.body.style.overflow = ''
+}
+async function initOnboarding() {
+  if (onboardingDismissed()) return
+  const s = await fetchOnboardingStatus()
+  if (!s || !s.needsOnboarding) return
+  renderOnboarding(s)
+}
+async function refreshOnboarding() {
+  const s = await fetchOnboardingStatus()
+  if (s) renderOnboarding(s)
+}
+function renderOnboarding(s) {
+  if (onboardingDismissed()) return
+  const overlay = document.getElementById('onboardingOverlay')
+  if (!overlay) return
+  const step = onboardingCurrentStep(s)
+  if (step === 0) { overlay.classList.remove('active'); overlay.hidden = true; document.body.style.overflow = ''; return }
+  overlay.hidden = false
+  overlay.classList.add('active')
+  document.body.style.overflow = 'hidden'
+  document.querySelectorAll('#onboardingSteps .onboarding-step').forEach((el) => {
+    const n = Number(el.dataset.ostep)
+    el.classList.toggle('active', n === step)
+    el.classList.toggle('done', n < step)
+  })
+  // The steps build on each other and the system only comes alive at the end
+  // of step 4 -- say so, or a fresh installer reads step 2's "saved" as "done"
+  // and every later "bot token not found" as a failure (BK bootcamp, 07-28).
+  const flowNote = document.getElementById('onbFlowNote')
+  if (flowNote) flowNote.textContent = step === 4 ? t('onboarding.flow_note_last') : t('onboarding.flow_note')
+  const body = document.getElementById('onboardingBody')
+  if (step === 1) body.innerHTML = onbIdentityHtml(s)
+  else if (step === 2) body.innerHTML = onbStep1Html(s)
+  else if (step === 3) body.innerHTML = onbStep2Html()
+  else body.innerHTML = onbStep3Html(s)
+  wireOnboarding(step)
+}
+function onbMsg(text, isErr) {
+  const el = document.getElementById('onbMsg')
+  if (el) { el.textContent = text; el.className = 'onb-msg' + (isErr ? ' err' : ' ok') }
+}
+function onbIdentityHtml(s) {
+  return `<p>${escapeHtml(t('onboarding.identity.desc'))}</p>`
+    + `<label class="form-label-sm">${escapeHtml(t('onboarding.identity.agent_label'))}</label>`
+    + `<input id="onbAgentName" type="text" class="onb-input" maxlength="40" value="${escapeHtml(s.currentAgentName || '')}" autocomplete="off">`
+    + `<label class="form-label-sm">${escapeHtml(t('onboarding.identity.owner_label'))}</label>`
+    + `<input id="onbOwnerName" type="text" class="onb-input" maxlength="60" value="${escapeHtml(s.currentOwnerName || '')}" autocomplete="off">`
+    + `<div class="onb-hint">${escapeHtml(t('onboarding.identity.hint'))}</div>`
+    + `<button class="btn-primary btn-compact" id="onbIdentityBtn">${escapeHtml(t('onboarding.identity.save_btn'))}</button>`
+    + `<div id="onbMsg" class="onb-msg"></div>`
+}
+function onbStep1Html(s) {
+  return `<p>${escapeHtml(t('onboarding.step1.desc'))}</p>`
+    + (s.claudeAuthPresent
+      ? `<p class="onb-ok-line">${escapeHtml(t('onboarding.step1.auth_done'))}</p>`
+      : `<label class="form-label-sm">${escapeHtml(t('onboarding.step1.token_label'))}</label>`
+        + `<input id="onbToken" type="password" class="onb-input" placeholder="sk-ant-oat01-..." autocomplete="off">`
+        + `<div class="onb-hint">${escapeHtml(t('onboarding.step1.token_hint'))}</div>`
+        + `<button class="btn-primary btn-compact" id="onbAuthBtn">${escapeHtml(t('onboarding.step1.save_btn'))}</button>`)
+    + (s.claudeAuthPresent && !s.agentsRunning
+      ? `<button class="btn-primary btn-compact" id="onbLaunchBtn">${escapeHtml(t('onboarding.step1.launch_btn'))}</button>`
+      : '')
+    + `<div id="onbMsg" class="onb-msg"></div>`
+}
+function onbStep2Html() {
+  return `<p>${escapeHtml(t('onboarding.step2.desc'))}</p>`
+    + `<label class="form-label-sm">${escapeHtml(t('onboarding.step2.token_label'))}</label>`
+    + `<input id="onbBotToken" type="password" class="onb-input" placeholder="123456:ABC..." autocomplete="off">`
+    + `<div class="onb-hint">${escapeHtml(t('onboarding.step2.token_hint'))}</div>`
+    + `<button class="btn-primary btn-compact" id="onbBotBtn">${escapeHtml(t('onboarding.step2.save_btn'))}</button>`
+    + `<div id="onbMsg" class="onb-msg"></div>`
+}
+function onbStep3Html(s) {
+  // Pairing needs the channels session up (the wizard restarted it after the
+  // bot-token save) -- show its state so a not-yet-up service reads as
+  // "starting", not as the user's failure.
+  const svcLine = s && s.agentsRunning
+    ? `<p class="onb-ok-line">${escapeHtml(t('onboarding.step3.svc_up'))}</p>`
+    : `<p class="onb-hint">${escapeHtml(t('onboarding.step3.svc_starting'))}</p>`
+  return `<p>${escapeHtml(t('onboarding.step3.desc'))}</p>`
+    + svcLine
+    + `<ol class="onb-list"><li>${escapeHtml(t('onboarding.step3.li1'))}</li><li>${escapeHtml(t('onboarding.step3.li2'))}</li></ol>`
+    + `<div id="onbPending" class="onb-pending"></div>`
+    + `<button class="btn-secondary btn-compact" id="onbRefreshBtn">${escapeHtml(t('onboarding.step3.refresh_btn'))}</button>`
+    + `<div id="onbMsg" class="onb-msg"></div>`
+}
+function wireOnboarding(step) {
+  if (step === 1) {
+    const idBtn = document.getElementById('onbIdentityBtn')
+    if (idBtn) idBtn.addEventListener('click', async () => {
+      const agentName = (document.getElementById('onbAgentName').value || '').trim()
+      const ownerName = (document.getElementById('onbOwnerName').value || '').trim()
+      if (!agentName || !ownerName) { onbMsg(t('onboarding.identity.empty'), true); return }
+      idBtn.disabled = true; onbMsg(t('onboarding.saving'))
+      try {
+        const res = await fetch('/api/onboarding/identity', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agentName, ownerName }) })
+        const d = await res.json().catch(() => ({}))
+        if (!res.ok) { idBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+        // The name is live in the .env now -- repaint the chrome from
+        // /api/marveen so the sidebar/title reflect it immediately, and
+        // surface the automatic channels restart (same pattern as the
+        // claude-auth step) instead of silently advancing.
+        if (typeof initSidebarBrand === 'function') initSidebarBrand()
+        if (d.restartError) { idBtn.disabled = false; onbMsg(t('onboarding.identity.saved_restart_failed'), true); setTimeout(refreshOnboarding, 6000); return }
+        if (d.restarted) { onbMsg(t('onboarding.identity.saved_restarted')); setTimeout(refreshOnboarding, 2500); return }
+        if (d.restartNeeded) { onbMsg(t('onboarding.identity.saved_restart_needed')); await refreshOnboarding(); return }
+        onbMsg(t('onboarding.identity.saved'))
+        await refreshOnboarding()
+      } catch (e) { idBtn.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
+    })
+    return
+  }
+  if (step === 2) {
+    const authBtn = document.getElementById('onbAuthBtn')
+    if (authBtn) authBtn.addEventListener('click', async () => {
+      const token = (document.getElementById('onbToken').value || '').trim()
+      if (!token) { onbMsg(t('onboarding.step1.token_empty'), true); return }
+      authBtn.disabled = true; onbMsg(t('onboarding.saving'))
+      try {
+        const res = await fetch('/api/onboarding/claude-auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) })
+        const d = await res.json().catch(() => ({}))
+        if (!res.ok) { authBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+        // Fresh-install path: the server restarts the (previously
+        // unauthenticated) channels session right after the first auth save --
+        // surface that, and on failure show the manual restart step instead of
+        // silently advancing.
+        if (d.restartError) { authBtn.disabled = false; onbMsg(t('onboarding.step1.saved_restart_failed'), true); setTimeout(refreshOnboarding, 6000); return }
+        if (d.restarted) { onbMsg(t('onboarding.step1.saved_restarted')); setTimeout(refreshOnboarding, 2500); return }
+        onbMsg(d.verified ? t('onboarding.step1.saved_verified') : t('onboarding.step1.saved_unverified'))
+        await refreshOnboarding()
+      } catch (e) { authBtn.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
+    })
+    const launchBtn = document.getElementById('onbLaunchBtn')
+    if (launchBtn) launchBtn.addEventListener('click', async () => {
+      launchBtn.disabled = true; onbMsg(t('onboarding.step1.launching'))
+      try {
+        const res = await fetch('/api/onboarding/launch', { method: 'POST' })
+        const d = await res.json().catch(() => ({}))
+        if (!res.ok) { launchBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+        onbMsg(t('onboarding.step1.launched'))
+        // On a fresh install the session is CREATED here (ONBTMUX1) and takes a
+        // ~minute cold start via channels.sh. Poll until it is up so the wizard
+        // advances on its own instead of stranding the user on step 2 after a
+        // single 2.5s re-check. Bounded so a genuinely failed start still hands
+        // control back rather than spinning forever.
+        let up = false
+        for (let i = 0; i < 40 && !up; i++) {  // ~40 x 3s = 2 min
+          await new Promise((r) => setTimeout(r, 3000))
+          const st = await fetchOnboardingStatus()
+          if (st && st.agentsRunning) { up = true; break }
+        }
+        if (up) { await refreshOnboarding() }
+        // Timeout is NOT success: on a slow machine the cold start can outlast
+        // the 2-min bound while still being healthy, so the message must say
+        // "still starting, check back / refresh" -- repeating the launched
+        // message here would also mask a genuinely dead start (PR #779 review).
+        else { launchBtn.disabled = false; onbMsg(t('onboarding.step1.launch_slow'), true) }
+      } catch (e) { launchBtn.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
+    })
+  } else if (step === 3) {
+    const botBtn = document.getElementById('onbBotBtn')
+    if (botBtn) botBtn.addEventListener('click', async () => {
+      const botToken = (document.getElementById('onbBotToken').value || '').trim()
+      if (!botToken) { onbMsg(t('onboarding.step2.token_empty'), true); return }
+      botBtn.disabled = true; onbMsg(t('onboarding.saving'))
+      try {
+        const res = await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ botToken }) })
+        const d = await res.json().catch(() => ({}))
+        if (!res.ok) { botBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+        // The server restarts the channels session so the new bot token goes
+        // live -- say so, and give the respawn a beat before advancing so the
+        // pairing step starts against the restarted service.
+        onbMsg(d.restarted ? t('onboarding.step2.saved_restarted') : t('onboarding.step2.saved'))
+        setTimeout(refreshOnboarding, d.restarted ? 4000 : 2000)
+      } catch (e) { botBtn.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
+    })
+  } else if (step === 4) {
+    const refreshBtn = document.getElementById('onbRefreshBtn')
+    // One sink for both failure paths. The box alone was not enough: it renders
+    // in the same muted onb-hint slot as "no pending", so the very distinction
+    // this fix is about -- "nobody is waiting" vs "I could not ask" -- stayed
+    // invisible. onbMsg is the error channel this function already uses for the
+    // approve step a few lines below.
+    const showPendingError = (msg) => {
+      const box = document.getElementById('onbPending')
+      if (box) box.innerHTML = `<span class="onb-hint">${escapeHtml(msg)}</span>`
+      onbMsg(msg, true)
+    }
+    const loadPending = async () => {
+      try {
+        // Same boot race the Messages page already guards against (see
+        // ensureMarveenLoaded): until /api/marveen resolves window._marveen,
+        // mainAgentId() returns the literal 'marveen' fallback. On a renamed
+        // install that is not the main agent, so the backend takes the
+        // sub-agent branch, finds no such agent dir and answers 404 -- and the
+        // wizard rendered that as "no pending pairing" while the Channel view,
+        // which uses the selected agent, listed the very same request.
+        await ensureMarveenLoaded()
+        const res = await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram/pending`)
+        // Surface the failure instead of rendering it as an empty list. This is
+        // a separate defect from the id race: without it a 404 or an auth error
+        // reads as "nobody is waiting for approval", which is the one answer the
+        // user cannot act on. A NETWORK failure does not land here at all -- the
+        // fetch rejects -- so the outer catch carries the same message; see the
+        // end of this function. The two together are what make the comment true.
+        if (!res.ok) {
+          const d = await res.json().catch(() => ({}))
+          showPendingError(d.error || t('onboarding.error'))
+          return
+        }
+        const p = await res.json()
+        // Backend contract: [{code, senderId, chatId, createdAt, expiresAt}].
+        // `code` is the approve key (the same code the bot sent the user) --
+        // POSTing anything else gets a 400 and the pairing never completes.
+        const now = Date.now()
+        const list = (Array.isArray(p) ? p : (p.pending || [])).filter((x) => x && x.code && (!x.expiresAt || x.expiresAt > now))
+        const box = document.getElementById('onbPending')
+        if (!box) return
+        if (!list.length) { box.innerHTML = `<span class="onb-hint">${escapeHtml(t('onboarding.step3.no_pending'))}</span>`; return }
+        box.innerHTML = list.map((x) => {
+          const code = escapeHtml(String(x.code))
+          const label = escapeHtml(String(x.senderId || x.chatId || '?')) + ' · ' + code
+          return `<div class="onb-pending-row"><span>${label}</span><button class="btn-primary btn-compact onb-approve" data-code="${code}">${escapeHtml(t('onboarding.step3.approve_btn'))}</button></div>`
+        }).join('')
+        box.querySelectorAll('.onb-approve').forEach((b) => b.addEventListener('click', async () => {
+          b.disabled = true
+          try {
+            const res = await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram/approve`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: b.dataset.code }) })
+            const d = await res.json().catch(() => ({}))
+            if (!res.ok) { b.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
+            onbMsg(t('onboarding.step3.approved'))
+            setTimeout(refreshOnboarding, 1500)
+          } catch (e) { b.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
+        }))
+      } catch (e) {
+        // Network-level failure: the fetch rejected, so the !res.ok branch never
+        // ran. Without this the box stays empty and the user reads it as "nobody
+        // is waiting" -- the exact defect this change is about.
+        showPendingError((e && e.message) || t('onboarding.error'))
+      }
+    }
+    if (refreshBtn) refreshBtn.addEventListener('click', () => { refreshOnboarding() })
+    loadPending()
+  }
+}
+
 // === Init ===
 populateAvatarGrid()
 loadMemAgents()
 loadOverview()
 loadAvailableModels()
+{
+  const onbClose = document.getElementById('onboardingClose')
+  if (onbClose) onbClose.addEventListener('click', dismissOnboarding)
+}
+initOnboarding()
 
 // "DeepSeek API kulcs hozzáadása" link az agent edit panel-en --
 // a Vault page-re visz, ahol a felhasználó egy DEEPSEEK_API_KEY
@@ -9594,19 +12631,15 @@ async function cancelBgTask(id) {
 // === Autonomy ===
 // ============================================================
 
-document.getElementById('refreshAutonomyBtn').addEventListener('click', loadAutonomy)
-
-async function loadAutonomy() {
-  const grid = document.getElementById('autonomyGrid')
-  const footer = document.getElementById('autonomyUpdatedAt')
-  grid.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('autonomy.loading')}</p>`
+async function renderAutonomyContent(gridEl, footerEl) {
+  gridEl.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('autonomy.loading')}</p>`
 
   try {
     const res = await fetch('/api/autonomy')
     if (!res.ok) throw new Error('fetch failed')
     const config = await res.json()
 
-    grid.innerHTML = ''
+    gridEl.innerHTML = ''
     for (const cat of config.categories) {
       const isCapped = !cat.locked && cat.maxLevel < 3
       const row = document.createElement('div')
@@ -9645,18 +12678,20 @@ async function loadAutonomy() {
         row.appendChild(cap)
       }
       row.appendChild(levels)
-      grid.appendChild(row)
+      gridEl.appendChild(row)
     }
 
-    if (config.updated_at > 0) {
-      const d = new Date(config.updated_at * 1000)
-      footer.textContent = t('autonomy.last_modified', { date: d.toLocaleString('hu-HU') })
-    } else {
-      footer.textContent = t('autonomy.not_modified')
+    if (footerEl) {
+      if (config.updated_at > 0) {
+        const d = new Date(config.updated_at * 1000)
+        footerEl.textContent = t('autonomy.last_modified', { date: d.toLocaleString('hu-HU') })
+      } else {
+        footerEl.textContent = t('autonomy.not_modified')
+      }
     }
   } catch (err) {
-    grid.innerHTML = `<p style="color:var(--danger)">${t('autonomy.error')}</p>`
-    footer.textContent = ''
+    gridEl.innerHTML = `<p style="color:var(--danger)">${t('autonomy.error')}</p>`
+    if (footerEl) footerEl.textContent = ''
   }
 }
 
@@ -9672,9 +12707,220 @@ async function setAutonomyLevel(key, level) {
       showToast(data.error || 'Hiba')
       return
     }
-    loadAutonomy()
+    // Refresh the settings tab autonomy grid if it is visible
+    const tabGrid = document.getElementById('settingsAutonomyGrid')
+    const tabFooter = document.getElementById('settingsAutonomyUpdatedAt')
+    if (tabGrid) renderAutonomyContent(tabGrid, tabFooter)
   } catch {
     showToast(t('kanban.toast.save_error'))
+  }
+}
+
+// ============================================================
+// === Approvals ===
+// ============================================================
+
+const APPROVALS_PAGE_LIMIT = 50
+
+let _approvalsCountdownInterval = null
+const _approvalsState = { status: '', agent: '', category: '', offset: 0 }
+
+document.getElementById('refreshApprovalsBtn').addEventListener('click', loadApprovalsPage)
+document.getElementById('approvalsFilterStatus').addEventListener('change', (e) => {
+  _approvalsState.status = e.target.value
+  _approvalsState.offset = 0
+  _renderApprovalsTable()
+})
+document.getElementById('approvalsFilterAgent').addEventListener('input', (e) => {
+  _approvalsState.agent = e.target.value.trim()
+  _approvalsState.offset = 0
+  _renderApprovalsTable()
+})
+document.getElementById('approvalsFilterCategory').addEventListener('input', (e) => {
+  _approvalsState.category = e.target.value.trim()
+  _approvalsState.offset = 0
+  _renderApprovalsTable()
+})
+
+let _approvalsAll = []
+
+async function loadApprovalsPage() {
+  const tbody = document.getElementById('approvalsTbody')
+  const statsEl = document.getElementById('approvalsStats')
+  tbody.innerHTML = `<tr><td colspan="7" style="color:var(--text-muted);padding:24px;text-align:center">${t('approvals.loading')}</td></tr>`
+  statsEl.innerHTML = ''
+  if (_approvalsCountdownInterval) { clearInterval(_approvalsCountdownInterval); _approvalsCountdownInterval = null }
+
+  try {
+    const res = await fetch('/api/approvals?limit=500')
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    _approvalsAll = await res.json()
+    _renderApprovalsStats()
+    _renderApprovalsTable()
+    _approvalsCountdownInterval = setInterval(_updateCountdowns, 1000)
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="7" style="color:var(--danger);padding:24px;text-align:center">${t('approvals.error')}</td></tr>`
+  }
+}
+
+function _renderApprovalsStats() {
+  const counts = { pending: 0, approved: 0, rejected: 0, timeout: 0 }
+  for (const a of _approvalsAll) counts[a.status] = (counts[a.status] || 0) + 1
+  const statsEl = document.getElementById('approvalsStats')
+  statsEl.innerHTML = `
+    <div class="stat-card"><div class="stat-value" style="color:var(--warning)">${counts.pending}</div><div class="stat-label">${t('approvals.stat.pending')}</div></div>
+    <div class="stat-card"><div class="stat-value" style="color:var(--success)">${counts.approved}</div><div class="stat-label">${t('approvals.stat.approved')}</div></div>
+    <div class="stat-card"><div class="stat-value" style="color:var(--danger)">${counts.rejected}</div><div class="stat-label">${t('approvals.stat.rejected')}</div></div>
+    <div class="stat-card"><div class="stat-value" style="color:var(--text-muted)">${counts.timeout}</div><div class="stat-label">${t('approvals.stat.timeout')}</div></div>
+  `
+
+  // Sidebar badge: show pending count, hidden when zero
+  const badge = document.getElementById('approvalsPendingBadge')
+  if (badge) {
+    badge.textContent = counts.pending
+    badge.hidden = counts.pending === 0
+  }
+
+  // Pending notice banner above stat cards
+  const banner = document.getElementById('approvalsPendingBanner')
+  if (banner) {
+    if (counts.pending === 0) {
+      banner.hidden = true
+    } else {
+      const pendingRows = _approvalsAll.filter(a => a.status === 'pending')
+      const oldest = pendingRows.reduce((min, a) => a.requested_at < min.requested_at ? a : min, pendingRows[0])
+      const ageMin = Math.round((Date.now() / 1000 - oldest.requested_at) / 60)
+      const timeoutMin = oldest.timeout_at ? Math.max(0, Math.round((oldest.timeout_at - Date.now() / 1000) / 60)) : null
+      const timeoutPart = timeoutMin !== null ? ` ${t('approvals.banner.timeout', { n: timeoutMin })}` : ''
+      banner.hidden = false
+      banner.textContent = `${t('approvals.banner.notice', { n: counts.pending, age: ageMin, agent: oldest.agent_id, category: oldest.category })}${timeoutPart}`
+    }
+  }
+}
+
+function _filterApprovals() {
+  const { status, agent, category } = _approvalsState
+  return _approvalsAll.filter(a => {
+    if (status && a.status !== status) return false
+    if (agent && !a.agent_id.includes(agent)) return false
+    if (category && !a.category.includes(category)) return false
+    return true
+  })
+}
+
+function _renderApprovalsTable() {
+  const filtered = _filterApprovals()
+  const { offset } = _approvalsState
+  const page = filtered.slice(offset, offset + APPROVALS_PAGE_LIMIT)
+  const tbody = document.getElementById('approvalsTbody')
+
+  if (!page.length) {
+    tbody.innerHTML = `<tr><td colspan="7" style="color:var(--text-muted);padding:24px;text-align:center">${t('approvals.empty')}</td></tr>`
+    _renderApprovalsPagination(filtered.length)
+    return
+  }
+
+  tbody.innerHTML = page.map(a => {
+    const isPending = a.status === 'pending'
+    const rowStyle = isPending ? 'background:color-mix(in srgb, var(--warning) 8%, transparent)' : ''
+    const time = a.requested_at ? new Date(a.requested_at * 1000).toLocaleString('hu-HU', { dateStyle: 'short', timeStyle: 'short' }) : '-'
+    const badge = _approvalBadge(a.status)
+    const countdown = isPending && a.timeout_at ? `<span class="approvals-countdown" data-timeout="${a.timeout_at}" id="cd-${a.id}"></span>` : (a.timeout_at ? '-' : '')
+    const actions = isPending
+      ? `<div style="display:flex;gap:4px">
+           <button class="btn-primary btn-compact approvals-decide" data-id="${escapeAttr(a.id)}" data-decision="approved" style="font-size:11px">${t('approvals.btn.approve')}</button>
+           <button class="btn-danger btn-compact approvals-decide" data-id="${escapeAttr(a.id)}" data-decision="rejected" style="font-size:11px">${t('approvals.btn.reject')}</button>
+         </div>`
+      : (() => {
+          const resolvedBy = escapeHtml(a.resolved_by || '')
+          if (!a.resolved_at) return `<span style="font-size:12px;color:var(--text-muted)">${resolvedBy}</span>`
+          const resolvedDate = new Date(a.resolved_at * 1000)
+          const requestedDate = a.requested_at ? new Date(a.requested_at * 1000) : null
+          const sameDay = requestedDate && resolvedDate.toDateString() === requestedDate.toDateString()
+          const resolvedStr = resolvedDate.toLocaleString('hu-HU', sameDay ? { timeStyle: 'short' } : { dateStyle: 'short', timeStyle: 'short' })
+          return `<span style="font-size:12px;color:var(--text-muted)">${resolvedBy}<br><span style="font-size:11px;opacity:0.7">${escapeHtml(resolvedStr)}</span></span>`
+        })()
+    return `<tr style="${rowStyle}">
+      <td style="white-space:nowrap;font-size:12px">${escapeHtml(time)}</td>
+      <td><code style="font-size:12px">${escapeHtml(a.agent_id)}</code></td>
+      <td style="font-size:12px">${escapeHtml(a.category)}</td>
+      <td style="max-width:280px;font-size:12px" title="${escapeAttr(a.action_description)}">${escapeHtml(a.action_description.length > 80 ? a.action_description.slice(0, 80) + '...' : a.action_description)}</td>
+      <td>${badge}</td>
+      <td style="font-size:12px;white-space:nowrap">${countdown}</td>
+      <td>${actions}</td>
+    </tr>`
+  }).join('')
+
+  _updateCountdowns()
+  _renderApprovalsPagination(filtered.length)
+
+  tbody.querySelectorAll('.approvals-decide').forEach(btn => {
+    btn.addEventListener('click', () => _resolveApproval(btn.dataset.id, btn.dataset.decision))
+  })
+}
+
+function _approvalBadge(status) {
+  const colors = { pending: 'var(--warning)', approved: 'var(--success)', rejected: 'var(--danger)', timeout: 'var(--text-muted)' }
+  const color = colors[status] || 'var(--text-muted)'
+  return `<span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;background:color-mix(in srgb,${color} 15%,transparent);color:${color}">${t('approvals.status.' + status) || status}</span>`
+}
+
+function _updateCountdowns() {
+  const now = Math.floor(Date.now() / 1000)
+  document.querySelectorAll('.approvals-countdown[data-timeout]').forEach(el => {
+    const timeout = parseInt(el.dataset.timeout, 10)
+    const diff = timeout - now
+    if (diff <= 0) {
+      el.textContent = t('approvals.countdown.expired')
+      el.style.color = 'var(--danger)'
+    } else {
+      const h = Math.floor(diff / 3600)
+      const m = Math.floor((diff % 3600) / 60)
+      const s = diff % 60
+      el.textContent = h > 0 ? `${h}h ${m}m` : `${m}m ${s}s`
+      el.style.color = diff < 300 ? 'var(--danger)' : 'var(--text-muted)'
+    }
+  })
+}
+
+function _renderApprovalsPagination(total) {
+  const pager = document.getElementById('approvalsPagination')
+  if (total <= APPROVALS_PAGE_LIMIT) { pager.innerHTML = ''; return }
+  const { offset } = _approvalsState
+  const hasPrev = offset > 0
+  const hasNext = offset + APPROVALS_PAGE_LIMIT < total
+  pager.innerHTML = `
+    <button class="btn-secondary btn-compact" ${hasPrev ? '' : 'disabled'} id="approvalsPrev">&#8592; Előző</button>
+    <span style="font-size:12px;color:var(--text-muted)">${offset + 1}-${Math.min(offset + APPROVALS_PAGE_LIMIT, total)} / ${total}</span>
+    <button class="btn-secondary btn-compact" ${hasNext ? '' : 'disabled'} id="approvalsNext">Következő &#8594;</button>
+  `
+  pager.querySelector('#approvalsPrev')?.addEventListener('click', () => {
+    _approvalsState.offset = Math.max(0, offset - APPROVALS_PAGE_LIMIT)
+    _renderApprovalsTable()
+  })
+  pager.querySelector('#approvalsNext')?.addEventListener('click', () => {
+    _approvalsState.offset = offset + APPROVALS_PAGE_LIMIT
+    _renderApprovalsTable()
+  })
+}
+
+async function _resolveApproval(id, decision) {
+  try {
+    const res = await fetch(`/api/approvals/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: decision, resolved_by: 'dashboard' }),
+    })
+    const data = await res.json()
+    if (!res.ok) { showToast(t('approvals.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    showToast(t(decision === 'approved' ? 'approvals.toast.approved' : 'approvals.toast.rejected'))
+    // Update in-place to avoid full reload flicker
+    const idx = _approvalsAll.findIndex(a => a.id === id)
+    if (idx !== -1) _approvalsAll[idx] = data
+    _renderApprovalsStats()
+    _renderApprovalsTable()
+  } catch (err) {
+    showToast(t('approvals.toast.error', { msg: String(err.message || err) }))
   }
 }
 
@@ -9692,7 +12938,7 @@ window.addEventListener('beforeunload', (e) => {
 // entry never requires a frontend change just to render a sane heading.
 function settingsModuleLabel(mod) {
   const key = `settings.module.${mod}`
-  const known = { kanban: true, system: true, heartbeat: true, audit: true, ideabox: true }
+  const known = { kanban: true, system: true, heartbeat: true, audit: true, ideabox: true, channels: true, security: true, autonomy: true }
   return known[mod] ? t(key) : (mod.charAt(0).toUpperCase() + mod.slice(1))
 }
 
@@ -9708,8 +12954,16 @@ function updateSettingsSaveBar() {
   if (countEl) countEl.textContent = t('settings.dirty_count', {n})
 }
 
+// Read the current editor value in the canonical form the API expects. A
+// boolean setting renders as a checkbox, so its value is derived from .checked
+// as the canonical "1"/"0" string (not the element's .value, which is "on").
+function settingInputValue(input, type) {
+  if (type === 'boolean') return input.checked ? '1' : '0'
+  return input.value
+}
+
 function markSettingDirty(key, input, originalValue, type, errorEl) {
-  const currentVal = type === 'color' ? input.value : input.value
+  const currentVal = settingInputValue(input, type)
   if (currentVal === String(originalValue)) {
     settingsDirty.delete(key)
   } else {
@@ -9718,11 +12972,365 @@ function markSettingDirty(key, input, originalValue, type, errorEl) {
   updateSettingsSaveBar()
 }
 
+const SETTINGS_ACTIVE_TAB_KEY = 'settings-active-tab'
+
+// === Dashboard browser login (optional) ===
+// The card in the Settings page lets the operator opt into a username+password
+// login (in addition to the always-available access token). All copy is framed
+// around the existing public remote-access surfaces (Tailscale Serve, LAN,
+// mobile QR) -- no other transport is referenced.
+
+async function fetchAuthStatus() {
+  try {
+    const r = await fetch('/api/auth/status')
+    return r.ok ? await r.json() : null
+  } catch {
+    return null
+  }
+}
+
+async function renderAuthCard() {
+  const body = document.getElementById('authCardBody')
+  if (!body) return
+  const status = await fetchAuthStatus()
+  if (!status) { body.innerHTML = `<p class="auth-muted">${t('auth.card.unavailable')}</p>`; return }
+  if (status.setup_required) { renderCreateLoginForm(body) }
+  else if (status.method === 'session') { renderSessionPanel(body, status) }
+  else renderTokenModePanel(body)
+  // Device keys are managed by token/session operators only (a device key
+  // itself gets 403 from the management endpoints, so don't render the panel).
+  if (status.method === 'token' || status.method === 'session') {
+    renderDeviceKeysSection(body)
+    renderBridgeEnrollSection(body)
+  }
+}
+
+// === Bridge pairing (AUTHPLAN1 #2) ===
+// Paste the public-key line shown by the Bridge app -> one confirm -> the
+// server writes the restricted SSH entry + mints a per-device key -> the
+// returned bundle (shown once, copyable) goes back into the Bridge.
+
+function renderBridgeEnrollSection(body) {
+  const wrap = document.createElement('div')
+  wrap.className = 'auth-device-keys auth-bridge-enroll'
+  wrap.id = 'authBridgeEnroll'
+  wrap.innerHTML =
+    `<div class="auth-sessions-title">${t('auth.bridge.title')}</div>` +
+    `<p class="auth-muted">${t('auth.bridge.desc')}</p>` +
+    `<div class="auth-form">` +
+      `<input id="authBridgeKeyLine" type="text" autocapitalize="off" spellcheck="false" placeholder="${t('auth.bridge.key_placeholder')}">` +
+      `<input id="authBridgeName" type="text" autocapitalize="off" spellcheck="false" maxlength="64" placeholder="${t('auth.bridge.name_placeholder')}">` +
+      `<input id="authBridgeHost" type="text" autocapitalize="off" spellcheck="false" maxlength="253" placeholder="${t('auth.bridge.host_placeholder')}">` +
+      `<button class="btn-secondary" id="authBridgeEnrollBtn">${t('auth.bridge.enroll')}</button>` +
+      `<div class="auth-form-msg" id="authBridgeMsg"></div>` +
+      `<div id="authBridgeBundle" hidden></div>` +
+    `</div>`
+  body.appendChild(wrap)
+  document.getElementById('authBridgeEnrollBtn').addEventListener('click', bridgeEnrollFromUi)
+}
+
+async function bridgeEnrollFromUi() {
+  const msg = document.getElementById('authBridgeMsg')
+  const out = document.getElementById('authBridgeBundle')
+  const keyLine = (document.getElementById('authBridgeKeyLine').value || '').trim()
+  const name = (document.getElementById('authBridgeName').value || '').trim()
+  const hostOverride = (document.getElementById('authBridgeHost').value || '').trim()
+  msg.className = 'auth-form-msg'
+  msg.textContent = ''
+  out.hidden = true
+  if (!keyLine || !name) { msg.classList.add('err'); msg.textContent = t('auth.bridge.err_empty'); return }
+  // The confirm step: pairing grants the device SSH-tunnel + dashboard access.
+  if (!confirm(t('auth.bridge.confirm', { name }))) return
+  msg.textContent = t('auth.bridge.working')
+  try {
+    const r = await fetch('/api/security/bridge-enroll', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(hostOverride ? { key_line: keyLine, name, host: hostOverride } : { key_line: keyLine, name }),
+    })
+    const data = await r.json().catch(() => ({}))
+    if (!r.ok) { msg.classList.add('err'); msg.textContent = data.error || t('auth.card.err_generic'); return }
+    msg.classList.add('ok')
+    msg.textContent = (data.action === 'replaced' ? t('auth.bridge.repaired') : t('auth.bridge.paired')) +
+      (data.warnings && data.warnings.length ? ` (${data.warnings.join('; ')})` : '')
+    document.getElementById('authBridgeKeyLine').value = ''
+    document.getElementById('authBridgeName').value = ''
+    document.getElementById('authBridgeHost').value = ''
+    out.hidden = false
+    out.innerHTML =
+      `<p class="auth-muted">${t('auth.bridge.bundle_hint', { host: escapeHtml(data.host || '') })}</p>` +
+      `<div class="auth-form auth-device-minted-row">` +
+        `<input id="authBridgeBundleVal" type="text" readonly value="${escapeHtml(data.bundle)}" onclick="this.select()">` +
+        `<button class="btn-secondary btn-compact" id="authBridgeCopyBtn">${t('auth.devices.copy')}</button>` +
+      `</div>`
+    document.getElementById('authBridgeCopyBtn').addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(data.bundle)
+        document.getElementById('authBridgeCopyBtn').textContent = t('auth.devices.copied')
+      } catch { document.getElementById('authBridgeBundleVal').select() }
+    })
+    refreshDeviceKeyList()
+  } catch { msg.classList.add('err'); msg.textContent = t('auth.login.err_network') }
+}
+
+// === Per-device keys (mint/list/revoke) ===
+// A device key is a revocable per-device credential (Bridge, phone). The raw
+// key is displayed exactly once, right after minting.
+
+function renderDeviceKeysSection(body) {
+  const wrap = document.createElement('div')
+  wrap.className = 'auth-device-keys'
+  wrap.id = 'authDeviceKeys'
+  wrap.innerHTML =
+    `<div class="auth-sessions-title">${t('auth.devices.title')}</div>` +
+    `<p class="auth-muted">${t('auth.devices.desc')}</p>` +
+    `<div class="auth-form-msg err auth-device-warn" id="authDeviceKeyWarn" hidden></div>` +
+    `<div id="authDeviceKeyList"></div>` +
+    `<div class="auth-form auth-device-mint">` +
+      `<input id="authDevName" type="text" autocapitalize="off" spellcheck="false" maxlength="64" placeholder="${t('auth.devices.name_placeholder')}">` +
+      `<input id="authDevExpiry" type="number" min="1" max="3650" placeholder="${t('auth.devices.expiry_placeholder')}">` +
+      `<button class="btn-secondary" id="authDevMintBtn">${t('auth.devices.mint')}</button>` +
+      `<div class="auth-form-msg" id="authDevMsg"></div>` +
+      `<div id="authDevMinted" hidden></div>` +
+    `</div>`
+  body.appendChild(wrap)
+  document.getElementById('authDevMintBtn').addEventListener('click', mintDeviceKey)
+  refreshDeviceKeyList()
+}
+
+async function refreshDeviceKeyList() {
+  const el = document.getElementById('authDeviceKeyList')
+  if (!el) return
+  try {
+    const r = await fetch('/api/auth/device-keys')
+    if (!r.ok) { el.innerHTML = ''; return }
+    const { keys } = await r.json()
+    if (!keys || !keys.length) { el.innerHTML = `<p class="auth-muted">${t('auth.devices.empty')}</p>`; return }
+    el.innerHTML = keys.map((k) => {
+      const created = new Date(k.createdAt * 1000).toLocaleDateString()
+      const lastUsed = k.lastUsedAt ? new Date(k.lastUsedAt * 1000).toLocaleString() : t('auth.devices.never_used')
+      const expires = k.expiresAt ? ` &middot; ${t('auth.devices.expires', { date: new Date(k.expiresAt * 1000).toLocaleDateString() })}` : ''
+      const bridge = k.installId ? ` <span class="auth-device-bridge-badge">${t('auth.devices.bridge_badge')}</span>` : ''
+      return `<div class="auth-session-row auth-device-row" data-key-id="${k.id}">` +
+        `<span class="auth-device-name">${escapeHtml(k.name)}${bridge}</span>` +
+        `<span class="auth-device-meta">${created} &middot; ${t('auth.devices.last_used', { date: lastUsed })}${expires}</span>` +
+        `<button class="btn-secondary btn-compact auth-device-revoke" data-key-id="${k.id}">${t('auth.devices.revoke')}</button>` +
+      `</div>`
+    }).join('')
+    el.querySelectorAll('.auth-device-revoke').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (!confirm(t('auth.devices.revoke_confirm'))) return
+        // A Bridge-paired revoke means BOTH halves (dashboard key + ssh line).
+        // The key is dead either way, but ssh_removed:false means the
+        // authorized_keys line survived (fs error) and the device can still
+        // open the tunnel -- the ONE outcome the UI must never hide.
+        const warnBefore = document.getElementById('authDeviceKeyWarn')
+        if (warnBefore) warnBefore.hidden = true
+        let sshWarn = false
+        try {
+          const r = await fetch(`/api/auth/device-keys/${btn.dataset.keyId}`, { method: 'DELETE' })
+          const data = await r.json().catch(() => ({}))
+          if (r.ok && data.ssh_removed === false) sshWarn = true
+        } catch { /* ignore -- the list refresh below shows the real state */ }
+        await refreshDeviceKeyList()
+        const warnEl = document.getElementById('authDeviceKeyWarn')
+        if (warnEl && sshWarn) {
+          warnEl.hidden = false
+          warnEl.textContent = t('auth.devices.revoke_ssh_warning')
+        }
+      })
+    })
+  } catch { el.innerHTML = '' }
+}
+
+async function mintDeviceKey() {
+  const msg = document.getElementById('authDevMsg')
+  const minted = document.getElementById('authDevMinted')
+  const name = (document.getElementById('authDevName').value || '').trim()
+  const expiryRaw = document.getElementById('authDevExpiry').value
+  msg.className = 'auth-form-msg'
+  minted.hidden = true
+  if (!name) { msg.classList.add('err'); msg.textContent = t('auth.devices.err_name'); return }
+  const payload = { name }
+  if (expiryRaw) payload.expires_in_days = Number(expiryRaw)
+  try {
+    const r = await fetch('/api/auth/device-keys', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    const data = await r.json().catch(() => ({}))
+    if (!r.ok) { msg.classList.add('err'); msg.textContent = data.error || t('auth.card.err_generic'); return }
+    document.getElementById('authDevName').value = ''
+    document.getElementById('authDevExpiry').value = ''
+    minted.hidden = false
+    minted.innerHTML =
+      `<p class="auth-muted">${t('auth.devices.minted_hint')}</p>` +
+      `<div class="auth-form auth-device-minted-row">` +
+        `<input id="authDevMintedKey" type="text" readonly value="${escapeHtml(data.key)}" onclick="this.select()">` +
+        `<button class="btn-secondary btn-compact" id="authDevCopyBtn">${t('auth.devices.copy')}</button>` +
+      `</div>`
+    document.getElementById('authDevCopyBtn').addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(data.key)
+        document.getElementById('authDevCopyBtn').textContent = t('auth.devices.copied')
+      } catch { document.getElementById('authDevMintedKey').select() }
+    })
+    refreshDeviceKeyList()
+  } catch { msg.classList.add('err'); msg.textContent = t('auth.login.err_network') }
+}
+
+function renderCreateLoginForm(body) {
+  body.innerHTML =
+    `<p class="auth-muted">${t('auth.card.setup_desc')}</p>` +
+    `<div class="auth-form">` +
+      `<input id="authNewUser" type="text" autocomplete="username" autocapitalize="off" spellcheck="false" placeholder="${t('auth.login.username')}">` +
+      `<input id="authNewPass" type="password" autocomplete="new-password" placeholder="${t('auth.card.new_password')}">` +
+      `<input id="authNewPass2" type="password" autocomplete="new-password" placeholder="${t('auth.card.repeat_password')}">` +
+      `<button class="btn-primary" id="authCreateBtn">${t('auth.card.create')}</button>` +
+      `<div class="auth-form-msg" id="authCreateMsg"></div>` +
+    `</div>`
+  document.getElementById('authCreateBtn').addEventListener('click', async () => {
+    const msg = document.getElementById('authCreateMsg')
+    const username = (document.getElementById('authNewUser').value || '').trim()
+    const p1 = document.getElementById('authNewPass').value || ''
+    const p2 = document.getElementById('authNewPass2').value || ''
+    msg.className = 'auth-form-msg'
+    if (!username || !p1) { msg.classList.add('err'); msg.textContent = t('auth.login.err_empty'); return }
+    if (p1 !== p2) { msg.classList.add('err'); msg.textContent = t('auth.card.err_mismatch'); return }
+    try {
+      const r = await fetch('/api/auth/users', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password: p1 }),
+      })
+      const data = await r.json().catch(() => ({}))
+      if (r.ok) { msg.classList.add('ok'); msg.textContent = t('auth.card.created'); renderAuthCard(); initAuthBanner() }
+      else { msg.classList.add('err'); msg.textContent = data.error || t('auth.card.err_generic') }
+    } catch { msg.classList.add('err'); msg.textContent = t('auth.login.err_network') }
+  })
+}
+
+function renderSessionPanel(body, status) {
+  body.innerHTML =
+    `<p class="auth-muted">${t('auth.card.signed_in_as', { user: escapeHtml(status.user) })}</p>` +
+    `<div class="auth-form">` +
+      `<input id="authCurPass" type="password" autocomplete="current-password" placeholder="${t('auth.card.current_password')}">` +
+      `<input id="authChgPass" type="password" autocomplete="new-password" placeholder="${t('auth.card.new_password')}">` +
+      `<input id="authChgPass2" type="password" autocomplete="new-password" placeholder="${t('auth.card.repeat_password')}">` +
+      `<button class="btn-primary" id="authChgBtn">${t('auth.card.change_password')}</button>` +
+      `<div class="auth-form-msg" id="authChgMsg"></div>` +
+    `</div>` +
+    `<div class="auth-sessions" id="authSessions"></div>` +
+    `<div class="auth-actions">` +
+      `<button class="btn-secondary btn-compact" id="authLogoutAllBtn">${t('auth.card.logout_all')}</button>` +
+      `<button class="btn-secondary btn-compact" id="authLogoutBtn">${t('auth.card.logout')}</button>` +
+    `</div>`
+  document.getElementById('authChgBtn').addEventListener('click', async () => {
+    const msg = document.getElementById('authChgMsg')
+    const cur = document.getElementById('authCurPass').value || ''
+    const p1 = document.getElementById('authChgPass').value || ''
+    const p2 = document.getElementById('authChgPass2').value || ''
+    msg.className = 'auth-form-msg'
+    if (p1 !== p2) { msg.classList.add('err'); msg.textContent = t('auth.card.err_mismatch'); return }
+    try {
+      const r = await fetch('/api/auth/password', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ current_password: cur, new_password: p1 }),
+      })
+      const data = await r.json().catch(() => ({}))
+      if (r.ok) { msg.classList.add('ok'); msg.textContent = t('auth.card.password_changed') }
+      else { msg.classList.add('err'); msg.textContent = data.error || t('auth.card.err_generic') }
+    } catch { msg.classList.add('err'); msg.textContent = t('auth.login.err_network') }
+  })
+  document.getElementById('authLogoutBtn').addEventListener('click', async () => {
+    try { await fetch('/api/auth/logout', { method: 'POST' }) } catch { /* ignore */ }
+    window.location.reload()
+  })
+  document.getElementById('authLogoutAllBtn').addEventListener('click', async () => {
+    try { await fetch('/api/auth/logout-all', { method: 'POST' }) } catch { /* ignore */ }
+    window.location.reload()
+  })
+  renderAuthSessions()
+}
+
+async function renderAuthSessions() {
+  const el = document.getElementById('authSessions')
+  if (!el) return
+  try {
+    const r = await fetch('/api/auth/sessions')
+    if (!r.ok) { el.innerHTML = ''; return }
+    const { sessions } = await r.json()
+    if (!sessions || !sessions.length) { el.innerHTML = ''; return }
+    el.innerHTML = `<div class="auth-sessions-title">${t('auth.card.active_sessions')}</div>` +
+      sessions.map((s) => {
+        const last = new Date(s.lastSeenAt * 1000).toLocaleString()
+        const ua = escapeHtml(s.userAgent || '-')
+        return `<div class="auth-session-row"><code>${escapeHtml(s.idHashPrefix)}</code><span>${last}</span><span class="auth-session-ua">${ua}</span></div>`
+      }).join('')
+  } catch { el.innerHTML = '' }
+}
+
+function renderTokenModePanel(body) {
+  body.innerHTML =
+    `<p class="auth-muted">${t('auth.card.token_mode')}</p>`
+}
+
+// Dismissible setup banner: shown only when the operator is authed via the token
+// and has not yet created a browser login. Dismissal persists per browser.
+const AUTH_BANNER_DISMISS_KEY = 'marveen.auth-banner-dismissed'
+
+async function initAuthBanner() {
+  const banner = document.getElementById('authSetupBanner')
+  if (!banner) return
+  let dismissed = false
+  try { dismissed = localStorage.getItem(AUTH_BANNER_DISMISS_KEY) === '1' } catch { /* storage blocked */ }
+  const status = await fetchAuthStatus()
+  const show = !!status && status.authenticated && status.method === 'token' && status.setup_required && !dismissed
+  banner.hidden = !show
+}
+
+function wireAuthBanner() {
+  const banner = document.getElementById('authSetupBanner')
+  if (!banner) return
+  const dismiss = document.getElementById('authBannerDismiss')
+  const go = document.getElementById('authBannerGoBtn')
+  if (dismiss) dismiss.addEventListener('click', () => {
+    try { localStorage.setItem(AUTH_BANNER_DISMISS_KEY, '1') } catch { /* storage blocked */ }
+    banner.hidden = true
+  })
+  if (go) go.addEventListener('click', () => {
+    // Land on the Security tab, where the auth card lives now.
+    try { localStorage.setItem(SETTINGS_ACTIVE_TAB_KEY, 'security') } catch { /* storage blocked */ }
+    if (typeof switchPage === 'function') switchPage('settings')
+    const link = document.querySelector('.sb-link[data-page="settings"]')
+    if (link) { document.querySelectorAll('.sb-link').forEach((l) => l.classList.remove('active')); link.classList.add('active') }
+  })
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  wireAuthBanner()
+  initAuthBanner()
+  wireBranchDriftBanner()
+})
+
 async function loadSettings() {
-  const container = document.getElementById('settingsGroups')
-  container.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('settings.loading')}</p>`
+  const tabNav = document.getElementById('settingsTabNav')
+  const tabPanels = document.getElementById('settingsTabPanels')
+  if (!tabNav || !tabPanels) return
+
+  // Park the auth card back outside the panels before wiping them: a previous
+  // loadSettings run moved it INTO the Security panel, and clearing
+  // tabPanels.innerHTML with the card still inside would destroy the node.
+  const parkedAuthCard = document.getElementById('authCard')
+  if (parkedAuthCard) {
+    parkedAuthCard.hidden = true
+    tabNav.parentElement.insertBefore(parkedAuthCard, tabNav)
+  }
+
+  tabNav.innerHTML = `<span style="color:var(--text-muted);font-size:13px;padding:12px 0;display:inline-block">${t('settings.loading')}</span>`
+  tabPanels.innerHTML = ''
   settingsDirty.clear()
   updateSettingsSaveBar()
+
+  renderAuthCard()
 
   try {
     const res = await fetch('/api/settings')
@@ -9735,29 +13343,352 @@ async function loadSettings() {
       byModule.get(s.module).push(s)
     }
 
-    container.innerHTML = ''
+    tabNav.innerHTML = ''
+    tabPanels.innerHTML = ''
+
     if (byModule.size === 0) {
-      container.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('settings.empty')}</p>`
+      tabPanels.innerHTML = `<p style="padding:24px;color:var(--text-muted);font-size:13px">${t('settings.empty')}</p>`
+      // No tabs to host the Security panel: fall back to showing the auth card
+      // in its static spot above the (empty) tab area.
+      const orphanAuthCard = document.getElementById('authCard')
+      if (orphanAuthCard) orphanAuthCard.hidden = false
       return
     }
 
+    // Registry keys declared with module:'security' render inside the synthetic
+    // Security tab (below the auth card) instead of getting their own tab.
+    const securityDefs = byModule.get('security') ?? []
+    byModule.delete('security')
+
+    const allModules = [...byModule.keys(), 'security', 'autonomy']
+    const savedTab = localStorage.getItem(SETTINGS_ACTIVE_TAB_KEY) || allModules[0]
+    const activeTab = allModules.includes(savedTab) ? savedTab : allModules[0]
+
+    // Build a tab button + panel for each settings module
     for (const [mod, defs] of byModule) {
+      const btn = document.createElement('button')
+      btn.className = 'tab-btn' + (mod === activeTab ? ' active' : '')
+      btn.dataset.tab = mod
+      btn.textContent = settingsModuleLabel(mod)
+      btn.addEventListener('click', () => activateSettingsTab(mod))
+      tabNav.appendChild(btn)
+
+      const panel = document.createElement('div')
+      panel.className = 'tab-panel'
+      panel.id = `settings-panel-${mod}`
+      panel.hidden = mod !== activeTab
+
       const group = document.createElement('div')
       group.className = 'settings-group'
-
-      const heading = document.createElement('h3')
-      heading.className = 'settings-group-title'
-      heading.textContent = settingsModuleLabel(mod)
-      group.appendChild(heading)
-
       for (const def of defs) {
         group.appendChild(buildSettingRow(def))
       }
-      container.appendChild(group)
+      panel.appendChild(group)
+      tabPanels.appendChild(panel)
+    }
+
+    // Security tab (synthetic, like autonomy: exists even with zero registry
+    // entries). Hosts the auth card -- browser login, password change, device
+    // keys -- plus any module:'security' registry keys.
+    {
+      const mod = 'security'
+      const btn = document.createElement('button')
+      btn.className = 'tab-btn' + (mod === activeTab ? ' active' : '')
+      btn.dataset.tab = mod
+      btn.textContent = settingsModuleLabel(mod)
+      btn.addEventListener('click', () => activateSettingsTab(mod))
+      tabNav.appendChild(btn)
+
+      const panel = document.createElement('div')
+      panel.className = 'tab-panel'
+      panel.id = `settings-panel-${mod}`
+      panel.hidden = mod !== activeTab
+
+      const authCard = document.getElementById('authCard')
+      if (authCard) {
+        panel.appendChild(authCard)
+        authCard.hidden = false
+      }
+
+      if (securityDefs.length) {
+        const group = document.createElement('div')
+        group.className = 'settings-group'
+        for (const def of securityDefs) {
+          group.appendChild(buildSettingRow(def))
+        }
+        panel.appendChild(group)
+      }
+      tabPanels.appendChild(panel)
+    }
+
+    // Autonomy tab
+    {
+      const mod = 'autonomy'
+      const btn = document.createElement('button')
+      btn.className = 'tab-btn' + (mod === activeTab ? ' active' : '')
+      btn.dataset.tab = mod
+      btn.textContent = settingsModuleLabel(mod)
+      btn.addEventListener('click', () => activateSettingsTab(mod))
+      tabNav.appendChild(btn)
+
+      const panel = document.createElement('div')
+      panel.className = 'tab-panel'
+      panel.id = `settings-panel-${mod}`
+      panel.hidden = mod !== activeTab
+
+      const legend = document.createElement('div')
+      legend.className = 'autonomy-legend'
+      legend.innerHTML = `
+        <div class="autonomy-legend-item"><span class="autonomy-level-dot" style="background:var(--text-muted)"></span><span><strong>1</strong> ${t('autonomy.level.1')}</span></div>
+        <div class="autonomy-legend-item"><span class="autonomy-level-dot" style="background:var(--accent)"></span><span><strong>2</strong> ${t('autonomy.level.2')}</span></div>
+        <div class="autonomy-legend-item"><span class="autonomy-level-dot" style="background:var(--success)"></span><span><strong>3</strong> ${t('autonomy.level.3')}</span></div>
+      `
+      panel.appendChild(legend)
+
+      const grid = document.createElement('div')
+      grid.className = 'autonomy-grid'
+      grid.id = 'settingsAutonomyGrid'
+      panel.appendChild(grid)
+
+      const footer = document.createElement('p')
+      footer.className = 'autonomy-footer'
+      footer.id = 'settingsAutonomyUpdatedAt'
+      panel.appendChild(footer)
+
+      const refreshBtn = document.createElement('button')
+      refreshBtn.className = 'btn-secondary btn-compact'
+      refreshBtn.textContent = t('common.btn.refresh')
+      refreshBtn.addEventListener('click', () => renderAutonomyContent(grid, footer))
+      panel.appendChild(refreshBtn)
+
+      tabPanels.appendChild(panel)
+
+      if (mod === activeTab) {
+        renderAutonomyContent(grid, footer)
+      }
+    }
+
+    // Providers tab (synthetic, owner-only feature for custom Anthropic-compatible endpoints)
+    {
+      const mod = 'providers'
+      const btn = document.createElement('button')
+      btn.className = 'tab-btn' + (mod === activeTab ? ' active' : '')
+      btn.dataset.tab = mod
+      btn.textContent = 'Provider-ok'
+      btn.addEventListener('click', () => activateSettingsTab(mod))
+      tabNav.appendChild(btn)
+
+      const panel = document.createElement('div')
+      panel.className = 'tab-panel'
+      panel.id = `settings-panel-${mod}`
+      panel.hidden = mod !== activeTab
+
+      const container = document.createElement('div')
+      container.id = 'settingsProvidersContainer'
+      panel.appendChild(container)
+
+      tabPanels.appendChild(panel)
+
+      if (mod === activeTab) {
+        renderProvidersContent(container)
+      }
     }
   } catch (err) {
-    container.innerHTML = `<p style="color:var(--danger)">${t('settings.error')}</p>`
+    tabPanels.innerHTML = `<p style="padding:24px;color:var(--danger)">${t('settings.error')}</p>`
   }
+}
+
+function activateSettingsTab(mod) {
+  document.querySelectorAll('#settingsTabNav .tab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.tab === mod)
+  })
+  document.querySelectorAll('#settingsTabPanels .tab-panel').forEach(panel => {
+    panel.hidden = panel.id !== `settings-panel-${mod}`
+  })
+  localStorage.setItem(SETTINGS_ACTIVE_TAB_KEY, mod)
+
+  if (mod === 'autonomy') {
+    const grid = document.getElementById('settingsAutonomyGrid')
+    const footer = document.getElementById('settingsAutonomyUpdatedAt')
+    if (grid && !grid.innerHTML.trim()) renderAutonomyContent(grid, footer)
+  }
+  if (mod === 'providers') {
+    const container = document.getElementById('settingsProvidersContainer')
+    if (container && !container.innerHTML.trim()) renderProvidersContent(container)
+  }
+}
+
+async function renderProvidersContent(container) {
+  container.innerHTML = '<p style="padding:16px;color:var(--text-muted);font-size:13px">Betöltés...</p>'
+  try {
+    const res = await fetch('/api/custom-providers')
+    if (!res.ok) throw new Error('fetch failed')
+    const { providers } = await res.json()
+    buildProvidersUI(container, providers)
+  } catch {
+    container.innerHTML = '<p style="padding:16px;color:var(--danger);font-size:13px">Hiba a provider lista betöltésekor.</p>'
+  }
+}
+
+function buildProvidersUI(container, providers) {
+  container.innerHTML = ''
+
+  const notice = document.createElement('p')
+  notice.style.cssText = 'font-size:12.5px;color:var(--text-muted);padding:12px 0 8px;line-height:1.5'
+  notice.textContent = 'Egyéni Anthropic Messages API (/v1/messages) kompatibilis végpontok. Tiszta OpenAI végponthoz proxy szükséges.'
+  container.appendChild(notice)
+
+  if (providers.length > 0) {
+    const tableWrap = document.createElement('div')
+    tableWrap.style.cssText = 'overflow-x:auto;margin-bottom:16px'
+    const table = document.createElement('table')
+    table.style.cssText = 'width:100%;min-width:520px;border-collapse:collapse;font-size:13px'
+    table.innerHTML = `<thead><tr style="border-bottom:1px solid var(--border)">
+      <th style="text-align:left;padding:6px 8px">Név</th>
+      <th style="text-align:left;padding:6px 8px">Base URL</th>
+      <th style="text-align:left;padding:6px 8px">Auth</th>
+      <th style="text-align:left;padding:6px 8px">Vault kulcs</th>
+      <th style="padding:6px 8px"></th>
+    </tr></thead><tbody id="customProvidersTableBody"></tbody>`
+    tableWrap.appendChild(table)
+    container.appendChild(tableWrap)
+    const tbody = table.querySelector('#customProvidersTableBody')
+    for (const p of providers) {
+      const tr = document.createElement('tr')
+      tr.style.borderBottom = '1px solid var(--border)'
+      tr.innerHTML = `
+        <td style="padding:6px 8px;font-weight:500">${escapeHtml(p.label)}</td>
+        <td style="padding:6px 8px;font-family:monospace;font-size:12px;word-break:break-all">${escapeHtml(p.baseUrl)}</td>
+        <td style="padding:6px 8px">${escapeHtml(p.authHeader)}</td>
+        <td style="padding:6px 8px;font-family:monospace;font-size:12px">${p.vaultKey ? escapeHtml(p.vaultKey) : '<em style="color:var(--text-muted)">nincs</em>'}</td>
+        <td style="padding:6px 8px;text-align:right;white-space:nowrap">
+          <button class="btn-secondary btn-compact" data-provider-edit="${escapeHtml(p.id)}" style="margin-right:4px">Szerkesztés</button>
+          <button class="btn-secondary btn-compact" style="color:var(--danger)" data-provider-delete="${escapeHtml(p.id)}">Törlés</button>
+        </td>`
+      tbody.appendChild(tr)
+    }
+    tbody.querySelectorAll('[data-provider-edit]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const id = btn.dataset.providerEdit
+        const p = providers.find(x => x.id === id)
+        if (p) openAddProviderModal(container, p)
+      })
+    })
+    tbody.querySelectorAll('[data-provider-delete]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.providerDelete
+        if (!confirm(`Biztosan törlöd a(z) "${id}" providert?`)) return
+        try {
+          const r = await fetch(`/api/custom-providers/${encodeURIComponent(id)}`, { method: 'DELETE' })
+          if (!r.ok) throw new Error()
+          renderProvidersContent(container)
+          loadAvailableModels()
+        } catch { alert('Hiba a törléskor.') }
+      })
+    })
+  } else {
+    const empty = document.createElement('p')
+    empty.style.cssText = 'color:var(--text-muted);font-size:13px;padding:8px 0 16px'
+    empty.textContent = 'Nincs egyéni provider konfigurálva.'
+    container.appendChild(empty)
+  }
+
+  const addBtn = document.createElement('button')
+  addBtn.className = 'btn-primary btn-compact'
+  addBtn.textContent = '+ Új provider'
+  addBtn.addEventListener('click', () => openAddProviderModal(container))
+  container.appendChild(addBtn)
+}
+
+function openAddProviderModal(container, editProvider = null) {
+  const existing = document.getElementById('addProviderModal')
+  if (existing) existing.remove()
+
+  const isEdit = editProvider !== null
+  const v = (field) => isEdit ? escapeHtml(editProvider[field] || '') : ''
+
+  const overlay = document.createElement('div')
+  overlay.id = 'addProviderModal'
+  overlay.className = 'modal-overlay active'
+  overlay.innerHTML = `
+    <div class="modal" style="max-width:480px">
+      <div class="modal-header">
+        <h2>${isEdit ? 'Provider szerkesztése' : 'Új egyéni provider'}</h2>
+        <button class="modal-close" id="addProviderModalClose">&times;</button>
+      </div>
+      <div class="modal-body" style="display:flex;flex-direction:column;gap:12px">
+        <div class="form-group">
+          <label class="form-label">Megjelenő név *</label>
+          <input type="text" id="cpLabel" class="input" placeholder="pl. DeepSeek (saját kulcs)" value="${v('label')}">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Provider azonosító (belső név) * <small style="color:var(--text-muted)">(csak a-z 0-9 _ -)</small></label>
+          <input type="text" id="cpId" class="input" placeholder="pl. my-deepseek" value="${v('id')}"${isEdit ? ' readonly style="opacity:0.6;cursor:not-allowed"' : ''}>
+          <small style="display:block;margin-top:4px;color:var(--text-muted);font-size:12px">Ez a provider belső neve, nem a modellazonosító. A modellt az ágens szerkesztőjében adod meg.</small>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Base URL * <small style="color:var(--text-muted)">(https:// vagy http://localhost)</small></label>
+          <input type="text" id="cpBaseUrl" class="input" placeholder="https://api.deepseek.com/anthropic" value="${v('baseUrl')}">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Auth header *</label>
+          <select id="cpAuthHeader" class="input">
+            <option value="x-api-key"${isEdit && editProvider.authHeader === 'x-api-key' ? ' selected' : ''}>x-api-key (ANTHROPIC_API_KEY)</option>
+            <option value="Bearer"${isEdit && editProvider.authHeader === 'Bearer' ? ' selected' : ''}>Bearer (ANTHROPIC_AUTH_TOKEN)</option>
+            <option value="none"${isEdit && editProvider.authHeader === 'none' ? ' selected' : ''}>none (Ollama-szerű, token nélkül)</option>
+          </select>
+        </div>
+        <div class="form-group" id="cpVaultKeyGroup"${isEdit && editProvider.authHeader === 'none' ? ' style="display:none"' : ''}>
+          <label class="form-label">Vault kulcs neve *</label>
+          <input type="text" id="cpVaultKey" class="input" placeholder="pl. my-deepseek-api-key" value="${v('vaultKey')}">
+          <small style="display:block;margin-top:4px;color:var(--text-muted);font-size:12px">A kulcs értékét a Vault tabon veheted fel.</small>
+        </div>
+        <p style="font-size:12px;color:var(--text-muted);background:var(--surface-hover);padding:10px;border-radius:6px;line-height:1.5">
+          Csak Anthropic Messages API (/v1/messages) kompatibilis végpont működik. Tiszta OpenAI végponthoz (pl. /v1/chat/completions) fordítóproxy szükséges, az most nem támogatott.
+        </p>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button class="btn-secondary" id="addProviderCancelBtn">Mégsem</button>
+          <button class="btn-primary" id="addProviderSaveBtn">Mentés</button>
+        </div>
+      </div>
+    </div>`
+  document.body.appendChild(overlay)
+
+  const closeModal = () => overlay.remove()
+  overlay.querySelector('#addProviderModalClose').addEventListener('click', closeModal)
+  overlay.querySelector('#addProviderCancelBtn').addEventListener('click', closeModal)
+
+  overlay.querySelector('#cpAuthHeader').addEventListener('change', (e) => {
+    const vkGroup = overlay.querySelector('#cpVaultKeyGroup')
+    vkGroup.style.display = e.target.value === 'none' ? 'none' : ''
+  })
+
+  overlay.querySelector('#addProviderSaveBtn').addEventListener('click', async () => {
+    const id = overlay.querySelector('#cpId').value.trim()
+    const label = overlay.querySelector('#cpLabel').value.trim()
+    const baseUrl = overlay.querySelector('#cpBaseUrl').value.trim()
+    const authHeader = overlay.querySelector('#cpAuthHeader').value
+    const vaultKey = authHeader !== 'none' ? overlay.querySelector('#cpVaultKey').value.trim() : null
+    if (!id || !label || !baseUrl || (authHeader !== 'none' && !vaultKey)) {
+      alert('Töltsd ki az összes kötelező mezőt.')
+      return
+    }
+    try {
+      const r = await fetch('/api/custom-providers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, label, baseUrl, authHeader, vaultKey }),
+      })
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}))
+        alert(err.error || 'Hiba a mentéskor.')
+        return
+      }
+      overlay.remove()
+      renderProvidersContent(container)
+      loadAvailableModels()
+    } catch { alert('Hiba a mentéskor.') }
+  })
 }
 
 function buildSettingRow(def) {
@@ -9812,6 +13743,11 @@ function buildSettingRow(def) {
       valueInput.appendChild(o)
     }
     valueInput.value = originalValue
+  } else if (def.type === 'boolean') {
+    valueInput = document.createElement('input')
+    valueInput.type = 'checkbox'
+    valueInput.className = 'settings-toggle'
+    valueInput.checked = String(def.value) === '1'
   } else if (def.type === 'color') {
     valueInput = document.createElement('input')
     valueInput.type = 'color'
@@ -9856,7 +13792,7 @@ async function saveAllSettings() {
 
   for (const [key, { input, type, errorEl }] of settingsDirty) {
     errorEl.textContent = ''
-    const raw = type === 'int' ? Number(input.value) : input.value
+    const raw = type === 'int' ? Number(input.value) : settingInputValue(input, type)
     try {
       const res = await fetch('/api/settings', {
         method: 'POST',
@@ -9878,8 +13814,8 @@ async function saveAllSettings() {
   }
 
   // Remove successfully saved keys from dirty map
-  for (const [key, { input }] of settingsDirty) {
-    if (String(input.value) === input.dataset.originalValue) settingsDirty.delete(key)
+  for (const [key, { input, type }] of settingsDirty) {
+    if (settingInputValue(input, type) === input.dataset.originalValue) settingsDirty.delete(key)
   }
   updateSettingsSaveBar()
 
@@ -10021,8 +13957,92 @@ const TU_COLORS = {
 let tuSelectedAgent = ''
 let tuChartState = null
 
+// Model pricing in USD per million tokens (input / output / cache-write / cache-read).
+// Fallback row is used when model is unknown or not yet captured.
+// cache-write is 1.25x input, cache-read is 0.1x input -- keep the derived
+// columns consistent with `in` when editing a row.
+// Sonnet 5 launched on introductory pricing (2 / 10) that ends 2026-08-31;
+// the standard rate (3 / 15) applies from 2026-09-01. Resolved by date at load
+// time instead of pinned to one of the two, so the table neither understates
+// spend today nor silently overstates it the morning the intro rate expires.
+const TU_SONNET5_INTRO_END = Date.parse('2026-09-01T00:00:00Z')
+const TU_SONNET5_PRICE = Date.now() < TU_SONNET5_INTRO_END
+  ? { in: 2.0, out: 10.0, cw: 2.50, cr: 0.20 }
+  : { in: 3.0, out: 15.0, cw: 3.75, cr: 0.30 }
+
+const TU_MODEL_PRICING = {
+  // INFERRED, not from the published catalogue: Opus 5 is not listed in the
+  // model reference this table was checked against. The value follows the rest
+  // of the current Opus tier (4.6/4.7/4.8 at 5 / 25); treat it as an estimate
+  // until a published rate confirms it.
+  'claude-opus-5':       { in: 5.0,   out: 25.0,  cw: 6.25,  cr: 0.50 },
+  'claude-opus-4-8':     { in: 5.0,   out: 25.0,  cw: 6.25,  cr: 0.50 },
+  'claude-opus-4-7':     { in: 5.0,   out: 25.0,  cw: 6.25,  cr: 0.50 },
+  'claude-opus-4-6':     { in: 5.0,   out: 25.0,  cw: 6.25,  cr: 0.50 },
+  // Opus 4.0 / 4.1 -- the last generation still on the old Opus pricing.
+  'claude-opus-4':       { in: 15.0,  out: 75.0,  cw: 18.75, cr: 1.50 },
+  'claude-sonnet-5':     TU_SONNET5_PRICE,
+  'claude-sonnet-4-6':   { in: 3.0,   out: 15.0,  cw: 3.75,  cr: 0.30 },
+  'claude-sonnet-4-5':   { in: 3.0,   out: 15.0,  cw: 3.75,  cr: 0.30 },
+  'claude-fable-5':      { in: 10.0,  out: 50.0,  cw: 12.50, cr: 1.00 },
+  'claude-mythos-5':     { in: 10.0,  out: 50.0,  cw: 12.50, cr: 1.00 },
+  'claude-haiku-4-5':    { in: 1.0,   out: 5.0,   cw: 1.25,  cr: 0.10 },
+  default:               { in: 3.0,   out: 15.0,  cw: 3.75,  cr: 0.30 },
+}
+
+// Longest-prefix wins. A plain first-match loop is order-dependent and silently
+// wrong here: 'claude-opus-4-8' also startsWith 'claude-opus-4', so whichever
+// key the object happens to list first decides the price -- that is how Opus 4.8
+// was billed at the Opus 4.1 rate even once it had its own row.
+function tuPriceForModel(model) {
+  if (!model) return TU_MODEL_PRICING.default
+  const keys = Object.keys(TU_MODEL_PRICING)
+    .filter((k) => k !== 'default')
+    .sort((a, b) => b.length - a.length)
+  for (const key of keys) {
+    if (model.startsWith(key)) return TU_MODEL_PRICING[key]
+  }
+  return TU_MODEL_PRICING.default
+}
+
+function tuCalcCostUSD(inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, model) {
+  const p = tuPriceForModel(model)
+  return (
+    (inputTokens || 0) * p.in +
+    (outputTokens || 0) * p.out +
+    (cacheCreationTokens || 0) * p.cw +
+    (cacheReadTokens || 0) * p.cr
+  ) / 1_000_000
+}
+
+function tuFormatCostUSD(usd) {
+  if (usd < 0.001) return '<$0.001'
+  if (usd < 1) return '$' + usd.toFixed(3)
+  return '$' + usd.toFixed(2)
+}
+
+// Pie chart color palette for model distribution (distinct from agent colors)
+const TU_MODEL_COLORS = ['#6366f1','#06b6d4','#f59e0b','#22c55e','#ef4444','#8b5cf6','#ec4899','#10b981']
+
+function tuGetModelColor(idx) { return TU_MODEL_COLORS[idx % TU_MODEL_COLORS.length] }
+
 function tuGetColor(agent) {
   return TU_COLORS[agent] || '#64748b'
+}
+
+function tuMcpServerFromTool(toolName) {
+  if (!toolName || !toolName.startsWith('mcp__')) return null
+  const parts = toolName.split('__')
+  // parts: ['mcp', '<server>', '<tool>'] for a full tool name, or
+  // ['mcp', '<server>'] for a tuMcpGroupKey() group key -- without accepting
+  // the 2-part form, every grouped MCP row would be mislabelled as builtin.
+  return parts.length >= 2 && parts[1] ? parts[1] : null
+}
+
+function tuMcpGroupKey(toolName) {
+  if (!toolName || !toolName.startsWith('mcp__')) return toolName
+  const parts = toolName.split('__')
+  return parts.length >= 3 ? 'mcp__' + parts[1] : toolName
 }
 
 function tuFormatTokens(n) {
@@ -10085,6 +14105,17 @@ async function loadTokenUsage() {
   tuDetailSearch = ''
   const searchEl = document.getElementById('tuSearchInput')
   if (searchEl) searchEl.value = ''
+
+  const agentParam = agent ? '&agent=' + encodeURIComponent(agent) : ''
+  const baseQuery = params.toString()
+
+  const [modelDistRes, toolStatsRes] = await Promise.all([
+    fetch('/api/token-usage/model-dist?' + baseQuery + agentParam),
+    fetch('/api/token-usage/tool-stats?' + baseQuery + agentParam),
+  ])
+  if (modelDistRes.ok) renderTuModelDist(await modelDistRes.json())
+  if (toolStatsRes.ok) renderTuToolStats(await toolStatsRes.json())
+
   await tuFetchDetails()
 }
 
@@ -10099,12 +14130,20 @@ function renderTuSummary(summary) {
     const totalIn = (s.totalInput || 0) + (s.totalCacheRead || 0) + (s.totalCacheCreation || 0)
     const isActive = tuSelectedAgent === s.agent
     const dimmed = tuSelectedAgent && !isActive
+    const costUSD = Array.isArray(s.perModel) && s.perModel.length
+      ? s.perModel.reduce((sum, m) => sum + tuCalcCostUSD(m.totalInput || 0, m.totalOutput || 0, m.totalCacheRead || 0, m.totalCacheCreation || 0, m.model && m.model !== '(unknown)' ? m.model : null), 0)
+      : tuCalcCostUSD(s.totalInput, s.totalOutput, s.totalCacheRead, s.totalCacheCreation, null)
+    const sessions = s.totalSessions || 0
+    const tokPerSession = sessions > 0 ? Math.round(totalIn / sessions) : 0
+    const costPerSession = sessions > 0 ? costUSD / sessions : 0
     return `
       <div class="overview-stat tu-agent-card${isActive ? ' tu-active' : ''}" data-agent="${escapeHtml(s.agent)}"
         style="border-left:3px solid ${tuGetColor(s.agent)};cursor:pointer;${dimmed ? 'opacity:0.4;' : ''}transition:opacity 0.2s">
         <div class="overview-stat-label">${escapeHtml(s.agent)}</div>
         <div class="overview-stat-value">${tuFormatTokens(totalIn)}</div>
         <div class="overview-stat-sub">${t('tokenUsage.calls_sub', { calls: (s.totalCalls || 0).toLocaleString(), out: tuFormatTokens(s.totalOutput) })}</div>
+        <div class="overview-stat-sub" style="margin-top:4px;color:var(--text-secondary)">${tuFormatCostUSD(costUSD)} &middot; ${sessions} sess</div>
+        <div class="overview-stat-sub" style="font-size:11px;color:var(--text-secondary)">${tuFormatTokens(tokPerSession)} tok/sess &middot; ${tuFormatCostUSD(costPerSession)}/sess</div>
       </div>`
   }).join('')
 
@@ -10695,12 +14734,176 @@ document.getElementById('tuCollectBtn')?.addEventListener('click', async () => {
 document.getElementById('tuPeriod')?.addEventListener('change', () => { tuSelectedAgent = ''; loadTokenUsage() })
 document.getElementById('tuAgent')?.addEventListener('change', () => { tuSelectedAgent = document.getElementById('tuAgent').value; loadTokenUsage() })
 document.getElementById('tuMinTokens')?.addEventListener('change', () => tuFetchDetails())
+document.getElementById('tuToolAgentBreakdown')?.addEventListener('change', () => {
+  if (tuToolStatsData) renderTuToolStats(tuToolStatsData)
+})
 
 window.addEventListener('resize', () => {
   if (!document.getElementById('tokenUsagePage')?.hidden) {
     if (tuChartState && renderTuTimeline.__lastData) renderTuTimeline(renderTuTimeline.__lastData, renderTuTimeline.__lastAgent)
+    if (tuModelDistData) renderTuModelDist(tuModelDistData)
   }
 })
+
+// ============================================================
+// Token Monitor: Model distribution pie chart
+// ============================================================
+let tuModelDistData = null
+
+function renderTuModelDist(data) {
+  tuModelDistData = data
+  const section = document.getElementById('tuModelDistSection')
+  const tableEl = document.getElementById('tuModelDistTable')
+  const canvas = document.getElementById('tuModelPieCanvas')
+  if (!section || !tableEl || !canvas) return
+
+  if (!data || !data.length) {
+    tableEl.innerHTML = `<span style="color:var(--text-secondary);font-size:13px">${t('tokenUsage.model_dist_no_data')}</span>`
+    const ctx = canvas.getContext('2d')
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+    return
+  }
+
+  // Pie chart
+  const dpr = window.devicePixelRatio || 1
+  const size = 180
+  canvas.width = size * dpr
+  canvas.height = size * dpr
+  canvas.style.width = size + 'px'
+  canvas.style.height = size + 'px'
+  const ctx = canvas.getContext('2d')
+  ctx.scale(dpr, dpr)
+  ctx.clearRect(0, 0, size, size)
+
+  const total = data.reduce((s, d) => s + (d.count || 0), 0)
+  const cx = size / 2, cy = size / 2, r = size / 2 - 8
+  let startAngle = -Math.PI / 2
+  for (let i = 0; i < data.length; i++) {
+    const frac = (data[i].count || 0) / total
+    const endAngle = startAngle + frac * Math.PI * 2
+    ctx.beginPath()
+    ctx.moveTo(cx, cy)
+    ctx.arc(cx, cy, r, startAngle, endAngle)
+    ctx.closePath()
+    ctx.fillStyle = tuGetModelColor(i)
+    ctx.fill()
+    // Thin separator
+    ctx.strokeStyle = 'var(--bg-primary, #0f172a)'
+    ctx.lineWidth = 1.5
+    ctx.stroke()
+    startAngle = endAngle
+  }
+
+  // Center hole (donut effect)
+  ctx.beginPath()
+  ctx.arc(cx, cy, r * 0.5, 0, Math.PI * 2)
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--bg-elevated') || '#1e293b'
+  ctx.fill()
+
+  // Legend + table
+  const thStyle = 'text-align:left;padding:4px 8px 4px 0;font-size:12px;color:var(--text-secondary);border-bottom:1px solid var(--border);font-weight:600'
+  const tdStyle = 'padding:4px 8px 4px 0;font-size:13px;vertical-align:middle'
+  const tdRStyle = tdStyle + ';text-align:right'
+
+  let rows = data.map((d, i) => {
+    const pct = total > 0 ? ((d.count / total) * 100).toFixed(1) : '0.0'
+    const costUSD = tuCalcCostUSD(d.totalInput, d.totalOutput, d.totalCacheRead, d.totalCacheCreation, d.model !== '(unknown)' ? d.model : null)
+    return `<tr>
+      <td style="${tdStyle}">
+        <span style="display:inline-block;width:10px;height:10px;background:${tuGetModelColor(i)};border-radius:2px;margin-right:6px;vertical-align:middle"></span>
+        <code style="font-size:12px">${escapeHtml(d.model)}</code>
+      </td>
+      <td style="${tdRStyle}">${(d.count || 0).toLocaleString()}</td>
+      <td style="${tdRStyle}">${pct}%</td>
+      <td style="${tdRStyle}">${tuFormatCostUSD(costUSD)}</td>
+    </tr>`
+  }).join('')
+
+  tableEl.innerHTML = `<div style="overflow-x:auto"><table style="border-collapse:collapse;width:100%;min-width:300px">
+    <thead><tr>
+      <th style="${thStyle}">Modell</th>
+      <th style="${thStyle.replace('text-align:left','text-align:right')}">${t('tokenUsage.model_dist_calls', { n: '' }).trim()}</th>
+      <th style="${thStyle.replace('text-align:left','text-align:right')}">%</th>
+      <th style="${thStyle.replace('text-align:left','text-align:right')}">Becsült USD</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`
+}
+
+// ============================================================
+// Token Monitor: MCP tool usage grid
+// ============================================================
+let tuToolStatsData = null
+
+function renderTuToolStats(data) {
+  tuToolStatsData = data
+  const el = document.getElementById('tuToolStatsContent')
+  if (!el) return
+
+  if (!data || !data.length) {
+    el.innerHTML = `<span style="color:var(--text-secondary);font-size:13px">${t('tokenUsage.tool_stats_no_data')}</span>`
+    return
+  }
+
+  // Aggregate per-model rows into one entry per tool (MCP tools grouped by server)
+  const byTool = new Map()
+  for (const row of data) {
+    const key = tuMcpGroupKey(row.tool_name)
+    let entry = byTool.get(key)
+    if (!entry) {
+      entry = { tool_name: key, count: 0, agentSet: new Set(), costUSD: 0 }
+      byTool.set(key, entry)
+    }
+    entry.count += row.count || 0
+    ;(row.agents || '').split(',').forEach(a => { const s = a.trim(); if (s) entry.agentSet.add(s) })
+    entry.costUSD += tuCalcCostUSD(row.totalInput || 0, row.totalOutput || 0, row.totalCacheRead || 0, row.totalCacheCreation || 0, row.model || null)
+  }
+  const aggregated = Array.from(byTool.values()).sort((a, b) => b.count - a.count).slice(0, 50)
+
+  const showAgents = document.getElementById('tuToolAgentBreakdown')?.checked
+  const thStyle = 'text-align:left;padding:4px 8px 4px 0;font-size:12px;color:var(--text-secondary);border-bottom:1px solid var(--border);font-weight:600'
+  const tdStyle = 'padding:4px 8px 4px 0;font-size:13px;overflow:hidden;text-overflow:ellipsis;max-width:260px;white-space:nowrap'
+  const tdRStyle = 'padding:4px 8px 4px 0;font-size:13px;text-align:right;font-variant-numeric:tabular-nums'
+
+  const maxCount = Math.max(...aggregated.map(d => d.count || 0))
+
+  const rows = aggregated.map(d => {
+    const barPct = maxCount > 0 ? Math.round((d.count / maxCount) * 100) : 0
+    const server = tuMcpServerFromTool(d.tool_name)
+    const serverLabel = server
+      ? `<span style="font-size:11px;color:var(--text-secondary)">${escapeHtml(server)}</span>`
+      : `<span style="font-size:11px;color:var(--text-secondary);opacity:0.6">${t('tokenUsage.tool_stats_builtin')}</span>`
+    const agentChips = Array.from(d.agentSet).map(a => {
+      const color = tuGetColor(a)
+      return `<span style="display:inline-block;padding:1px 6px;border-radius:10px;font-size:11px;font-weight:500;border:1px solid ${color};color:${color};margin:1px 2px 1px 0;white-space:nowrap">${escapeHtml(a)}</span>`
+    }).join('')
+    const agentCell = showAgents ? `<td style="${tdStyle};white-space:normal">${agentChips}</td>` : ''
+    return `<tr>
+      <td style="${tdStyle}" title="${escapeHtml(d.tool_name)}"><code style="font-size:12px">${escapeHtml(d.tool_name)}</code></td>
+      <td style="${tdRStyle}">${(d.count || 0).toLocaleString()}</td>
+      <td style="padding:4px 8px 4px 0;vertical-align:middle;min-width:70px">
+        <div style="background:var(--accent,#6366f1);height:6px;border-radius:3px;width:${barPct}%;opacity:0.7"></div>
+      </td>
+      <td style="${tdStyle}">${serverLabel}</td>
+      <td style="${tdRStyle}">${tuFormatCostUSD(d.costUSD)}</td>
+      ${agentCell}
+    </tr>`
+  }).join('')
+
+  const agentHeader = showAgents ? `<th style="${thStyle}">${t('tokenUsage.tool_stats_col_agents')}</th>` : ''
+
+  el.innerHTML = `<div style="overflow-x:auto"><table style="border-collapse:collapse;width:100%;min-width:400px">
+    <thead><tr>
+      <th style="${thStyle}">${t('tokenUsage.tool_stats_col_tool')}</th>
+      <th style="${thStyle.replace('text-align:left','text-align:right')}">${t('tokenUsage.tool_stats_col_calls')}</th>
+      <th style="${thStyle}"></th>
+      <th style="${thStyle}">${t('tokenUsage.tool_stats_col_server')}</th>
+      <th style="${thStyle.replace('text-align:left','text-align:right')}">${t('tokenUsage.tool_stats_col_cost')}</th>
+      ${agentHeader}
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`
+}
 
 // ============================================================
 // Ideas (Ötletláda)
@@ -11061,6 +15264,21 @@ async function handleAgentLogin(agentName, btn) {
 let terminalInstance = null
 let terminalSSE = null
 let terminalFit = null
+// Master input gate (mirrors the server-side terminal-input toggle). Keystrokes
+// are dropped locally when OFF so we never spam the audit log with 403s; the
+// server enforces the same gate independently (fail-closed). Owner flips it via
+// the checkbox in the modal header (POST /api/terminal-input).
+let terminalInputEnabled = false
+
+function syncTerminalInputToggleUI() {
+  const cb = document.getElementById('terminalInputToggle')
+  const label = document.getElementById('terminalInputToggleLabel')
+  if (cb) cb.checked = terminalInputEnabled
+  if (label) {
+    label.textContent = terminalInputEnabled ? 'Input on' : 'Input off'
+    label.style.color = terminalInputEnabled ? '#8fbf6f' : '#b8b2a6'
+  }
+}
 
 function openTerminalModal(agentName) {
   const overlay = document.getElementById('terminalOverlay')
@@ -11069,6 +15287,12 @@ function openTerminalModal(agentName) {
   if (!overlay || !container) return
 
   title.textContent = agentName + ' - Terminal'
+
+  // Read the current server-side gate so the modal reflects reality on open.
+  fetch('/api/terminal-input')
+    .then(r => r.ok ? r.json() : { enabled: false })
+    .then(d => { terminalInputEnabled = d.enabled === true; syncTerminalInputToggleUI() })
+    .catch(() => { terminalInputEnabled = false; syncTerminalInputToggleUI() })
 
   // Cleanup previous
   if (terminalSSE) { terminalSSE.close(); terminalSSE = null }
@@ -11116,8 +15340,13 @@ function openTerminalModal(agentName) {
     paintedPane = latestPane
     term.write('\x1b[3J\x1b[2J\x1b[H' + latestPane)
   }
+  // EventSource cannot set an Authorization header. In token mode we pass the
+  // token via ?token=; in password-login (session-cookie) mode there is no
+  // token, so we open a plain URL and the browser attaches the mv_session
+  // cookie automatically -- the gate's cookie branch covers the SSE path.
   const token = localStorage.getItem('marveen-dashboard-token') || ''
-  const sse = new EventSource(`/api/agents/${encodeURIComponent(agentName)}/pane/stream?token=${encodeURIComponent(token)}`)
+  const streamBase = `/api/agents/${encodeURIComponent(agentName)}/pane/stream`
+  const sse = new EventSource(token ? `${streamBase}?token=${encodeURIComponent(token)}` : streamBase)
   sse.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data)
@@ -11145,6 +15374,12 @@ function openTerminalModal(agentName) {
   term.onData(data => {
     if (data === '\x1b[5~') { term.scrollPages(-1); return } // PageUp -> scroll history up
     if (data === '\x1b[6~') { term.scrollPages(1); return }  // PageDown -> scroll history down
+    if (!terminalInputEnabled) {
+      // Read-only mode: input gate is OFF. Drop the keystroke locally (server
+      // would 403 it anyway) and nudge the user to the toggle.
+      showToast('Terminal input is off. Enable it with the header toggle first.')
+      return
+    }
     const special = ESC_TO_SPECIAL[data]
     const body = special ? { special } : { keys: data }
     fetch(`/api/agents/${encodeURIComponent(agentName)}/keys`, {
@@ -11169,6 +15404,27 @@ document.getElementById('terminalClose')?.addEventListener('click', () => {
   if (overlay) closeModal(overlay)
   if (terminalSSE) { terminalSSE.close(); terminalSSE = null }
   if (terminalInstance) { terminalInstance.dispose(); terminalInstance = null }
+})
+
+// Owner flips the master terminal-input gate. Optimistically reflect the desired
+// state, POST it, then reconcile with the server's authoritative response.
+document.getElementById('terminalInputToggle')?.addEventListener('change', (e) => {
+  const desired = e.target.checked === true
+  fetch('/api/terminal-input', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: desired }),
+  })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+    .then(d => {
+      terminalInputEnabled = d.enabled === true
+      syncTerminalInputToggleUI()
+      showToast(terminalInputEnabled ? 'Terminal input enabled (audit-logged)' : 'Terminal input disabled')
+    })
+    .catch(() => {
+      terminalInputEnabled = false
+      syncTerminalInputToggleUI()
+      showToast('Could not change terminal input state')
+    })
 })
 
 // === Agent conversation (readable transcript) modal ===
@@ -11301,10 +15557,319 @@ document.getElementById('conversationClose')?.addEventListener('click', () => {
 document.getElementById('conversationSearch')?.addEventListener('input', () => renderConversation())
 document.getElementById('conversationShowActions')?.addEventListener('change', () => renderConversation())
 document.getElementById('conversationRefresh')?.addEventListener('click', () => loadConversation())
+
+// === Federation page ===
+// State lets live BEFORE the router IIFE (top-level code runs in order; a
+// first-load #federation route must not hit a TDZ on these).
+let fedPageWired = false
+let fedPeersViewCache = null
+
+async function loadFederationPage() {
+  wireFederationPage()
+  const statsEl = document.getElementById('federationStats')
+  const masterEl = document.getElementById('federationMaster')
+  const peersEl = document.getElementById('federationPeers')
+  if (!statsEl || !masterEl || !peersEl) return
+  peersEl.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('common.loading')}</p>`
+  try {
+    const [peersRes, statusRes] = await Promise.all([
+      fetch('/api/federation/peers'),
+      fetch('/api/federation/status').then((r) => (r.ok ? r.json() : null)).catch(() => null),
+    ])
+    if (!peersRes.ok) throw new Error('HTTP ' + peersRes.status)
+    fedPeersViewCache = await peersRes.json()
+    if (statusRes && Array.isArray(statusRes.peers)) federatedPeerStatus = statusRes.peers
+    renderFederationPage()
+  } catch (e) {
+    peersEl.innerHTML = `<p style="color:var(--danger)">${t('federation.error', { msg: escapeHtml(String(e.message || e)) })}</p>`
+  }
+}
+
+function fedStateLabel(state) {
+  const key = 'federation.peer_state.' + (state || 'unknown')
+  return t(key)
+}
+
+function renderFederationPage() {
+  const view = fedPeersViewCache
+  if (!view) return
+  const statsEl = document.getElementById('federationStats')
+  const masterEl = document.getElementById('federationMaster')
+  const peersEl = document.getElementById('federationPeers')
+  const statusById = new Map(federatedPeerStatus.map((p) => [p.id, p]))
+  const okCount = federatedPeerStatus.filter((p) => p.state === 'ok').length
+
+  const statBox = (value, label) => `<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 16px;min-width:110px">
+    <div style="font-size:20px;font-weight:600">${value}</div>
+    <div style="font-size:12px;color:var(--text-muted)">${label}</div>
+  </div>`
+  statsEl.innerHTML = [
+    statBox(view.enabled ? t('common.yes') : t('common.no'), t('federation.stat.enabled')),
+    statBox(String(view.peers.length), t('federation.stat.peers')),
+    statBox(String(okCount), t('federation.stat.reachable')),
+    statBox(escapeHtml(view.systemId || '-'), t('federation.stat.system_id')),
+  ].join('')
+
+  const routingMode = view.routingMode || 'catalog-first'
+  const routingRadios = ['strong', 'catalog-first', 'advisory'].map((m) => `
+    <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;padding:5px 0">
+      <input type="radio" name="fedRoutingMode" value="${m}" ${routingMode === m ? 'checked' : ''} style="margin-top:3px;accent-color:var(--accent)">
+      <span>
+        <span style="font-weight:600">${t('federation.routing.mode.' + m + '.label')}</span>
+        <span style="display:block;font-size:12px;color:var(--text-muted)">${t('federation.routing.mode.' + m + '.hint')}</span>
+      </span>
+    </label>`).join('')
+  masterEl.innerHTML = `
+    <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+      <input type="checkbox" id="fedEnabledToggle" style="width:16px;height:16px;accent-color:var(--accent)" ${view.enabled ? 'checked' : ''}>
+      <span style="font-weight:600">${t('federation.master_label')}</span>
+    </label>
+    <p style="font-size:12px;color:var(--text-muted);margin:6px 0 0 26px">${t('federation.master_hint')}</p>
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+      <div style="font-weight:600">${t('federation.routing.title')}</div>
+      <p style="font-size:12px;color:var(--text-muted);margin:2px 0 8px 0">${t('federation.routing.subtitle')}</p>
+      ${routingRadios}
+      <p style="font-size:12px;color:var(--text-muted);margin:8px 0 0 0">${t('federation.routing.apply_note')}</p>
+    </div>`
+  document.getElementById('fedEnabledToggle').addEventListener('change', async (e) => {
+    const enabled = e.target.checked
+    if (!enabled && !confirm(t('federation.confirm.disable'))) { e.target.checked = true; return }
+    try {
+      const res = await fetch('/api/federation/enabled', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); e.target.checked = !enabled; return }
+      showToast(enabled ? t('federation.toast.enabled') : t('federation.toast.disabled'))
+      fedRefreshAndReload()
+    } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })); e.target.checked = !enabled }
+  })
+  document.querySelectorAll('input[name="fedRoutingMode"]').forEach((radio) => {
+    radio.addEventListener('change', async (e) => {
+      const mode = e.target.value
+      try {
+        const res = await fetch('/api/federation/routing-mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }) })
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+        showToast(t('federation.routing.toast_set', { mode: t('federation.routing.mode.' + mode + '.label') }))
+      } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+    })
+  })
+
+  if (!view.peers.length) {
+    peersEl.innerHTML = `<p style="color:var(--text-muted);font-size:13px">${t('federation.peers_empty')}</p>`
+    return
+  }
+  peersEl.innerHTML = ''
+  for (const peer of view.peers) {
+    const st = statusById.get(peer.id)
+    const state = peer.hasOutboundToken ? (st ? st.state : 'unknown') : 'unpaired'
+    const reachable = state === 'ok'
+    const lastOk = st && st.lastOkAt ? new Date(st.lastOkAt).toLocaleString() : '-'
+    const agentCount = st && st.manifest && Array.isArray(st.manifest.agents) ? String(st.manifest.agents.length) : '-'
+    const card = document.createElement('div')
+    card.className = 'card'
+    card.style.cssText = 'padding:12px 16px;display:flex;flex-direction:column;gap:8px'
+    // Peer ids/baseUrls are OWNER-entered and segment-validated; state labels
+    // come from t(). Still: text nodes only, escapeHtml everywhere.
+    card.innerHTML = `
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <strong style="font-size:15px">${escapeHtml(peer.id)}</strong>
+        <span class="tg-status"><span class="tg-dot ${reachable ? 'connected' : 'disconnected'}"></span> ${fedStateLabel(state)}</span>
+        <span style="color:var(--text-muted);font-size:12px;margin-left:auto">${t('federation.card.last_ok')}: ${escapeHtml(lastOk)} · ${t('federation.card.agents')}: ${escapeHtml(agentCount)}</span>
+      </div>
+      <div style="font-size:13px;color:var(--text-muted);word-break:break-all">${escapeHtml(peer.baseUrl)}</div>
+      ${st && st.error ? `<div style="font-size:12px;color:var(--danger)">${escapeHtml(st.error)}</div>` : ''}
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-muted);cursor:pointer">
+        <input type="checkbox" class="fed-share-cap" ${peer.shareCapabilitySummaries ? 'checked' : ''} style="accent-color:var(--accent)">
+        ${t('federation.share_cap_label')}
+      </label>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn-secondary btn-compact" data-action="reveal">${t('federation.btn.reveal')}</button>
+        <button class="btn-secondary btn-compact" data-action="rotate">${t('federation.btn.rotate')}</button>
+        <button class="btn-secondary btn-compact" data-action="edit">${t('common.edit')}</button>
+        <button class="btn-secondary btn-compact" data-action="delete" style="color:var(--danger)">${t('common.delete')}</button>
+      </div>
+      <div class="fed-token-reveal" hidden style="font-family:monospace;font-size:12px;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px;word-break:break-all"></div>`
+    card.querySelector('[data-action="reveal"]').addEventListener('click', () => fedRevealToken(peer.id, card))
+    card.querySelector('[data-action="rotate"]').addEventListener('click', () => fedRotateToken(peer.id))
+    card.querySelector('[data-action="edit"]').addEventListener('click', () => fedOpenPeerModal(peer))
+    card.querySelector('[data-action="delete"]').addEventListener('click', () => fedDeletePeer(peer.id))
+    card.querySelector('.fed-share-cap').addEventListener('change', (e) => fedToggleShareCap(peer.id, e.target.checked))
+    peersEl.appendChild(card)
+  }
+}
+
+async function fedRevealToken(peerId, card) {
+  const box = card.querySelector('.fed-token-reveal')
+  if (!box.hidden) { box.hidden = true; box.textContent = ''; return }
+  try {
+    const res = await fetch(`/api/federation/peers/${encodeURIComponent(peerId)}/inbound-token`)
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    box.textContent = data.inboundToken
+    box.hidden = false
+    navigator.clipboard?.writeText(data.inboundToken).then(
+      () => showToast(t('federation.toast.token_copied')),
+      () => {},
+    )
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+}
+
+async function fedRotateToken(peerId) {
+  if (!confirm(t('federation.confirm.rotate', { peer: peerId }))) return
+  try {
+    const res = await fetch(`/api/federation/peers/${encodeURIComponent(peerId)}/rotate-inbound-token`, { method: 'POST' })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    showToast(t('federation.toast.rotated'))
+    loadFederationPage()
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+}
+
+async function fedToggleShareCap(peerId, share) {
+  try {
+    const res = await fetch(`/api/federation/peers/${encodeURIComponent(peerId)}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ shareCapabilitySummaries: share }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); loadFederationPage(); return }
+    showToast(share ? t('federation.toast.share_cap_on') : t('federation.toast.share_cap_off'))
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })); loadFederationPage() }
+}
+
+async function fedDeletePeer(peerId) {
+  if (!confirm(t('federation.confirm.delete_peer', { peer: peerId }))) return
+  try {
+    const res = await fetch(`/api/federation/peers/${encodeURIComponent(peerId)}`, { method: 'DELETE' })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    // Sweep browser leftovers scoped to the removed peer.
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const key = localStorage.key(i)
+      if (key && key.startsWith('chat_last_seen_' + peerId + '/')) localStorage.removeItem(key)
+    }
+    if (chatSelectedAgent && chatSelectedAgent.startsWith(peerId + '/')) chatSelectedAgent = null
+    showToast(t('federation.toast.peer_deleted'))
+    loadFederationPage()
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+}
+
+// Apply federation config changes to the RUNNING main agent by restarting it
+// (it reloads CLAUDE.md, which carries the federation onboarding + delegation
+// directive). Reuses the existing main-agent restart endpoint -- no new
+// backend, no terminal command for the operator.
+async function fedApplyToMainAgent() {
+  if (!confirm(t('federation.confirm.apply'))) return
+  try {
+    // Server-side apply: restarts the main channels agent by MAIN_AGENT_ID,
+    // so the client does not depend on window._marveen being loaded (the
+    // Federation page does not populate it -> the old /api/agents/:name path
+    // 404'd when it fell back to the 'marveen' default).
+    const res = await fetch('/api/federation/apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    showToast(t('federation.toast.applied'))
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+}
+
+// Re-poll peer reachability then re-render. Called after config mutations
+// (enable, peer add/edit) so the status shows fresh -- there is no separate
+// manual "refresh" button anymore (the apply action owns the top-right slot).
+async function fedRefreshAndReload() {
+  try { await fetch('/api/federation/refresh', { method: 'POST' }) } catch { /* best effort */ }
+  loadFederationPage()
+}
+
+let fedPeerModalEditId = null
+
+function fedOpenPeerModal(peer) {
+  fedPeerModalEditId = peer ? peer.id : null
+  document.getElementById('fedPeerModalTitle').textContent = peer ? t('federation.modal.edit_title', { peer: peer.id }) : t('federation.modal.add_title')
+  const idInput = document.getElementById('fedPeerId')
+  idInput.value = peer ? peer.id : ''
+  idInput.disabled = !!peer
+  document.getElementById('fedPeerBaseUrl').value = peer ? peer.baseUrl : ''
+  document.getElementById('fedPeerOutboundToken').value = ''
+  document.getElementById('fedPeerOutboundToken').placeholder = peer && peer.hasOutboundToken ? t('federation.modal.outbound_keep') : ''
+  document.getElementById('fedPeerAbandonWindow').value = peer && peer.abandonWindowMinutes ? String(peer.abandonWindowMinutes) : ''
+  openModal(document.getElementById('fedPeerModalOverlay'))
+}
+
+async function fedSavePeerModal() {
+  // Ids are case-insensitive server-side (stored lowercase); fold here too so
+  // the operator immediately sees the canonical form.
+  const id = document.getElementById('fedPeerId').value.trim().toLowerCase()
+  const baseUrl = document.getElementById('fedPeerBaseUrl').value.trim()
+  const outbound = document.getElementById('fedPeerOutboundToken').value.trim()
+  const abandonRaw = document.getElementById('fedPeerAbandonWindow').value.trim()
+  try {
+    let res, data
+    if (fedPeerModalEditId) {
+      const body = { baseUrl }
+      if (outbound) body.outboundToken = outbound
+      if (abandonRaw) body.abandonWindowMinutes = parseInt(abandonRaw, 10)
+      else body.abandonWindowMinutes = null
+      res = await fetch(`/api/federation/peers/${encodeURIComponent(fedPeerModalEditId)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      data = await res.json().catch(() => ({}))
+      if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+      showToast(t('federation.toast.peer_saved'))
+    } else {
+      const body = { id, baseUrl }
+      if (outbound) body.outboundToken = outbound
+      res = await fetch('/api/federation/peers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      data = await res.json().catch(() => ({}))
+      if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+      // The minted inbound token is shown ONCE right away: the owner hands it
+      // to the peer's operator during pairing.
+      prompt(t('federation.modal.minted_token_hint'), data.inboundToken)
+      showToast(t('federation.toast.peer_added'))
+    }
+    closeModal(document.getElementById('fedPeerModalOverlay'))
+    fedRefreshAndReload()
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+}
+
+async function fedRemoveAll() {
+  if (!confirm(t('federation.confirm.remove'))) return
+  try {
+    const res = await fetch('/api/federation/remove', { method: 'POST' })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: data.error || ('HTTP ' + res.status) })); return }
+    federatedPeerStatus = []
+    // Sweep browser leftovers for ALL federated (qualified) threads -- the
+    // per-peer DELETE path does this per peer, full removal must do it wholesale.
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const key = localStorage.key(i)
+      if (key && /^chat_last_seen_[^/]+\//.test(key)) localStorage.removeItem(key)
+    }
+    if (chatSelectedAgent && chatSelectedAgent.includes('/')) chatSelectedAgent = null
+    showToast(t('federation.toast.removed'))
+    loadFederationPage()
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+}
+
+function wireFederationPage() {
+  if (fedPageWired) return
+  fedPageWired = true
+  const fedApplyBtn = document.getElementById('federationApplyBtn')
+  if (fedApplyBtn) { fedApplyBtn.title = t('federation.apply_hint'); fedApplyBtn.addEventListener('click', fedApplyToMainAgent) }
+  document.getElementById('federationAddPeerBtn')?.addEventListener('click', () => fedOpenPeerModal(null))
+  document.getElementById('federationRemoveBtn')?.addEventListener('click', fedRemoveAll)
+  document.getElementById('fedPeerModalSave')?.addEventListener('click', fedSavePeerModal)
+  document.getElementById('fedPeerModalCancel')?.addEventListener('click', () => closeModal(document.getElementById('fedPeerModalOverlay')))
+  document.getElementById('fedPeerModalClose')?.addEventListener('click', () => closeModal(document.getElementById('fedPeerModalOverlay')))
+  const overlay = document.getElementById('fedPeerModalOverlay')
+  overlay?.addEventListener('click', (e) => { if (e.target === overlay) closeModal(overlay) })
+}
+
 ;(() => {
   function routeFromHash() {
     let pageId = decodeURIComponent((location.hash || '').replace(/^#/, ''))
     if (!pageId) pageId = new URLSearchParams(window.location.search).get('page') || ''
+    // 'team' page is merged into 'agents' (org-chart view toggle).
+    if (pageId === 'team') { pageId = 'agents'; _agentsActiveView = 'tree' }
     if (pageId && document.getElementById(pageId + 'Page')) switchPage(pageId)
   }
   window.addEventListener('hashchange', routeFromHash)
@@ -11350,7 +15915,7 @@ function renderMarkdown(md) {
       i++
       while (i < lines.length && !/^```\s*$/.test(lines[i])) { code.push(lines[i]); i++ }
       i++
-      out.push('<pre><code>' + escapeHtml(code.join('\n')) + '</code></pre>')
+      out.push('<pre><code' + (fence[1] ? ' class="language-' + escapeHtml(fence[1]) + '"' : '') + '>' + escapeHtml(code.join('\n')) + '</code></pre>')
       continue
     }
     const h = line.match(/^(#{1,6})\s+(.*)$/)
@@ -11446,7 +16011,7 @@ async function openDoc(name) {
       '<div class="docs-content-toolbar">' +
         '<button class="btn-secondary btn-compact" id="docsDownloadBtn">' + t('docs.download_btn') + '</button>' +
       '</div>' +
-      '<div class="docs-rendered markdown-body">' + renderMarkdown(content) + '</div>'
+      '<div class="docs-rendered markdown-body md-rendered">' + renderMarkdown(content) + '</div>'
     const dl = document.getElementById('docsDownloadBtn')
     if (dl) dl.addEventListener('click', () => downloadMarkdown(name, content))
   } catch (e) {
@@ -11468,6 +16033,72 @@ function downloadMarkdown(name, content) {
     setTimeout(() => URL.revokeObjectURL(url), 1000)
   } catch (e) {
     showToast(t('common.toast.download_failed', { msg: String(e && e.message || e) }))
+  }
+}
+
+// === Research (read-only viewer for each agent's research/ folder) ===
+// Mirrors the Docs tab above, but the API groups docs by agent
+// ([{agent, docs:[{name,title,updated}]}]), so the list needs a per-agent
+// header and each item's dataset carries both agent+name for the detail
+// fetch. Reuses escapeHtml/escapeAttr/renderMarkdown/downloadMarkdown as-is.
+async function loadResearch() {
+  const listEl = document.getElementById('researchList')
+  const contentEl = document.getElementById('researchContent')
+  if (!listEl) return
+  listEl.innerHTML = '<p class="muted">' + t('research.loading') + '</p>'
+  let groups = []
+  try {
+    const res = await fetch('/api/research')
+    groups = await res.json()
+    if (!Array.isArray(groups)) groups = []
+  } catch (e) {
+    listEl.innerHTML = '<p class="muted">' + t('research.list_load_error') + ': ' + escapeHtml(String(e.message || e)) + '</p>'
+    return
+  }
+  if (!groups.length) {
+    listEl.innerHTML = '<p class="muted">' + t('research.empty_list') + '</p>'
+    if (contentEl) contentEl.innerHTML = '<p class="muted">' + t('research.empty_content') + '</p>'
+    return
+  }
+  listEl.innerHTML = groups.map(g =>
+    '<div class="docs-list-group-label">' + escapeHtml(g.agent) + '</div>' +
+    g.docs.map(d =>
+      '<a href="#" class="docs-list-item" data-agent="' + escapeAttr(g.agent) + '" data-doc="' + escapeAttr(d.name) + '">' +
+        '<span class="docs-list-title">' + escapeHtml(d.title || d.name) + '</span>' +
+        (d.updated ? '<span class="docs-list-date">' + escapeHtml(d.updated) + '</span>' : '') +
+      '</a>'
+    ).join('')
+  ).join('')
+  listEl.querySelectorAll('.docs-list-item').forEach(a => {
+    a.addEventListener('click', (e) => {
+      e.preventDefault()
+      listEl.querySelectorAll('.docs-list-item').forEach(x => x.classList.remove('active'))
+      a.classList.add('active')
+      openResearchDoc(a.dataset.agent, a.dataset.doc)
+    })
+  })
+  const first = listEl.querySelector('.docs-list-item')
+  if (first) { first.classList.add('active'); openResearchDoc(first.dataset.agent, first.dataset.doc) }
+}
+
+async function openResearchDoc(agent, name) {
+  const contentEl = document.getElementById('researchContent')
+  if (!contentEl) return
+  contentEl.innerHTML = '<p class="muted">' + t('research.loading') + '</p>'
+  try {
+    const res = await fetch('/api/research/' + encodeURIComponent(agent) + '/' + encodeURIComponent(name))
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    const doc = await res.json()
+    const content = doc.content || ''
+    contentEl.innerHTML =
+      '<div class="docs-content-toolbar">' +
+        '<button class="btn-secondary btn-compact" id="researchDownloadBtn">' + t('docs.download_btn') + '</button>' +
+      '</div>' +
+      '<div class="docs-rendered markdown-body">' + renderMarkdown(content) + '</div>'
+    const dl = document.getElementById('researchDownloadBtn')
+    if (dl) dl.addEventListener('click', () => downloadMarkdown(name, content))
+  } catch (e) {
+    contentEl.innerHTML = '<p class="muted">' + t('research.open_error') + ': ' + escapeHtml(String(e.message || e)) + '</p>'
   }
 }
 
@@ -11746,6 +16377,10 @@ function downloadMarkdown(name, content) {
       document.getElementById('archivedSearchBtn').addEventListener('click', doArchivedSearch)
       document.getElementById('archivedRefreshBtn').addEventListener('click', doArchivedSearch)
       document.getElementById('archivedQ').addEventListener('keydown', e => { if (e.key === 'Enter') doArchivedSearch() })
+      // Back button mirrors the kanban row's Archivaltak entry point; explicit
+      // switchPage (not history.back) so it works on direct-link arrivals too.
+      const backBtn = document.getElementById('archivedBackToKanban')
+      if (backBtn) backBtn.addEventListener('click', () => switchPage('kanban'))
       const adOverlay = document.getElementById('archivedDetailOverlay')
       document.getElementById('archivedDetailClose').addEventListener('click', () => closeModal(adOverlay))
       adOverlay.addEventListener('click', e => { if (e.target === adOverlay) closeModal(adOverlay) })
@@ -11858,4 +16493,349 @@ function downloadMarkdown(name, content) {
   }
 
   window.loadNaplo = loadNaplo
+})()
+
+// === Kanban Gantt / timeline view ===
+;(function () {
+  // --- State ---
+  let ganttPeriod = 'week'  // 'week' | 'month' | 'quarter'
+  let ganttPeriodOffset = 0  // periods stepped from the current one (0 = current, -1 = prev, +1 = next)
+  let ganttOverdueOnly = false
+  let _initialized = false
+
+  // --- Color map by status (vars from theme) ---
+  const STATUS_COLOR = {
+    planned:     { bg: 'var(--accent)',  border: 'var(--accent)' },
+    in_progress: { bg: '#4f8ef7',        border: '#3a7be0' },
+    waiting:     { bg: '#e8a838',        border: '#c88c20' },
+    done:        { bg: '#3dbf79',        border: '#28a560' },
+  }
+
+  // Period window: returns { rangeStart: Date, rangeEnd: Date } (midnight boundaries)
+  function periodWindow() {
+    const now = new Date()
+    const start = new Date(now)
+    start.setHours(0, 0, 0, 0)
+    const end = new Date(start)
+    if (ganttPeriod === 'week') {
+      // Mon..Sun of current week, shifted by ganttPeriodOffset weeks
+      const dow = (start.getDay() + 6) % 7  // Mon=0
+      start.setDate(start.getDate() - dow + ganttPeriodOffset * 7)
+      end.setTime(start.getTime())
+      end.setDate(start.getDate() + 7)
+    } else if (ganttPeriod === 'month') {
+      start.setDate(1)
+      start.setMonth(start.getMonth() + ganttPeriodOffset)
+      end.setFullYear(start.getFullYear(), start.getMonth() + 1, 1)
+    } else {  // quarter
+      const qStart = Math.floor(start.getMonth() / 3) * 3 + ganttPeriodOffset * 3
+      start.setMonth(qStart, 1)
+      end.setFullYear(start.getFullYear(), start.getMonth() + 3, 1)
+    }
+    return { rangeStart: start, rangeEnd: end }
+  }
+
+  // Format date as short label (e.g. "jún 15" / "Jun 15")
+  function fmtDateShort(d) {
+    return d.toLocaleDateString(typeof _lang !== 'undefined' && _lang === 'en' ? 'en-US' : 'hu-HU', { month: 'short', day: 'numeric' })
+  }
+
+  // Return header tick labels for the visible range
+  function buildHeaderTicks(rangeStart, rangeEnd) {
+    const ticks = []
+    const totalMs = rangeEnd - rangeStart
+    // Aim for ~5-8 ticks; snap to day boundaries
+    let stepDays = 1
+    if (ganttPeriod === 'month') stepDays = 7
+    else if (ganttPeriod === 'quarter') stepDays = 14
+    const cur = new Date(rangeStart)
+    while (cur < rangeEnd) {
+      ticks.push({
+        date: new Date(cur),
+        pct: (cur - rangeStart) / totalMs * 100,
+      })
+      cur.setDate(cur.getDate() + stepDays)
+    }
+    return ticks
+  }
+
+  // Group visible cards by project (or 'Nincs projekt' for null)
+  function groupCardsByProject(cards) {
+    const map = new Map()
+    for (const c of cards) {
+      const key = c.project || t('kanban.gantt.no_project')
+      if (!map.has(key)) map.set(key, [])
+      map.get(key).push(c)
+    }
+    return map
+  }
+
+  // Build and inject the Gantt DOM into #kanbanGanttView
+  function renderGantt() {
+    const container = document.getElementById('kanbanGanttView')
+    if (!container) return
+    container.innerHTML = ''
+
+    const { rangeStart, rangeEnd } = periodWindow()
+    const totalMs = rangeEnd - rangeStart
+    const nowMs = Date.now()
+    const todayPct = Math.max(0, Math.min(100, (nowMs - rangeStart) / totalMs * 100))
+
+    // Filter: cards that have a due_date
+    let cards = (Array.isArray(kanbanCards) ? kanbanCards : []).filter(c => c.due_date)
+
+    if (ganttOverdueOnly) {
+      // Keep cards that are overdue OR due within 7 days
+      const cutoff = (nowMs + 7 * 86400000) / 1000
+      cards = cards.filter(c => c.due_date <= cutoff / 1 && c.status !== 'done')
+    }
+
+    // Exclude cards whose entire bar lies outside the window
+    cards = cards.filter(c => {
+      const barStart = c.created_at ? c.created_at * 1000 : rangeStart.getTime()
+      const barEnd   = c.due_date * 1000
+      return barEnd >= rangeStart && barStart <= rangeEnd
+    })
+
+    if (cards.length === 0) {
+      container.innerHTML = `<p style="color:var(--muted);padding:24px 0;text-align:center;">${t('kanban.gantt.no_cards')}</p>`
+      return
+    }
+
+    const grouped = groupCardsByProject(cards)
+
+    // --- Outer layout ---
+    const wrap = document.createElement('div')
+    wrap.className = 'gantt-wrap'
+    wrap.style.cssText = 'display:flex;flex-direction:column;overflow:hidden;'
+
+    // --- Header row: left label + tick strip ---
+    const headerRow = document.createElement('div')
+    headerRow.style.cssText = 'display:flex;border-bottom:1px solid var(--border);margin-bottom:4px;'
+
+    const headerLabel = document.createElement('div')
+    headerLabel.style.cssText = 'width:220px;min-width:220px;font-size:12px;color:var(--muted);padding:4px 8px;border-right:1px solid var(--border);'
+    headerLabel.textContent = t('kanban.gantt.col_label')
+    headerRow.appendChild(headerLabel)
+
+    const headerTrack = document.createElement('div')
+    headerTrack.style.cssText = 'flex:1;position:relative;height:28px;overflow:hidden;'
+    const ticks = buildHeaderTicks(rangeStart, rangeEnd)
+    for (const tick of ticks) {
+      const el = document.createElement('div')
+      el.style.cssText = `position:absolute;left:${tick.pct.toFixed(2)}%;transform:translateX(-50%);font-size:11px;color:var(--muted);top:6px;white-space:nowrap;`
+      el.textContent = fmtDateShort(tick.date)
+      headerTrack.appendChild(el)
+    }
+    // Today marker in header
+    if (todayPct >= 0 && todayPct <= 100) {
+      const todayHead = document.createElement('div')
+      todayHead.style.cssText = `position:absolute;left:${todayPct.toFixed(2)}%;top:0;bottom:0;width:2px;background:var(--danger,#e05252);opacity:0.6;`
+      headerTrack.appendChild(todayHead)
+    }
+    headerRow.appendChild(headerTrack)
+    wrap.appendChild(headerRow)
+
+    // --- Body rows ---
+    const body = document.createElement('div')
+    body.style.cssText = 'overflow-y:auto;max-height:70vh;'
+
+    for (const [project, projCards] of grouped) {
+      // Group header
+      const groupHeader = document.createElement('div')
+      groupHeader.style.cssText = 'display:flex;align-items:center;background:var(--bg2,var(--sidebar-bg));border-bottom:1px solid var(--border);'
+      const ghLabel = document.createElement('div')
+      ghLabel.style.cssText = 'width:220px;min-width:220px;font-size:12px;font-weight:600;color:var(--fg);padding:5px 8px;border-right:1px solid var(--border);'
+      ghLabel.textContent = `${project} (${projCards.length})`
+      groupHeader.appendChild(ghLabel)
+      const ghStripe = document.createElement('div')
+      ghStripe.style.cssText = 'flex:1;height:26px;background:var(--bg2,var(--sidebar-bg));'
+      groupHeader.appendChild(ghStripe)
+      body.appendChild(groupHeader)
+
+      // Card rows
+      for (const card of projCards) {
+        const barStartMs = card.created_at ? card.created_at * 1000 : rangeStart.getTime()
+        const barEndMs   = card.due_date * 1000
+        const isOverdue  = card.status !== 'done' && barEndMs < nowMs
+
+        // Clamp to window
+        const clampedStart = Math.max(barStartMs, rangeStart.getTime())
+        const clampedEnd   = Math.min(barEndMs,   rangeEnd.getTime())
+        const leftPct  = (clampedStart - rangeStart) / totalMs * 100
+        const widthPct = Math.max(0.5, (clampedEnd - clampedStart) / totalMs * 100)
+
+        const col = isOverdue ? { bg: 'var(--danger,#e05252)', border: '#b83030' }
+                              : (STATUS_COLOR[card.status] || STATUS_COLOR.planned)
+
+        const row = document.createElement('div')
+        row.style.cssText = 'display:flex;align-items:center;border-bottom:1px solid var(--border);min-height:32px;'
+
+        const rowLabel = document.createElement('div')
+        rowLabel.style.cssText = 'width:220px;min-width:220px;font-size:12px;color:var(--fg);padding:4px 8px;border-right:1px solid var(--border);overflow:hidden;white-space:nowrap;text-overflow:ellipsis;cursor:pointer;'
+        rowLabel.title = card.title
+        // Show the running display number (#N, card.seq) like the board, not the hex id.
+        const seqLabel = card.seq != null ? `#${card.seq}` : `#${card.id}`
+        rowLabel.textContent = `${seqLabel} ${card.title}`
+        rowLabel.addEventListener('click', () => { if (typeof openCardDetail === 'function') openCardDetail(card.id) })
+
+        const rowTrack = document.createElement('div')
+        rowTrack.style.cssText = 'flex:1;position:relative;height:32px;overflow:hidden;'
+
+        // Today line (in each row)
+        if (todayPct >= 0 && todayPct <= 100) {
+          const tl = document.createElement('div')
+          tl.style.cssText = `position:absolute;left:${todayPct.toFixed(2)}%;top:0;bottom:0;width:2px;background:var(--danger,#e05252);z-index:1;pointer-events:none;`
+          rowTrack.appendChild(tl)
+        }
+
+        const bar = document.createElement('div')
+        bar.style.cssText = [
+          `position:absolute`,
+          `left:${leftPct.toFixed(2)}%`,
+          `width:${widthPct.toFixed(2)}%`,
+          `top:5px`,
+          `bottom:5px`,
+          `background:${col.bg}`,
+          `border:1px solid ${col.border}`,
+          `border-radius:4px`,
+          `overflow:hidden`,
+          `white-space:nowrap`,
+          `font-size:11px`,
+          `color:#fff`,
+          `display:flex`,
+          `align-items:center`,
+          `padding:0 6px`,
+          `box-sizing:border-box`,
+          `cursor:pointer`,
+          `z-index:2`,
+          isOverdue ? 'background-image:repeating-linear-gradient(45deg,rgba(0,0,0,.12) 0px,rgba(0,0,0,.12) 4px,transparent 4px,transparent 8px)' : '',
+        ].filter(Boolean).join(';')
+        bar.title = `${seqLabel} ${card.title}\n${fmtDateShort(new Date(barStartMs))} - ${fmtDateShort(new Date(barEndMs))}`
+        bar.textContent = `${seqLabel} ${card.title}`
+        bar.addEventListener('click', () => { if (typeof openCardDetail === 'function') openCardDetail(card.id) })
+        rowTrack.appendChild(bar)
+        row.appendChild(rowLabel)
+        row.appendChild(rowTrack)
+        body.appendChild(row)
+      }
+    }
+
+    wrap.appendChild(body)
+
+    // --- Legend ---
+    const legend = document.createElement('div')
+    legend.style.cssText = 'display:flex;align-items:center;gap:16px;margin-top:10px;font-size:12px;flex-wrap:wrap;'
+    const legendItems = [
+      { key: 'planned',     color: STATUS_COLOR.planned.bg },
+      { key: 'in_progress', color: STATUS_COLOR.in_progress.bg },
+      { key: 'waiting',     color: STATUS_COLOR.waiting.bg },
+      { key: 'done',        color: STATUS_COLOR.done.bg },
+      { key: 'overdue',     color: 'var(--danger,#e05252)' },
+    ]
+    for (const item of legendItems) {
+      const dot = document.createElement('span')
+      dot.innerHTML = `<span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:${item.color};vertical-align:middle;margin-right:4px;"></span>${t('kanban.gantt.legend.' + item.key)}`
+      legend.appendChild(dot)
+    }
+    const todayLegend = document.createElement('span')
+    todayLegend.style.cssText = 'margin-left:auto;color:var(--muted);'
+    todayLegend.innerHTML = `<span style="display:inline-block;width:12px;height:2px;background:var(--danger,#e05252);vertical-align:middle;margin-right:4px;"></span>${t('kanban.gantt.legend.today')}`
+    legend.appendChild(todayLegend)
+    wrap.appendChild(legend)
+
+    container.appendChild(wrap)
+
+    // --- Period stepper (below the timeline): step back/forward by one period unit ---
+    const nav = document.createElement('div')
+    nav.style.cssText = 'display:flex;align-items:center;justify-content:center;gap:10px;margin-top:12px;'
+    const prevBtn = document.createElement('button')
+    prevBtn.className = 'view-btn'
+    prevBtn.style.cssText = 'width:auto;padding:0 14px;'
+    prevBtn.textContent = '‹ ' + t('kanban.gantt.nav_prev')
+    prevBtn.addEventListener('click', () => { ganttPeriodOffset--; renderGantt() })
+    const rangeLbl = document.createElement('span')
+    rangeLbl.style.cssText = 'font-size:12px;color:var(--muted);min-width:130px;text-align:center;'
+    rangeLbl.textContent = `${fmtDateShort(rangeStart)} - ${fmtDateShort(new Date(rangeEnd.getTime() - 1))}`
+    const nextBtn = document.createElement('button')
+    nextBtn.className = 'view-btn'
+    nextBtn.style.cssText = 'width:auto;padding:0 14px;'
+    nextBtn.textContent = t('kanban.gantt.nav_next') + ' ›'
+    nextBtn.addEventListener('click', () => { ganttPeriodOffset++; renderGantt() })
+    nav.append(prevBtn, rangeLbl, nextBtn)
+    container.appendChild(nav)
+  }
+
+  // --- View switcher init (called once after DOM ready) ---
+  function initGanttViewSwitcher() {
+    if (_initialized) return
+    _initialized = true
+
+    const boardBtn  = document.getElementById('kanbanViewBoard')
+    const ganttBtn  = document.getElementById('kanbanViewGantt')
+    const boardFilters = document.getElementById('kanbanBoardFilters')
+    const ganttFilters = document.getElementById('kanbanGanttFilters')
+    const boardEls  = [document.getElementById('kanbanBoard'), document.getElementById('kanbanSwimlaneBoard')]
+    const ganttEl   = document.getElementById('kanbanGanttView')
+
+    function activateBoard() {
+      boardBtn.classList.add('active')
+      ganttBtn.classList.remove('active')
+      boardFilters.style.display = 'flex'
+      ganttFilters.style.display = 'none'
+      boardEls.forEach(el => { if (el) el.style.removeProperty('display') })
+      ganttEl.style.display = 'none'
+    }
+
+    function activateGantt() {
+      ganttBtn.classList.add('active')
+      boardBtn.classList.remove('active')
+      ganttFilters.style.display = 'flex'
+      boardFilters.style.display = 'none'
+      boardEls.forEach(el => { if (el) el.style.display = 'none' })
+      ganttEl.style.display = 'block'
+      renderGantt()
+    }
+
+    boardBtn.addEventListener('click', activateBoard)
+    ganttBtn.addEventListener('click', activateGantt)
+
+    // Archived button: navigates AWAY to the archived page (its sidebar entry
+    // was removed -- this button is now the entry point). It never takes the
+    // 'active' state here because leaving the kanban page hides the row.
+    const archivedBtn = document.getElementById('kanbanViewArchived')
+    if (archivedBtn) archivedBtn.addEventListener('click', () => switchPage('archived'))
+
+    // Period buttons
+    document.querySelectorAll('#kanbanGanttFilters [data-period]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        ganttPeriod = btn.dataset.period
+        ganttPeriodOffset = 0  // recenter on the current period when switching granularity
+        document.querySelectorAll('#kanbanGanttFilters [data-period]').forEach(b => b.classList.remove('active'))
+        btn.classList.add('active')
+        renderGantt()
+      })
+    })
+
+    // Overdue toggle
+    const overdueChk = document.getElementById('ganttOverdueOnly')
+    if (overdueChk) {
+      overdueChk.addEventListener('change', () => {
+        ganttOverdueOnly = overdueChk.checked
+        renderGantt()
+      })
+    }
+
+    // Re-render on data refresh (hook into global loadKanban completion)
+    const _origRenderKanban = window.renderKanban
+    if (typeof _origRenderKanban === 'function') {
+      window.renderKanban = function () {
+        _origRenderKanban.apply(this, arguments)
+        if (ganttEl.style.display !== 'none') renderGantt()
+      }
+    }
+  }
+
+  window._initGanttViewSwitcher = initGanttViewSwitcher
+  window.renderGantt = renderGantt
 })()

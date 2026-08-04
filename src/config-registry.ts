@@ -9,7 +9,13 @@
 // array is how a future setting becomes editable from the UI -- no route or
 // frontend change needed beyond what already reads the registry.
 
-export type SettingType = 'int' | 'string' | 'color'
+// The model a fresh install runs when DEFAULT_AGENT_MODEL is unset. Kept here
+// (a zero-import module) so the registry default and the boot-time constant in
+// config.ts cannot drift apart -- bumping the distribution default is a
+// one-line change in exactly one place.
+export const DISTRIBUTION_DEFAULT_AGENT_MODEL = 'claude-opus-4-8[1m]'
+
+export type SettingType = 'int' | 'string' | 'color' | 'boolean'
 
 export interface SettingDefinition {
   key: string
@@ -47,6 +53,17 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     min: 0,
     max: 100,
     description: 'Az "in_progress" oszlop WIP-limitje (max. kártyaszám). 0 = korlátlan.',
+    module: 'kanban',
+    secret: false,
+    requiresRestart: false,
+  },
+  {
+    key: 'KANBAN_WIP_TESTING',
+    type: 'int',
+    default: 0,
+    min: 0,
+    max: 100,
+    description: 'A "testing" oszlop WIP-limitje (max. kártyaszám). 0 = korlátlan.',
     module: 'kanban',
     secret: false,
     requiresRestart: false,
@@ -287,6 +304,27 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     requiresRestart: true,
   },
   {
+    key: 'HEARTBEAT_CALENDAR_ACCOUNT',
+    type: 'string',
+    default: '',
+    description: 'Google Calendar fiók neve/e-mailje a heartbeat naptár-összefoglalóhoz. Üresen hagyva a heartbeat nem kérdez le naptáreseményeket.',
+    module: 'heartbeat',
+    secret: false,
+    // Consumed as a boot-time const (src/config.ts) -- a saved override takes
+    // effect on the next restart, and the UI must say so.
+    requiresRestart: true,
+  },
+  {
+    key: 'HEARTBEAT_CALENDAR_ID',
+    type: 'string',
+    default: '',
+    description: 'Google Calendar naptár-azonosítója a heartbeat összefoglalóhoz (pl. primary). Üresen hagyva a heartbeat nem kérdez le naptáreseményeket.',
+    module: 'heartbeat',
+    secret: false,
+    // Boot-time const, see HEARTBEAT_CALENDAR_ACCOUNT above.
+    requiresRestart: true,
+  },
+  {
     key: 'IDEA_BREAKDOWN_MAX_SUBTASKS',
     type: 'int',
     default: 10,
@@ -343,6 +381,52 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     secret: false,
     requiresRestart: false,
   },
+  // --- Channels module ---
+  {
+    key: 'MAIN_AGENT_ISOLATED_CONFIG',
+    type: 'boolean',
+    default: '0',
+    description: 'Bármely platformon: a fő channels-agent kapjon-e saját, izolált CLAUDE_CONFIG_DIR-t (mint a sub-agentek). Bekapcsolva a fő agent a hosszú élettartamú fleet setup-tokenből (store/.claude-oauth-token) hitelesít, nem a megosztott, önmagát frissítő session-hitelesítésből (macOS: rotálódó Keychain OAuth-session; Linux: megosztott ~/.claude/.credentials.json) -- mindkettő periodikusan lejár, és a lejárt fájl a Claude Code precedencia miatt akkor is nyer az érvényes env-tokennel szemben, ha az élő token ott van mellette (2026-07-23 kiesés). Token hiányában no-op. A módosítás a channels session újraindításakor lép életbe.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: true,
+  },
+  {
+    key: 'MAIN_AGENT_CONFIG_DIR',
+    type: 'string',
+    default: '',
+    description: 'A fő channels-agent explicit CLAUDE_CONFIG_DIR-je (pl. ~/.claude-bot). Akkor kell, ha a botnak SAJÁT Claude-loginja van, külön a flottáétól: a MAIN_AGENT_ISOLATED_CONFIG erre nem alkalmas, mert az a fleet setup-tokenből hitelesít, tehát a flotta identitását adja a botnak (és token nélkül no-op). Üresen hagyva a fő agent a közös ~/.claude-ot használja (alapértelmezés). Ha a megadott könyvtár nem létezik, a beállítás no-op és figyelmeztetést logol. Elsőbbséget élvez a MAIN_AGENT_ISOLATED_CONFIG-gal szemben. A módosítás a channels session újraindításakor lép életbe.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: true,
+  },
+  // --- System module ---
+  {
+    key: 'SCHEDULER_TZ',
+    type: 'string',
+    default: '',
+    description: 'A telepítés időzónája (IANA, pl. Europe/Budapest). EGY zóna vezérli az ütemezést (cron) ÉS minden megjelenített időt (heartbeat, napi napló, memória-címkék). Üresen hagyva a gép saját időzónáját használja. A módosítás a szolgáltatás újraindításakor lép életbe.',
+    module: 'system',
+    secret: false,
+    requiresRestart: true,
+    valueSet: ['Europe/London', 'Europe/Budapest', 'UTC', 'Europe/Dublin', 'Europe/Berlin', 'Europe/Bucharest', 'America/New_York'],
+  },
+  {
+    key: 'DEFAULT_AGENT_MODEL',
+    type: 'string',
+    default: DISTRIBUTION_DEFAULT_AGENT_MODEL,
+    description: 'Az új ügynökök alapértelmezett modellje, egyben a háttér-worker sessionök modellje. Meglévő ügynökök NEM változnak: akinek az agent-config.json-jában konkrét modell van, az marad. A módosítás a szolgáltatás újraindításakor lép életbe.',
+    module: 'agents',
+    secret: false,
+    requiresRestart: true,
+    valueSet: [
+      'claude-opus-5',
+      'claude-sonnet-5',
+      'claude-fable-5',
+      'claude-opus-4-8[1m]',
+      'claude-haiku-4-5-20251001',
+    ],
+  },
 ]
 
 export function getSettingDefinition(key: string): SettingDefinition | undefined {
@@ -369,6 +453,16 @@ export function validateSettingValue(def: SettingDefinition, raw: unknown): Sett
       return { ok: false, error: `Érvénytelen érték. Megengedett: ${def.valueSet.join(', ')}` }
     }
     return { ok: true, value: str }
+  }
+
+  if (def.type === 'boolean') {
+    // Normalise any of true/false, 1/0, "1"/"0", "true"/"false" to the
+    // canonical "1"/"0" string so it round-trips through .env and the bash
+    // launcher (which compares against "1") identically.
+    const s = String(raw).trim().toLowerCase()
+    if (raw === true || s === '1' || s === 'true') return { ok: true, value: '1' }
+    if (raw === false || s === '0' || s === 'false' || s === '') return { ok: true, value: '0' }
+    return { ok: false, error: 'Logikai érték szükséges (be/ki).' }
   }
 
   if (def.type === 'int') {

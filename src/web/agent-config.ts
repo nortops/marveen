@@ -1,18 +1,32 @@
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
-import { PROJECT_ROOT, MAIN_AGENT_ID } from '../config.js'
+import { PROJECT_ROOT, MAIN_AGENT_ID, DEFAULT_AGENT_MODEL } from '../config.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { safeJoin } from './sanitize.js'
+import {
+  resolveAgentModelFromConfig,
+  validateModelProfileMap,
+  type AgentModelConfig,
+  type ModelProfileMapState,
+  type ModelResolution,
+} from '../model-profiles.js'
 
 export const AGENTS_BASE_DIR = join(PROJECT_ROOT, 'agents')
 
-export const DEFAULT_MODEL = 'claude-opus-4-8[1m]'
+// Install-wide default (DEFAULT_AGENT_MODEL: config-overrides.json > .env >
+// distribution default). Re-exported under the historical name so the many
+// call sites -- and the 'inherit' alias below -- keep working unchanged.
+export const DEFAULT_MODEL = DEFAULT_AGENT_MODEL
 
 // Map short model names to full Claude model IDs (backwards compat with old configs)
 export const MODEL_ALIASES: Record<string, string> = {
   'opus': 'claude-opus-4-8[1m]',
-  'sonnet': 'claude-sonnet-4-6',
+  'sonnet': 'claude-sonnet-5',
+  'sonnet-5': 'claude-sonnet-5',
+  'sonnet5': 'claude-sonnet-5',
+  'opus-5': 'claude-opus-5',
+  'opus5': 'claude-opus-5',
   'haiku': 'claude-haiku-4-5-20251001',
   'inherit': DEFAULT_MODEL,
 }
@@ -54,14 +68,68 @@ export function resolveModelId(raw: string): string {
   return MODEL_ALIASES[raw] || raw
 }
 
-export function readAgentModel(name: string): string {
-  const configPath = join(agentDir(name), 'agent-config.json')
+// ---- model-profile map (deployment-local, card c755f4b2 Block B) -------------
+//
+// store/ is gitignored, so the concrete profile -> model mapping never leaves
+// the machine. config-examples/model-profile-map.example.json documents the
+// shape. A missing map is FINE: every agent that names a concrete `model`
+// keeps working untouched, which is every agent today.
+const MODEL_PROFILE_MAP_PATH = join(PROJECT_ROOT, 'store', 'model-profile-map.json')
+
+let cachedProfileMap: { state: ModelProfileMapState; mtimeMs: number } | null = null
+
+export function readModelProfileMap(): ModelProfileMapState | null {
   try {
-    const config = JSON.parse(readFileOr(configPath, '{}'))
-    return resolveModelId(config.model || DEFAULT_MODEL)
+    if (!existsSync(MODEL_PROFILE_MAP_PATH)) return null
+    const mtimeMs = statSync(MODEL_PROFILE_MAP_PATH).mtimeMs
+    if (cachedProfileMap && cachedProfileMap.mtimeMs === mtimeMs) return cachedProfileMap.state
+    let state: ModelProfileMapState
+    try {
+      state = validateModelProfileMap(JSON.parse(readFileSync(MODEL_PROFILE_MAP_PATH, 'utf-8')))
+    } catch {
+      state = { ok: false, error: 'profile_map_unparseable' }
+    }
+    cachedProfileMap = { state, mtimeMs }
+    return state
   } catch {
-    return DEFAULT_MODEL
+    return { ok: false, error: 'profile_map_read_error' }
   }
+}
+
+export function invalidateModelProfileMapCache(): void {
+  cachedProfileMap = null
+}
+
+// Full resolution result, for callers that need to show or log WHY an agent is
+// on a given model (the /api/agents payload, the profile canary).
+export function resolveAgentModelDetailed(name: string): ModelResolution {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: AgentModelConfig
+  try {
+    config = JSON.parse(readFileOr(configPath, '{}')) as AgentModelConfig
+  } catch {
+    return { model: DEFAULT_MODEL, source: 'default' }
+  }
+  return resolveAgentModelFromConfig(config, readModelProfileMap(), DEFAULT_MODEL, resolveModelId)
+}
+
+// Unchanged contract: the concrete model id this agent runs on. For every
+// config that names a `model` -- which is all of them today -- this returns
+// byte-identically what it returned before Block B existed.
+export function readAgentModel(name: string): string {
+  return resolveAgentModelDetailed(name).model
+}
+
+// Card c755f4b2 Block B. Passing null REMOVES the key rather than writing a
+// null: an absent field and an explicit null must not become two ways of
+// saying the same thing in a config a human also edits by hand.
+export function writeAgentModelProfile(name: string, profile: string | null): void {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch { /* start fresh */ }
+  if (profile === null) delete config.modelProfile
+  else config.modelProfile = profile
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }
 
 export function writeAgentModel(name: string, model: string): void {
@@ -143,16 +211,18 @@ function hasParentTraversal(raw: string): boolean {
   return raw.split('/').some(segment => segment === '..')
 }
 
-export function resolveClaudeConfigDir(
-  rawConfigJson: string,
+// Expand + validate a raw config-dir string (already extracted from wherever
+// it was stored) against the launcher's shell-safety rules. Shared by the
+// per-agent `claudeConfigDir` resolver and the named-plan registry
+// (claude-plans.ts) so both feed the tmux launcher through the exact same
+// whitelist/traversal/tilde gauntlet -- there is only one place that decides
+// what is safe to inline into the launch command. Returns the absolute path,
+// or null when the value is blank/malformed/unsafe.
+export function expandAndValidateConfigDir(
+  rawValue: string,
   homeDir: string,
 ): string | null {
-  let config: unknown
-  try { config = JSON.parse(rawConfigJson) } catch { return null }
-  if (!config || typeof config !== 'object') return null
-  const value = (config as Record<string, unknown>).claudeConfigDir
-  if (typeof value !== 'string') return null
-  const raw = value.trim()
+  const raw = rawValue.trim()
   if (!raw) return null
   if (!CLAUDE_CONFIG_DIR_ALLOWED.test(raw)) return null
   if (hasParentTraversal(raw)) return null
@@ -177,6 +247,18 @@ export function resolveClaudeConfigDir(
   // launcher cmd. Reject rather than ship a broken export.
   if (!CLAUDE_CONFIG_DIR_ALLOWED.test(resolved)) return null
   return resolved
+}
+
+export function resolveClaudeConfigDir(
+  rawConfigJson: string,
+  homeDir: string,
+): string | null {
+  let config: unknown
+  try { config = JSON.parse(rawConfigJson) } catch { return null }
+  if (!config || typeof config !== 'object') return null
+  const value = (config as Record<string, unknown>).claudeConfigDir
+  if (typeof value !== 'string') return null
+  return expandAndValidateConfigDir(value, homeDir)
 }
 
 // Optional per-agent override for the Claude Code config directory. When set,
@@ -318,6 +400,31 @@ export function readAgentAuthMode(name: string): AuthMode {
   return 'shared'
 }
 
+// Opt-in per-agent auto-memory isolation (default OFF). When true, the
+// launcher plants a stub git root in the agent dir so Claude Code's
+// file-based auto-memory resolves to the agent's own project key instead of
+// the shared install-root key. See src/web/memory-boundary.ts for the full
+// mechanism and trade-offs. Absent/false = current shared behavior, unchanged.
+export function readAgentMemoryIsolation(name: string): boolean {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    return config.memoryIsolation === true
+  } catch { /* fall through */ }
+  return false
+}
+
+// Persist the opt-in memoryIsolation flag. `false` removes the key so the
+// config file stays minimal and the default-OFF semantics remain explicit.
+export function writeAgentMemoryIsolation(name: string, enabled: boolean): void {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  if (enabled) config.memoryIsolation = true
+  else delete config.memoryIsolation
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
 export function writeAgentAuthMode(name: string, mode: AuthMode): void {
   if (!VALID_AUTH_MODES.has(mode)) return
   const configPath = join(agentDir(name), 'agent-config.json')
@@ -332,6 +439,36 @@ export function writeAgentSecurityProfile(name: string, profileId: string): void
   let config: Record<string, unknown> = {}
   try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
   config.securityProfile = profileId
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
+// Optional per-agent named Claude subscription plan. Stores a registry id
+// (see claude-plans.ts) that resolves to a CLAUDE_CONFIG_DIR at launch. This
+// is the operator-facing, dashboard-selectable indirection over the raw
+// `claudeConfigDir` field: a plan bundles {configDir, planType, channelsAllowed}
+// under a stable id so many agents can share one login without repeating the
+// path. When unset (null), launch falls back to the raw claudeConfigDir and
+// then to Claude Code's default -- fully backwards-compatible.
+export function readAgentClaudePlan(name: string): string | null {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    const value = config.claudePlan
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  } catch { /* fall through */ }
+  return null
+}
+
+// Set (non-empty string) or clear (empty/whitespace) the per-agent plan id.
+// Clearing removes the key so the agent reverts to the raw-configDir/default
+// resolution path.
+export function writeAgentClaudePlan(name: string, planId: string): void {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  const trimmed = planId.trim()
+  if (trimmed) config.claudePlan = trimmed
+  else delete config.claudePlan
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }
 
@@ -359,6 +496,67 @@ export function listAgentNames(): string[] {
   })
 }
 
+// ---- per-agent voice config -----------------------------------------------
+
+export type VoiceResponseMode = 'text' | 'voice' | 'auto'
+
+export interface AgentVoiceConfig {
+  responseMode: VoiceResponseMode
+  voiceModel: string
+}
+
+// Canonical set of bundled voice model identifiers (basename without .onnx).
+// Extend here when new models are added to the installer.
+export const KNOWN_VOICE_MODELS = new Set<string>([
+  'hu_HU-imre-medium',
+  'hu_HU-anna-medium',
+])
+
+const VALID_RESPONSE_MODES = new Set<VoiceResponseMode>(['text', 'voice', 'auto'])
+
+export const DEFAULT_VOICE_CONFIG: AgentVoiceConfig = {
+  responseMode: 'text',
+  voiceModel: 'hu_HU-imre-medium',
+}
+
+export function readAgentVoiceConfig(name: string): AgentVoiceConfig {
+  const configPath = join(agentConfigRoot(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    const vc = (config.voice ?? {}) as Partial<AgentVoiceConfig>
+    return {
+      responseMode: VALID_RESPONSE_MODES.has(vc.responseMode as VoiceResponseMode)
+        ? (vc.responseMode as VoiceResponseMode)
+        : DEFAULT_VOICE_CONFIG.responseMode,
+      voiceModel: KNOWN_VOICE_MODELS.has(vc.voiceModel ?? '')
+        ? (vc.voiceModel as string)
+        : DEFAULT_VOICE_CONFIG.voiceModel,
+    }
+  } catch {
+    return { ...DEFAULT_VOICE_CONFIG }
+  }
+}
+
+export function writeAgentVoiceConfig(name: string, patch: Partial<AgentVoiceConfig>): void {
+  if (patch.responseMode !== undefined && !VALID_RESPONSE_MODES.has(patch.responseMode)) {
+    throw new Error(`Invalid responseMode: ${patch.responseMode}`)
+  }
+  if (patch.voiceModel !== undefined && !KNOWN_VOICE_MODELS.has(patch.voiceModel)) {
+    throw new Error(`Unknown voiceModel: ${patch.voiceModel}`)
+  }
+  const configPath = join(agentConfigRoot(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  const current = readAgentVoiceConfig(name)
+  config.voice = {
+    responseMode: patch.responseMode ?? current.responseMode,
+    voiceModel: patch.voiceModel ?? current.voiceModel,
+  }
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
+// ---- agent lookup ----------------------------------------------------------
+
 // Does this identifier refer to a registered agent? MAIN_AGENT_ID always
 // counts (it lives outside agents/ but is a first-class peer). Sub-agents
 // need a directory on disk. One fs stat per call -- the router calls this
@@ -373,4 +571,65 @@ export function isKnownAgent(name: string): boolean {
   } catch {
     return false
   }
+}
+
+// Parse YAML frontmatter capabilities from a persona file.
+// Expected format (first block in the file):
+//   ---
+//   capabilities: [tag1, tag2, tag3]
+//   ---
+// Returns [] if the file has no frontmatter or no capabilities key.
+function parsePersonaCapabilities(name: string): string[] {
+  const personaPath = join(PROJECT_ROOT, 'personas', `${name}.md`)
+  try {
+    const content = readFileSync(personaPath, 'utf-8')
+    const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/)
+    if (!fmMatch) return []
+    const lineMatch = fmMatch[1].match(/^capabilities:\s*\[([^\]]*)\]/m)
+    if (!lineMatch) return []
+    return lineMatch[1].split(',').map(s => s.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+// Capability resolution order (first match wins):
+//   1. agent-config.json "capabilities" field (runtime override via PUT API)
+//   2. personas/<name>.md YAML frontmatter "capabilities:" line (auto-derived)
+export function readAgentCapabilities(name: string): string[] {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    if (Array.isArray(config.capabilities)) return config.capabilities
+  } catch { /* fall through to persona */ }
+  return parsePersonaCapabilities(name)
+}
+
+export function writeAgentCapabilities(name: string, capabilities: string[]): void {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  config.capabilities = capabilities
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
+// ---- per-agent custom provider ---------------------------------------------
+
+export function readAgentCustomProvider(name: string): string | null {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    const value = config.customProvider
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  } catch { /* fall through */ }
+  return null
+}
+
+export function writeAgentCustomProvider(name: string, id: string | null): void {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  if (id && id.trim()) config.customProvider = id.trim()
+  else delete config.customProvider
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }

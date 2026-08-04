@@ -9,6 +9,7 @@ import {
   DB_FILENAME,
   PROJECT_ROOT,
   OWNER_NAME,
+  APP_TZ,
 } from './config.js'
 import { getHeartbeatKanbanSummary, getActiveScheduledTaskCount } from './db.js'
 import { getCalendarEvents, type CalendarEvent } from './google-api.js'
@@ -16,6 +17,7 @@ import { runAgent } from './agent.js'
 import { notifyTelegram } from './notify.js'
 import { logger } from './logger.js'
 import { wrapUntrusted, UNTRUSTED_PREAMBLE } from './prompt-safety.js'
+import { CHANNEL_PLUGIN_IDS } from './web/plugin-ids.js'
 
 // Isolation cwd for the heartbeat sub-agent. Keep this OUT of PROJECT_ROOT
 // so the @anthropic-ai/claude-agent-sdk-spawned headless claude does NOT
@@ -58,11 +60,7 @@ const HEARTBEAT_CONFIG_DIR = join(HEARTBEAT_AGENT_CWD, '.claude-config')
 // its own bun poller against the same bot token -> 409 Conflict -> Marveen
 // channel down by 09:02:45. Project-scope `enabledPlugins: false` overrides
 // the user-scope `true` per Claude Code settings precedence.
-const HEARTBEAT_DISABLED_PLUGINS = [
-  'telegram@claude-plugins-official',
-  'slack-channel@marveen-marketplace',
-  'discord@claude-plugins-official',
-] as const
+const HEARTBEAT_DISABLED_PLUGINS = Object.values(CHANNEL_PLUGIN_IDS)
 
 interface ClaudeSettings {
   enabledPlugins?: Record<string, boolean>
@@ -293,7 +291,7 @@ interface SystemInfo {
 interface HeartbeatData {
   timestamp: Date
   calendar: CalendarEvent[]
-  kanban: { urgent: number; in_progress: number; waiting: number; urgentTitles: string[]; waitingTitles: string[] }
+  kanban: { urgent: number; in_progress: number; waiting: number; urgentLabels: string[]; waitingLabels: string[] }
   system: SystemInfo
   tasks: { count: number; nextRun: number | null }
 }
@@ -311,6 +309,18 @@ async function collectCalendar(): Promise<CalendarEvent[]> {
   }
 }
 
+/** Label a card for the heartbeat prompt: `[ID] title`, title truncated.
+ * HBNAME1: the prompt used to carry bare titles, and because our titles
+ * routinely REFERENCE other cards by name, the summarizing model picked an
+ * id-looking token out of the wrong title ("urgent: 2 (INSTWIZ1, ...)" while
+ * the actual urgent card was 8290FF71). The bracketed id is the one
+ * authoritative handle; the truncation keeps cross-references out of view. */
+export function formatHeartbeatCardLabel(card: { id: string; title: string }): string {
+  const max = 80
+  const title = card.title.length > max ? card.title.slice(0, max) + '...' : card.title
+  return `[${card.id}] ${title}`
+}
+
 function collectKanban(): HeartbeatData['kanban'] {
   try {
     const summary = getHeartbeatKanbanSummary()
@@ -318,12 +328,12 @@ function collectKanban(): HeartbeatData['kanban'] {
       urgent: summary.urgent.length,
       in_progress: summary.in_progress.length,
       waiting: summary.waiting.length,
-      urgentTitles: summary.urgent.map((c) => c.title),
-      waitingTitles: summary.waiting.map((c) => c.title),
+      urgentLabels: summary.urgent.map(formatHeartbeatCardLabel),
+      waitingLabels: summary.waiting.map(formatHeartbeatCardLabel),
     }
   } catch (err) {
     logger.error({ err }, 'Heartbeat: kanban fetch failed')
-    return { urgent: 0, in_progress: 0, waiting: 0, urgentTitles: [], waitingTitles: [] }
+    return { urgent: 0, in_progress: 0, waiting: 0, urgentLabels: [], waitingLabels: [] }
   }
 }
 
@@ -379,7 +389,7 @@ function shouldNotify(data: HeartbeatData): boolean {
 // --- Agent prompt ---
 
 function buildAgentPrompt(data: HeartbeatData): string {
-  const timeStr = data.timestamp.toLocaleString('hu-HU', { timeZone: 'Europe/Budapest' })
+  const timeStr = data.timestamp.toLocaleString('hu-HU', { timeZone: APP_TZ })
 
   // Preamble first so the <untrusted> tag convention is established before any
   // attacker-controlled strings (calendar/kanban/email titles) appear.
@@ -397,7 +407,7 @@ function buildAgentPrompt(data: HeartbeatData): string {
   } else {
     for (const ev of data.calendar) {
       const start = ev.start?.dateTime
-        ? new Date(ev.start.dateTime).toLocaleTimeString('hu-HU', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Budapest' })
+        ? new Date(ev.start.dateTime).toLocaleTimeString('hu-HU', { hour: '2-digit', minute: '2-digit', timeZone: APP_TZ })
         : 'egesz napos'
       const attendeesRaw = ev.attendees?.map((a) => a.displayName || a.email).join(', ') || '-'
       const summaryWrapped = wrapUntrusted('gcal-event-summary', ev.summary ?? '(cim nelkul)')
@@ -410,15 +420,16 @@ function buildAgentPrompt(data: HeartbeatData): string {
   // Kanban -- card titles are operator-authored today, but a future Kanban-sync
   // integration could bring them from third parties. Wrap defensively.
   prompt += `## Kanban\n`
+  prompt += `A kanban-sor KESZ TENYLISTA: kartyat KIZAROLAG a szogletes zarojeles ID-javal nevezz meg (a cimben mas kartyak nevei is szerepelhetnek, azok NEM azonositok). CSAK jelentsd a listat -- valtozast ne magyarazz, eltunt tetelre okot ne kovetkeztess: amit az adat nem mond ki, azt nem tudhatod.\n`
   prompt += `- In Progress: ${data.kanban.in_progress}\n`
   prompt += `- Urgent: ${data.kanban.urgent}`
-  if (data.kanban.urgentTitles.length > 0) {
-    prompt += ` ${wrapUntrusted('kanban-urgent-titles', data.kanban.urgentTitles.join(', '))}`
+  if (data.kanban.urgentLabels.length > 0) {
+    prompt += ` ${wrapUntrusted('kanban-urgent-titles', data.kanban.urgentLabels.join(', '))}`
   }
   prompt += '\n'
   prompt += `- Waiting: ${data.kanban.waiting}`
-  if (data.kanban.waitingTitles.length > 0) {
-    prompt += ` ${wrapUntrusted('kanban-waiting-titles', data.kanban.waitingTitles.join(', '))}`
+  if (data.kanban.waitingLabels.length > 0) {
+    prompt += ` ${wrapUntrusted('kanban-waiting-titles', data.kanban.waitingLabels.join(', '))}`
   }
   prompt += '\n\n'
 
@@ -428,7 +439,7 @@ function buildAgentPrompt(data: HeartbeatData): string {
   prompt += `- Aktiv utemezett feladatok: ${data.tasks.count}\n`
   if (data.tasks.nextRun) {
     const nextDate = new Date(data.tasks.nextRun * 1000)
-    prompt += `- Kovetkezo feladat: ${nextDate.toLocaleString('hu-HU', { timeZone: 'Europe/Budapest' })}\n`
+    prompt += `- Kovetkezo feladat: ${nextDate.toLocaleString('hu-HU', { timeZone: APP_TZ })}\n`
   }
 
   return prompt
@@ -542,8 +553,8 @@ function scheduleNext(delayMs: number): void {
     const nextDelayMs = msUntilNextHeartbeat()
     const nextRun = new Date(Date.now() + nextDelayMs)
     logger.info(
-      { nextRun: nextRun.toLocaleString('hu-HU', { timeZone: 'Europe/Budapest' }) },
-      `Heartbeat kovetkezo: ${nextRun.toLocaleTimeString('hu-HU', { timeZone: 'Europe/Budapest' })}`
+      { nextRun: nextRun.toLocaleString('hu-HU', { timeZone: APP_TZ }) },
+      `Heartbeat kovetkezo: ${nextRun.toLocaleTimeString('hu-HU', { timeZone: APP_TZ })}`
     )
     scheduleNext(nextDelayMs)
   }, delayMs)
@@ -553,8 +564,8 @@ export function initHeartbeat(): void {
   const delayMs = msUntilNextHeartbeat()
   const nextRun = new Date(Date.now() + delayMs)
   logger.info(
-    { nextRun: nextRun.toLocaleString('hu-HU', { timeZone: 'Europe/Budapest' }) },
-    `Heartbeat utemezve (kovetkezo: ${nextRun.toLocaleTimeString('hu-HU', { timeZone: 'Europe/Budapest' })})`
+    { nextRun: nextRun.toLocaleString('hu-HU', { timeZone: APP_TZ }) },
+    `Heartbeat utemezve (kovetkezo: ${nextRun.toLocaleTimeString('hu-HU', { timeZone: APP_TZ })})`
   )
   scheduleNext(delayMs)
 }

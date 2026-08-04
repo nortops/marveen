@@ -1,12 +1,18 @@
-import { existsSync, readFileSync, mkdirSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync, copyFileSync, renameSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync, copyFileSync, renameSync } from 'node:fs'
 import { join, extname, dirname } from 'node:path'
-import { homedir, platform } from 'node:os'
+import { homedir, platform, tmpdir } from 'node:os'
 import { execSync } from 'node:child_process'
 import { logger } from '../../logger.js'
-import { MAIN_AGENT_ID, BOT_NAME, PROJECT_ROOT } from '../../config.js'
-import { createAgentMessage, listPendingChannelRequests, updateChannelRequestStatus, getDb } from '../../db.js'
+import { isModelProfileId, MODEL_PROFILE_IDS } from '../../model-profiles.js'
+import { MAIN_AGENT_ID, currentBotName, PROJECT_ROOT } from '../../config.js'
+import { createAgentMessage, listPendingChannelRequests, updateChannelRequestStatus, getDb, claimPendingForAgent, markMessageFailed } from '../../db.js'
+import { classifyAgentMessage, wrapAgentMessageForDelivery } from '../agent-message-wrap.js'
+import { ensureFederationClaudeMdSection } from '../federation/onboarding.js'
 import { atomicWriteFileSync } from '../atomic-write.js'
+import { CHANNEL_PLUGIN_IDS } from '../plugin-ids.js'
 import { getSecret, setSecret, deleteSecret, listSecrets } from '../vault.js'
+import { loadOpenRouterCatalog, fetchAllOpenRouterModels, loadCuratedManual, addCuratedManual, removeCuratedManual } from '../openrouter-models.js'
+import { listCustomProviders } from '../custom-providers.js'
 import {
   agentDir,
   agentConfigRoot,
@@ -16,6 +22,9 @@ import {
   findAvatarForAgent,
   resolveModelId,
   readAgentModel,
+  resolveAgentModelDetailed,
+  readModelProfileMap,
+  writeAgentModelProfile,
   writeAgentModel,
   readAgentDisplayName,
   writeAgentDisplayName,
@@ -27,23 +36,35 @@ import {
   writeAgentChannelProvider,
   readAgentAuthMode,
   writeAgentAuthMode,
+  readAgentClaudePlan,
+  writeAgentClaudePlan,
+  readAgentMemoryIsolation,
+  writeAgentMemoryIsolation,
   readAgentClaudeConfigDir,
   readAgentRemoteConfig,
   readAgentRemoteHost,
   writeAgentRemoteConfig,
+  readAgentVoiceConfig,
+  writeAgentVoiceConfig,
+  KNOWN_VOICE_MODELS,
+  readAgentCustomProvider,
+  writeAgentCustomProvider,
   type AuthMode,
 } from '../agent-config.js'
+import { readClaudePlans, resolveAgentConfigDir } from '../claude-plans.js'
 import {
   readAgentTeam,
   writeAgentTeam,
   sanitizeTeamConfig,
   cleanupTeamReferences,
+  reportsToCreatesCycle,
   type TeamConfig,
 } from '../agent-team.js'
 import {
   readAgentTelegramConfig,
   readAgentDiscordConfig,
   readAgentGooglechatConfig,
+  readAgentTeamsConfig,
   readMarveenTelegramConfig,
   sendAvatarChangeMessage,
   sendWelcomeMessage,
@@ -88,9 +109,12 @@ import { addDesiredAgent, removeDesiredAgent } from '../agent-desired-state.js'
 import { RemoteStatusCache } from '../remote-status-cache.js'
 import type { AgentRunState } from '../ssh-tmux.js'
 import { readActiveModelFromProjectDir, readContextTokensFromProjectDir } from '../active-model.js'
-import { detectPaneState } from '../../pane-state.js'
+import { detectPaneState, detectPermissionMode } from '../../pane-state.js'
+import { checkAgentPutFields, AGENT_PUT_WRITABLE_FIELDS } from '../agent-put-fields.js'
 import { detectReauthNeeded } from '../reauth-detect.js'
 import { readAutoRestartConfig, writeAutoRestartConfig } from '../auto-restart-store.js'
+import { readContextGuardConfig, writeContextGuardConfig } from '../context-guard-store.js'
+import { getContextGuardStatus } from '../context-guard-runner.js'
 import type { AutoRestartConfig } from '../../auto-restart.js'
 import { setStoreWriteActor } from '../../store-watcher.js'
 import { attemptChannelMcpReconnect } from '../channel-mcp-reconnect.js'
@@ -99,15 +123,24 @@ import {
   loadProfileTemplate,
   resolveProfilePlaceholders,
 } from '../profiles.js'
-import { sanitizeAgentName } from '../sanitize.js'
+import { sanitizeAgentName, safeJoin } from '../sanitize.js'
 import { parseMultipart } from '../multipart.js'
-import { readBody, json, serveFile } from '../http-helpers.js'
+import { readBody, json, jsonMaybeGzip, serveFile } from '../http-helpers.js'
+import {
+  exportAgentBundle,
+  importAgentBundle,
+  exportAllAgentsBundle,
+  importAllAgentsBundle,
+  peekBundleKind,
+  bundleFilename,
+  fleetBundleFilename,
+} from '../agent-bundle.js'
 import type { RouteContext } from './types.js'
 import { suggestForAgent, type AgentSignals } from '../model-suggest.js'
 import { getTokenSummary } from '../token-usage.js'
 import { listScheduledTasks } from '../scheduled-tasks-io.js'
 
-const VALID_PROVIDERS = new Set<ChannelProviderType>(['telegram', 'slack', 'discord', 'googlechat'])
+const VALID_PROVIDERS = new Set<ChannelProviderType>(['telegram', 'slack', 'discord', 'googlechat', 'teams'])
 
 // Short-TTL caches so the synchronous, frequently-polled status endpoints
 // (`/api/agents` on load, `/api/agents/activity` every 3s) don't issue a fresh
@@ -144,7 +177,7 @@ function parseChannelProvider(raw: string): ChannelProviderType | null {
 // Match both new /channels/:provider/ and legacy /telegram/ URL patterns.
 // Returns [agentName, provider] or null. Legacy routes always resolve to 'telegram'.
 function matchChannelRoute(path: string, suffix: string): [string, ChannelProviderType] | null {
-  const newPattern = new RegExp(`^/api/agents/([^/]+)/channels/(telegram|slack|discord|googlechat)${suffix}$`)
+  const newPattern = new RegExp(`^/api/agents/([^/]+)/channels/(telegram|slack|discord|googlechat|teams)${suffix}$`)
   const newMatch = path.match(newPattern)
   if (newMatch) {
     const provider = parseChannelProvider(newMatch[2])
@@ -221,13 +254,7 @@ export function setAgentEnabledPlugins(name: string, provider: ChannelProviderTy
     try { existing = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { /* overwrite */ }
   }
   const plugins = (existing.enabledPlugins ?? {}) as Record<string, boolean>
-  const allPlugins: Record<ChannelProviderType, string> = {
-    telegram: 'telegram@claude-plugins-official',
-    slack: 'slack-channel@marveen-marketplace',
-    discord: 'discord@claude-plugins-official',
-    googlechat: 'googlechat@claude-channel-googlechat',
-  }
-  for (const [p, pluginKey] of Object.entries(allPlugins)) {
+  for (const [p, pluginKey] of Object.entries(CHANNEL_PLUGIN_IDS)) {
     plugins[pluginKey] = p === provider
   }
   existing.enabledPlugins = plugins
@@ -295,16 +322,27 @@ interface AgentSummary {
   name: string
   displayName: string
   description: string
+  /** The concrete model id this agent resolves to. Unchanged meaning: for a
+   *  config that names a `model`, this is exactly what it always was. */
   model: string
+  /** Card c755f4b2 Block B: how `model` was arrived at. Metadata only -- it
+   *  reports the existing resolution, it does not change it. */
+  modelProfile: string | null
+  modelSource: 'explicit_model' | 'model_profile' | 'default'
+  modelProfileError: string | null
   activeModel: string | null
   runningSince: number | null
   authMode: AuthMode
   securityProfile: string
+  /** Named Claude subscription plan id (see claude-plans.ts), or null when the
+   *  agent uses the raw claudeConfigDir / default resolution. */
+  claudePlan: string | null
   team: TeamConfig
   hasTelegram: boolean
   telegramBotUsername?: string
   hasDiscord: boolean
   hasGooglechat: boolean
+  hasTeams: boolean
   status: 'configured' | 'draft'
   running: boolean
   /** Tri-state: 'running' | 'stopped' | 'unreachable' (remote ssh failure). */
@@ -325,6 +363,8 @@ interface AgentSummary {
 }
 
 interface AgentDetail extends AgentSummary {
+  memoryIsolation: boolean
+  customProvider: string | null
   claudeMd: string
   soulMd: string
   mcpJson: string
@@ -341,8 +381,14 @@ function getAgentSummary(name: string): AgentSummary {
   const tg = readAgentTelegramConfig(name)
   const dc = readAgentDiscordConfig(name)
   const gc = readAgentGooglechatConfig(name)
+  const tc = readAgentTeamsConfig(name)
   const hasClaudeMd = claudeMd.trim().length > 0
   const hasSoulMd = soulMd.trim().length > 0
+  // Card c755f4b2 Block B: resolve once and report both the answer and how it
+  // was reached, so "configured" and "resolved" are never conflated in the API.
+  let agentModelConfig: { model?: unknown; modelProfile?: unknown } = {}
+  try { agentModelConfig = JSON.parse(readFileOr(join(dir, 'agent-config.json'), '{}')) } catch { /* defaults */ }
+  const modelResolution = resolveAgentModelDetailed(name)
 
   // Resolve run state through the cache (remote agents) so listing the fleet
   // never blocks on a sleeping laptop's ssh timeout. `running` is derived from
@@ -362,16 +408,21 @@ function getAgentSummary(name: string): AgentSummary {
     name,
     displayName: readAgentDisplayName(name),
     description: extractDescriptionFromClaudeMd(claudeMd),
-    model: readAgentModel(name),
-    activeModel: running ? readActiveModelFromProjectDir(dir, runningSince ?? undefined, readAgentClaudeConfigDir(name) ?? undefined) : null,
+    model: modelResolution.model,
+    modelProfile: typeof agentModelConfig.modelProfile === 'string' ? agentModelConfig.modelProfile : null,
+    modelSource: modelResolution.source,
+    modelProfileError: modelResolution.error ?? null,
+    activeModel: running ? readActiveModelFromProjectDir(dir, runningSince ?? undefined, resolveAgentConfigDir(name).configDir ?? undefined) : null,
     runningSince,
     authMode: readAgentAuthMode(name),
     securityProfile: readAgentSecurityProfile(name),
+    claudePlan: readAgentClaudePlan(name),
     team: readAgentTeam(name),
     hasTelegram: tg.hasTelegram,
     telegramBotUsername: tg.botUsername,
     hasDiscord: dc.hasDiscord,
     hasGooglechat: gc.hasGooglechat,
+    hasTeams: tc.hasTeams,
     status: hasClaudeMd && hasSoulMd ? 'configured' : 'draft',
     running,
     runState,
@@ -380,7 +431,7 @@ function getAgentSummary(name: string): AgentSummary {
     session,
     hasAvatar: findAvatarForAgent(name) !== null,
     autoRestart: readAutoRestartConfig(name),
-    contextTokens: running ? readContextTokensFromProjectDir(dir, readAgentClaudeConfigDir(name) ?? undefined) : null,
+    contextTokens: running ? readContextTokensFromProjectDir(dir, resolveAgentConfigDir(name).configDir ?? undefined) : null,
     needsReauth: reauth.needsReauth,
     reauthReason: reauth.reason,
   }
@@ -409,6 +460,8 @@ function getAgentDetail(name: string): AgentDetail {
 
   return {
     ...summary,
+    memoryIsolation: readAgentMemoryIsolation(name),
+    customProvider: readAgentCustomProvider(name),
     claudeMd,
     soulMd,
     mcpJson,
@@ -422,6 +475,11 @@ function listAgentSummaries(): AgentSummary[] {
   return listAgentNames().map(getAgentSummary)
 }
 
+// Max inter-agent messages a single main-agent inbox drain returns. The rest
+// stay pending (FIFO) for the next turn's drain -- bounds the context a single
+// turn absorbs, mirroring the router's MAX_MESSAGES_PER_TICK.
+const INBOX_DRAIN_CAP = 10
+
 export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promise<boolean> {
   const { req, res, path, method } = ctx
 
@@ -429,15 +487,27 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   // Claude IDs are static. DeepSeek is gated behind a vault secret because
   // the agent-process launcher reads the key from there at start time --
   // surfacing the option in the UI without the key would let the operator
-  // pick a model that 401s on first prompt. The frontend renders this list
-  // both in the "new agent" wizard and the agent edit panel.
+  // pick a model that 401s on first prompt.
+  //
+  // NOTE: loadAvailableModels() in web/app.js consumes only `deepseek` and
+  // `openrouter` from this payload -- the Claude options are static <option>
+  // elements in web/index.html (wizard + edit panel). The `claude` array is
+  // therefore an API-only listing today; keep it in sync with those options so
+  // a client that does read it (or a future refactor that drops the static
+  // markup) does not silently offer a stale set.
   if (path === '/api/models/available' && method === 'GET') {
     const hasDeepseek = getSecret('DEEPSEEK_API_KEY') !== null
+    // OpenRouter is gated behind the vault key, same as DeepSeek: surfacing the
+    // options without the key would let the operator pick a model that 401s.
+    const hasOpenRouter = getSecret('openrouter-fleet-key') !== null
+    const orCatalog = loadOpenRouterCatalog()
     json(res, {
       claude: [
-        { id: 'claude-fable-5', label: 'Fable 5 (legújabb)' },
-        { id: 'claude-opus-4-8[1m]', label: 'Opus 4.8 (1M kontextus, alapértelmezett)' },
+        { id: 'claude-opus-5', label: 'Opus 5 (legújabb Opus)' },
+        { id: 'claude-sonnet-5', label: 'Sonnet 5' },
         { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
+        { id: 'claude-fable-5', label: 'Fable 5' },
+        { id: 'claude-opus-4-8[1m]', label: 'Opus 4.8 (1M kontextus)' },
         { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5 (leggyorsabb)' },
       ],
       deepseek: hasDeepseek
@@ -447,12 +517,84 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
           ]
         : [],
       deepseekConfigured: hasDeepseek,
+      // OpenRouter tiers for the model picker. `auto` per tier feeds the "Auto"
+      // mode (stored as `openrouter-auto:<tierKey>`, resolved weekly-fresh at
+      // launch); `manual` (2 ids) feeds the "Manual" mode.
+      openrouter: hasOpenRouter
+        ? {
+            updated: orCatalog.updated,
+            tiers: orCatalog.tiers.map(t => ({
+              key: t.key,
+              label: t.label,
+              autoId: `openrouter-auto:${t.key}`,
+              auto: t.auto,
+              manual: t.manual,
+            })),
+          }
+        : null,
+      // User-curated manual models (ticked in the main agent's browse popup).
+      // Feeds the "OpenRouter - kézi" optgroup in every agent's model dropdown.
+      openrouterManual: hasOpenRouter ? loadCuratedManual() : [],
+      openrouterConfigured: hasOpenRouter,
+      // Custom Anthropic-compatible providers defined in store/custom-providers.json.
+      customProviders: listCustomProviders(),
     })
     return true
   }
 
+  // Curated manual-model list read/toggle. Curation is main-agent-only in the UI
+  // (the browse popup is hidden for sub-agents), but the API just gates on the
+  // vault key; the ticked set is shared across all agents' dropdowns.
+  if (path === '/api/openrouter/manual' && method === 'GET') {
+    if (getSecret('openrouter-fleet-key') === null) {
+      json(res, { error: 'OpenRouter not configured' }, 403)
+      return true
+    }
+    json(res, { models: loadCuratedManual() })
+    return true
+  }
+  if (path === '/api/openrouter/manual' && method === 'POST') {
+    if (getSecret('openrouter-fleet-key') === null) {
+      json(res, { error: 'OpenRouter not configured' }, 403)
+      return true
+    }
+    const body = await readBody(req)
+    const { id, name, checked } = JSON.parse(body.toString()) as { id?: string; name?: string; checked?: boolean }
+    if (!id || typeof id !== 'string') { json(res, { error: 'id is required' }, 400); return true }
+    const models = checked ? addCuratedManual(id, name || id) : removeCuratedManual(id)
+    json(res, { ok: true, models })
+    return true
+  }
+
+  // Full OpenRouter model list for the manual "browse all" picker popup.
+  // Gated behind the vault key like the tier group. The upstream /models list
+  // is public; the module caches it for 6h.
+  if (path === '/api/openrouter/models' && method === 'GET') {
+    if (getSecret('openrouter-fleet-key') === null) {
+      json(res, { error: 'OpenRouter not configured' }, 403)
+      return true
+    }
+    try {
+      const models = await fetchAllOpenRouterModels(Date.now())
+      json(res, { models })
+    } catch (err) {
+      logger.warn({ err }, 'openrouter models list fetch failed')
+      json(res, { error: 'Could not fetch OpenRouter models' }, 502)
+    }
+    return true
+  }
+
   if (path === '/api/agents' && method === 'GET') {
-    json(res, listAgentSummaries())
+    jsonMaybeGzip(req, res, listAgentSummaries())
+    return true
+  }
+
+  // Named Claude subscription registry (store/claude-plans.json), resolved +
+  // validated. Feeds the per-agent plan dropdown; empty array when no registry
+  // file exists (opt-in feature). Read-only in PR1 -- editing the registry is a
+  // separate surface.
+  if (path === '/api/claude-plans' && method === 'GET') {
+    json(res, readClaudePlans())
     return true
   }
 
@@ -480,7 +622,15 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
             .filter(l => l.trim().length > 0)
             .slice(-8)
 
-    const entries: Array<{ name: string; isMain: boolean; running: boolean; state: string; tail: string[] }> = []
+    // The permission mode the agent is sitting in. Every mode counts as idle
+    // for delivery, so `state` alone cannot distinguish "working normally" from
+    // "will stop at its first tool call waiting for an approval nobody is
+    // watching for" -- an agent spent hours in the second case on 2026-07-27
+    // while the dashboard showed it as perfectly idle.
+    const modeOf = (running: boolean, pane: string | null): string | null =>
+      running && pane !== null ? detectPermissionMode(pane) : null
+
+    const entries: Array<{ name: string; isMain: boolean; running: boolean; state: string; mode: string | null; tail: string[] }> = []
 
     // Main agent runs in the --channels session, not agent-<name>.
     {
@@ -491,6 +641,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
         isMain: true,
         running,
         state: label(running, mainPane),
+        mode: modeOf(running, mainPane),
         tail: tailOf(mainPane),
       })
     }
@@ -508,10 +659,10 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
           : capturePane(agentSessionName(name))
       }
       const state = runState === 'unreachable' ? 'unreachable' : label(running, pane)
-      entries.push({ name, isMain: false, running, state, tail: tailOf(pane) })
+      entries.push({ name, isMain: false, running, state, mode: modeOf(running, pane), tail: tailOf(pane) })
     }
 
-    json(res, entries)
+    jsonMaybeGzip(req, res, entries)
     return true
   }
 
@@ -696,7 +847,8 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   if (avatarUploadMatch && method === 'GET') {
     const name = decodeURIComponent(avatarUploadMatch[1])
     const avatarPath = findAvatarForAgent(name)
-    if (avatarPath) { serveFile(req, res, avatarPath); return true }
+    // 1h client cache: see /api/marveen/avatar for the staleness trade-off.
+    if (avatarPath) { serveFile(req, res, avatarPath, { cacheSeconds: 3600 }); return true }
     res.writeHead(404); res.end()
     return true
   }
@@ -994,6 +1146,33 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     return true
   }
 
+  // GET/PUT /api/agents/:name/context-guard -- per-agent context-guard config
+  // (kanban #81). Default-off (opt-in): a GET for an agent with no store entry
+  // returns the disabled defaults. PUT normalizes server-side like auto-restart.
+  const contextGuardMatch = path.match(/^\/api\/agents\/([^/]+)\/context-guard$/)
+  if (contextGuardMatch && (method === 'GET' || method === 'PUT')) {
+    const name = decodeURIComponent(contextGuardMatch[1])
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    if (method === 'GET') {
+      json(res, { ok: true, contextGuard: readContextGuardConfig(name) })
+      return true
+    }
+    const body = await readBody(req)
+    let data: unknown
+    try { data = JSON.parse(body.toString()) } catch { json(res, { error: 'invalid JSON' }, 400); return true }
+    setStoreWriteActor('dashboard')
+    const saved = writeContextGuardConfig(name, data)
+    json(res, { ok: true, contextGuard: saved })
+    return true
+  }
+
+  // GET /api/context-guard -- live guard status (phase + measured context pct)
+  // for every agent, main included.
+  if (path === '/api/context-guard' && method === 'GET') {
+    json(res, { ok: true, agents: getContextGuardStatus() })
+    return true
+  }
+
   // PUT /api/agents/:name/remote -- set or clear the remote host + workdir that
   // makes this agent's tmux session run on another machine over ssh. Empty
   // strings clear the fields (revert to local). The main agent is always local.
@@ -1026,7 +1205,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     }> = []
     nodes.push({
       id: MAIN_AGENT_ID,
-      label: BOT_NAME,
+      label: currentBotName(),
       role: 'main',
       reportsTo: null,
       delegatesTo: [],
@@ -1052,7 +1231,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
         : (n.id === MAIN_AGENT_ID ? null : MAIN_AGENT_ID)
       if (reports) edges.push({ from: reports, to: n.id })
     }
-    json(res, { nodes, edges, mainAgentId: MAIN_AGENT_ID })
+    jsonMaybeGzip(req, res, { nodes, edges, mainAgentId: MAIN_AGENT_ID })
     return true
   }
 
@@ -1083,9 +1262,21 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
         ? data.trustFrom.filter((x: unknown) => typeof x === 'string')
         : (current.trustFrom ?? []),
     }
+    // Reject a reportsTo that would create a reporting cycle (e.g. dragging a
+    // manager under its own report in the Team graph). Keep the current parent
+    // and flag it so the UI can explain why the drop was ignored.
+    let cycleRejected = false
+    if (
+      proposed.reportsTo &&
+      proposed.reportsTo !== current.reportsTo &&
+      reportsToCreatesCycle(name, proposed.reportsTo, readAgentTeam, MAIN_AGENT_ID)
+    ) {
+      proposed.reportsTo = current.reportsTo
+      cycleRejected = true
+    }
     const { team: next, warnings } = sanitizeTeamConfig(name, proposed)
     writeAgentTeam(name, next)
-    json(res, { ok: true, team: next, warnings })
+    json(res, { ok: true, team: next, warnings, cycleRejected })
     return true
   }
 
@@ -1155,7 +1346,11 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
 
       const approvedDir = join(chDir, 'approved')
       mkdirSync(approvedDir, { recursive: true })
-      writeFileSync(join(approvedDir, entry.senderId), '')
+      // Marker contents = chatId, per the plugin's /telegram:access pair
+      // contract (the channel server polls approved/ to send the "Paired!"
+      // confirmation; current server keys off the filename, the chatId
+      // contents keep us aligned with the documented format).
+      writeFileSync(join(approvedDir, entry.senderId), String(entry.chatId ?? ''))
 
       logger.info({ name, provider, senderId: entry.senderId, code }, 'Channel pairing approved')
       json(res, { ok: true, senderId: entry.senderId })
@@ -1288,8 +1483,12 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       const access = JSON.parse(readFileOr(accessPath, '{}'))
       if (kind === 'user') {
         access.allowFrom = (access.allowFrom || []).filter((s: string) => s !== id)
-        const approvedFile = join(chDir, 'approved', id)
-        try { if (existsSync(approvedFile)) unlinkSync(approvedFile) } catch { /* ignore */ }
+        // safeJoin blocks a traversal id (e.g. "..%2F..%2Ftmp%2Fvictim") from
+        // escaping the approved/ dir into an arbitrary unlinkSync target.
+        try {
+          const approvedFile = safeJoin(join(chDir, 'approved'), id)
+          if (existsSync(approvedFile)) unlinkSync(approvedFile)
+        } catch { /* ignore missing file or rejected traversal */ }
       } else {
         if (access.groups) delete access.groups[id]
       }
@@ -1385,7 +1584,7 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     const session = agentSessionName(name)
     const host = readAgentRemoteHost(name)
     try {
-      sendPromptToSession(session, '/login', host)
+      await sendPromptToSession(session, '/login', host)
       // Wait for Claude Code to render the auth URL (typically 3-6s)
       let authUrl: string | null = null
       for (let i = 0; i < 12; i++) {
@@ -1415,8 +1614,17 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   const startMatch = path.match(/^\/api\/agents\/([^/]+)\/start$/)
   if (startMatch && method === 'POST') {
     const name = decodeURIComponent(startMatch[1])
+    if (isMainChannelsAgent(name)) {
+      json(res, { error: 'Main agent lifecycle is service-managed; use /api/marveen/restart for recovery' }, 400)
+      return true
+    }
     if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
-    const result = startAgentProcess(name)
+    // Optional { "fresh": true } body -> no `--continue`. Required for channel
+    // agents on Claude Code 2.1.193, where a `--continue` resume does not load
+    // the --channels plugin MCP server (agent comes up deaf).
+    let startFresh = false
+    try { startFresh = JSON.parse((await readBody(req)).toString() || '{}').fresh === true } catch {}
+    const result = startAgentProcess(name, { fresh: startFresh })
     // Record operator intent so the monitor keeps this agent up across shared
     // tmux-server restarts / reboots (see agent-desired-state.ts).
     if (result.ok || result.error === 'Agent is already running') addDesiredAgent(name)
@@ -1428,11 +1636,52 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   const stopMatch = path.match(/^\/api\/agents\/([^/]+)\/stop$/)
   if (stopMatch && method === 'POST') {
     const name = decodeURIComponent(stopMatch[1])
+    if (isMainChannelsAgent(name)) {
+      json(res, { error: 'Main agent lifecycle is service-managed; use /api/marveen/restart for recovery' }, 400)
+      return true
+    }
     const result = stopAgentProcess(name)
     // Explicit stop clears intent so the monitor will not resurrect it.
     removeDesiredAgent(name)
     if (result.ok) { json(res, { ok: true }); return true }
     json(res, { error: result.error }, 400)
+    return true
+  }
+
+  // Main-agent inbox PULL (drain-inbox): atomically CLAIM the main agent's
+  // pending inter-agent messages and return them already WRAPPED (single-source
+  // security framing via agent-message-wrap), for the UserPromptSubmit hook to
+  // print into the agent's context. The router skips main-agent tmux delivery,
+  // so this is the SOLE delivery path for the main agent -- which is why it is
+  // restricted to the main agent (serving a sub-agent here would double-deliver
+  // alongside the router's still-active tmux push). Auth is the global /api
+  // bearer gate. One quick claim+wrap per turn (NOT a hot loop -> not the #498
+  // self-HTTP event-loop hazard).
+  const drainMatch = path.match(/^\/api\/agents\/([^/]+)\/drain-inbox$/)
+  if (drainMatch && method === 'POST') {
+    const name = decodeURIComponent(drainMatch[1])
+    if (name !== MAIN_AGENT_ID) {
+      json(res, { error: 'drain-inbox is main-agent only (sub-agents use the router push path)' }, 400)
+      return true
+    }
+    const claimed = claimPendingForAgent(name, INBOX_DRAIN_CAP)
+    const blocks: string[] = []
+    for (const msg of claimed) {
+      const cls = classifyAgentMessage(msg.from_agent, msg.to_agent)
+      if (!cls) {
+        // The claim already flipped the row to 'delivered'; a silent skip
+        // here is invisible message loss (delivered in the DB, never shown
+        // to the agent, no log, no retry). Surface it like the router does.
+        logger.warn({ id: msg.id, rawFrom: msg.from_agent }, 'drain-inbox: message rejected, from_agent cannot be framed safely')
+        if (!markMessageFailed(msg.id, 'Invalid or empty from_agent')) {
+          logger.warn({ id: msg.id }, 'markMessageFailed affected 0 rows (deleted concurrently?)')
+        }
+        continue
+      }
+      const { prefix, wrapped } = wrapAgentMessageForDelivery(cls.category, cls.safeFrom, msg.from_agent, msg.content, msg.id, msg.origin_note)
+      blocks.push(prefix + wrapped)
+    }
+    json(res, { count: blocks.length, text: blocks.join('\n\n') })
     return true
   }
 
@@ -1451,7 +1700,10 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       return true
     }
     if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
-    const result = restartAgentProcess(name)
+    // Optional { "fresh": true } body -> no `--continue` (see /start note).
+    let restartFresh = false
+    try { restartFresh = JSON.parse((await readBody(req)).toString() || '{}').fresh === true } catch {}
+    const result = restartAgentProcess(name, { fresh: restartFresh })
     if (result.ok) { json(res, { ok: true }); return true }
     json(res, { error: result.error }, 400)
     return true
@@ -1462,6 +1714,145 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     const name = decodeURIComponent(statusMatch[1])
     if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
     json(res, getAgentProcessInfo(name))
+    return true
+  }
+
+  // --- Per-agent export/import bundle (move an agent to another machine) ---
+  //
+  // GET  /api/agents/:name/export?secrets=1   -> downloads a .tar.gz bundle
+  // POST /api/agents/import                   -> uploads a bundle (multipart)
+  //
+  // The bundle is the portable subset of agents/<name>/ (identity + behaviour),
+  // with channel tokens included only when ?secrets=1 is set explicitly. See
+  // src/web/agent-bundle.ts. The main agent lives at PROJECT_ROOT (not under
+  // agents/) so it is not exportable this way -- use scripts/backup.sh for a
+  // whole-host move.
+  // GET /api/agents/export-all?secrets=1 -> a single .tar.gz of EVERY sub-agent
+  // (the main agent lives at PROJECT_ROOT and is excluded). Must be matched
+  // before the generic /api/agents/:name GET further down, or "export-all"
+  // would be read as an agent name.
+  if (path === '/api/agents/export-all' && method === 'GET') {
+    const names = listAgentNames().filter((n) => n !== MAIN_AGENT_ID)
+    if (names.length === 0) { json(res, { error: 'No agents to export' }, 404); return true }
+    const includeSecrets = /[?&]secrets=(1|true)\b/.test(req.url || '')
+    const work = mkdtempSync(join(tmpdir(), 'marveen-fleet-dl-'))
+    const outPath = join(work, fleetBundleFilename())
+    try {
+      exportAllAgentsBundle(outPath, names, {
+        includeSecrets,
+        exportedBy: MAIN_AGENT_ID,
+        exportedAt: new Date().toISOString(),
+      })
+      const data = readFileSync(outPath)
+      res.writeHead(200, {
+        'Content-Type': 'application/gzip',
+        'Content-Disposition': `attachment; filename="${fleetBundleFilename()}"`,
+        'Content-Length': String(data.length),
+        'Cache-Control': 'private, no-store',
+      })
+      res.end(data)
+    } catch (err) {
+      logger.error({ err }, 'Fleet export failed')
+      json(res, { error: 'Export failed', detail: err instanceof Error ? err.message : String(err) }, 500)
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+    return true
+  }
+
+  const exportMatch = path.match(/^\/api\/agents\/([^/]+)\/export$/)
+  if (exportMatch && method === 'GET') {
+    const name = decodeURIComponent(exportMatch[1])
+    if (name === MAIN_AGENT_ID) {
+      json(res, { error: 'The main agent cannot be exported as a bundle; use scripts/backup.sh for a whole-host move.' }, 400)
+      return true
+    }
+    if (!existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    const includeSecrets = /[?&]secrets=(1|true)\b/.test(req.url || '')
+    const work = mkdtempSync(join(tmpdir(), 'marveen-agent-dl-'))
+    const outPath = join(work, bundleFilename(name))
+    try {
+      exportAgentBundle(name, outPath, {
+        includeSecrets,
+        exportedBy: MAIN_AGENT_ID,
+        exportedAt: new Date().toISOString(),
+      })
+      const data = readFileSync(outPath)
+      res.writeHead(200, {
+        'Content-Type': 'application/gzip',
+        'Content-Disposition': `attachment; filename="${bundleFilename(name)}"`,
+        'Content-Length': String(data.length),
+        'Cache-Control': 'private, no-store',
+      })
+      res.end(data)
+    } catch (err) {
+      logger.error({ err, name }, 'Agent export failed')
+      json(res, { error: 'Export failed', detail: err instanceof Error ? err.message : String(err) }, 500)
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+    return true
+  }
+
+  if (path === '/api/agents/import' && method === 'POST') {
+    const body = await readBody(req)
+    const contentType = req.headers['content-type'] || ''
+    let bundle: Buffer | undefined
+    let overrideName = ''
+    let overwrite = false
+    if (contentType.includes('multipart/form-data')) {
+      const { file, fields } = parseMultipart(body, contentType)
+      if (file) bundle = file.data
+      overrideName = (fields.name || '').trim()
+      overwrite = fields.overwrite === '1' || fields.overwrite === 'true'
+    } else {
+      // Raw .tar.gz body; name/overwrite from query string.
+      bundle = body
+      const url = req.url || ''
+      const nameMatch = url.match(/[?&]name=([^&]+)/)
+      if (nameMatch) overrideName = decodeURIComponent(nameMatch[1]).trim()
+      overwrite = /[?&]overwrite=(1|true)\b/.test(url)
+    }
+    if (!bundle || bundle.length === 0) { json(res, { error: 'No bundle uploaded' }, 400); return true }
+    try {
+      // One endpoint accepts either format: peek the manifest, then dispatch to
+      // the single-agent or whole-fleet importer.
+      if (peekBundleKind(bundle) === 'fleet') {
+        const result = importAllAgentsBundle(bundle, { overwrite })
+        logger.info(
+          { imported: result.imported.map((a) => a.name), skipped: result.skipped, secrets: result.includesSecrets },
+          'Fleet imported from bundle',
+        )
+        // Any collision (even with some fresh agents already imported) returns
+        // 409 so the UI can offer to overwrite the rest; re-POSTing with
+        // overwrite=1 is idempotent for the already-imported ones.
+        const hasCollision = result.skipped.some((s) => s.reason === 'already exists')
+        json(res, {
+          ok: true,
+          kind: 'fleet',
+          imported: result.imported,
+          skipped: result.skipped,
+          includedSecrets: result.includesSecrets,
+        }, hasCollision ? 409 : 200)
+        return true
+      }
+
+      const result = importAgentBundle(bundle, { overrideName: overrideName || undefined, overwrite })
+      logger.info({ name: result.name, overwritten: result.overwritten, secrets: result.manifest.includesSecrets }, 'Agent imported from bundle')
+      json(res, {
+        ok: true,
+        kind: 'agent',
+        name: result.name,
+        overwritten: result.overwritten,
+        includedSecrets: result.manifest.includesSecrets,
+      })
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      // A name collision without overwrite is a 409 the UI can offer to resolve;
+      // everything else (malformed bundle, bad name) is a 400.
+      const status = /already exists/.test(msg) ? 409 : 400
+      json(res, { error: msg }, status)
+    }
     return true
   }
 
@@ -1476,16 +1867,87 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
   if (agentMatch && method === 'PUT') {
     const name = decodeURIComponent(agentMatch[1])
     if (!isKnownAgent(name)) { json(res, { error: 'Agent not found' }, 404); return true }
+    if (isMainChannelsAgent(name)) {
+      json(res, { error: 'Main agent configuration is read-only through the dashboard API' }, 400)
+      return true
+    }
     const body = await readBody(req)
     const configRoot = agentConfigRoot(name)
     const data = JSON.parse(body.toString()) as {
       claudeMd?: string; soulMd?: string; mcpJson?: string; model?: string
-      authMode?: AuthMode; apiKey?: string
+      authMode?: AuthMode; apiKey?: string; claudePlan?: string; memoryIsolation?: boolean
+      modelProfile?: string | null
+      customProvider?: string | null
     }
-    if (data.claudeMd !== undefined) atomicWriteFileSync(join(configRoot, 'CLAUDE.md'), data.claudeMd)
+
+    // Unknown fields are rejected rather than silently dropped -- see
+    // agent-put-fields.ts for why, and for the securityProfile redirect.
+    const fieldCheck = checkAgentPutFields(name, data)
+    if (!fieldCheck.ok) {
+      json(res, { error: fieldCheck.message, rejected: fieldCheck.rejected, writable: AGENT_PUT_WRITABLE_FIELDS }, 400)
+      return true
+    }
+
+    if (data.memoryIsolation !== undefined) {
+      // The main agent's cwd IS the install repo root, which is already a git
+      // root: a memory boundary there is meaningless, and exposing the knob
+      // for it would invite the classic main-agent footgun. Sub-agents only.
+      if (isMainChannelsAgent(name)) {
+        json(res, { error: 'memoryIsolation is not applicable to the main agent' }, 400)
+        return true
+      }
+      writeAgentMemoryIsolation(name, data.memoryIsolation === true)
+    }
+    if (data.claudeMd !== undefined) {
+      atomicWriteFileSync(join(configRoot, 'CLAUDE.md'), data.claudeMd)
+      // A stale dashboard-editor buffer can carry a pre-federation snapshot
+      // (or a block from a since-disabled state): reconcile the managed
+      // federation section right after the write, not just at boot -- the
+      // service runs for weeks between restarts. No-op for sub-agents.
+      if (name === MAIN_AGENT_ID) ensureFederationClaudeMdSection()
+    }
     if (data.soulMd !== undefined) atomicWriteFileSync(join(agentDir(name), 'SOUL.md'), data.soulMd)
     if (data.mcpJson !== undefined) atomicWriteFileSync(join(agentDir(name), '.mcp.json'), data.mcpJson)
-    if (data.model !== undefined) writeAgentModel(name, data.model)
+    if (data.model !== undefined) {
+      // When a custom provider is being set (either in this same request or
+      // already persisted), validate the model id to prevent apostrophe/shell
+      // metacharacter breakout from the single-quoted `'${model}'` in the
+      // agent launch command. Allow: alphanumeric, dot, underscore, dash, colon, slash.
+      const incomingProvider = data.customProvider !== undefined ? (data.customProvider || null) : readAgentCustomProvider(name)
+      if (incomingProvider) {
+        if (!/^[a-zA-Z0-9._/:+-]+$/.test(data.model)) {
+          json(res, { error: 'Custom provider model id contains disallowed characters (allowed: a-z A-Z 0-9 . _ / : + -)' }, 400)
+          return true
+        }
+      }
+      writeAgentModel(name, data.model)
+    }
+    // Card c755f4b2 Block B: optional generic capability tier. An unknown id
+    // is a 400, never a persisted value -- storing one would leave the UI
+    // showing a profile while resolution silently fell back to the install
+    // default, i.e. a model change nobody asked for. Empty string clears it.
+    if (data.modelProfile !== undefined) {
+      if (data.modelProfile === '' || data.modelProfile === null) {
+        writeAgentModelProfile(name, null)
+      } else if (isModelProfileId(data.modelProfile)) {
+        const mapState = readModelProfileMap()
+        if (!mapState) {
+          json(res, { error: 'No model-profile map is provisioned on this deployment; a modelProfile cannot be honoured yet.' }, 400)
+          return true
+        }
+        if (!mapState.ok) {
+          json(res, { error: `Model-profile map is unusable: ${mapState.error}` }, 400)
+          return true
+        }
+        writeAgentModelProfile(name, data.modelProfile)
+      } else {
+        json(res, { error: `modelProfile must be one of ${MODEL_PROFILE_IDS.join('|')}` }, 400)
+        return true
+      }
+    }
+    if (data.customProvider !== undefined) {
+      writeAgentCustomProvider(name, data.customProvider || null)
+    }
     if (data.authMode !== undefined) {
       writeAgentAuthMode(name, data.authMode)
       if (data.authMode === 'api' && typeof data.apiKey === 'string' && data.apiKey.trim()) {
@@ -1494,6 +1956,26 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       if (data.authMode !== 'api') {
         deleteSecret(`agent-${name}-api-key`)
       }
+    }
+    // Named Claude plan id. Empty string clears it (-> raw claudeConfigDir /
+    // default). A non-empty id MUST exist in the registry, otherwise the
+    // dashboard would show the agent as plan-assigned while launch silently
+    // falls back to a different login (state/launch drift). Reject unknown ids
+    // rather than persist them.
+    if (data.claudePlan !== undefined) {
+      // The main agent's Claude login comes up via channels.sh (hardcoded
+      // CLAUDE_CONFIG_DIR), not this per-agent path, so a plan set here would be
+      // a silent no-op at launch. Reject loudly rather than mislead the UI.
+      if (name === MAIN_AGENT_ID) {
+        json(res, { error: 'main agent plan is managed via channels.sh, not settable here' }, 400)
+        return true
+      }
+      const planId = data.claudePlan.trim()
+      if (planId && !readClaudePlans().some(p => p.id === planId)) {
+        json(res, { error: `Ismeretlen Claude plan id: ${planId}` }, 400)
+        return true
+      }
+      writeAgentClaudePlan(name, planId)
     }
     json(res, { ok: true })
     return true
@@ -1506,6 +1988,36 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     rmSync(dir, { recursive: true, force: true })
     cleanupTeamReferences(name)
     json(res, { ok: true })
+    return true
+  }
+
+  // GET /api/agents/:name/voice-config
+  const voiceConfigMatch = path.match(/^\/api\/agents\/([^/]+)\/voice-config$/)
+  if (voiceConfigMatch && method === 'GET') {
+    const name = decodeURIComponent(voiceConfigMatch[1])
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    json(res, { ...readAgentVoiceConfig(name), availableVoices: Array.from(KNOWN_VOICE_MODELS) })
+    return true
+  }
+
+  // PUT /api/agents/:name/voice-config
+  // Body: { responseMode?: 'text'|'voice'|'auto', voiceModel?: string }
+  if (voiceConfigMatch && method === 'PUT') {
+    const name = decodeURIComponent(voiceConfigMatch[1])
+    if (name !== MAIN_AGENT_ID && !existsSync(agentDir(name))) { json(res, { error: 'Agent not found' }, 404); return true }
+    const body = await readBody(req)
+    let data: { responseMode?: string; voiceModel?: string }
+    try { data = JSON.parse(body.toString()) } catch { json(res, { error: 'invalid JSON' }, 400); return true }
+    try {
+      writeAgentVoiceConfig(name, {
+        responseMode: data.responseMode as 'text' | 'voice' | 'auto' | undefined,
+        voiceModel: data.voiceModel,
+      })
+    } catch (err: unknown) {
+      json(res, { error: err instanceof Error ? err.message : 'invalid config' }, 400)
+      return true
+    }
+    json(res, { ok: true, ...readAgentVoiceConfig(name) })
     return true
   }
 
