@@ -6,11 +6,77 @@
 // construction, replace-by-id merging, host-key parsing, and connection
 // bundle building. All filesystem work lives in remote-enroll-fs.ts.
 
-/** Fixed loopback endpoint the enrolled key is permitted to open. */
+/** Default loopback dashboard port. The enrolled key's permitopen and the
+ * connection bundle both target the ACTUAL dashboard port (WEB_PORT); this is
+ * only the fallback when a caller does not supply one. A hardcoded value here
+ * silently broke any install whose dashboard ran on a non-default port
+ * (INSTUX1): the permitopen stayed 3420 while the dashboard moved, so the
+ * tunnel hit a dead port. The port is now threaded through from the caller. */
 export const REMOTE_PORT = 3420
 
 /** The only key type accepted for enrollment. */
 export const ACCEPTED_KEY_TYPE = 'ssh-ed25519'
+
+/**
+ * Shape check for the pairing target address (JANKBRIDGE803).
+ *
+ * A customer typed the email address of his Tailscale ACCOUNT here. Nothing in
+ * the chain objected: the bundle was built with it, the Bridge imported it, and
+ * the failure surfaced only at connect time as `getaddrinfo EAI_FAIL <email>`.
+ * Measured on the shipped Bridge before writing this: parseBundle accepted an
+ * email, whitespace, a URL, an embedded newline and a 400-character string --
+ * only the empty string was rejected, while the PORT field next to it was fully
+ * validated. The asymmetry, not the customer, produced the incident.
+ *
+ * NOT reusable from the remote-AGENT host check (agent-config.ts
+ * REMOTE_HOST_ALLOWED). That one is an ssh DESTINATION charset, where `user@host`
+ * is legitimate, so it accepts `someone@gmail.com` -- measured. Reusing it here
+ * would look like a fix and would let this exact report through again.
+ *
+ * Deliberately permissive about hostname purity: `_` is accepted because real
+ * machines carry it, and a trailing dot is accepted because an FQDN may be
+ * written that way. The job is to reject what CANNOT be a host (an address with
+ * `@`, spaces, a URL, control characters), not to enforce RFC 1123.
+ */
+const HOSTNAME_LABEL = '[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?'
+const HOSTNAME_RE = new RegExp(`^${HOSTNAME_LABEL}(?:\\.${HOSTNAME_LABEL})*\\.?$`)
+
+export type HostCheck = { ok: true; host: string } | { ok: false; reason: string }
+
+/**
+ * Validate a user-supplied target address. `isIP` covers IPv4 and IPv6
+ * literals; anything else must look like a hostname.
+ *
+ * The email case gets its OWN message on purpose. "Invalid host" would be
+ * technically correct and useless: the reporter believed the field wanted his
+ * Tailscale identity, so the message has to correct the belief, not the syntax.
+ */
+export function checkEnrollHost(raw: string, isIP: (s: string) => number): HostCheck {
+  const host = raw.trim()
+  if (!host) return { ok: false, reason: 'target address is empty' }
+  // Quote back at most 60 characters: enough to recognise what was typed,
+  // short enough that a pasted blob does not become the whole message.
+  const seen = host.length > 60 ? `${host.slice(0, 60)}...` : host
+  if (host.length > 253) {
+    return { ok: false, reason: `target address is too long (${host.length} characters, maximum 253)` }
+  }
+  if (isIP(host) !== 0) return { ok: true, host }
+  if (host.includes('@')) {
+    return {
+      ok: false,
+      reason:
+        `"${seen}" looks like an email address. The target address is the machine's IP address or ` +
+        'hostname; with Tailscale it is the address starting with 100, not the email address of the Tailscale account.',
+    }
+  }
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(host)) {
+    return { ok: false, reason: `"${seen}" is a URL. Enter only the address, without http:// or a path.` }
+  }
+  if (!HOSTNAME_RE.test(host)) {
+    return { ok: false, reason: `"${seen}" is not a valid IP address or hostname.` }
+  }
+  return { ok: true, host }
+}
 
 /** Prefix that every per-device comment must carry. The full comment is
  * `marveen-remote:<uuid>`, where the uuid is the per-device revocation and
@@ -131,15 +197,26 @@ export function validatePublicKeyLine(rawLine: string): ParsedKey {
 /** Options string prepended to the enrolled key in authorized_keys. This is
  * the tight restriction set: no shell (command forced to /bin/false), no
  * agent/x11/pty, forwarding limited to a single loopback endpoint. */
-export const RESTRICT_OPTIONS =
-  `restrict,port-forwarding,permitopen="127.0.0.1:${REMOTE_PORT}",command="/bin/false"`
+/** The tight restriction set for a given dashboard port. The permitopen stays
+ * a SINGLE loopback endpoint (never a wildcard or a range), and the forced
+ * `command="/bin/false"` plus `restrict` are unchanged -- widening any of these
+ * would turn the enrolled key into a general port-forward grant on the server.
+ * Only the port follows the caller's WEB_PORT. */
+export function restrictOptions(webPort: number = REMOTE_PORT): string {
+  return `restrict,port-forwarding,permitopen="127.0.0.1:${webPort}",command="/bin/false"`
+}
+
+/** The default-port restriction string. Retained for callers/tests that assert
+ * the default shape; port-aware callers use restrictOptions(webPort). */
+export const RESTRICT_OPTIONS = restrictOptions(REMOTE_PORT)
 
 /**
  * Build the exact restricted authorized_keys line for a validated key.
- * The key material and comment are reproduced verbatim.
+ * The key material and comment are reproduced verbatim. `webPort` is the actual
+ * dashboard port the key may tunnel to (defaults to REMOTE_PORT).
  */
-export function buildRestrictedLine(parsed: ParsedKey): string {
-  return `${RESTRICT_OPTIONS} ${parsed.keyType} ${parsed.base64} ${parsed.comment}`
+export function buildRestrictedLine(parsed: ParsedKey, webPort: number = REMOTE_PORT): string {
+  return `${restrictOptions(webPort)} ${parsed.keyType} ${parsed.base64} ${parsed.comment}`
 }
 
 /** Extract the trailing comment field of an authorized_keys line, or null if
@@ -313,6 +390,10 @@ export interface ConnectionBundleInput {
    * field is a SECRET: it grants dashboard access to anyone holding it, so it
    * must be transported over a private channel, never email or chat logs. */
   dashboardToken?: string
+  /** Actual dashboard port the tunnel targets. Defaults to REMOTE_PORT. Must
+   * match the permitopen written by buildRestrictedLine, or the tunnel opens a
+   * dead port (INSTUX1). */
+  webPort?: number
 }
 
 export interface ConnectionBundle {
@@ -342,7 +423,7 @@ export function buildBundle(input: ConnectionBundleInput): ConnectionBundle {
     host: input.host,
     sshPort: input.sshPort,
     sshUser: input.sshUser,
-    remotePort: REMOTE_PORT,
+    remotePort: input.webPort ?? REMOTE_PORT,
     ...(input.hostKey !== undefined ? { hostKey: input.hostKey } : {}),
     installId: input.installId,
     ...(input.dashboardToken !== undefined ? { dashboardToken: input.dashboardToken } : {}),

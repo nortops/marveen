@@ -57,7 +57,25 @@ export type PaneState = 'idle' | 'busy' | 'typing' | 'unknown' | 'error'
 // shift+tab hint OR any `·`-separated tail ending in a known idle action (ctrl+t
 // / ↓ to manage). Busy states are filtered above (esc to interrupt / busy
 // indicators / paste placeholder), so this stays idle-specific.
-const IDLE_FOOTER_RX = /bypass permissions on(?: \(shift\+tab to cycle\)| · [^\n]*?(?:ctrl\+t|↓ to manage))|\? for shortcuts/
+//
+// THE MODE PREFIX IS NOT ALWAYS `bypass permissions`. That was the whole bug:
+// the footer names whichever permission mode the session is in --
+// `bypass permissions on`, `accept edits on`, `plan mode on`, `auto mode on`,
+// `manual mode on` -- and only the first was accepted. Every agent NOT in
+// bypass mode read as 'unknown', so the router refused to deliver to it. On
+// 2026-07-27 that silently swallowed four messages to an agent sitting in
+// `accept edits on`, while bypass-mode agents received everything.
+//
+// Deliberately NOT an enumeration of the five known modes. An earlier attempt
+// at this fix listed `auto mode on` and `manual mode on` and still missed
+// `accept edits on` -- the mode that was actually losing messages. Whatever
+// list we write today, Claude Code adds a mode tomorrow and the hole reopens.
+// So: one to three words followed by `on`, and the anti-false-positive work is
+// left where it already was -- in the REQUIRED TAIL. A bare `... on` in
+// scrollback still will not match; it needs the shift+tab hint or a `·`
+// separated idle action, which is UI chrome that prose does not carry.
+// `← for agents` is the FleetView tail on current builds; older tails kept.
+const IDLE_FOOTER_RX = /(?:[A-Za-z][\w-]* ){1,3}on(?: \(shift\+tab to cycle\)| · [^\n]*?(?:ctrl\+t|↓ to manage|← for agents))|\? for shortcuts/
 
 // Positive busy signals. ANY match anywhere in the pane means the turn
 // is mid-flight, even if the footer looks idle for a frame.
@@ -219,6 +237,28 @@ const BOX_SEP_RX = /^─{10,}/
 // admitting the NBSP and any other horizontal Unicode space the TUI emits.
 const PARKED_INPUT_RX = /❯[^\S\r\n]+\S/
 
+// QUEUED MESSAGES: Claude Code holds prompts typed during a running turn in a
+// queue and renders them ABOVE the box, putting this hint INSIDE the (otherwise
+// empty) live input box. The hint is DIM, exactly like the autocomplete ghost,
+// so idleConsideringDimGhost strips it and the pane reads 'idle' -- while the
+// session in fact has unprocessed input waiting. Every writer (nudge watcher,
+// scheduler, router, keepalive) then believes the session is free and types
+// ANOTHER line, which just joins the queue.
+//
+// Observed 2026-08-04: the main agent ran one 32-minute turn; three inbox
+// nudges were "sent" into it 5 minutes apart, all three queued unprocessed,
+// and the watcher escalated to the owner claiming a broken drain hook -- while
+// nothing was broken and no message was lost. The second half of the misread
+// is that with the queued block rendered, the busy spinner is pushed to the
+// edge of (and sometimes past) the BUSY_LIVE_REGION_LINES window, so the
+// spinner check cannot be relied on to catch this state either.
+//
+// MUST stay scoped to the live input box, never whole-pane: an incident report
+// or a chat log quoting this very sentence would otherwise pin an idle session
+// busy forever (the same self-contamination that made the `esc to interrupt`
+// check region-scoped above).
+const QUEUED_MESSAGES_HINT_RX = /Press up to edit queued messages/
+
 // Strip Claude Code's DIM (SGR 2) "ghost suggestion" autocomplete from a
 // COLOURED pane capture (`tmux capture-pane -e -p`), then remove every
 // remaining ANSI escape, yielding plain text equivalent to `capture-pane -p`
@@ -272,6 +312,71 @@ export function stripGhostSuggestion(coloredPane: string): string {
     i++
   }
   return out
+}
+
+// Strip every ANSI escape sequence, leaving plain text. Unlike
+// stripGhostSuggestion this drops NO visible characters -- it only removes the
+// SGR/CSI codes -- so stripAllAnsi(`capture-pane -e -p`) equals `capture-pane -p`.
+export function stripAllAnsi(s: string): string {
+  let out = ''
+  let i = 0
+  const n = s.length
+  while (i < n) {
+    const ch = s[i]
+    if (ch === '\x1b') {
+      if (s[i + 1] !== '[') { i++; continue } // drop lone ESC / non-CSI
+      let j = i + 2
+      while (j < n && (s[j] < '@' || s[j] > '~')) j++
+      i = j < n ? j + 1 : n // skip the whole CSI sequence
+      continue
+    }
+    out += ch
+    i++
+  }
+  return out
+}
+
+// A pane line carries a background fill (highlight bar) when its SGR codes SET a
+// non-default background: 256/truecolor bg (48;5;.. / 48;2;..), the basic/bright
+// bg ranges (40-47 / 100-107), or reverse-video (7). The 38/48 colour specs are
+// skipped by mode so a *foreground* 256-colour index (e.g. 38;5;7) is never
+// misread as SGR 7. Foreground-only styling returns false.
+function lineHasBackgroundFill(line: string): boolean {
+  const seqs = line.match(/\x1b\[([0-9;]*)m/g)
+  if (!seqs) return false
+  for (const seq of seqs) {
+    const params = seq.slice(2, -1).split(';').map(x => (x === '' ? 0 : Number(x)))
+    let k = 0
+    while (k < params.length) {
+      const c = params[k]
+      if (c === 48) return true // any background colour set (256/truecolor)
+      if (c === 38) { const mode = params[k + 1]; k += mode === 5 ? 3 : mode === 2 ? 5 : 1; continue }
+      if (c === 7) return true // reverse video
+      if ((c >= 40 && c <= 47) || (c >= 100 && c <= 107)) return true // basic / bright bg
+      k++
+    }
+  }
+  return false
+}
+
+// Claude Code renders a custom session name (set via /rename) as a full-width
+// highlighted bar pinned to the BOTTOM of the pane, below the input box / idle
+// footer. A pathological name -- e.g. a whole <scheduled-task> block that a
+// /rename accidentally swallowed as its argument -- wraps to many lines and
+// pushes the live footer/spinner out of detectPaneState's bottom "live region",
+// so the pane classifies as 'unknown'. 'unknown' blocks BOTH the scheduler and
+// inter-agent delivery (2026-08-01: a rename-banner pinned the main agent
+// 'unknown' and stalled a queued inter-agent message). This strips that trailing
+// banner from a COLOURED capture so the real footer/spinner classifies normally.
+// The idle footer, input box and spinner never carry a background fill, and the
+// name bar is the bottom-most element, so trailing background-filled lines are
+// the banner; non-banner content is left untouched (no-op when absent).
+export function stripSessionTitleBanner(coloredPane: string): string {
+  const lines = coloredPane.split('\n')
+  let end = lines.length
+  while (end > 0 && lineHasBackgroundFill(lines[end - 1])) end--
+  if (end === lines.length) return coloredPane
+  return lines.slice(0, end).join('\n')
 }
 
 // Persistent Anthropic thinking-block API error. When an assistant turn
@@ -532,6 +637,28 @@ export interface DetectPaneStateOptions {
  *   6. Text parked inside the bottom input box -> 'typing'.
  *   7. Otherwise -> 'idle'.
  */
+// Which permission mode the footer is advertising, e.g. 'bypass permissions',
+// 'accept edits', 'plan mode'. Purely additive: the router still treats every
+// mode as idle, because for DELIVERY purposes they are all idle -- the message
+// can arrive. What differs is what happens next: an agent in an ask-first mode
+// receives the message and then stops at its first tool call, waiting for an
+// approval nobody is watching for. That is how an agent sat unusable for hours
+// on 2026-07-27 while looking perfectly healthy on the dashboard.
+//
+// Returns the phrase VERBATIM rather than mapping to an enum, for the same
+// reason IDLE_FOOTER_RX does not enumerate modes: a new Claude Code mode should
+// show up on the dashboard on its own, not wait for someone to extend a union.
+// 'default' is the no-banner footer ('? for shortcuts'), which is what Claude
+// Code renders when no mode is switched on -- i.e. it asks about everything.
+export function detectPermissionMode(pane: string): string | null {
+  if (!pane || !pane.trim()) return null
+  const m = pane.match(
+    /((?:[A-Za-z][\w-]* ){1,3})on(?: \(shift\+tab to cycle\)| · [^\n]*?(?:ctrl\+t|↓ to manage|← for agents))/,
+  )
+  if (m) return m[1].trim()
+  return /\? for shortcuts/.test(pane) ? 'default' : null
+}
+
 export function detectPaneState(
   pane: string,
   opts: DetectPaneStateOptions = {},
@@ -599,6 +726,12 @@ export function detectPaneState(
     }
     if (topSep >= 0 && bottomSep > topSep) {
       const inputLines = lines.slice(topSep + 1, bottomSep)
+      // Queued messages first: the hint lives in the box and would otherwise
+      // read as parked text ('typing'), which idleConsideringDimGhost then
+      // rescues to 'idle' because the hint is dim -- the exact false-ready
+      // path this guards. 'busy' is the honest answer: input IS waiting, it
+      // just isn't ours to submit. See QUEUED_MESSAGES_HINT_RX.
+      if (inputLines.some(l => QUEUED_MESSAGES_HINT_RX.test(l))) return 'busy'
       if (inputLines.some(l => PARKED_INPUT_RX.test(l))) {
         return opts.mergeTypingAsBusy ? 'busy' : 'typing'
       }
@@ -1139,12 +1272,36 @@ const MACHINE_ORIGIN_PREFIXES = [
   /^<channel\s+source="plugin:/,
 ] as const
 
+// A long injection can lose its HEAD: the TUI drops the leading rows of an
+// overfull input box, so every anchored prefix above misses while unmistakable
+// wrapper text survives further in. Measured 2026-08-01 on a live MAIN pane
+// whose box began mid-sentence at "</scheduled-task> block is one of YOUR OWN
+// scheduled tasks." -- and the consequence was total: parkedScheduledTaskInput
+// read false so decideStuckInputAction fell through to 'hold' (no soft remedy),
+// AND parkedMachineOriginInput read false so the restart guard treated a
+// machine injection as "possibly a human draft" and deferred. Neither the clear
+// nor the restart could fire; the channel stayed mute until the box was cleared
+// by hand.
+//
+// These markers must stay BOILERPLATE a human does not reproduce verbatim --
+// wrapper syntax and the scheduler's own fixed sentences, never a topic phrase
+// like "SCHEDULED TASK NOTICE", which someone may legitimately type while
+// discussing the system. That distinction is why the list above is anchored and
+// this one is not; the human-draft fixtures in parked-machine-input.test.ts
+// guard it.
+const MACHINE_ORIGIN_TRUNCATED_MARKERS = [
+  /<\/scheduled-task>/,
+  /is one of YOUR OWN scheduled tasks/,
+  /fired by the local scheduler/,
+] as const
+
 // True when the live input box holds parked ('typing') text that is
 // identifiably machine-injected (see MACHINE_ORIGIN_PREFIXES). Pure.
 export function parkedMachineOriginInput(pane: string): boolean {
   const flat = parkedInputText(pane)
   if (flat == null) return false
   return MACHINE_ORIGIN_PREFIXES.some((rx) => rx.test(flat))
+    || MACHINE_ORIGIN_TRUNCATED_MARKERS.some((rx) => rx.test(flat))
 }
 
 // True when the parked text is a scheduled-task injection (the scheduler's
@@ -1157,7 +1314,51 @@ export function parkedMachineOriginInput(pane: string): boolean {
 export function parkedScheduledTaskInput(pane: string): boolean {
   const flat = parkedInputText(pane)
   if (flat == null) return false
-  return /^SCHEDULED TASK NOTICE/.test(flat) || /^<scheduled-task[\s>]/.test(flat)
+  if (/^SCHEDULED TASK NOTICE/.test(flat) || /^<scheduled-task[\s>]/.test(flat)) return true
+  // Head dropped by the TUI -- see MACHINE_ORIGIN_TRUNCATED_MARKERS. Clear-only
+  // is exactly as safe here as for an intact tick: the instruction is already
+  // corrupted by the truncation, and the next schedule fire re-delivers it.
+  return MACHINE_ORIGIN_TRUNCATED_MARKERS.some((rx) => rx.test(flat))
+}
+
+// Keystrokes that actually EMPTY a parked input box.
+//
+// Measured 2026-08-01 on a wedged MAIN pane holding 489 characters over 7
+// visible rows. The previous cascade (`C-u` x3, then `C-a` + `C-k`, then `C-u`
+// x3) removed nothing at all across repeated runs, and the cursor position is
+// why: a literal string sent with tmux send-keys lands in FRONT of the parked
+// text, so the cursor sits at OFFSET 0.
+//
+//   before      len=489  "the user if it looks wrong. The wrapper marks prov"
+//   +MARKER123  len=498  "MARKER123the user if it looks wrong. The wrapper m"
+//   after C-u   len=489  "the user if it looks wrong. The wrapper marks prov"
+//
+// `C-u` kills BACKWARDS to the start of the line. With nothing before the
+// cursor it is a no-op every round -- it only ever removed a marker typed in
+// front of it. The lone `C-a` + `C-k` escalation clears exactly ONE line, so
+// with PARKED_CLEAR_MAX = 3 the whole cascade could strip at most one line off
+// a multi-line box and then failed its own emptiness check.
+//
+// Forward deletion is what drains it: `C-k` kills to end of line and `Delete`
+// eats the newline joining the next one. The live box needed 20 such rounds, so
+// the budget scales with the visible row count (the buffer is usually longer
+// than the box shows) and is clamped at both ends: a floor for a single-row box
+// whose buffer still wraps, and a ceiling so a bogus row count cannot turn into
+// an unbounded keystroke storm against a live session.
+const PARKED_CLEAR_ROUNDS_PER_ROW = 4
+const PARKED_CLEAR_ROUNDS_MIN = 12
+const PARKED_CLEAR_ROUNDS_MAX = 240
+
+export function parkedClearSequence(rowCount: number): string[] {
+  const rounds = Math.min(
+    PARKED_CLEAR_ROUNDS_MAX,
+    Math.max(PARKED_CLEAR_ROUNDS_MIN, Math.max(0, rowCount) * PARKED_CLEAR_ROUNDS_PER_ROW),
+  )
+  // Home first: the first kill must start at the beginning even when the cursor
+  // was left mid-buffer by an earlier attempt.
+  const keys = ['C-a']
+  for (let i = 0; i < rounds; i++) keys.push('C-k', 'Delete')
+  return keys
 }
 
 // How many VISUAL rows the live input box content occupies, ignoring the

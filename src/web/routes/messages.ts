@@ -4,12 +4,14 @@ import {
   getKanbanSeqByIdPrefix,
   markMessageDone, markMessageFailed, getAgentMessage,
   closeOtelSpan,
+  getPendingBacklogByAgent,
   type AgentMessage,
 } from '../../db.js'
 import { logger } from '../../logger.js'
 import { COORDINATOR_AGENT_ID } from '../../channel-coordinator/ingest.js'
 import { sanitizeAgentIdent } from '../../prompt-safety.js'
 import { isKnownAgent } from '../agent-config.js'
+import { OWNER_NAME } from '../../config.js'
 import { readBody, json, jsonMaybeGzip } from '../http-helpers.js'
 import { normalizeKanbanRefs } from '../kanban-ref-normalize.js'
 import { parseQualifiedId, formatQualifiedId } from '../federation/address.js'
@@ -65,7 +67,15 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     // filesystem (agents/<id>/ directory, or MAIN_AGENT_ID). This is not
     // impersonation-proof between fleet agents (they share the same token) but
     // it closes the "unknown sender" injection path without per-agent secrets.
-    if (!isKnownAgent(sanitizeAgentIdent(from))) {
+    //
+    // The human OWNER is a legitimate sender too: the dashboard "Messages" page
+    // composes with from=OWNER_NAME (resolveOwnerName -> the owner assignee), so
+    // without this exemption the operator's own dashboard messages 403 with
+    // "unknown agent". The owner is not a fleet agent (no agents/<id>/ dir), so
+    // isKnownAgent alone rejects it. Match on the router's normalization to stay
+    // symmetric with the other guards above.
+    const isOwnerSender = sanitizeAgentIdent(from) === sanitizeAgentIdent(OWNER_NAME)
+    if (!isOwnerSender && !isKnownAgent(sanitizeAgentIdent(from))) {
       logger.warn({ from: from.trim(), to: to.trim() }, 'Rejected /api/messages POST from unregistered agent')
       json(res, { error: `unknown agent '${from.trim()}' -- from must be a registered fleet agent id` }, 403)
       return true
@@ -130,6 +140,14 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
   // each with its count + most-recent message, recency computed per-peer.
   if (path === '/api/messages/threads' && method === 'GET') {
     json(res, getAgentConversationThreads())
+    return true
+  }
+
+  // Backlog per agent: count + how long the oldest has been waiting. Cheap
+  // enough to curl on a schedule; the point is that a growing queue behind a
+  // busy agent becomes visible BEFORE someone mistakes it for lost messages.
+  if (path === '/api/messages/backlog' && method === 'GET') {
+    json(res, getPendingBacklogByAgent())
     return true
   }
 

@@ -3,6 +3,7 @@ import { hostname } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
 import { resolveFromPath } from '../platform.js'
+import { WEB_PORT } from '../config.js'
 import { logger } from '../logger.js'
 import { MAIN_AGENT_ID, SERVICE_ID, BOT_NAME, CHANNEL_PROVIDER, PROJECT_ROOT, RESPAWN_ENABLED } from '../config.js'
 import { agentDir, listAgentNames, readAgentChannelProvider } from './agent-config.js'
@@ -25,7 +26,9 @@ import {
   hasFleetOauthToken,
   FLEET_OAUTH_TOKEN_PATH,
   answerFirstRunGates,
+  shSingleQuote,
 } from './agent-process.js'
+import { withSessionSendLock } from './session-send-lock.js'
 import { reapChannelOrphans, reapDetachedChannelClaudes, collectPollerEvidence } from './channel-poller-reap.js'
 import { probeTelegramConflict } from './channel-conflict-probe.js'
 import { schedulePluginUnlockAfterRespawn, wasPluginConfirmedAbsent, clearPluginAbsent } from './channel-plugin-unlock.js'
@@ -177,7 +180,9 @@ const AGENT_BUSY_DEFER_MAX_MS = 30 * 60 * 1000 // 30m
 // fresh (re-stamped by each post-respawn probe, cleared on recovery).
 const PLUGIN_ABSENT_MAX_RESTART_ATTEMPTS = 1
 const PLUGIN_ABSENT_TTL_MS = 15 * 60 * 1000
-const PLUGIN_ALERT_DEDUP_MS = 30 * 60 * 1000
+// Re-alert cadence while the main plugin is STILL down. The first alert is the
+// informative one; keep repeats to a few hours (owner request 2026-07-30).
+const PLUGIN_ALERT_DEDUP_MS = 3 * 60 * 60 * 1000
 
 // Stuck channel-input recovery (MAIN session only). A channel notification
 // delivered while Boss is busy can be parked as plain text at the ❯ prompt
@@ -348,18 +353,36 @@ async function performStuckInputAction(
   let submitted = false
   try {
     switch (action) {
-      case 'reinject-block':
+      case 'reinject-block': {
         logger.warn({ session, chatId: block?.chatId, attempt }, 'Stuck channel input -- clear + verbatim re-inject')
-        await clearInputBuffer(session)
-        await sendPromptToSession(session, block!.block!)
+        // DELIVLOCK805: clear+re-inject MUTATES the input box, so it must not
+        // race a live delivery into this pane (it could clear a partial send or
+        // submit the wrong buffer). Run the clear+re-inject as ONE recover-mode
+        // critical section; if a delivery holds the lane, skip and log -- a
+        // stuck box recovers on the next tick once the delivery finishes.
+        const res = await withSessionSendLock(session, null, 'recover', async () => {
+          await clearInputBuffer(session)
+          await sendPromptToSession(session, block!.block!, null, { lockMode: 'held' })
+        })
+        if (!res.ran) {
+          logger.info({ session, attempt }, 'Stuck-input recovery (reinject-block) skipped: a delivery is in flight into this pane (fail-closed)')
+          break
+        }
         submitted = true
         break
+      }
       case 'reinject-plain': {
         const text = parkedInputText(paneBefore)
         if (text != null) {
           logger.warn({ session, attempt }, 'Stuck input (non-channel) -- clear + re-inject parked text')
-          await clearInputBuffer(session)
-          await sendPromptToSession(session, text)
+          const res = await withSessionSendLock(session, null, 'recover', async () => {
+            await clearInputBuffer(session)
+            await sendPromptToSession(session, text, null, { lockMode: 'held' })
+          })
+          if (!res.ran) {
+            logger.info({ session, attempt }, 'Stuck-input recovery (reinject-plain) skipped: a delivery is in flight into this pane (fail-closed)')
+            break
+          }
         } else {
           // FABLEFALL1: a bare Enter on the model consent dialog confirms its
           // DEFAULT option, which switches the model. Answer the dialog safely
@@ -441,7 +464,7 @@ const paneErrorState: Map<string, PaneErrorAlertState> = new Map()
 // spell alive across brief non-error blips (null capture, mid-flight
 // busy) so a flapping but genuinely wedged session still alerts.
 const PANE_ERROR_CONFIRM_MS = 120_000
-const PANE_ERROR_DEDUP_MS = 30 * 60 * 1000
+const PANE_ERROR_DEDUP_MS = 3 * 60 * 60 * 1000
 const PANE_ERROR_CLEAR_MS = 5 * 60 * 1000
 
 // Per-session tracking for a session parked in a blocking interactive menu
@@ -488,7 +511,7 @@ async function triggerMarveenMemorySave(): Promise<void> {
     `mulva hard restart lesz a ${MAIN_CHANNELS_SESSION} session-on (a beszelgetes elveszik).`,
     `MOST mentsd el a ${BOT_NAME} memoriaba amit a kovetkezo sessionnek tudnia kell:`,
     'aktiv feladatok (category hot), friss dontesek/preferenciak (warm), tanulsagok (cold).',
-    'Hasznald: curl -s -X POST http://localhost:3420/api/memories ... (lasd CLAUDE.md).',
+    `Hasznald: curl -s -X POST http://localhost:${WEB_PORT}/api/memories ... (lasd CLAUDE.md).`,
     'Ha kesz vagy, irj egy rovid napi naplo bejegyzest is a /api/daily-log-ra. Utana eleg.',
   ].join(' ')
   try {
@@ -499,13 +522,47 @@ async function triggerMarveenMemorySave(): Promise<void> {
   }
 }
 
-// Read the main agent's configured model from .claude/settings.json so a
-// soft resume passes --model explicitly, mirroring scripts/channels.sh. Without
-// it the respawned session falls back to claude-code's built-in default and
-// silently drifts off the model the user picked. Returns '' when unset.
-function readConfiguredMainModel(): string {
+// Single `KEY=value` lookup in the install's .env, used by the readers below.
+// Deliberately dumb (first matching line, trimmed): it mirrors the `grep -E
+// '^KEY=' | head -1 | cut -d= -f2-` that scripts/channels.sh already does, so
+// both sides read the same file the same way.
+function readEnvValue(projectRoot: string, key: string): string {
   try {
-    const settingsPath = join(PROJECT_ROOT, '.claude', 'settings.json')
+    const envPath = join(projectRoot, '.env')
+    if (!existsSync(envPath)) return ''
+    const line = readFileSync(envPath, 'utf-8')
+      .split('\n')
+      .find((l) => l.startsWith(`${key}=`))
+    return line ? line.slice(key.length + 1).trim() : ''
+  } catch {
+    return ''
+  }
+}
+
+// Read the main agent's configured model so a soft resume passes --model
+// explicitly, mirroring scripts/channels.sh. Without it the respawned session
+// falls back to claude-code's built-in default and silently drifts off the model
+// the user picked. Returns '' when unset.
+//
+// PRECEDENCE MUST MATCH channels.sh resolve_main_model(): .env MAIN_AGENT_MODEL
+// (per-install, gitignored) wins over .claude/settings.json (tracked, shipped
+// with the repo). Reading ONLY settings.json here was a silent split-brain: an
+// install that sets its model the documented way -- in .env, precisely so the
+// tracked file stays clean for the update preflight -- got that choice honoured
+// on the LAUNCH path and ignored on the RESPAWN path. The two only agreed while
+// someone kept both files in sync by hand, and nothing detected the drift.
+//
+// The failure is not hypothetical and not symmetric: the tracked settings.json
+// ships a model of its own, so a respawn after an update (which reverts local
+// edits to tracked files) can silently move the main agent to a DIFFERENT model
+// than the one it launched with -- below the operator's required floor, with no
+// dialog, no error and no log line. The launch path would keep saying the right
+// thing, which is exactly what makes it hard to see.
+export function readConfiguredMainModel(projectRoot: string = PROJECT_ROOT): string {
+  const fromEnv = readEnvValue(projectRoot, 'MAIN_AGENT_MODEL')
+  if (fromEnv) return fromEnv
+  try {
+    const settingsPath = join(projectRoot, '.claude', 'settings.json')
     if (!existsSync(settingsPath)) return ''
     const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'))
     const model = parsed?.model
@@ -527,17 +584,7 @@ function readConfiguredMainModel(): string {
 // Observed in practice: a context-saturation hard restart dropped the secondary
 // inbound for ~20 minutes while the primary channel kept working normally.
 export function readExtraChannelPluginIds(projectRoot: string = PROJECT_ROOT): string[] {
-  try {
-    const envPath = join(projectRoot, '.env')
-    if (!existsSync(envPath)) return []
-    const line = readFileSync(envPath, 'utf-8')
-      .split('\n')
-      .find((l) => l.startsWith('CHANNEL_PLUGINS_EXTRA='))
-    if (!line) return []
-    return line.slice('CHANNEL_PLUGINS_EXTRA='.length).trim().split(/\s+/).filter(Boolean)
-  } catch {
-    return []
-  }
+  return readEnvValue(projectRoot, 'CHANNEL_PLUGINS_EXTRA').split(/\s+/).filter(Boolean)
 }
 
 // Build the claude command used to (re)spawn the main channels session via
@@ -601,9 +648,13 @@ export function buildMainSessionRespawnCmd(opts: {
     '&&', opts.claudePath,
     ...(opts.continueSession ? ['--continue'] : []),
     '--dangerously-skip-permissions',
-    // Single-quote the model id so a value like `claude-opus-4-8[1m]` is not
-    // glob-expanded by the shell that tmux respawn-pane spawns the command in.
-    ...(opts.model ? ['--model', `'${opts.model}'`] : []),
+    // Escape the model id so a value like `claude-opus-4-8[1m]` is not
+    // glob-expanded -- and so a hostile value cannot break out of the quote and
+    // inject a command into the string the tmux respawn-pane shell runs. This is
+    // the 5th launch sink; it must use the same escaper as the other four (the
+    // allowlist is the belt, this is the braces). shSingleQuote makes the value
+    // one inert shell word. See model-id-injection.test.ts.
+    ...(opts.model ? ['--model', shSingleQuote(opts.model)] : []),
     [`--channels plugin:${opts.pluginId}`, ...(opts.extraPluginIds ?? []).map((p) => `plugin:${p}`)].join(' '),
   ].join(' ')
 }
@@ -870,14 +921,21 @@ export function mainChannelsSessionExists(): boolean {
   }
 }
 
-export function createMainChannelsSession(): boolean {
+// Discriminated result instead of a boolean: 'grace' (already kicked, session
+// is booting -- benign) and 'script-missing'/'spawn-failed' (the install is
+// broken) must NOT look alike to callers. The onboarding launch endpoint
+// reports the former as "starting" and the latter as a hard error; a boolean
+// collapsed both into a silent false success (PR #779 review).
+export type MainSessionCreateResult = 'started' | 'grace' | 'script-missing' | 'spawn-failed'
+
+export function createMainChannelsSession(): MainSessionCreateResult {
   const now = Date.now()
   if (marveenLastSessionCreate && now - marveenLastSessionCreate < MAIN_SESSION_CREATE_GRACE_MS) {
-    return false
+    return 'grace'
   }
   if (!existsSync(CHANNELS_SCRIPT)) {
     logger.error({ script: CHANNELS_SCRIPT }, 'Cannot recreate main channels session: channels.sh missing')
-    return false
+    return 'script-missing'
   }
   try {
     // Detached + unref'd: channels.sh is a long-lived supervisor (it tails the
@@ -896,10 +954,10 @@ export function createMainChannelsSession(): boolean {
     writeRespawnStamp()
     logger.warn({ session: MAIN_CHANNELS_SESSION }, 'Main channels session absent -- recreating via channels.sh')
     sendAlert(`♻️ A ${MAIN_CHANNELS_SESSION} session eltunt -- ujrainditom (channels.sh). Enelkul minden utemezett feladat csendben kimaradna.`)
-    return true
+    return 'started'
   } catch (err) {
     logger.error({ err }, 'Failed to recreate main channels session via channels.sh')
-    return false
+    return 'spawn-failed'
   }
 }
 
@@ -1561,7 +1619,7 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           // with no supervising service, and every scheduled main-agent task
           // silently skips (scheduler !sessionExists branch).
           if (!mainChannelsSessionExists()) {
-            if (shouldEscalateMarveenDown() && createMainChannelsSession()) {
+            if (shouldEscalateMarveenDown() && createMainChannelsSession() === 'started') {
               marveenDownState = null
               marveenSuspectFirstSeen = null
             }

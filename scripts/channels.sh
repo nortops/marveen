@@ -5,11 +5,15 @@
 # from CHANNEL_PROVIDER in .env; when absent, defaults to "telegram" for
 # full backward compatibility.
 #
-# A LaunchAgent hívja. Működés:
+# A LaunchAgent (macOS) vagy a systemd user unit (Linux) hívja. Működés:
 # 1. Tmux session indul a claude processzel
 # 2. A script vár amíg a session él
 # 3. Ha a claude kilép, a tmux session záródik, a script is kilép
-# 4. A launchd KeepAlive újraindítja
+# 4. A launchd KeepAlive újraindítja -- kilépési kódtól függetlenül.
+#    A systemd oldalon ez NEM volt igaz: a unit Restart=always nélkül a nulla
+#    kilépési kódot "kész, nem kell újraindítani"-ként olvasta, így a csatorna
+#    némán, véglegesen leállt. Ezért ad a watchdog-ág mostantól nem-nulla kódot,
+#    és ezért Restart=always a unit -- a két platform szemantikája így egyezik.
 #
 # Kézzel rácsatlakozás: tmux attach -t <MAIN_AGENT_ID>-channels (pl. marveen-channels)
 
@@ -30,6 +34,12 @@ if [ -f "$INSTALL_DIR/.env" ]; then
   # primary provider still drives the orphan-reaper + liveness watchdog logic
   # below unchanged; the extras are best-effort co-listeners on the same session.
   CHANNEL_PLUGINS_EXTRA="$(grep -E '^CHANNEL_PLUGINS_EXTRA=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2-)"
+  # Optional per-install model override for the MAIN agent. Lives here rather
+  # than in .claude/settings.json because that file is TRACKED: an install that
+  # writes its model choice there carries a permanent local diff, which blocks
+  # the update preflight's clean-tree check and silently reverts to the
+  # repository's value on the next update. .env is per-install and gitignored.
+  MAIN_AGENT_MODEL="$(grep -E '^MAIN_AGENT_MODEL=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2-)"
   # Claude Code auth: pass API key or OAuth token so the tmux-spawned
   # claude process can authenticate. These are safe to export -- unlike
   # TELEGRAM_BOT_TOKEN they don't cause cross-session conflicts.
@@ -102,6 +112,31 @@ classify_mcp_plugin_row() {
 
 # Test hook: classify a pane from stdin and exit before anything touches tmux,
 # the store or a live session.
+# Resolve the main agent's model. Precedence: MAIN_AGENT_MODEL from .env
+# (per-install, gitignored) over .claude/settings.json (tracked, shipped with
+# the repo). Without the .env route an install that wants a different model has
+# to edit a tracked file, which then blocks the update preflight's clean-tree
+# check and gets reverted by the next update.
+#
+# Kept as a function so `--resolve-main-model` can exercise exactly the code
+# the launch path uses, with no tmux, store or network involved.
+resolve_main_model() {
+  if [ -n "${MAIN_AGENT_MODEL:-}" ]; then
+    printf '%s' "$MAIN_AGENT_MODEL"
+    return 0
+  fi
+  if [ -f "$INSTALL_DIR/.claude/settings.json" ] && command -v jq >/dev/null 2>&1; then
+    jq -r '.model // empty' "$INSTALL_DIR/.claude/settings.json" 2>/dev/null
+  fi
+}
+
+# Test seam: print the resolved model and exit before any side effect.
+if [ "${1:-}" = "--resolve-main-model" ]; then
+  resolve_main_model
+  echo
+  exit 0
+fi
+
 if [ "${1:-}" = "--classify-mcp-pane" ]; then
   resolve_plugin_ids "${2:-$CHANNEL_PROVIDER}"
   classify_mcp_plugin_row "$(cat)"
@@ -277,14 +312,16 @@ TMUX="$(command -v tmux)"
 # too closes the gap end-to-end). Parity with the sub-agent launch.
 MCP_BATCH_ENV="export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false MCP_SERVER_CONNECTION_BATCH_SIZE=10 MCP_CONNECTION_NONBLOCKING=1 MCP_TIMEOUT=60000 && "
 
-# Read the main agent's default model from .claude/settings.json so we can
-# pass --model explicitly. Without --model claude-code falls back to its
-# built-in default, which can drift across versions. Passing the flag makes
-# the choice deterministic and visible in `ps`.
-MAIN_MODEL=""
-if [ -f "$INSTALL_DIR/.claude/settings.json" ] && command -v jq >/dev/null 2>&1; then
-  MAIN_MODEL="$(jq -r '.model // empty' "$INSTALL_DIR/.claude/settings.json" 2>/dev/null)"
-fi
+# Resolve the main agent's model so we can pass --model explicitly. Without
+# --model claude-code falls back to its built-in default, which can drift
+# across versions. Passing the flag makes the choice deterministic and visible
+# in `ps`.
+#
+# Precedence: MAIN_AGENT_MODEL from .env (per-install, gitignored) wins over
+# .claude/settings.json (tracked, shipped with the repo). Without the .env
+# route an install that wants a different model has to edit a tracked file,
+# which then blocks the update preflight and gets reverted by the next update.
+MAIN_MODEL="$(resolve_main_model)"
 MODEL_FLAG=""
 # Single-quote the model id so values like `claude-opus-4-8[1m]` survive the
 # tmux command-string round-trip without the inner shell glob-expanding `[1m]`.
@@ -340,15 +377,39 @@ if [ -n "$_node_bin" ] && [ -f "$INSTALL_DIR/dist/web/agent-process.js" ]; then
     fi
     echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: main-agent $_cfg_mode CLAUDE_CONFIG_DIR=$_cfg_dir" >> "$INSTALL_DIR/store/channels-failures.log"
   fi
-  # LOUD REGRESSION GUARD: an isolated main-agent config dir on disk (provisioned
-  # by an earlier isolated boot) combined with THIS boot resolving to the shared
-  # ~/.claude means the isolation setting was lost -- e.g. store/config-overrides.json
-  # deleted with no .env key backing it. The silent fallback rides the rotating
-  # shared credential session, which is exactly how the 2026-07-27 evening 401
-  # outage started and was only noticed hours later when the owner got no replies.
-  # Surface it at START time instead: a failures-log line plus a best-effort
-  # inter-agent message to the main agent. Installs that never ran isolated have
-  # no .channels-config dir and stay quiet, so default setups see no new noise.
+  # LOUD REGRESSION GUARD, in two triggers. Both mean the same thing: this boot
+  # resolved to the shared ~/.claude, so the main agent rides the rotating
+  # shared credential session -- exactly how the 2026-07-27 evening 401 outage
+  # started, unnoticed for hours because the owner simply got no replies. Both
+  # surface it at START time: a failures-log line plus a best-effort inter-agent
+  # message. Measured, not assumed: the only combination silent on BOTH is an
+  # install that never ran isolated AND carries no fleet setup-token -- which is
+  # the plain default setup, so that one still sees no new noise. Note trigger 2
+  # does fire without a token when the .channels-config dir is there, which is
+  # correct: that dir means isolation once worked here.
+  #
+  # Trigger 1 (below): a FRESH install. A fleet setup-token exists while the
+  # resolution came back empty. The token is the thing isolation is gated on, so
+  # carrying one and still landing on the shared root means the setting is
+  # missing, not that isolation was declined. This is the shape issue #835 is
+  # about, and trigger 2 is structurally blind to it.
+  if [ -z "$CFG_ENV" ] && [ ! -d "$INSTALL_DIR/.channels-config" ] && [ -s "$INSTALL_DIR/store/.claude-oauth-token" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: WARN main-agent starting on SHARED ~/.claude although a fleet setup-token exists (store/.claude-oauth-token) -- MAIN_AGENT_ISOLATED_CONFIG is unset, so the main bot authenticates from the rotating shared credential and can 401 into a silent channel." >> "$INSTALL_DIR/store/channels-failures.log"
+    if [ -f "$INSTALL_DIR/store/.dashboard-token" ]; then
+      _guard_port="$(grep -E '^WEB_PORT=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+      curl -s --max-time 5 -X POST "http://localhost:${_guard_port:-3420}/api/messages" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $(cat "$INSTALL_DIR/store/.dashboard-token")" \
+        -d "{\"from\":\"channels-sh-guard\",\"to\":\"${MAIN_AGENT_ID:-marveen}\",\"content\":\"[GUARD] A fo agens a KOZOS ~/.claude alol indult, pedig van flotta setup-token (store/.claude-oauth-token). A MAIN_AGENT_ISOLATED_CONFIG nincs beallitva, ezert az auth a rotalodo megosztott credentialbol megy: ez lejarhat, 401-be all a TUI, es a csatorna NEMAN elerhetetlen lesz. Teendo: MAIN_AGENT_ISOLATED_CONFIG=1 beallitasa, majd channels session restart.\"}" \
+        >/dev/null 2>&1 || true
+      unset _guard_port
+    fi
+  fi
+  # Trigger 2 (below): an install that HAS run isolated before. Its
+  # .channels-config dir is still on disk, yet this boot resolved to the shared
+  # root -- so the isolation setting was LOST, e.g. store/config-overrides.json
+  # deleted with no .env key backing it. Needing that dir is what makes this
+  # trigger blind on a fresh install, hence trigger 1.
   if [ -z "$CFG_ENV" ] && [ -d "$INSTALL_DIR/.channels-config" ]; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: WARN main-agent starting on SHARED ~/.claude although isolated dir $INSTALL_DIR/.channels-config exists -- MAIN_AGENT_ISOLATED_CONFIG resolution came back empty (overrides/.env key lost?). Auth rides the rotating shared session and can 401." >> "$INSTALL_DIR/store/channels-failures.log"
     if [ -f "$INSTALL_DIR/store/.dashboard-token" ]; then
@@ -690,12 +751,61 @@ MAIN_BOT_PID_FILE="$HOME/.claude/channels/$CHANNEL_PROVIDER/bot.pid"
 # Never-started budget: generous so a slow cold-start (WSL first-run, MCP
 # handshake + /mcp unlock retries) is never killed prematurely. The plugin
 # normally writes bot.pid within ~1-2 min; 10 min is a safe ceiling.
-PLUGIN_NEVER_STARTED_DEADLINE=$((START_TS + 600))
+#
+# The budget GROWS across consecutive restarts, and that is the point. On a host
+# where the plugin cannot start at all -- AVX-less box, broken plugin cache,
+# Claude auth deferred at install -- a fixed 10-minute budget becomes a
+# ten-minute restart cycle that never ends. Each restart kill-sessions and
+# recreates the agent's tmux session, so on a machine where Claude itself works
+# and only the plugin is dead, the main agent loses its context every ten
+# minutes. Measured on a live host on 2026-08-04: exit 1 at 08:23:52, systemd
+# restart at 08:24:03, fresh session at 08:24:04, and the same again one budget
+# later. Before the watchdog exited non-zero that host simply kept a working
+# agent with a dead channel -- so an unbounded cycle would be a regression for
+# that population, not an improvement.
+#
+# What is deliberately NOT damped: the signal. The warning still goes to the log
+# and the exit is still non-zero, so the service manager still restarts the unit
+# and OnFailure= still fires. We slow the churn down; we do not silence the
+# symptom. A host that recovers resets the streak, so a healthy machine keeps
+# the original fast watchdog.
+NEVER_STARTED_BASE=600
+NEVER_STARTED_CAP=2400
+NEVER_STARTED_STREAK_FILE="$INSTALL_DIR/store/.channel-neverstart-streak"
+
+# Budget for the Nth consecutive never-started exit: 600 -> 1200 -> 2400, capped.
+never_started_budget() {
+  _streak="${1:-0}"
+  case "$_streak" in ''|*[!0-9]*) _streak=0 ;; esac
+  _budget=$NEVER_STARTED_BASE
+  _i=0
+  while [ "$_i" -lt "$_streak" ]; do
+    _budget=$((_budget * 2))
+    if [ "$_budget" -ge "$NEVER_STARTED_CAP" ]; then
+      _budget=$NEVER_STARTED_CAP
+      break
+    fi
+    _i=$((_i + 1))
+  done
+  echo "$_budget"
+}
+
+NEVER_STARTED_STREAK="$(cat "$NEVER_STARTED_STREAK_FILE" 2>/dev/null | tr -d '[:space:]')"
+case "$NEVER_STARTED_STREAK" in ''|*[!0-9]*) NEVER_STARTED_STREAK=0 ;; esac
+PLUGIN_NEVER_STARTED_BUDGET="$(never_started_budget "$NEVER_STARTED_STREAK")"
+PLUGIN_NEVER_STARTED_DEADLINE=$((START_TS + PLUGIN_NEVER_STARTED_BUDGET))
 # Died-after-up budget: once we have seen the plugin alive, a continuous
 # disappearance this long means it crashed and is not self-recovering.
 PLUGIN_DEAD_GRACE=180
 PLUGIN_SEEN_ONCE=false
 PLUGIN_DEAD_SINCE=0
+# Set to 1 when the watchdog below breaks out ON PURPOSE to be restarted. The
+# exit status has to carry that intent: a watchdog exit is not a normal one, and
+# a unit still carrying the old Restart=on-failure would read exit 0 as "this
+# service is done" and never bring the channel back. Measured on a live install
+# 2026-08-04: channels.sh logged "exiting for service-manager restart", exited 0,
+# and the unit stayed inactive/dead for the next ten minutes.
+RESTART_REQUESTED=0
 
 # Várakozás amíg a session él
 while $TMUX has-session -t "$SESSION" 2>/dev/null; do
@@ -725,6 +835,13 @@ while $TMUX has-session -t "$SESSION" 2>/dev/null; do
   if [ "$_plugin_alive" = "true" ]; then
     PLUGIN_SEEN_ONCE=true
     PLUGIN_DEAD_SINCE=0
+    # The plugin came up, so this host is not in the never-starting state:
+    # drop the streak so the next cold start gets the fast 10-minute watchdog
+    # again instead of inheriting a 40-minute budget from an old outage.
+    if [ "$NEVER_STARTED_STREAK" != "0" ]; then
+      rm -f "$NEVER_STARTED_STREAK_FILE" 2>/dev/null || true
+      NEVER_STARTED_STREAK=0
+    fi
   elif [ "$PLUGIN_SEEN_ONCE" = "true" ]; then
     # Was up, now gone -- start/continue the dead-grace timer (a transient
     # gap that recovers resets it, so only a sustained death triggers exit).
@@ -733,13 +850,20 @@ while $TMUX has-session -t "$SESSION" 2>/dev/null; do
       echo "WARN: $CHANNEL_PROVIDER plugin (bot.pid) disappeared -- ${PLUGIN_DEAD_GRACE}s grace before restart" >&2
     elif [ "$((NOW - PLUGIN_DEAD_SINCE))" -ge "$PLUGIN_DEAD_GRACE" ]; then
       echo "WARN: $CHANNEL_PROVIDER plugin dead for $((NOW - PLUGIN_DEAD_SINCE))s -- exiting for service-manager restart" >&2
+      RESTART_REQUESTED=1
       break
     fi
   else
     # Never came up at all (e.g. a Claude Code build that silently disables
     # --channels). Give it the full cold-start budget, then restart.
     if [ "$NOW" -ge "$PLUGIN_NEVER_STARTED_DEADLINE" ]; then
-      echo "WARN: $CHANNEL_PROVIDER plugin never started within $((PLUGIN_NEVER_STARTED_DEADLINE - START_TS))s -- exiting for service-manager restart" >&2
+      # Persist the streak BEFORE exiting: the next process start reads it and
+      # waits longer. Written first so a kill between the write and the exit
+      # still leaves the counter advanced rather than stuck at the fast budget.
+      _next_streak=$((NEVER_STARTED_STREAK + 1))
+      echo "$_next_streak" > "$NEVER_STARTED_STREAK_FILE" 2>/dev/null || true
+      echo "WARN: $CHANNEL_PROVIDER plugin never started within ${PLUGIN_NEVER_STARTED_BUDGET}s -- exiting for service-manager restart (consecutive: $_next_streak, next budget: $(never_started_budget "$_next_streak")s)" >&2
+      RESTART_REQUESTED=1
       break
     fi
   fi
@@ -763,4 +887,11 @@ fi
 
 # Normal exit: clear failure log
 rm -f "$INSTALL_DIR/store/channels-failures.log"
+
+# A watchdog exit asked for a restart, so it must NOT look like a clean finish.
+# Written as an if (not `[ ] && exit 1`) so a future `set -e` cannot turn the
+# false branch into an accidental non-zero exit of the whole script.
+if [ "$RESTART_REQUESTED" = "1" ]; then
+  exit 1
+fi
 exit 0

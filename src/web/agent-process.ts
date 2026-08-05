@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, lstatSync, symlinkSync, rmSync, realpathSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, lstatSync, symlinkSync, rmSync, realpathSync, renameSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { execSync, execFileSync } from 'node:child_process'
@@ -12,7 +12,11 @@ import {
   detectsPastePlaceholder,
   detectPaneState,
   parkedInputText,
+  parkedInputRowCount,
+  parkedClearSequence,
   stripGhostSuggestion,
+  stripSessionTitleBanner,
+  stripAllAnsi,
   paneShowsContextSaturation,
   idleConsideringDimGhost,
   detectsFirstRunGate,
@@ -25,6 +29,7 @@ import { resolveAgentConfigDir } from './claude-plans.js'
 import { provisionMemoryBoundaryDir } from './memory-boundary.js'
 import { renameSharedCredentialsIfSafe } from './claude-credentials-guard.js'
 import { atomicWriteFileSync } from './atomic-write.js'
+import { withSessionSendLock, type SendLockMode } from './session-send-lock.js'
 import {
   buildTmuxInvocation,
   buildSshExec,
@@ -373,6 +378,78 @@ export function resolveMainAgentConfigDir(): string | null {
 // two can never diverge. `cfg` is the isolated CLAUDE_CONFIG_DIR to create; `cwd`
 // is the agent's project dir stamped into its own installed_plugins.json; `name`
 // is used for logs only.
+// Write JSON through a temp file + rename, so a Claude Code process reading
+// the file concurrently sees either the old content or the new one, never a
+// half-written one. The temp name carries the pid so two provisions racing on
+// the same dir cannot truncate each other's staging file.
+//
+// The mode is carried over deliberately. A plain writeFileSync writes THROUGH
+// the existing inode and keeps its permissions; tmp + rename replaces the file
+// with a NEW inode, which would silently take the umask default and relax an
+// 0600 config to 0644. That matters here: some isolated .claude.json files are
+// 0600, and their mcpServers entries carry env blocks with credentials -- and
+// this reconcile is exactly the path that starts rewriting the file regularly.
+// Fall back to 0600 (not the umask) when the target does not exist yet, since
+// the content class is the same either way.
+function writeJsonAtomic(path: string, value: unknown): void {
+  let mode = 0o600
+  try { mode = statSync(path).mode & 0o777 } catch { /* new file -> owner-only */ }
+  const tmp = `${path}.tmp-${process.pid}`
+  writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n', { mode })
+  renameSync(tmp, path)
+}
+
+// Fill mcpServers gaps in an ALREADY provisioned isolated .claude.json from the
+// shared ~/.claude.json.
+//
+// Why this exists (issue #834): the isolated .claude.json is seeded from a full
+// copy of the shared one ONLY on first provision. Every later spawn just makes
+// sure hasCompletedOnboarding stays set, so the server list is frozen at its
+// first-seed snapshot -- an MCP server added to ~/.claude.json afterwards
+// reaches brand-new agents but never an existing one, silently: the agent just
+// lacks the tool, with no error anywhere. Rolling one out to a running fleet
+// then needs a manual per-agent backfill, and that only fixes the current set.
+//
+// ADDITIVE ONLY, deliberately. This is a gap-fill, not a two-way sync:
+//   - a server missing from the isolated file is copied in,
+//   - an entry that already exists is NEVER overwritten -- Claude Code owns its
+//     evolved state, and a per-agent scoping decision must survive,
+//   - a server removed from the shared config is left in place,
+//   - a non-object mcpServers on either side means we do not touch it at all,
+//     because we cannot merge what we do not understand.
+// Returns true if the caller should persist `cur`.
+function reconcileMcpServers(
+  cur: Record<string, unknown>,
+  sharedDot: string,
+  name: string,
+): boolean {
+  if (!existsSync(sharedDot)) return false
+  let shared: Record<string, unknown>
+  try { shared = JSON.parse(readFileSync(sharedDot, 'utf-8')) as Record<string, unknown> }
+  catch { return false } // unparseable shared config -> leave the isolated one alone
+  if (!isPlainObject(shared.mcpServers)) return false
+  // An existing but non-object mcpServers is not ours to repair.
+  if ('mcpServers' in cur && !isPlainObject(cur.mcpServers)) {
+    logger.warn({ name }, 'isolated-config: mcpServers is not an object, skipping reconcile')
+    return false
+  }
+  const own = isPlainObject(cur.mcpServers) ? cur.mcpServers : {}
+  const added: string[] = []
+  for (const [key, def] of Object.entries(shared.mcpServers)) {
+    if (key in own) continue
+    own[key] = def
+    added.push(key)
+  }
+  if (added.length === 0) return false
+  cur.mcpServers = own
+  logger.info({ name, added }, 'isolated-config: added missing MCP servers from the shared config')
+  return true
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
 function provisionIsolatedConfigDir(
   cfg: string,
   cwd: string,
@@ -491,14 +568,17 @@ function provisionIsolatedConfigDir(
           try { seed = JSON.parse(readFileSync(sharedDot, 'utf-8')) as Record<string, unknown> } catch { /* keep minimal */ }
         }
         seed.hasCompletedOnboarding = true
-        writeFileSync(dotClaude, JSON.stringify(seed, null, 2) + '\n')
+        writeJsonAtomic(dotClaude, seed)
       } else {
         try {
           const cur = JSON.parse(readFileSync(dotClaude, 'utf-8')) as Record<string, unknown>
+          let dirty = false
           if (cur.hasCompletedOnboarding !== true) {
             cur.hasCompletedOnboarding = true
-            writeFileSync(dotClaude, JSON.stringify(cur, null, 2) + '\n')
+            dirty = true
           }
+          if (reconcileMcpServers(cur, sharedDot, name)) dirty = true
+          if (dirty) writeJsonAtomic(dotClaude, cur)
         } catch { /* unparseable -> leave for Claude Code to recreate */ }
       }
     } catch (err) {
@@ -722,6 +802,19 @@ function resolveAgentProvider(name: string): ChannelProviderType {
 
 export function agentSessionName(name: string): string {
   return `agent-${name}`
+}
+
+/**
+ * POSIX single-quote a value for safe interpolation into a shell command STRING (card b7fa5281).
+ *
+ * The agent launch is a shell string tmux runs (`new-session -d -s <s> <cmd>`), and the model id --
+ * which the operator controls via the dashboard -- was interpolated as `'${model}'`. Single-quoting
+ * made a `:` safe but not a `'`: `x'; curl ... | sh; echo '` closed the quote and injected a command.
+ * Wrapping in single quotes with each embedded `'` rewritten as `'\''` makes ANY value a single inert
+ * shell word. This is defence #2 at the sink; the model-id allowlist (model-id.ts) is defence #1.
+ */
+export function shSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
 // All tmux operations route through these two wrappers so the local-vs-remote
@@ -1044,13 +1137,13 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
     // the custom ANTHROPIC_BASE_URL ("model does not exist"). The env var is
     // authoritative and bypasses that validation. (`--print` honors --model, but
     // the agents run the TUI.) Single-quoted so a `:` in the tag is shell-safe.
-    const ollamaEnv = isOllama ? `export ANTHROPIC_AUTH_TOKEN=ollama && export ANTHROPIC_BASE_URL=${OLLAMA_URL} && export ANTHROPIC_MODEL='${model}' && ` : ''
+    const ollamaEnv = isOllama ? `export ANTHROPIC_AUTH_TOKEN=ollama && export ANTHROPIC_BASE_URL=${OLLAMA_URL} && export ANTHROPIC_MODEL=${shSingleQuote(model)} && ` : ''
     const deepseekKey = isDeepseek ? (getSecret('DEEPSEEK_API_KEY') ?? '') : ''
-    const deepseekEnv = isDeepseek ? `export ANTHROPIC_AUTH_TOKEN="${deepseekKey}" && export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic && export ANTHROPIC_MODEL='${model}' && ` : ''
+    const deepseekEnv = isDeepseek ? `export ANTHROPIC_AUTH_TOKEN="${deepseekKey}" && export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic && export ANTHROPIC_MODEL=${shSingleQuote(model)} && ` : ''
     // OpenRouter: Anthropic-compatible endpoint at https://openrouter.ai/api
     // (the SDK appends /v1/messages). Key from the vault (openrouter-fleet-key).
     const openrouterKey = isOpenRouter ? (getSecret('openrouter-fleet-key') ?? '') : ''
-    const openrouterEnv = isOpenRouter ? `export ANTHROPIC_AUTH_TOKEN="${openrouterKey}" && export ANTHROPIC_BASE_URL=https://openrouter.ai/api && export ANTHROPIC_MODEL='${model}' && ` : ''
+    const openrouterEnv = isOpenRouter ? `export ANTHROPIC_AUTH_TOKEN="${openrouterKey}" && export ANTHROPIC_BASE_URL=https://openrouter.ai/api && export ANTHROPIC_MODEL=${shSingleQuote(model)} && ` : ''
     // When authMode is 'api', the agent uses its own ANTHROPIC_API_KEY from
     // the vault instead of the host's OAuth. The vault entry ID follows the
     // convention `agent-{name}-api-key`. We inject it as an env var so Claude
@@ -1322,9 +1415,11 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
     // member. Killing the suggestion at the source removes the ghost the recovery
     // misreads. Env var verified present in claude.exe (CLAUDE_CODE_ENABLE_*).
     const promptSuggestionEnv = 'export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false && '
-    // Single-quote `${model}` so values like `claude-opus-4-8[1m]` (1M-context
-    // suffix) are not glob-expanded by the shell that tmux spawns the command in.
-    const cmd = `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && ${unsetTokens} && ${promptSuggestionEnv}${mcpEnv}${channelSetup}${apiKeyEnv}${claudeConfigEnv}${oauthTokenEnv}${customEnv}${ollamaEnv}${deepseekEnv}${openrouterEnv}cd "${dir}" && ${claudeBin()} ${continueFlag}${skipFlag}--model '${model}' ${channelFlag}`.trimEnd()
+    // shSingleQuote(model) (card b7fa5281): the model is POSIX single-quote ESCAPED, which both keeps
+    // values like `claude-opus-4-8[1m]` (1M-context suffix) from being glob-expanded AND makes a `'`
+    // in the value inert rather than a quote-break -> command injection. Same escape at the three
+    // ANTHROPIC_MODEL env sites above.
+    const cmd = `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && ${unsetTokens} && ${promptSuggestionEnv}${mcpEnv}${channelSetup}${apiKeyEnv}${claudeConfigEnv}${oauthTokenEnv}${customEnv}${ollamaEnv}${deepseekEnv}${openrouterEnv}cd "${dir}" && ${claudeBin()} ${continueFlag}${skipFlag}--model ${shSingleQuote(model)} ${channelFlag}`.trimEnd()
     runTmux(null, ['new-session', '-d', '-s', session, cmd], { timeout: 10000 })
 
     logger.info({ name, session, channelDir: agentChannelDir }, 'Agent tmux session started')
@@ -1653,14 +1748,22 @@ export async function waitForPaneIdle(
   }
 }
 
-// Buffer-clear (Ctrl-U) used pre-flight when shouldClearTruncatedPreamble
-// flags a stale preamble. Sent as a single key name (no `-l` literal
-// flag) so tmux interprets it as the control sequence.
+// Pre-flight buffer clear, used when shouldClearTruncatedPreamble flags a stale
+// preamble. This used to send a single Ctrl-U, which is a no-op whenever the
+// cursor sits at offset 0 of the buffer -- the normal state for text that
+// arrived via send-keys (see parkedClearSequence). A failed pre-flight clear is
+// worse than none: the prompt about to be typed is APPENDED to the stale text
+// instead of replacing it, which is how a box accumulates tick after tick until
+// nothing can be submitted at all. Keys are sent by name (no `-l` literal flag)
+// so tmux interprets them as control sequences.
 export async function clearInputBuffer(session: string, host: string | null = null): Promise<void> {
   try {
-    runTmux(host, ['send-keys', '-t', session, 'C-u'], { timeout: 5000 })
+    const pane = capturePane(session, host)
+    for (const key of parkedClearSequence(pane != null ? parkedInputRowCount(pane) : 0)) {
+      runTmux(host, ['send-keys', '-t', session, key], { timeout: 5000 })
+    }
     // Settle briefly so the next send-keys lands in the freshly cleared
-    // buffer rather than racing the Ctrl-U.
+    // buffer rather than racing the clear.
     await delay(100)
   } catch (err) {
     logger.warn({ err, session }, 'Failed to clear pane input buffer before send')
@@ -1728,8 +1831,8 @@ export async function sendPromptToSession(
   session: string,
   text: string,
   host: string | null = null,
-  opts: { waitForIdle?: boolean; onBusyTimeout?: 'send' | 'abort'; idleTimeoutMs?: number } = {},
-): Promise<'sent' | 'aborted-busy'> {
+  opts: { waitForIdle?: boolean; onBusyTimeout?: 'send' | 'abort'; idleTimeoutMs?: number; lockMode?: SendLockMode } = {},
+): Promise<'sent' | 'aborted-busy' | 'skipped-locked'> {
   await dismissSurveyModalIfPresent(session, host)
   await dismissResumeSummaryModalIfPresent(session, host)
   await dismissModelConsentDialogIfPresent(session, host)
@@ -1768,6 +1871,14 @@ export async function sendPromptToSession(
     logger.warn({ session }, 'sendPromptToSession: pane still busy after wait-until-idle budget; sending best-effort')
   }
 
+  // DELIVLOCK805: everything from here to `return 'sent'` EMITS keystrokes into
+  // the pane (preamble-clear, chunk stream, submit-retry loop). Two writers
+  // interleaving this span splice foreign text into one framed message, so it
+  // is the per-session critical section. Held under a per-pane in-process mutex
+  // (session-send-lock): normal delivery is fail-open (a stuck holder must not
+  // silence the fleet); a `recover` caller skips instead of racing a live send.
+  const lockMode: SendLockMode = opts.lockMode ?? 'deliver'
+  const emitToPane = async (): Promise<'sent'> => {
   // Pre-flight buffer-clear when a stale preamble is detected. Reading
   // the pane is best-effort: a capture failure here means we cannot
   // prove the buffer is clean, but proceeding without the clear is no
@@ -1867,6 +1978,31 @@ export async function sendPromptToSession(
       break
     }
   }
+    return 'sent'
+  }
+
+  // 'held': the caller already owns this pane's lane (e.g. the stuck-input
+  // recovery clears + re-injects as ONE recover-mode critical section). Re-
+  // acquiring the same lane here would deadlock against ourselves, so emit
+  // directly.
+  if (lockMode === 'held') {
+    return emitToPane()
+  }
+
+  const lockResult = await withSessionSendLock(session, host, lockMode, emitToPane)
+  if (!lockResult.ran) {
+    // recover mode + lane busy: a delivery is mid-flight into this pane. Do NOT
+    // race it (we would clear or submit the wrong buffer). Skip this round and
+    // say so out loud -- a skip nobody logs is not a skip.
+    logger.info({ session }, 'sendPromptToSession: pane delivery in progress; recover-mode send skipped this round')
+    return 'skipped-locked'
+  }
+  if (lockResult.failedOpen) {
+    // Fail-open: the wait budget elapsed against a stuck holder and we wrote
+    // without the lock. Delivery still happened; log loudly so a wedged holder
+    // is visible rather than silently degrading into re-interleaving.
+    logger.warn({ session }, 'sendPromptToSession: delivery lock wait budget elapsed; sent WITHOUT the per-pane lock (fail-open) -- a holder may be wedged')
+  }
   return 'sent'
 }
 
@@ -1895,7 +2031,13 @@ export function sendEnterToSession(session: string, host: string | null = null):
 // the caller can treat "capture failed" as "not ready".
 export function capturePane(session: string, host: string | null = null): string | null {
   try {
-    return captureTmux(host, ['capture-pane', '-t', session, '-p'])
+    // Capture WITH colour, strip a trailing /rename session-title banner, then
+    // remove all remaining ANSI. For a pane without a banner this is byte-for-byte
+    // the old `capture-pane -p` output; when a pathological rename-banner is pinned
+    // to the bottom it is removed so the live footer/spinner classifies normally
+    // (a banner otherwise pins detectPaneState 'unknown', blocking scheduler +
+    // inter-agent delivery). See stripSessionTitleBanner.
+    return stripAllAnsi(stripSessionTitleBanner(captureTmux(host, ['capture-pane', '-t', session, '-e', '-p'])))
   } catch {
     return null
   }
@@ -1977,10 +2119,13 @@ export async function isSessionReadyForPrompt(session: string, host: string | nu
 // the input box is STUCK (stale) vs being actively typed. Identical parked text
 // across this gap means nobody is typing -> it is a stranded artifact.
 const PARKED_STABLE_CONFIRM_MS = 2000
-// Settle after a Ctrl-U so the next capture reflects the cleared box.
+// Settle after a batch of clearing keystrokes so the next capture reflects the
+// emptied box.
 const PARKED_CLEAR_SETTLE_MS = 300
-// Bound the Ctrl-U presses for a (possibly multi-line) stale parked input.
-const PARKED_CLEAR_MAX = 3
+// How often to re-capture while working through parkedClearSequence(): often
+// enough that a box which empties early stops right away, rarely enough that the
+// settle delay is not paid per keystroke.
+const PARKED_CLEAR_RECHECK_EVERY = 8
 // A parked input that resists clearing must NOT be retried on every router tick:
 // each attempt awaits ~PARKED_STABLE_CONFIRM_MS on the settle
 // delay, so a permanently-stuck box would otherwise starve the loop, stall the HTTP server
@@ -2055,26 +2200,22 @@ export async function clearStaleParkedInput(session: string, host: string | null
     return false
   }
 
-  for (let i = 0; i < PARKED_CLEAR_MAX; i++) {
-    runTmux(host, ['send-keys', '-t', session, 'C-u'], { timeout: 5000 })
-    await delay(PARKED_CLEAR_SETTLE_MS)
-    const after = capturePane(session, host)
-    if (after == null || detectPaneState(after) !== 'typing') break
-  }
-
-  // Escalation: if Ctrl-U alone did not empty a multi-row box, send Home (C-a)
-  // then kill-to-end (C-k) and one more Ctrl-U round before giving up.
-  let post = capturePane(session, host)
-  if (post != null && detectPaneState(post) === 'typing' && parkedInputText(post) === parked) {
-    runTmux(host, ['send-keys', '-t', session, 'C-a'], { timeout: 5000 })
-    runTmux(host, ['send-keys', '-t', session, 'C-k'], { timeout: 5000 })
-    for (let i = 0; i < PARKED_CLEAR_MAX; i++) {
-      runTmux(host, ['send-keys', '-t', session, 'C-u'], { timeout: 5000 })
+  // Forward deletion, budgeted by the visible row count -- see the rationale and
+  // the 2026-08-01 measurement above parkedClearSequence(). The cursor sits at
+  // offset 0 of the buffer, so the previous Ctrl-U rounds were no-ops and the
+  // single C-a + C-k escalation could only ever strip ONE line off a multi-line
+  // box. Re-check every few keystrokes so a box that empties early stops
+  // immediately instead of spending the whole budget.
+  const sequence = parkedClearSequence(parkedInputRowCount(a))
+  for (let i = 0; i < sequence.length; i++) {
+    runTmux(host, ['send-keys', '-t', session, sequence[i]], { timeout: 5000 })
+    if (i % PARKED_CLEAR_RECHECK_EVERY === PARKED_CLEAR_RECHECK_EVERY - 1) {
       await delay(PARKED_CLEAR_SETTLE_MS)
-      post = capturePane(session, host)
-      if (post == null || detectPaneState(post) !== 'typing') break
+      const after = capturePane(session, host)
+      if (after == null || detectPaneState(after) !== 'typing') break
     }
   }
+  await delay(PARKED_CLEAR_SETTLE_MS)
 
   // Verify the box is ACTUALLY empty before claiming success: only then is the
   // pending message safe to deliver next tick. Otherwise record the failure so

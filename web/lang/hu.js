@@ -376,6 +376,15 @@ window._i18n.hu = {
   'agents.wizard.desc_label':    'Írd le szabadon, mit szeretnél hogy csináljon ez az ügynök',
   'agents.wizard.profile_label': 'Biztonsági profil',
   'agents.wizard.gen_hint':      'Ez néhány másodpercig tarthat',
+  // Shown on step 3 when the backend answered personalityPending:true. State, not
+  // error: the agent exists and works, only its personality text is a placeholder.
+  // "ügynök", not "ágens": the wizard modal above this banner is titled
+  // "Új ügynök létrehozása", and two words for the same thing on one screen reads
+  // as carelessness. The product-wide split (hu.js: 66 x ügynök, 31 x ágens) is a
+  // separate decision, tracked on its own card.
+  'agents.wizard.pending_title': 'Az ügynök elkészült, a személyisége viszont sablonból jött',
+  'agents.wizard.pending_body':  'Az ügynök létrejött és működik, nem veszett el semmi. A személyiségét nem sikerült legenerálni, ezért amit alább látsz, az egy sablon. Átírhatod most itt, vagy később bármikor az ügynök beállításainál.',
+  'agents.wizard.pending_detail': 'Ami nem sikerült: {detail}',
   'agents.model.inherit':        'Öröklött (alapértelmezett)',
   'agents.model.fable5':         'Fable 5 (legújabb)',
   'agents.model.opus5':          'Opus 5 (legújabb Opus)',
@@ -456,6 +465,7 @@ window._i18n.hu = {
   'activity.error_load':         'Nem sikerült lekérni az aktivitást',
   'activity.empty':              'Nincs ügynök.',
   'activity.badge.main':         'fő',
+  'activity.tooltip.mode':       'Jogosultsági mód: {mode}. Ebben a módban az ágens megáll és jóváhagyásra vár, mielőtt eszközt hívna -- ha senki nem figyeli, órákig állhat úgy, hogy közben tétlennek látszik.',
   'activity.loading':            'Betöltés…',
   'activity.state.working':      'dolgozik',
   'activity.state.idle':         'várakozik',
@@ -998,7 +1008,7 @@ window._i18n.hu = {
   'settings.loading':            'Betöltés...',
   'settings.empty':              'Nincs regisztrált beállítás.',
   'settings.error':              'Nem sikerült betölteni a beállításokat.',
-  'settings.restart_badge':      'Újraindítást igényel',
+  'settings.restart_badge':      'Újraindítás után lép életbe',
   'settings.save_btn.saving':    'Mentés...',
   'settings.save_btn.save':      'Mentés',
   'settings.btn.refresh':        'Frissítés',
@@ -1519,6 +1529,7 @@ window._i18n.hu = {
   'onboarding.step1.saved_restart_failed': 'A token elmentve, de az ügynök újraindítása nem sikerült. Indítsd újra kézzel (Linux: systemctl --user restart marveen-channels), aztán térj vissza ide.',
   'onboarding.step1.launching':  'Indítás...',
   'onboarding.step1.launched':   'Ügynökök indítása folyamatban...',
+  'onboarding.step1.launch_slow':'Az ügynökök még nem álltak fel a várt időn belül. Lassabb gépen a hidegindítás pár percig is eltarthat: várj egy kicsit, majd frissítsd az oldalt. Ha 10 perc után sincs változás, nézd meg a store/channels-failures.log fájlt.',
   'onboarding.step2.tab':        'Telegram bot',
   'onboarding.step2.desc':       'Add meg a Telegram bot tokenjét (a BotFather-től).',
   'onboarding.step2.token_label':'Telegram bot token',
@@ -1737,6 +1748,8 @@ window._i18n.hu = {
   'auth.bridge.desc':              'Illeszd be a Bridge alkalmazásban megjelenő kulcs-sort (ssh-ed25519 ... marveen-remote:...), adj nevet az eszköznek, és a kapott csomagot másold vissza a Bridge-be. Az eszköz saját, külön visszavonható kulcsot kap.',
   'auth.bridge.key_placeholder':   'ssh-ed25519 ... marveen-remote:...',
   'auth.bridge.name_placeholder':  'Eszköz neve (pl. Szabi laptopja)',
+  'auth.bridge.host_placeholder':  'Cél-cím: IP-cím vagy gépnév (opcionális)',
+  'auth.bridge.host_hint':         'Üresen hagyva a gép Tailscale-címe kerül bele, ha van ilyen, különben a LAN-címe. Tailscale esetén a 100-zal kezdődő IP-cím kell ide, NEM a Tailscale-fiók email címe.',
   'auth.bridge.enroll':            'Párosítás',
   'auth.bridge.confirm':           'Párosítod "{name}" eszközt? SSH-alagút + saját eszközkulcs hozzáférést kap a dashboardhoz.',
   'auth.bridge.working':           'Párosítás folyamatban...',

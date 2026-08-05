@@ -159,25 +159,77 @@ loop entirely.
 
 When you receive the heartbeat prompt:
 
+0. **Read the clock.** Every timestamp you print is local time in
+   ${APP_TZ}, and you have no clock of your own -- so measure it:
+
+   \`\`\`bash
+   TZ=${APP_TZ} date +'%Y-%m-%d %H:%M'
+   \`\`\`
+
+   Use THAT string in the header. Never \`date -u\`, never
+   \`datetime.now(timezone.utc)\`, never the hour the schedule was
+   supposed to fire. UTC printed under a \`${APP_TZ}\` label is worse
+   than no timestamp: every window in this report ("next 2h", "last
+   1h") is read against it, so an hour of drift silently moves the
+   window as well as the label.
+
 1. **Collect** the four data sources:
    - **Calendar (next 2 hours)** -- use the
      \`mcp__server-google-calendar-mcp__list-events\` tool
      ${calendarTarget}, timeMin=now, timeMax=now+2h.
+     Call it as a TOOL, directly. Do not try to reach an MCP server
+     from Bash, python, curl or any other subprocess: MCP tools exist
+     only in your own tool list, so a subprocess will always come back
+     empty and that emptiness says nothing about the server. If the
+     tool is genuinely absent from your tool list, say
+     "calendar tool not available in this session" -- that is a
+     different fact from a failed call, and only the tool itself can
+     produce the latter.
      If the call fails (token revoked / 401), record the failure
      reason rather than the events; the main agent can act on the
      failure.
-   - **Kanban** -- read the SQLite DB at
-     \`${id.storeDir}/claudeclaw.db\`:
-     \`sqlite3 ${id.storeDir}/claudeclaw.db "SELECT status, COUNT(*)
-     FROM kanban_cards WHERE archived_at IS NULL GROUP BY status"\`
-     for counts, and grab the titles of cards where
-     \`archived_at IS NULL AND priority='urgent' AND status != 'done'\`
-     (a card can be \`urgent\` priority but already \`done\` -- exclude
-     those, or you will report closed issues as active every hour)
-     or \`archived_at IS NULL AND status='waiting'\`.
-   - **Scheduled tasks** -- count active rows in
-     \`scheduled_tasks\` table; record \`next_run_at\` for the
-     earliest upcoming one.
+   - **Kanban** -- ONE call, and do not compose a query of your own:
+
+     \`\`\`bash
+     curl -s -H "Authorization: Bearer $(cat ${id.storeDir}/.dashboard-token)" \\
+       ${id.dashboardOrigin}/api/kanban/heartbeat-summary
+     \`\`\`
+
+     It returns exactly what this section may report:
+     \`{"urgent":[...], "waiting":[...], "counts":{...}}\`, where the
+     lists contain only UNFINISHED cards -- never archived, never
+     \`done\`, but \`planned\` included, because "urgent and nobody
+     has touched it" is exactly what this line is for. Report the ids
+     and titles it gives you and nothing else.
+
+     Two things this replaces, both measured: the old instruction told
+     you to write the filter yourself, and on 2026-08-04 the 09:00
+     report still listed five items of which THREE were \`done\` --
+     a rule you must re-apply every hour is not a mechanism. And the
+     old call used \`sqlite3\`, which does not exist on a stock Linux
+     install (exit 127), so on those hosts this step died silently.
+
+     If a list comes back EMPTY, write that it is empty. Do not widen
+     the query, do not fall back to another status, do not fill the
+     line with closed cards so that it has content: an empty urgent
+     list is the good news, and a report nobody can trust to be empty
+     is a report nobody reads.
+   - **Scheduled tasks** -- the live registry is the dashboard API, NOT
+     the \`scheduled_tasks\` table (that table is empty on this
+     deployment, and a count taken from it reports 0 forever):
+
+     \`\`\`bash
+     curl -s -H "Authorization: Bearer $(cat ${id.storeDir}/.dashboard-token)" \\
+       ${id.dashboardOrigin}/api/schedules \\
+       | python3 -c "import json,sys; r=json.load(sys.stdin); print(sum(1 for x in r if x.get('enabled')))"
+     \`\`\`
+
+     For what actually ran, query \`task_runs\`. Its \`ts\` column is in
+     MILLISECONDS, so the one-hour cutoff is \`(unixepoch()-3600)*1000\`
+     -- with a seconds comparison every row matches and the count is
+     the whole table:
+     \`sqlite3 ${id.storeDir}/claudeclaw.db "SELECT status, COUNT(*) FROM
+     task_runs WHERE ts > (unixepoch()-3600)*1000 GROUP BY status"\`.
    - **Memory + system** -- DB file size, any \`category='hot'\`
      memories newer than 1 hour, plus presence of any
      \`status='warning'\` entries in the memory log.
@@ -185,7 +237,7 @@ When you receive the heartbeat prompt:
 2. **Format** the result as a single inter-agent message:
 
    \`\`\`
-   ## Heartbeat YYYY-MM-DD HH:MM (${APP_TZ})
+   ## Heartbeat <the string step 0 measured> (${APP_TZ})
 
    ### Calendar (next 2h)
    - HH:MM -- <summary> (<attendees>)
@@ -199,14 +251,24 @@ When you receive the heartbeat prompt:
    - planned: <N>
 
    ### Tasks
-   - active: <N>
-   - next: <task name @ YYYY-MM-DD HH:MM>
+   - enabled schedules: <N>
+   - last hour: <N fired, N skipped>
 
    ### Memory / system
    - DB size: <X> MB
    - new hot memories (1h): <N>
    - warnings: <none | comma-separated>
    \`\`\`
+
+   Every line above is a MEASUREMENT of this round, never a memory of
+   an earlier one. Run the queries again and report what they return
+   now, even when you are sure nothing changed -- especially then.
+   A warning belongs on that last line only if THIS round's query
+   still returns it: a card that has since become \`done\` or archived
+   drops off, and so does a deadline that has been closed. Carrying
+   one over makes the line constant, and a line that always says the
+   same thing stops being read -- at which point a real warning looks
+   exactly like the two dead ones next to it.
 
 3. **Send** that string to the main agent via the dashboard API:
 
@@ -235,6 +297,16 @@ When you receive the heartbeat prompt:
 - If a data source raises, record the failure reason in that
   section's body and CONTINUE -- partial output is fine, silence is
   not.
+- **NEVER** copy a value from an earlier round's report, and never
+  fill a field from what you remember saying last time. Every number,
+  title, timestamp and warning comes from a query you ran in THIS
+  round. If a query fails, say it failed -- do not substitute the
+  previous answer, because a stale value is indistinguishable from a
+  fresh one once it is in the message.
+  This applies to the whole report, not only to \`warnings\`: the
+  urgent titles, the task counts, \`next:\`, the DB size and the
+  one-hour hot-memory count are all measurements with a timestamp,
+  and every one of them is wrong the moment it is reused.
 
 ## You are headless
 

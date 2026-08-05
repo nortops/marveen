@@ -456,6 +456,36 @@ export function initDatabase(dbPathOverride?: string): void {
   try { db.exec('ALTER TABLE agent_messages ADD COLUMN span_id TEXT') } catch { /* exists */ }
   try { db.exec('ALTER TABLE agent_messages ADD COLUMN parent_span_id TEXT') } catch { /* exists */ }
 
+  // INVARIANT: a row that says 'delivered' must carry a delivered_at.
+  //
+  // On 2026-07-27 an operator bulk-closed a 28-row backlog with raw SQL that
+  // set status without a timestamp. Nothing broke loudly -- but the queue,
+  // which is the only signal we have for "what actually went out", started
+  // claiming that messages had been delivered when they never left. It took an
+  // hour of log archaeology to work out which of them the recipients had
+  // genuinely received and which they had only read out of band, and the answer
+  // was recoverable that day purely by luck.
+  //
+  // Enforced with a trigger rather than a CHECK constraint because SQLite
+  // cannot add a CHECK to an existing table without rebuilding it, and this is
+  // not worth a rebuild of the message log. Self-healing rather than ABORT:
+  // aborting would turn a bookkeeping slip into a failed operation for the
+  // caller, and the point is to keep the RECORD honest, not to police writers.
+  // The row gets a timestamp AND -- if nothing else explains it -- a marker
+  // saying it was closed without ever being delivered, so the distinction
+  // survives in the data instead of in someone's memory.
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS agent_messages_delivered_needs_ts
+    AFTER UPDATE OF status ON agent_messages
+    FOR EACH ROW WHEN NEW.status = 'delivered' AND NEW.delivered_at IS NULL
+    BEGIN
+      UPDATE agent_messages
+         SET delivered_at = CAST(strftime('%s','now') AS INTEGER),
+             result = COALESCE(result, 'closed-without-delivery')
+       WHERE id = NEW.id;
+    END
+  `)
+
   // One-time L1 backfill: federation system ids are now stored lowercase, but
   // rows written by a pre-L1 build (an install that federated with a
   // display-cased id like "Teodor/agent") keep their old case. Left alone,
@@ -1953,16 +1983,39 @@ export interface HeartbeatKanbanSummary {
   waiting: KanbanCard[]
 }
 
+/**
+ * The ONE definition of "what the heartbeat lists". Both consumers read it from
+ * here: the built-in heartbeat prompt (heartbeat.ts) and the heartbeat AGENT,
+ * which gets it over /api/kanban/heartbeat-summary instead of composing its own
+ * query. Two hand-written copies of the same filter is how they drift apart.
+ *
+ * `urgent` means urgent and NOT FINISHED: priority='urgent', not archived, not
+ * `done`. `planned` stays IN on purpose -- "urgent and nobody has touched it" is
+ * one of the states most worth seeing, and a list that hides it would be quiet
+ * for the wrong reason. (A first draft of this change narrowed it to
+ * waiting/in_progress; that was withdrawn precisely because it would have hidden
+ * untouched urgent work.)
+ *
+ * What DID have to go is closed work: on 2026-08-04 the 09:00 report listed five
+ * items of which three were already `done`, and the 08-03 count was 22 done
+ * against 2 waiting -- the most prominent line of an hourly report was mostly
+ * finished cards, so it stopped being read. Those 22 were only reachable through
+ * a hand-written query; this statement never returned them, which is why the real
+ * fix is that the heartbeat agent no longer writes its own query.
+ */
+/** Exported so a test can execute the SHIPPED statement against a fixture DB
+ *  instead of re-typing an equivalent one and proving nothing. */
+export const HEARTBEAT_URGENT_SQL =
+  "SELECT * FROM kanban_cards WHERE archived_at IS NULL AND priority = 'urgent' AND status != 'done'"
+export const HEARTBEAT_IN_PROGRESS_SQL =
+  "SELECT * FROM kanban_cards WHERE archived_at IS NULL AND status = 'in_progress'"
+export const HEARTBEAT_WAITING_SQL =
+  "SELECT * FROM kanban_cards WHERE archived_at IS NULL AND status = 'waiting'"
+
 export function getHeartbeatKanbanSummary(): HeartbeatKanbanSummary {
-  const urgent = db
-    .prepare("SELECT * FROM kanban_cards WHERE archived_at IS NULL AND priority = 'urgent' AND status != 'done'")
-    .all() as KanbanCard[]
-  const in_progress = db
-    .prepare("SELECT * FROM kanban_cards WHERE archived_at IS NULL AND status = 'in_progress'")
-    .all() as KanbanCard[]
-  const waiting = db
-    .prepare("SELECT * FROM kanban_cards WHERE archived_at IS NULL AND status = 'waiting'")
-    .all() as KanbanCard[]
+  const urgent = db.prepare(HEARTBEAT_URGENT_SQL).all() as KanbanCard[]
+  const in_progress = db.prepare(HEARTBEAT_IN_PROGRESS_SQL).all() as KanbanCard[]
+  const waiting = db.prepare(HEARTBEAT_WAITING_SQL).all() as KanbanCard[]
   return { urgent, in_progress, waiting }
 }
 
@@ -2027,6 +2080,52 @@ export function getPendingMessages(toAgent?: string): AgentMessage[] {
 export function markMessageDelivered(id: number): boolean {
   const now = Math.floor(Date.now() / 1000)
   return db.prepare("UPDATE agent_messages SET status = 'delivered', delivered_at = ? WHERE id = ? AND status = 'pending'").run(now, id).changes > 0
+}
+
+// Per-agent backlog: how many messages are waiting, and how old the oldest one
+// is. The queue only surfaces when somebody opens a pane and notices, which is
+// how an 18-row backlog went unseen on 2026-07-27 and got mistaken for data
+// loss. Age matters more than count: three messages from a minute ago is a busy
+// agent working normally, one message from two hours ago is an agent that is
+// never going to pick it up.
+export type AgentBacklog = { agent: string; pending: number; oldestAgeSeconds: number }
+
+export function getPendingBacklogByAgent(): AgentBacklog[] {
+  const now = Math.floor(Date.now() / 1000)
+  const rows = db.prepare(
+    `SELECT to_agent AS agent, COUNT(*) AS pending, MIN(created_at) AS oldest
+       FROM agent_messages
+      WHERE status = 'pending'
+      GROUP BY to_agent`,
+  ).all() as { agent: string; pending: number; oldest: number }[]
+  return rows
+    .map(r => ({ agent: r.agent, pending: r.pending, oldestAgeSeconds: Math.max(0, now - r.oldest) }))
+    // oldest-first: whoever has been waiting longest is the one worth looking at
+    .sort((a, b) => b.oldestAgeSeconds - a.oldestAgeSeconds)
+}
+
+// Close a pending backlog that is NOT going to be delivered -- stale rows an
+// operator does not want the router to replay (an old thank-you note, a legal
+// warning whose content has since changed). Separate from markMessageDelivered
+// because the two mean opposite things: one records that a message went out,
+// this one records that it never will. Both leave a timestamp, and this one
+// leaves a reason, so the log can still answer "was this actually delivered?"
+// afterwards. Without it the only way to clear a backlog is raw SQL, which is
+// how the queue got 24 rows claiming delivery they never had.
+export function closeMessagesWithoutDelivery(ids: number[], reason: string): number {
+  if (!ids.length) return 0
+  const now = Math.floor(Date.now() / 1000)
+  const note = `closed-without-delivery: ${reason}`
+  const stmt = db.prepare(
+    `UPDATE agent_messages SET status = 'delivered', delivered_at = ?, result = ?
+      WHERE id = ? AND status = 'pending'`,
+  )
+  const run = db.transaction((rows: number[]) => {
+    let n = 0
+    for (const id of rows) n += stmt.run(now, note, id).changes
+    return n
+  })
+  return run(ids)
 }
 
 // Supplementary result text WITHOUT a status change. The federation bridge

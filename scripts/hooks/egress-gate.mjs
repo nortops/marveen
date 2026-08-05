@@ -39,6 +39,26 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const EGRESS_BLOCK_LOG = join(REPO_ROOT, 'store', 'egress-blocked.log')
 const RUNTIME_ALLOWLIST_PATH = join(REPO_ROOT, 'store', 'egress-allowlist.json')
 
+// Dashboard port: env WEB_PORT, else the install .env, else the 3420 default.
+// A fixed 3420 in the allowlist below blocked the agent's own dashboard as soon
+// as the install moved to another port.
+// SECURITY: the value is interpolated into an allowlist PREFIX (`http://localhost:${PORT}/`), so it
+// must be digits ONLY. An unvalidated value containing `@` turns the whole `localhost:<value>` part
+// into a URL userinfo section -- `http://localhost:3420@evil.com/` resolves to host evil.com, which
+// would put an attacker-chosen host on the built-in allowlist and defeat the egress gate entirely.
+// Anything that is not 1-5 digits is rejected and falls back to the default port.
+const isValidPort = (v) => /^\d{1,5}$/.test(v)
+const DASHBOARD_PORT = (() => {
+  const fromEnv = process.env['WEB_PORT']
+  if (fromEnv && isValidPort(fromEnv)) return fromEnv
+  try {
+    const m = readFileSync(join(REPO_ROOT, '.env'), 'utf-8').match(/^WEB_PORT=(.*)$/m)
+    const v = m?.[1]?.trim().replace(/^["']|["']$/g, '')
+    if (v && isValidPort(v)) return v
+  } catch { /* no .env: fall through to the default */ }
+  return '3420'
+})()
+
 // Built-in allowlist: URL prefixes the main agent may call directly via WebFetch.
 // Anything not on this list (or the runtime allowlist) must go through the
 // quarantine-reader sub-agent. Keep sorted and documented so additions are
@@ -61,9 +81,10 @@ const ALLOWED_PREFIXES = [
   // Ollama (local LLM server) -- localhost and loopback
   'http://localhost:11434/',
   'http://127.0.0.1:11434/',
-  // Marveen dashboard API (local)
-  'http://localhost:3420/',
-  'http://127.0.0.1:3420/',
+  // Marveen dashboard API (local). The port follows WEB_PORT: a fixed 3420 here
+  // blocked the agent's own dashboard once the install moved to another port.
+  `http://localhost:${DASHBOARD_PORT}/`,
+  `http://127.0.0.1:${DASHBOARD_PORT}/`,
 ]
 
 // Load the runtime allowlist from store/egress-allowlist.json.

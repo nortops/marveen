@@ -4,6 +4,14 @@ import { homedir } from 'node:os'
 import { PROJECT_ROOT, MAIN_AGENT_ID, DEFAULT_AGENT_MODEL } from '../config.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { safeJoin } from './sanitize.js'
+import { isValidModelId, InvalidModelIdError } from '../model-id.js'
+import {
+  resolveAgentModelFromConfig,
+  validateModelProfileMap,
+  type AgentModelConfig,
+  type ModelProfileMapState,
+  type ModelResolution,
+} from '../model-profiles.js'
 
 export const AGENTS_BASE_DIR = join(PROJECT_ROOT, 'agents')
 
@@ -15,7 +23,7 @@ export const DEFAULT_MODEL = DEFAULT_AGENT_MODEL
 // Map short model names to full Claude model IDs (backwards compat with old configs)
 export const MODEL_ALIASES: Record<string, string> = {
   'opus': 'claude-opus-4-8[1m]',
-  'sonnet': 'claude-sonnet-4-6',
+  'sonnet': 'claude-sonnet-5',
   'sonnet-5': 'claude-sonnet-5',
   'sonnet5': 'claude-sonnet-5',
   'opus-5': 'claude-opus-5',
@@ -61,17 +69,72 @@ export function resolveModelId(raw: string): string {
   return MODEL_ALIASES[raw] || raw
 }
 
-export function readAgentModel(name: string): string {
-  const configPath = join(agentDir(name), 'agent-config.json')
+// ---- model-profile map (deployment-local, card c755f4b2 Block B) -------------
+//
+// store/ is gitignored, so the concrete profile -> model mapping never leaves
+// the machine. config-examples/model-profile-map.example.json documents the
+// shape. A missing map is FINE: every agent that names a concrete `model`
+// keeps working untouched, which is every agent today.
+const MODEL_PROFILE_MAP_PATH = join(PROJECT_ROOT, 'store', 'model-profile-map.json')
+
+let cachedProfileMap: { state: ModelProfileMapState; mtimeMs: number } | null = null
+
+export function readModelProfileMap(): ModelProfileMapState | null {
   try {
-    const config = JSON.parse(readFileOr(configPath, '{}'))
-    return resolveModelId(config.model || DEFAULT_MODEL)
+    if (!existsSync(MODEL_PROFILE_MAP_PATH)) return null
+    const mtimeMs = statSync(MODEL_PROFILE_MAP_PATH).mtimeMs
+    if (cachedProfileMap && cachedProfileMap.mtimeMs === mtimeMs) return cachedProfileMap.state
+    let state: ModelProfileMapState
+    try {
+      state = validateModelProfileMap(JSON.parse(readFileSync(MODEL_PROFILE_MAP_PATH, 'utf-8')))
+    } catch {
+      state = { ok: false, error: 'profile_map_unparseable' }
+    }
+    cachedProfileMap = { state, mtimeMs }
+    return state
   } catch {
-    return DEFAULT_MODEL
+    return { ok: false, error: 'profile_map_read_error' }
   }
 }
 
+export function invalidateModelProfileMapCache(): void {
+  cachedProfileMap = null
+}
+
+// Full resolution result, for callers that need to show or log WHY an agent is
+// on a given model (the /api/agents payload, the profile canary).
+export function resolveAgentModelDetailed(name: string): ModelResolution {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: AgentModelConfig
+  try {
+    config = JSON.parse(readFileOr(configPath, '{}')) as AgentModelConfig
+  } catch {
+    return { model: DEFAULT_MODEL, source: 'default' }
+  }
+  return resolveAgentModelFromConfig(config, readModelProfileMap(), DEFAULT_MODEL, resolveModelId)
+}
+
+// Unchanged contract: the concrete model id this agent runs on. For every
+// config that names a `model` -- which is all of them today -- this returns
+// byte-identically what it returned before Block B existed.
+export function readAgentModel(name: string): string {
+  return resolveAgentModelDetailed(name).model
+}
+
+// Card c755f4b2 Block B. Passing null REMOVES the key rather than writing a
+// null: an absent field and an explicit null must not become two ways of
+// saying the same thing in a config a human also edits by hand.
+export function writeAgentModelProfile(name: string, profile: string | null): void {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  let config: Record<string, unknown> = {}
+  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch { /* start fresh */ }
+  if (profile === null) delete config.modelProfile
+  else config.modelProfile = profile
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
 export function writeAgentModel(name: string, model: string): void {
+  if (!isValidModelId(model)) throw new InvalidModelIdError(model)
   const configPath = join(agentDir(name), 'agent-config.json')
   let config: Record<string, unknown> = {}
   try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
@@ -421,17 +484,36 @@ export function writeAgentClaudePlan(name: string, planId: string): void {
 // jelenjen a dashboardon").
 export const HIDDEN_AGENT_SENTINEL = '.hidden-from-dashboard'
 
-export function listAgentNames(): string[] {
+/**
+ * EVERY agent directory, hidden technical workers included.
+ *
+ * This answers "what does the fleet have to KEEP ALIVE"; listAgentNames()
+ * answers "what should the operator SEE". They were the same call for a long
+ * time, and that is precisely how the hourly heartbeat went silent on
+ * 2026-08-04: agents/heartbeat carries HIDDEN_AGENT_SENTINEL, so the
+ * context-guard sweep -- the ONLY mechanism that rescues a 100%-context
+ * session -- never visited it. The schedule runner correctly refuses to inject
+ * into a saturated pane and defers to the retry queue, but that deferral
+ * assumes somebody eventually rescues the session. Nobody did, so the retry sat
+ * unbounded and two hourly ticks plus a support-inbox tick died quietly.
+ *
+ * Hiding an agent from the dashboard is a VISIBILITY decision. It must never
+ * decide whether that agent gets kept alive. Lifecycle sweeps use this
+ * function; anything that renders a list to the operator uses listAgentNames().
+ */
+export function listAllAgentNames(): string[] {
   if (!existsSync(AGENTS_BASE_DIR)) return []
   return readdirSync(AGENTS_BASE_DIR).filter((f) => {
-    try {
-      if (!statSync(join(AGENTS_BASE_DIR, f)).isDirectory()) return false
-      // Hide technical workers explicitly opted out via the sentinel
-      // file. Cheap fs stat -- one extra existsSync per agent dir per
-      // tick; the agent list is small (~6 today).
-      if (existsSync(join(AGENTS_BASE_DIR, f, HIDDEN_AGENT_SENTINEL))) return false
-      return true
-    } catch { return false }
+    try { return statSync(join(AGENTS_BASE_DIR, f)).isDirectory() } catch { return false }
+  })
+}
+
+export function listAgentNames(): string[] {
+  // Hide technical workers explicitly opted out via the sentinel file. Cheap
+  // fs stat -- one extra existsSync per agent dir per tick; the agent list is
+  // small (~6 today).
+  return listAllAgentNames().filter((f) => {
+    try { return !existsSync(join(AGENTS_BASE_DIR, f, HIDDEN_AGENT_SENTINEL)) } catch { return false }
   })
 }
 
