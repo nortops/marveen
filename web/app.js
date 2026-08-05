@@ -2927,6 +2927,159 @@ function setupAutoRestartUI(agent) {
   }
 }
 
+// ---- context-guard UI -------------------------------------------------------
+
+const CG_PHASE_LABELS = {
+  idle: 'Várakozás',
+  'await-handoff': 'Handoff kérés folyamatban',
+  'await-ready': 'Újraindítás után, resume vár',
+  cooldown: 'Hűtési idő',
+}
+
+async function setupContextGuardUI(agentName) {
+  const cgEnabled = document.getElementById('cgEnabled')
+  const cgAdvancedWrap = document.getElementById('cgAdvancedWrap')
+  if (!cgEnabled || !cgAdvancedWrap) return
+
+  // Show/hide advanced wrap on toggle
+  if (cgEnabled.dataset.wired !== '1') {
+    cgEnabled.addEventListener('change', () => {
+      cgAdvancedWrap.hidden = !cgEnabled.checked
+    })
+    cgEnabled.dataset.wired = '1'
+  }
+
+  // Validation: hardPct must be >= actPct
+  const cgActPct = document.getElementById('cgActPct')
+  const cgHardPct = document.getElementById('cgHardPct')
+  const cgValidationHint = document.getElementById('cgValidationHint')
+  const validatePcts = () => {
+    const act = Number(cgActPct.value)
+    const hard = Number(cgHardPct.value)
+    const invalid = hard < act
+    if (cgValidationHint) cgValidationHint.style.display = invalid ? '' : 'none'
+  }
+  if (cgActPct && cgActPct.dataset.cgwired !== '1') {
+    cgActPct.addEventListener('input', validatePcts)
+    cgHardPct.addEventListener('input', validatePcts)
+    cgActPct.dataset.cgwired = '1'
+  }
+
+  // Load current config
+  try {
+    const r = await fetch(`/api/agents/${encodeURIComponent(agentName)}/context-guard`)
+    if (!r.ok) return
+    const body = await r.json()
+    const cfg = body.contextGuard || {}
+    cgEnabled.checked = cfg.enabled === true
+    cgAdvancedWrap.hidden = !cgEnabled.checked
+    const cgLimitTokens = document.getElementById('cgLimitTokens')
+    if (cgLimitTokens) cgLimitTokens.value = cfg.limitTokens ? String(cfg.limitTokens) : ''
+    if (cgActPct) cgActPct.value = cfg.actPct != null ? Math.round(cfg.actPct * 100) : 90
+    if (cgHardPct) cgHardPct.value = cfg.hardPct != null ? Math.round(cfg.hardPct * 100) : 97
+    const cgCooldownMinutes = document.getElementById('cgCooldownMinutes')
+    if (cgCooldownMinutes) cgCooldownMinutes.value = cfg.cooldownMinutes ?? 15
+    const cgHandoffTimeout = document.getElementById('cgHandoffTimeout')
+    if (cgHandoffTimeout) cgHandoffTimeout.value = cfg.handoffTimeoutMinutes ?? 20
+  } catch { /* silent */ }
+
+  // Update live status badge from the fleet-wide status endpoint
+  updateContextGuardLiveStatus(agentName)
+}
+
+function updateContextGuardLiveStatus(agentName) {
+  const liveEl = document.getElementById('cgLiveStatus')
+  const phaseEl = document.getElementById('cgPhaseDisplay')
+  const pctEl = document.getElementById('cgPctDisplay')
+  if (!liveEl || !phaseEl || !pctEl) return
+  fetch('/api/context-guard')
+    .then(r => r.ok ? r.json() : null)
+    .then(body => {
+      if (!body || !Array.isArray(body.agents)) return
+      const entry = body.agents.find(a => a.agent === agentName)
+      if (!entry) return
+      liveEl.style.display = ''
+      phaseEl.textContent = CG_PHASE_LABELS[entry.phase] || entry.phase || '-'
+      pctEl.textContent = typeof entry.pct === 'number' ? Math.round(entry.pct * 100) + '%' : '-'
+    })
+    .catch(() => {})
+}
+
+// Poll context-guard status every 30 s and paint small badges on agent cards.
+// Badges only appear when the guard is active (not idle) to avoid cluttering
+// the card for agents in their default state.
+;(function startContextGuardPoll() {
+  function poll() {
+    fetch('/api/context-guard')
+      .then(r => r.ok ? r.json() : null)
+      .then(body => {
+        if (!body || !Array.isArray(body.agents)) return
+        body.agents.forEach(entry => {
+          const card = document.querySelector(`.agent-card[data-name="${CSS.escape(entry.agent)}"]`)
+          if (!card) return
+          let badge = card.querySelector('.ctx-guard-badge')
+          const active = entry.phase && entry.phase !== 'idle'
+          if (!active) {
+            if (badge) badge.remove()
+            return
+          }
+          if (!badge) {
+            badge = document.createElement('span')
+            badge.className = 'ctx-guard-badge'
+            badge.style.cssText = 'font-size:10px;padding:1px 5px;border-radius:10px;background:var(--accent-warning,#f59e0b);color:#000;margin-left:4px;font-weight:600'
+            const footer = card.querySelector('.agent-card-footer')
+            if (footer) footer.appendChild(badge)
+          }
+          const pctStr = typeof entry.pct === 'number' ? ' ' + Math.round(entry.pct * 100) + '%' : ''
+          badge.textContent = (CG_PHASE_LABELS[entry.phase] || entry.phase) + pctStr
+        })
+        // Refresh live status in open modal if any
+        if (currentAgent && document.getElementById('cgLiveStatus')) {
+          updateContextGuardLiveStatus(currentAgent.autoRestartId || currentAgent.name)
+        }
+      })
+      .catch(() => {})
+  }
+  setInterval(poll, 30_000)
+})()
+
+document.getElementById('saveContextGuardBtn').addEventListener('click', async () => {
+  if (!currentAgent) return
+  const id = currentAgent.autoRestartId || currentAgent.name
+  const cgEnabled = document.getElementById('cgEnabled')
+  const cgActPct = document.getElementById('cgActPct')
+  const cgHardPct = document.getElementById('cgHardPct')
+  const cgCooldownMinutes = document.getElementById('cgCooldownMinutes')
+  const cgHandoffTimeout = document.getElementById('cgHandoffTimeout')
+  const cgLimitTokensEl = document.getElementById('cgLimitTokens')
+
+  const actPct = Number(cgActPct.value) / 100
+  const hardPct = Number(cgHardPct.value) / 100
+  if (hardPct < actPct) {
+    showToast('A kényszer-küszöb nem lehet kisebb a handoff-küszöbnél.')
+    return
+  }
+
+  const limitTokensRaw = cgLimitTokensEl ? cgLimitTokensEl.value.trim() : ''
+  const cfg = {
+    enabled: cgEnabled.checked,
+    actPct,
+    hardPct,
+    cooldownMinutes: Number(cgCooldownMinutes.value) || 15,
+    handoffTimeoutMinutes: Number(cgHandoffTimeout.value) || 20,
+    limitTokens: limitTokensRaw ? Number(limitTokensRaw) : null,
+  }
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(id)}/context-guard`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cfg),
+    })
+    if (!res.ok) throw new Error()
+    showToast('Kontextus-guard beállítása mentve.')
+  } catch { showToast(t('common.error_save')) }
+})
+
 async function openMarveenDetail() {
   const m = window._marveen
   if (!m) return
@@ -2934,6 +3087,7 @@ async function openMarveenDetail() {
   // Reuse the agent detail modal for Marveen
   currentAgent = { ...m, name: mainAgentId(), claudeMd: '', soulMd: '', mcpJson: '', skills: [] }
   setupAutoRestartUI(currentAgent)
+  setupContextGuardUI(agentApiName())
 
   const displayName = m.name || 'Marveen'
   document.getElementById('agentDetailTitle').textContent = displayName
@@ -3445,6 +3599,7 @@ async function openAgentDetail(agentName) {
 
   // Auto-restart settings + live context size
   setupAutoRestartUI(currentAgent)
+  setupContextGuardUI(currentAgent.autoRestartId || currentAgent.name)
 
   // Telegram tab
   updateChannelTab(currentAgent)
