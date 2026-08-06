@@ -110,7 +110,7 @@ import { RemoteStatusCache } from '../remote-status-cache.js'
 import type { AgentRunState } from '../ssh-tmux.js'
 import { readActiveModelFromProjectDir, readContextTokensFromProjectDir } from '../active-model.js'
 import { detectPaneState, detectPermissionMode } from '../../pane-state.js'
-import { checkAgentPutFields, AGENT_PUT_WRITABLE_FIELDS } from '../agent-put-fields.js'
+import { checkAgentPutFields, AGENT_PUT_WRITABLE_FIELDS, validateCustomProvider } from '../agent-put-fields.js'
 import { detectReauthNeeded } from '../reauth-detect.js'
 import { readAutoRestartConfig, writeAutoRestartConfig } from '../auto-restart-store.js'
 import { readContextGuardConfig, writeContextGuardConfig } from '../context-guard-store.js'
@@ -2062,7 +2062,13 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       }
     }
     if (data.customProvider !== undefined) {
-      writeAgentCustomProvider(name, data.customProvider || null)
+      const providerVal = data.customProvider || null
+      const providerCheck = validateCustomProvider(providerVal, listCustomProviders().map(p => p.id))
+      if (!providerCheck.ok) {
+        json(res, { error: providerCheck.error }, 400)
+        return true
+      }
+      writeAgentCustomProvider(name, providerVal)
     }
     if (data.authMode !== undefined) {
       writeAgentAuthMode(name, data.authMode)
