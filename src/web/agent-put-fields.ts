@@ -15,6 +15,7 @@
 export const AGENT_PUT_WRITABLE_FIELDS = [
   'claudeMd', 'soulMd', 'mcpJson', 'model',
   'authMode', 'apiKey', 'claudePlan', 'memoryIsolation',
+  'customProvider', 'modelProfile',
 ] as const
 
 // Fields that exist on the agent but belong to a different endpoint. Listed
@@ -29,6 +30,17 @@ const ELSEWHERE: Record<string, (name: string) => string> = {
 export type AgentPutFieldCheck =
   | { ok: true }
   | { ok: false; rejected: string[]; message: string }
+
+// Validates a customProvider value against the set of known provider ids.
+// null / empty string means "clear the provider" and is always valid.
+export function validateCustomProvider(
+  value: string | null | undefined,
+  knownIds: string[],
+): { ok: true } | { ok: false; error: string } {
+  if (value === null || value === undefined || value === '') return { ok: true }
+  if (!knownIds.includes(value)) return { ok: false, error: `Unknown provider id: ${value}` }
+  return { ok: true }
+}
 
 // Rejects the UNKNOWN rather than allow-listing the known at the call site: a
 // field someone adds to the client tomorrow surfaces as a loud 400 instead of
