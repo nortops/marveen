@@ -708,6 +708,10 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     }
 
     for (const name of listAgentNames()) {
+      // The main agent was already pushed as isMain:true above; skip it here so
+      // it never appears twice (once as main, once as a stopped worker card).
+      if (isMainChannelsAgent(name)) continue
+
       // Remote agents: resolve run state + pane through the short-TTL caches so
       // this 3s-polled endpoint never blocks the event loop on an ssh timeout.
       const host = readAgentRemoteHost(name)
