@@ -658,6 +658,7 @@ function renderStaticI18n() {
   document.querySelectorAll('[data-i18n-html]').forEach(el => {
     el.innerHTML = t(el.dataset.i18nHtml)
   })
+  if (typeof applyOnboardingProviderTab === 'function') applyOnboardingProviderTab()
 }
 
 // Initial render on page load.
@@ -12102,6 +12103,27 @@ setInterval(pollUpdatesBadge, 5 * 60_000)
 async function fetchOnboardingStatus() {
   try { return await (await fetch('/api/onboarding/status')).json() } catch { return null }
 }
+// WIZFLOW809 BEGIN waitForChannelLive
+// Poll the onboarding status until the channel is MEASURABLY live
+// (status.channelLive: the bun-child/process liveness the channel-monitor
+// uses), instead of a fixed setTimeout. The restart response's
+// `restarted: true` is only a dispatch receipt -- on the cold path the real
+// start takes ~minutes, and a fixed wait opened the pairing step against a
+// still-booting session (WIZFLOW809, three field reports). Checks BEFORE the
+// first sleep so an already-live channel advances immediately; a timeout is
+// NOT success -- the caller must keep the user on this step and say the
+// channel is still starting. Dependencies are parameters so the slow path is
+// unit-testable with a delayed fake signal (the acceptance criterion: the
+// wizard WAITS, it does not get lucky with timing).
+async function waitForChannelLive(fetchStatus, delayMs, maxTries) {
+  for (let i = 0; i < maxTries; i++) {
+    const st = await fetchStatus()
+    if (st && st.channelLive) return 'live'
+    await new Promise((r) => setTimeout(r, delayMs))
+  }
+  return 'timeout'
+}
+// WIZFLOW809 END waitForChannelLive
 function onboardingCurrentStep(s) {
   if (!s.identityConfirmed) return 1
   if (!s.claudeAuthPresent || !s.agentsRunning) return 2
@@ -12132,10 +12154,21 @@ async function refreshOnboarding() {
   const s = await fetchOnboardingStatus()
   if (s) renderOnboarding(s)
 }
+let onboardingChannelProvider = 'telegram'
+let onboardingAgentId = null
+// The step-3 tab is a static HTML label ("Telegram bot") that renderStaticI18n's generic data-i18n sweep would otherwise reset
+// to the Telegram wording on every language switch, so both call sites re-apply the provider-specific text here.
+function applyOnboardingProviderTab() {
+  const el = document.querySelector('#onboardingSteps .onboarding-step[data-ostep="3"] span:last-child')
+  if (el) el.textContent = onboardingChannelProvider === 'slack' ? t('onboarding.step2.tab_slack') : t('onboarding.step2.tab')
+}
 function renderOnboarding(s) {
   if (onboardingDismissed()) return
   const overlay = document.getElementById('onboardingOverlay')
   if (!overlay) return
+  if (s.channelProvider) onboardingChannelProvider = s.channelProvider
+  if (s.agentId) onboardingAgentId = s.agentId
+  applyOnboardingProviderTab()
   const step = onboardingCurrentStep(s)
   if (step === 0) { overlay.classList.remove('active'); overlay.hidden = true; document.body.style.overflow = ''; return }
   overlay.hidden = false
@@ -12154,9 +12187,12 @@ function renderOnboarding(s) {
   const body = document.getElementById('onboardingBody')
   if (step === 1) body.innerHTML = onbIdentityHtml(s)
   else if (step === 2) body.innerHTML = onbStep1Html(s)
-  else if (step === 3) body.innerHTML = onbStep2Html()
+  else if (step === 3) body.innerHTML = onbStep2Html(s)
   else body.innerHTML = onbStep3Html(s)
   wireOnboarding(step)
+  // Step 3, token already on disk, managed-settings.json still missing: the status GET already knows this (no probe/write/restart triggered),
+  // so show the sudo command right away instead of waiting for a Save click. Retry just re-polls status -- no token POST, no channel restart.
+  if (step === 3 && s.sudoCommand) showSudoModal(s.sudoCommand, () => refreshOnboarding())
 }
 function onbMsg(text, isErr) {
   const el = document.getElementById('onbMsg')
@@ -12185,11 +12221,26 @@ function onbStep1Html(s) {
       : '')
     + `<div id="onbMsg" class="onb-msg"></div>`
 }
-function onbStep2Html() {
-  return `<p>${escapeHtml(t('onboarding.step2.desc'))}</p>`
-    + `<label class="form-label-sm">${escapeHtml(t('onboarding.step2.token_label'))}</label>`
-    + `<input id="onbBotToken" type="password" class="onb-input" placeholder="123456:ABC..." autocomplete="off">`
-    + `<div class="onb-hint">${escapeHtml(t('onboarding.step2.token_hint'))}</div>`
+function onbStep2Html(s) {
+  const isSlack = onboardingChannelProvider === 'slack'
+  const desc = isSlack ? t('onboarding.step2.desc_slack') : t('onboarding.step2.desc')
+  const tokenLabel = isSlack ? t('onboarding.step2.token_label_slack') : t('onboarding.step2.token_label')
+  const tokenHint = isSlack ? t('onboarding.step2.token_hint_slack') : t('onboarding.step2.token_hint')
+  const placeholder = isSlack ? 'xoxb-...' : '123456:ABC...'
+  // Pre-fill from a token already on disk (e.g. a prior save that stopped at the managed-settings.json gate) so the operator isn't forced to dig it
+  // back out of ~/.claude/channels/<provider>/.env and repaste it. Saving still re-runs the managed-settings check server-side either way.
+  const existingBotToken = (s && s.existingBotToken) || ''
+  const existingAppToken = (s && s.existingAppToken) || ''
+  const appTokenFields = isSlack
+    ? `<label class="form-label-sm">${escapeHtml(t('onboarding.step2.app_token_label_slack'))}</label>`
+      + `<input id="onbSlackAppToken" type="password" class="onb-input" placeholder="xapp-..." value="${escapeHtml(existingAppToken)}" autocomplete="off" required>`
+      + `<div class="onb-hint">${escapeHtml(t('onboarding.step2.app_token_hint_slack'))}</div>`
+    : ''
+  return `<p>${escapeHtml(desc)}</p>`
+    + `<label class="form-label-sm">${escapeHtml(tokenLabel)}</label>`
+    + `<input id="onbBotToken" type="password" class="onb-input" placeholder="${placeholder}" value="${escapeHtml(existingBotToken)}" autocomplete="off">`
+    + `<div class="onb-hint">${escapeHtml(tokenHint)}</div>`
+    + appTokenFields
     + `<button class="btn-primary btn-compact" id="onbBotBtn">${escapeHtml(t('onboarding.step2.save_btn'))}</button>`
     + `<div id="onbMsg" class="onb-msg"></div>`
 }
@@ -12285,16 +12336,36 @@ function wireOnboarding(step) {
     if (botBtn) botBtn.addEventListener('click', async () => {
       const botToken = (document.getElementById('onbBotToken').value || '').trim()
       if (!botToken) { onbMsg(t('onboarding.step2.token_empty'), true); return }
+      const payload = { botToken }
+      if (onboardingChannelProvider === 'slack') {
+        const appToken = (document.getElementById('onbSlackAppToken')?.value || '').trim()
+        // Required, not optional: without SLACK_APP_TOKEN the channel session starts but Socket Mode never connects,
+        // so "saved" would read as success while Slack silently never comes online.
+        if (!appToken) { onbMsg(t('onboarding.step2.app_token_empty_slack'), true); return }
+        payload.appToken = appToken
+      }
       botBtn.disabled = true; onbMsg(t('onboarding.saving'))
       try {
-        const res = await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ botToken }) })
+        const res = await fetch(`/api/agents/${encodeURIComponent(onboardingAgentId || mainAgentId())}/channels/${onboardingChannelProvider}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
         const d = await res.json().catch(() => ({}))
+        if (res.status === 409 && d.error === 'managed-settings-missing') {
+          botBtn.disabled = false
+          showSudoModal(d.sudoCommand, () => botBtn.click())
+          return
+        }
         if (!res.ok) { botBtn.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
         // The server restarts the channels session so the new bot token goes
-        // live -- say so, and give the respawn a beat before advancing so the
-        // pairing step starts against the restarted service.
+        // live. Do NOT advance on a timer: the restart response is a dispatch
+        // receipt, and the cold start is ~minutes. Wait for the MEASURED
+        // channelLive signal, tell the user the channel is starting meanwhile,
+        // and on timeout stay on this step with an honest "still starting"
+        // message -- the old fixed 4s opened the pairing step against a
+        // booting session, which looked done-and-empty (WIZFLOW809).
         onbMsg(d.restarted ? t('onboarding.step2.saved_restarted') : t('onboarding.step2.saved'))
-        setTimeout(refreshOnboarding, d.restarted ? 4000 : 2000)
+        onbMsg(t('onboarding.step2.waiting_channel'))
+        const outcome = await waitForChannelLive(fetchOnboardingStatus, 3000, 40)  // ~2 min bound
+        if (outcome === 'live') { await refreshOnboarding() }
+        else { botBtn.disabled = false; onbMsg(t('onboarding.step2.channel_slow'), true) }
       } catch (e) { botBtn.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
     })
   } else if (step === 4) {
@@ -12319,7 +12390,7 @@ function wireOnboarding(step) {
         // wizard rendered that as "no pending pairing" while the Channel view,
         // which uses the selected agent, listed the very same request.
         await ensureMarveenLoaded()
-        const res = await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram/pending`)
+        const res = await fetch(`/api/agents/${encodeURIComponent(onboardingAgentId || mainAgentId())}/channels/${onboardingChannelProvider}/pending`)
         // Surface the failure instead of rendering it as an empty list. This is
         // a separate defect from the id race: without it a 404 or an auth error
         // reads as "nobody is waiting for approval", which is the one answer the
@@ -12348,7 +12419,7 @@ function wireOnboarding(step) {
         box.querySelectorAll('.onb-approve').forEach((b) => b.addEventListener('click', async () => {
           b.disabled = true
           try {
-            const res = await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}/channels/telegram/approve`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: b.dataset.code }) })
+            const res = await fetch(`/api/agents/${encodeURIComponent(onboardingAgentId || mainAgentId())}/channels/${onboardingChannelProvider}/approve`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: b.dataset.code }) })
             const d = await res.json().catch(() => ({}))
             if (!res.ok) { b.disabled = false; onbMsg(d.error || t('onboarding.error'), true); return }
             onbMsg(t('onboarding.step3.approved'))
@@ -12387,12 +12458,12 @@ document.getElementById('deepseekConfigLink')?.addEventListener('click', (e) => 
 })
 
 // === Sudo modal for managed-settings.json (Slack setup pre-flight) ===
-function showSudoModal(sudoCommand) {
+function showSudoModal(sudoCommand, onRetry) {
   let overlay = document.getElementById('sudoModalOverlay')
   if (overlay) overlay.remove()
   overlay = document.createElement('div')
   overlay.id = 'sudoModalOverlay'
-  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center'
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10001;display:flex;align-items:center;justify-content:center'
   const card = document.createElement('div')
   card.style.cssText = 'background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;max-width:560px;width:90%'
   card.innerHTML = `
@@ -12419,7 +12490,8 @@ function showSudoModal(sudoCommand) {
   document.getElementById('sudoCancelBtn').addEventListener('click', () => overlay.remove())
   document.getElementById('sudoDoneBtn').addEventListener('click', () => {
     overlay.remove()
-    document.getElementById('chConnectBtn').click()
+    if (onRetry) onRetry()
+    else document.getElementById('chConnectBtn').click()
   })
   overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove() })
 }
