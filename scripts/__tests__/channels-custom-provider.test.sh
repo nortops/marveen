@@ -222,23 +222,32 @@ then
     fail "x-api-key provider -> exit 0, non-empty output" "exit=0, non-empty" "exit=$GOT_RC, stdout='$GOT_OUT'"
   fi
 
-  # 12. stdout is BYTE-EXACTLY the env prefix -- no logger JSON leaking in.
-  # Run 5 times under NODE_ENV=production to catch any pino/SonicBoom races.
-  # Expected: single line, ends with " && " (trailing space is intentional -- see
-  # channels.sh which appends the claude invocation after this prefix).
+  # 12. stdout is BYTE-EXACTLY the env prefix on a COLD stamp path.
+  #
+  # The contamination only fires when stampCustomApiKeyApproval does real work:
+  # the suffix is NOT yet in .claude.json (cold). A warm run (suffix already
+  # present) is a no-op and never called logger.info -- so a warm-only test is
+  # a false green. Each iteration must start from a cold config dir.
+  #
+  # Implementation: a fresh temp dir per iteration (no .claude.json at all)
+  # so the stamp always writes a new file and exercises the cold path.
   EXPECTED_XKEY="unset CLAUDE_CODE_OAUTH_TOKEN && export ANTHROPIC_BASE_URL='http://127.0.0.1:4010' && export ANTHROPIC_API_KEY='${TEST_XAPIKEY}' && unset ANTHROPIC_AUTH_TOKEN && export ANTHROPIC_MODEL='oc/test' && "
   XKEY_FAIL=0
   for _i in 1 2 3 4 5; do
-    RAW_XKEY="$(NODE_ENV=production node "$root/scripts/main-agent-custom-provider.mjs" "$root" 2>/dev/null)"
-    if [ "$RAW_XKEY" != "$EXPECTED_XKEY" ]; then
+    # Fresh cfg dir: no .claude.json present -> cold stamp on every iteration.
+    _cold_cfg="$(mktemp -d "$root/tmp.cold.XXXXXX")"
+    RAW_XKEY="$(NODE_ENV=production node "$root/scripts/main-agent-custom-provider.mjs" "$_cold_cfg" 2>/dev/null)"
+    _xkey_rc=$?
+    rm -rf "$_cold_cfg"
+    if [ "$RAW_XKEY" != "$EXPECTED_XKEY" ] || [ "$_xkey_rc" -ne 0 ]; then
       XKEY_FAIL=1
       break
     fi
   done
   if [ "$XKEY_FAIL" -eq 0 ]; then
-    pass "x-api-key stdout is byte-exact under NODE_ENV=production (5 iterations)"
+    pass "x-api-key cold-stamp stdout is byte-exact (5 iterations, each cold)"
   else
-    fail "x-api-key stdout is byte-exact under NODE_ENV=production" \
+    fail "x-api-key cold-stamp stdout is byte-exact" \
       "$EXPECTED_XKEY" "$RAW_XKEY"
   fi
 
