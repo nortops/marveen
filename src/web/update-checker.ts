@@ -1,4 +1,6 @@
 import { execFileSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { PROJECT_ROOT } from '../config.js'
 
 const GIT = '/usr/bin/git'
@@ -30,6 +32,7 @@ export interface UpdateStatus {
   latest: string
   behind: number
   commits: UpdateCommit[]
+  version?: string
   /** Commits grouped by release tag (newest first; the first group is the
    * not-yet-released "upcoming" commits with version=""). Derived from the
    * chore(release) commits in the list. Absent/empty when there is nothing to
@@ -57,7 +60,16 @@ let updateStatusCache: UpdateStatus = {
 }
 
 export function getUpdateStatus(): UpdateStatus {
-  return updateStatusCache
+  return { ...updateStatusCache, version: currentVersion() }
+}
+
+export function currentVersion(root: string = PROJECT_ROOT): string {
+  try {
+    const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8'))
+    return typeof pkg?.version === 'string' ? pkg.version : ''
+  } catch {
+    return ''
+  }
 }
 
 function git(args: string[], timeout = 15000): string {
