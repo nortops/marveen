@@ -63,6 +63,7 @@ import {
 import {
   readAgentTelegramConfig,
   readAgentDiscordConfig,
+  readAgentSlackConfig,
   readAgentGooglechatConfig,
   readAgentTeamsConfig,
   readMarveenTelegramConfig,
@@ -111,12 +112,18 @@ import { RemoteStatusCache } from '../remote-status-cache.js'
 import type { AgentRunState } from '../ssh-tmux.js'
 import { readActiveModelFromProjectDir, readContextTokensFromProjectDir } from '../active-model.js'
 import { detectPaneState, detectPermissionMode } from '../../pane-state.js'
-import { checkAgentPutFields, AGENT_PUT_WRITABLE_FIELDS, validateCustomProvider } from '../agent-put-fields.js'
+import { checkAgentPutFields, checkConfigPutFields, AGENT_PUT_WRITABLE_FIELDS, validateCustomProvider } from '../agent-put-fields.js'
 import { detectReauthNeeded } from '../reauth-detect.js'
 import { readAutoRestartConfig, writeAutoRestartConfig } from '../auto-restart-store.js'
 import { readContextGuardConfig, writeContextGuardConfig } from '../context-guard-store.js'
 import { getContextGuardStatus } from '../context-guard-runner.js'
 import type { AutoRestartConfig } from '../../auto-restart.js'
+import type { ContextGuardConfig } from '../../context-guard.js'
+// Derived from the DEFAULT config objects, not hand-listed: a field added to
+// the interface is added to its default too, so the accepted-key set cannot
+// drift away from what normalize*Config() actually reads.
+import { DEFAULT_AUTO_RESTART } from '../../auto-restart.js'
+import { DEFAULT_CONTEXT_GUARD } from '../../context-guard.js'
 import { setStoreWriteActor } from '../../store-watcher.js'
 import { attemptChannelMcpReconnect } from '../channel-mcp-reconnect.js'
 import { getChannelHealth } from '../channel-health-monitor.js'
@@ -403,6 +410,7 @@ interface AgentSummary {
   hasTelegram: boolean
   telegramBotUsername?: string
   hasDiscord: boolean
+  hasSlack: boolean
   hasGooglechat: boolean
   hasTeams: boolean
   status: 'configured' | 'draft'
@@ -415,6 +423,9 @@ interface AgentSummary {
   session?: string
   hasAvatar: boolean
   autoRestart: AutoRestartConfig
+  /** Per-agent context-guard config, carried here for the same reason as
+   *  autoRestart: the settings pane renders both from one detail fetch. */
+  contextGuard: ContextGuardConfig
   /** Live context size in tokens (input+cache_read+cache_creation of the last
    *  turn), or null when not running / no transcript yet. */
   contextTokens: number | null
@@ -442,6 +453,7 @@ function getAgentSummary(name: string): AgentSummary {
   const soulMd = readFileOr(join(dir, 'SOUL.md'), '')
   const tg = readAgentTelegramConfig(name)
   const dc = readAgentDiscordConfig(name)
+  const sc = readAgentSlackConfig(name)
   const gc = readAgentGooglechatConfig(name)
   const tc = readAgentTeamsConfig(name)
   const hasClaudeMd = claudeMd.trim().length > 0
@@ -483,6 +495,7 @@ function getAgentSummary(name: string): AgentSummary {
     hasTelegram: tg.hasTelegram,
     telegramBotUsername: tg.botUsername,
     hasDiscord: dc.hasDiscord,
+    hasSlack: sc.hasSlack,
     hasGooglechat: gc.hasGooglechat,
     hasTeams: tc.hasTeams,
     status: hasClaudeMd && hasSoulMd ? 'configured' : 'draft',
@@ -493,6 +506,7 @@ function getAgentSummary(name: string): AgentSummary {
     session,
     hasAvatar: findAvatarForAgent(name) !== null,
     autoRestart: readAutoRestartConfig(name),
+    contextGuard: readContextGuardConfig(name),
     contextTokens: running ? readContextTokensFromProjectDir(dir, resolveAgentConfigDir(name).configDir ?? undefined) : null,
     needsReauth: reauth.needsReauth,
     reauthReason: reauth.reason,
@@ -1262,8 +1276,10 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
 
   // PUT /api/agents/:name/auto-restart -- set the per-agent auto-restart config.
   // Accepts the main orchestrator id too (auto-restart applies to it as well).
-  // The body is normalized server-side, so a partial/garbled payload is coerced
-  // to a safe config rather than rejected.
+  // The body is normalized server-side, so a partial/garbled VALUE is coerced
+  // to a safe config rather than rejected. An unknown KEY is a different story:
+  // normalization never looks at it, so it would vanish behind a 200 -- those
+  // are rejected loudly (see checkConfigPutFields).
   const autoRestartMatch = path.match(/^\/api\/agents\/([^/]+)\/auto-restart$/)
   if (autoRestartMatch && method === 'PUT') {
     const name = decodeURIComponent(autoRestartMatch[1])
@@ -1271,6 +1287,11 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     const body = await readBody(req)
     let data: unknown
     try { data = JSON.parse(body.toString()) } catch { json(res, { error: 'invalid JSON' }, 400); return true }
+    const arFields = checkConfigPutFields(data, Object.keys(DEFAULT_AUTO_RESTART))
+    if (!arFields.ok) {
+      json(res, { error: arFields.message, rejected: arFields.rejected, known: Object.keys(DEFAULT_AUTO_RESTART) }, 400)
+      return true
+    }
     setStoreWriteActor('dashboard')
     const saved = writeAutoRestartConfig(name, data)
     json(res, { ok: true, autoRestart: saved })
@@ -1279,7 +1300,8 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
 
   // GET/PUT /api/agents/:name/context-guard -- per-agent context-guard config
   // (kanban #81). Default-off (opt-in): a GET for an agent with no store entry
-  // returns the disabled defaults. PUT normalizes server-side like auto-restart.
+  // returns the disabled defaults. PUT normalizes server-side like auto-restart,
+  // and like auto-restart it rejects unknown keys instead of swallowing them.
   const contextGuardMatch = path.match(/^\/api\/agents\/([^/]+)\/context-guard$/)
   if (contextGuardMatch && (method === 'GET' || method === 'PUT')) {
     const name = decodeURIComponent(contextGuardMatch[1])
@@ -1291,6 +1313,11 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     const body = await readBody(req)
     let data: unknown
     try { data = JSON.parse(body.toString()) } catch { json(res, { error: 'invalid JSON' }, 400); return true }
+    const cgFields = checkConfigPutFields(data, Object.keys(DEFAULT_CONTEXT_GUARD))
+    if (!cgFields.ok) {
+      json(res, { error: cgFields.message, rejected: cgFields.rejected, known: Object.keys(DEFAULT_CONTEXT_GUARD) }, 400)
+      return true
+    }
     setStoreWriteActor('dashboard')
     const saved = writeContextGuardConfig(name, data)
     json(res, { ok: true, contextGuard: saved })
@@ -2122,6 +2149,13 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     const name = decodeURIComponent(agentMatch[1])
     const dir = agentDir(name)
     if (!existsSync(dir)) { json(res, { error: 'Agent not found' }, 404); return true }
+    // Stop the running tmux session BEFORE removing the dir. Otherwise the
+    // orphaned session survives the delete, rewrites a minimal .claude-config
+    // under agents/<name>/, and the agent "returns" as an empty draft (persona
+    // gone) that still reports running=true, with the model reset to the default.
+    // stopAgentProcess() reads config from the dir (remote host, channel
+    // provider) for its orphan reap, so it must run while the dir still exists.
+    if (isAgentRunning(name)) stopAgentProcess(name)
     rmSync(dir, { recursive: true, force: true })
     cleanupTeamReferences(name)
     // Deleting an agent is at least as strong a statement of intent as stopping
