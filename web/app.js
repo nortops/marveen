@@ -3075,14 +3075,20 @@ document.getElementById('saveContextGuardBtn').addEventListener('click', async (
   }
 
   const limitTokensRaw = cgLimitTokensEl ? cgLimitTokensEl.value.trim() : ''
-  const cfg = {
+  let current = {}
+  try {
+    const cur = await fetch(`/api/agents/${encodeURIComponent(id)}/context-guard`)
+    if (!cur.ok) throw new Error()
+    current = (await cur.json()).contextGuard || {}
+  } catch { showToast(t('common.error_save')); return }
+  const cfg = Object.assign({}, current, {
     enabled: cgEnabled.checked,
     actPct,
     hardPct,
     cooldownMinutes: Number(cgCooldownMinutes.value) || 15,
     handoffTimeoutMinutes: Number(cgHandoffTimeout.value) || 20,
     limitTokens: limitTokensRaw ? Number(limitTokensRaw) : null,
-  }
+  })
   try {
     const res = await fetch(`/api/agents/${encodeURIComponent(id)}/context-guard`, {
       method: 'PUT',
