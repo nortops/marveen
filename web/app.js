@@ -10652,6 +10652,104 @@ if (skillsPageNewBtn) {
   })
 }
 
+// === Skill Access Matrix ===
+
+let skillsAccessPanelOpen = false
+const skillsAccessPanel = document.getElementById('skillsAccessPanel')
+const skillsAccessBtn = document.getElementById('skillsAccessBtn')
+
+if (skillsAccessBtn) {
+  skillsAccessBtn.addEventListener('click', async () => {
+    skillsAccessPanelOpen = !skillsAccessPanelOpen
+    skillsAccessBtn.classList.toggle('active', skillsAccessPanelOpen)
+    if (skillsAccessPanelOpen) {
+      await renderSkillAccessMatrix()
+      skillsAccessPanel.hidden = false
+    } else {
+      skillsAccessPanel.hidden = true
+      skillsAccessPanel.innerHTML = ''
+    }
+  })
+}
+
+async function renderSkillAccessMatrix() {
+  if (!skillsAccessPanel) return
+  skillsAccessPanel.innerHTML = '<div class="connector-loading"><span class="spinner"></span> Betöltés...</div>'
+  try {
+    const [configRes, agentsRes] = await Promise.all([
+      fetch('/api/skill-access'),
+      fetch('/api/agents'),
+    ])
+    const accessConfig = configRes.ok ? await configRes.json() : {}
+    const agentsData = agentsRes.ok ? await agentsRes.json() : []
+    const agentIds = agentsData.map(a => a.name || a.id).filter(Boolean)
+
+    // Only user-source skills
+    const userSkills = globalSkills.filter(s => s.source === 'user')
+    if (!userSkills.length) {
+      skillsAccessPanel.innerHTML = '<p style="padding:12px;color:var(--muted)">Nincsenek user-source skillek.</p>'
+      return
+    }
+
+    const rows = userSkills.map(skill => {
+      const restricted = accessConfig[skill.name]
+      const cells = agentIds.map(agentId => {
+        const isAtlas = agentId === mainAgentId()
+        const checked = !restricted || restricted.includes(agentId)
+        return `<td style="text-align:center;padding:4px 8px">
+          <input type="checkbox" class="sac-cb"
+            data-skill="${escapeHtml(skill.name)}"
+            data-agent="${escapeHtml(agentId)}"
+            ${checked ? 'checked' : ''}
+            ${isAtlas ? 'disabled title="Atlas mindig hozzáfér"' : ''}
+          >
+        </td>`
+      }).join('')
+      return `<tr>
+        <td style="padding:4px 12px 4px 0;white-space:nowrap;font-family:var(--font-mono,monospace);font-size:12px">${escapeHtml(skill.name)}</td>
+        ${cells}
+      </tr>`
+    }).join('')
+
+    const headerCells = agentIds.map(id =>
+      `<th style="padding:4px 8px;font-size:11px;font-weight:600;text-align:center;white-space:nowrap">${escapeHtml(id)}</th>`
+    ).join('')
+
+    skillsAccessPanel.innerHTML = `
+      <div style="overflow-x:auto;border:1px solid var(--border);border-radius:8px;padding:12px;background:var(--surface)">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px">Hozzáférés-mátrix <span style="font-weight:400;color:var(--muted);font-size:11px">(✓ = hozzáférhet)</span></div>
+        <table style="border-collapse:collapse;font-size:12px">
+          <thead><tr><th style="text-align:left;padding:4px 12px 4px 0">Skill</th>${headerCells}</tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`
+
+    skillsAccessPanel.querySelectorAll('.sac-cb').forEach(cb => {
+      cb.addEventListener('change', async (e) => {
+        const skillName = e.target.dataset.skill
+        const agentId = e.target.dataset.agent
+        // Rebuild the full allowed list from current checkbox states
+        const allCbs = [...skillsAccessPanel.querySelectorAll(`.sac-cb[data-skill="${CSS.escape(skillName)}"]`)]
+        const checkedAgents = allCbs.filter(c => c.checked).map(c => c.dataset.agent)
+        const allChecked = checkedAgents.length === agentIds.length
+        const body = { skill: skillName, agents: allChecked ? null : checkedAgents }
+        const res = await fetch('/api/skill-access', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+        if (!res.ok) {
+          showToast('Hiba a mentésnél')
+          e.target.checked = !e.target.checked // revert
+        }
+      })
+    })
+  } catch (err) {
+    console.error('Skill access matrix error:', err)
+    skillsAccessPanel.innerHTML = '<p style="padding:12px;color:var(--danger)">Hiba a betöltésnél.</p>'
+  }
+}
+
 async function loadGlobalSkills() {
   skillsGrid.innerHTML = `<div class="connector-loading"><span class="spinner"></span> ${t('skills.loading')}</div>`
   skillsStats.innerHTML = ''

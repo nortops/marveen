@@ -489,6 +489,46 @@ export function ensureEgressGate(name: string): boolean {
   return true
 }
 
+// Idempotently wire the skill-access-gate PreToolUse hook. Applied to ALL agents
+// so that any agent trying to invoke a restricted skill is blocked regardless of
+// their own settings. The gate reads store/skill-access.json at call-time; no
+// restart is needed when the config changes.
+export function injectSkillAccessGate(existing: Record<string, unknown>): void {
+  const hooks = (existing.hooks && typeof existing.hooks === 'object'
+    ? existing.hooks
+    : (existing.hooks = {})) as Record<string, unknown>
+  const command = hookCommand(join(PROJECT_ROOT, 'scripts', 'hooks', 'skill-access-gate.mjs'))
+  if (isUnsafeHookCommand(command)) return
+  const entry = {
+    hooks: [{ type: 'command', command, timeout: 5 }],
+  }
+  const prev = Array.isArray(hooks.PreToolUse) ? (hooks.PreToolUse as unknown[]) : []
+  hooks.PreToolUse = [
+    ...prev.filter((e) => !JSON.stringify(e).includes('skill-access-gate.mjs')),
+    entry,
+  ]
+}
+
+export function ensureSkillAccessGate(name: string): boolean {
+  const settingsPath = agentSettingsPath(name)
+  let settings: Record<string, unknown> = {}
+  if (existsSync(settingsPath)) {
+    try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { return false }
+  }
+  const command = hookCommand(join(PROJECT_ROOT, 'scripts', 'hooks', 'skill-access-gate.mjs'))
+  const hooks = (settings.hooks && typeof settings.hooks === 'object')
+    ? settings.hooks as Record<string, unknown>
+    : {}
+  const ptu = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse as unknown[] : []
+  const ptuJson = JSON.stringify(ptu)
+  if (ptuJson.includes('skill-access-gate.mjs') && hookCommandWired(ptuJson, command)) return false
+  if (isUnsafeHookCommand(command)) return false
+  injectSkillAccessGate(settings)
+  if (name !== MAIN_AGENT_ID) mkdirSync(join(agentDir(name), '.claude'), { recursive: true })
+  atomicWriteFileSync(settingsPath, JSON.stringify(settings, null, 2))
+  return true
+}
+
 // The domains the owner added for this install, from the egress allowlist.
 // That file is the owner's gate for outbound calls; the reader's own list used
 // to be a SECOND list of the same decision, kept by hand, and the two drifted:
