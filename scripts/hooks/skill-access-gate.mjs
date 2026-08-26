@@ -50,14 +50,16 @@ function loadConfig() {
 }
 
 function allow() {
-  console.log(JSON.stringify({ continue: true }))
   process.exit(0)
 }
 
 function deny(reason) {
-  console.log(JSON.stringify({
-    decision: 'deny',
-    reason,
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: reason,
+    },
   }))
   process.exit(0)
 }

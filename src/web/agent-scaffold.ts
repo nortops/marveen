@@ -497,7 +497,10 @@ export function injectSkillAccessGate(existing: Record<string, unknown>): void {
   const hooks = (existing.hooks && typeof existing.hooks === 'object'
     ? existing.hooks
     : (existing.hooks = {})) as Record<string, unknown>
-  const command = hookCommand(join(PROJECT_ROOT, 'scripts', 'hooks', 'skill-access-gate.mjs'))
+  const scriptPath = join(PROJECT_ROOT, 'scripts', 'hooks', 'skill-access-gate.mjs')
+  // Bash-guarded form matches the settings.json.template entry: fail-open when
+  // the hook script is absent so a missing file never silently blocks skill calls.
+  const command = `bash -c '[ -f ${scriptPath} ] && exec node ${scriptPath}; exit 0'`
   if (isUnsafeHookCommand(command)) return
   const entry = {
     hooks: [{ type: 'command', command, timeout: 5 }],
@@ -515,7 +518,8 @@ export function ensureSkillAccessGate(name: string): boolean {
   if (existsSync(settingsPath)) {
     try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { return false }
   }
-  const command = hookCommand(join(PROJECT_ROOT, 'scripts', 'hooks', 'skill-access-gate.mjs'))
+  const scriptPath = join(PROJECT_ROOT, 'scripts', 'hooks', 'skill-access-gate.mjs')
+  const command = `bash -c '[ -f ${scriptPath} ] && exec node ${scriptPath}; exit 0'`
   const hooks = (settings.hooks && typeof settings.hooks === 'object')
     ? settings.hooks as Record<string, unknown>
     : {}
