@@ -13,6 +13,7 @@ import { readBody, json } from '../http-helpers.js'
 import { sanitizeSkillName, shellEscape } from '../sanitize.js'
 import type { RouteContext } from './types.js'
 
+
 function parseFrontmatterField(content: string, field: string): string {
   const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---/)
   if (!fmMatch) return ''
@@ -617,7 +618,7 @@ export async function tryHandleSkills(ctx: RouteContext): Promise<boolean> {
   return false
 }
 
-function readSkillAccessConfig(): Record<string, string[]> {
+export function readSkillAccessConfig(): Record<string, string[]> {
   const configPath = join(STORE_DIR, 'skill-access.json')
   try {
     const raw = readFileSync(configPath, 'utf-8').trim()
