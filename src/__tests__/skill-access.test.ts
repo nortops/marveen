@@ -1,26 +1,17 @@
 // Unit tests for readSkillAccessConfig() exported from src/web/routes/skills.ts.
 // Tests cover: missing file, malformed JSON, non-array values, valid config,
 // and the MAIN_AGENT_ID fail-safe.
+//
+// STORE_DIR is never reached because readFileSync is stubbed; no config mock needed.
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { join } from 'node:path'
-import { tmpdir } from 'node:os'
 
-// Point STORE_DIR at a temp directory so the helper reads our fixture files.
-const tmpRoot = join(tmpdir(), 'skill-access-test')
-
-vi.mock('../config.js', async (orig) => {
-  const actual = await orig<typeof import('../config.js')>()
-  return { ...actual, STORE_DIR: tmpRoot }
-})
-
-// Stub readFileSync so tests control what the helper sees.
-// Override readFileSync globally; each test restores and re-mocks as needed.
 let _mockFsContent: string | null = null
+
 vi.mock('node:fs', async (orig) => {
   const actual = await orig<typeof import('node:fs')>()
   return {
     ...actual,
-    readFileSync: (p: unknown, opts?: unknown): string => {
+    readFileSync: (): string => {
       if (_mockFsContent !== null) return _mockFsContent
       throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
     },
@@ -35,19 +26,18 @@ describe('readSkillAccessConfig', () => {
     _mockFsContent = null
   })
 
-  it('returns an empty object when the file is missing', () => {
-    _mockFsContent = null // readFileSync throws
+  it('returns an empty Record when the file is missing', () => {
     const result = readSkillAccessConfig()
     expect(result).toEqual({})
   })
 
-  it('returns an empty object for malformed JSON', () => {
+  it('returns an empty Record for malformed JSON', () => {
     _mockFsContent = 'not json{{'
     const result = readSkillAccessConfig()
     expect(result).toEqual({})
   })
 
-  it('returns an empty object for a non-object root value (array)', () => {
+  it('returns an empty Record for a non-object root value (array)', () => {
     _mockFsContent = '[]'
     const result = readSkillAccessConfig()
     expect(result).toEqual({})
