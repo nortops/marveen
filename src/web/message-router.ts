@@ -25,6 +25,7 @@ import {
   sendPromptToSession,
   sessionExistsOnHost,
   capturePane,
+  clearFeedbackModalAndRecheck,
 } from './agent-process.js'
 import { detectPaneState, type PaneState } from '../pane-state.js'
 import { setLastInboundModality } from './voice-modality.js'
@@ -566,6 +567,19 @@ export async function runMessageRouterTick(): Promise<void> {
       }
 
       if (!(await isSessionReadyForPrompt(session, host))) {
+        // A self-drafted feedback modal ("Bug report drafted ... 0 to dismiss")
+        // holds the pane in a not-ready state, and the pre-flight dismissal in
+        // sendPromptToSession never runs because this gate short-circuits
+        // first. Measured twice on 2026-08-31 on agent-samu: 10 minutes
+        // not-ready, 10 queued messages, the second time AFTER the pre-flight
+        // dismissal had shipped -- the fix was in the wrong place for this
+        // path. Clear it here and re-read readiness ONCE; only a still-held
+        // pane falls through to the stuck bookkeeping below.
+        if (await clearFeedbackModalAndRecheck(session, host)) {
+          agentStuckSince.delete(msg.to_agent)
+          routerLoggedMisses.delete(msg.id)
+          continue // cleared; deliver on the next tick
+        }
         // ---- session-stuck detection (card 2922e380 thread a) ----
         // Track how long this session has been continuously not-ready.
         const stuckStart = agentStuckSince.get(msg.to_agent)
