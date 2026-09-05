@@ -211,6 +211,13 @@ export function egressDecision(
   // 3. Runtime domain check: parse the URL to extract a verified hostname.
   //    URL parsing fails on non-URLs -> block (fail-safe).
   const rtDomains = runtimeList.domains ?? []
+  // Wildcard: a lone "*" in the runtime domain list disables the allowlist and
+  // permits any host (operator opt-out of egress filtering). Requires a valid,
+  // parseable URL so a malformed value still fails safe.
+  if (rtDomains.includes('*')) {
+    try { new URL(url); return { blocked: false, tier: 'wildcard' } }
+    catch { return { blocked: true, tier: 'unparseable' } }
+  }
   if (rtDomains.length > 0) {
     let hostname
     try {
