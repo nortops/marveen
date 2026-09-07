@@ -1317,6 +1317,76 @@ export function ensureSkillsPathTrapSection(name: string): void {
   atomicWriteFileSync(claudeMdPath, updated)
 }
 
+// Injects a scheduler-alarm-guard block into every sub-agent's CLAUDE.md on
+// each respawn, preventing speculative scheduler-loop alerts.
+//
+// Background (2026-09-08): Hestia (Haiku) generated 6+ false positive
+// "scheduler loop detected" alerts per day. Root cause: the model inferred a
+// loop from normal periodic firing (e.g. */30 → ~1800 s delta) without
+// querying task_runs. There is no code-level detector; the guard must live in
+// the agent's CLAUDE.md. This generated section ensures it survives restarts
+// without operator-side manual edits, just like skills-path-trap.
+//
+// The guard targets sub-agents only (not the main agent): the main agent's
+// CLAUDE.md is maintained separately and already carries fleet-wide rules.
+// Idempotency contract: same five-rule contract as ensureFleetRosterSection.
+const SCHED_ALARM_BEGIN = '<!-- BEGIN GENERATED: scheduler-alarm-guard (auto-generated, do not edit by hand) -->'
+const SCHED_ALARM_END = '<!-- END GENERATED: scheduler-alarm-guard -->'
+const SCHED_ALARM_BLOCK_RE = new RegExp(
+  `${SCHED_ALARM_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${SCHED_ALARM_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
+)
+
+function buildSchedulerAlarmGuardBody(): string {
+  return [
+    '## Scheduler-riasztás szabályai (KÖTELEZŐ)',
+    '',
+    'Ha azt észleled, hogy egy ütemezett feladat "loopban fut", "X-szer tüzelt" vagy',
+    '"ismétlődik": NE küldj riasztást spekulatív alapon.',
+    '',
+    'Kötelező lépések riasztás küldése ELŐTT:',
+    '',
+    '1. Töltsd be és futtasd a `verify-scheduler-loop-alarm` skill-t.',
+    '2. A skill lekérdezi a `task_runs` táblát (ahol `ts` MILLISZEKUNDUMBAN van, 13 jegy,',
+    '   NEM másodpercben). Másodpercként kezelve a delták ezerszeres torzítást mutatnak.',
+    '3. Csak VALÓS loop esetén riassz: ugyanazon nevű task deltái << a cron-kadenciánál',
+    '   (tipikusan < 60 s). Normális periodikus futás (pl. */30 cron -> ~1800 s delta)',
+    '   NEM loop, hanem tervezett ismétlés.',
+    '',
+    'Spekulatív riasztás tilos. A `verify-scheduler-loop-alarm` skill az egyetlen',
+    'engedélyezett forrás loop-verdikthez.',
+  ].join('\n')
+}
+
+// Idempotently ensures the scheduler-alarm-guard block is present and current
+// in the agent's CLAUDE.md. Called on every startAgentProcess() alongside the
+// other ensure* guards so existing agents receive the block automatically on
+// respawn without manual migration.
+export function ensureSchedulerAlarmGuardSection(name: string): void {
+  // Sub-agents only. The main agent's CLAUDE.md is maintained separately.
+  if (name === MAIN_AGENT_ID) return
+  const claudeMdPath = join(agentDir(name), 'CLAUDE.md')
+  if (!existsSync(claudeMdPath)) return
+
+  const block = `${SCHED_ALARM_BEGIN}\n${buildSchedulerAlarmGuardBody()}\n${SCHED_ALARM_END}`
+
+  let existing: string
+  try {
+    existing = readFileSync(claudeMdPath, 'utf-8')
+  } catch {
+    return
+  }
+
+  let updated: string
+  if (SCHED_ALARM_BLOCK_RE.test(existing)) {
+    updated = existing.replace(SCHED_ALARM_BLOCK_RE, block)
+  } else {
+    updated = existing.trimEnd() + '\n\n' + block + '\n'
+  }
+
+  if (updated === existing) return
+  atomicWriteFileSync(claudeMdPath, updated)
+}
+
 export async function generateClaudeMd(name: string, description: string, model: string): Promise<string> {
   // Distribution-safe default-drive line: only emit a concrete folder when this
   // install has one configured (OWNER_DRIVE_FOLDER). A fresh install with no
