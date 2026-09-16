@@ -1,18 +1,20 @@
 {
   "id": "researcher",
   "label": "Kutató",
-  "description": "Piackutatás, versenytárs-elemzés, webes források olvasása. Prompt injection szempontból ugyanúgy kiemelt mint a marketinges. Draft-only: riportot ír a mappájába, nem küld magától kifelé.",
+  "description": "Piackutatás, versenytárs-elemzés, webes források olvasása. Prompt injection szempontból kiemelt felület, ezért a deny-lista (SSH/AWS/.env, sudo, rm, curl -X POST, git push) változatlanul szigorú. A permissionMode viszont permissive a gazda 2026-09-07-i döntése szerint (TG 14764): strict alatt az ágens minden tool-hívásnál engedélykérő párbeszédre állt meg, amire nem-interaktív ágensben senki nem válaszol. Draft-only marad: riportot ír a saját mappájába, nem küld magától kifelé.",
   "permissionMode": "permissive",
   "filesystem": {
     "allow": [
       "Read(${AGENT_DIR}/**)",
-      "Write(${AGENT_DIR}/**)",
       "Edit(${AGENT_DIR}/**)",
       "Read(${HOME}/Downloads/**)",
       "Bash(ls:*)",
       "Bash(cat:*)",
       "WebFetch(*)",
-      "WebSearch(*)"
+      "WebSearch(*)",
+      "Read(${HOME}/.claude/skills/**)",
+      "Bash(${PROJECT_ROOT}/scripts/agent-post.sh:*)",
+      "Bash(${PROJECT_ROOT}/scripts/notify.sh:*)"
     ],
     "deny": [
       "Read(${HOME}/.ssh/**)",
