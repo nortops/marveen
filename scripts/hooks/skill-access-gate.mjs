@@ -20,6 +20,20 @@
 // NOTE: sessions running outside the repo tree cannot be
 // attributed to a sub-agent and are treated as the main agent (unrestricted).
 //
+// THIS IS A GUARD-RAIL ON THE SKILL TOOL, NOT AN ACCESS BOUNDARY. Whether that
+// guard-rail is wanted at all is a fleet/maintainer decision, not implied by
+// its existence here. In particular (Szotasz upstream review on #1368):
+//   - A restricted sub-agent can still reach a "blocked" skill by spawning an
+//     isolated worktree sub-agent (the Agent tool's worktree isolation runs
+//     from a path like <repo>/.claude/worktrees/agent-<id>/..., which does not
+//     match /agents/<name>/ and so resolves to the always-allowed main agent).
+//   - The skill's SKILL.md body stays readable via Read/Bash for every agent
+//     regardless of this config, because the skills directory is one shared
+//     tree; only the Skill-tool invocation itself is gated.
+// Present this to operators as "keeps an agent from routinely reaching for a
+// skill it isn't meant to use," not as "this skill's contents are secret from
+// that agent."
+//
 // Blocked calls are logged to store/skill-access-blocked.log.
 
 import { readFileSync, appendFileSync, mkdirSync } from 'node:fs'

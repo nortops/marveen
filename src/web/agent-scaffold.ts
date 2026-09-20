@@ -1085,6 +1085,24 @@ export function ensureEgressGate(name: string): boolean {
   return true
 }
 
+// Command builder for the skill-access-gate hook. Unlike hookCommand(), this
+// gate must stay fail-OPEN when the SCRIPT ITSELF is missing (an install that
+// has not yet picked up this feature must not have every Skill call blocked),
+// but the two failure modes must not be conflated: a missing interpreter is a
+// *different* fault than an intentionally-absent script, and Szotasz's review
+// on #1368 caught that the previous `bash -c '[ -f X ] && exec node X; exit 0'`
+// form silently allowed both through a bare `node` -- on an nvm PATH, `node`
+// resolves to nothing, `exec` fails with exit 127, and Claude Code treats 127
+// as a non-blocking hook error, so the gate goes quiet exactly the way
+// hookCommand()'s own header comment warns about. Splitting the two checks
+// keeps "script absent" fail-open (`exit 0`) and makes "interpreter absent"
+// fail-closed (`exit 2`, HOOK_NODE_BIN's absolute path so nvm PATH gaps do not
+// matter) the same way every other gate in this file already blocks.
+function skillAccessGateCommand(scriptPath: string): string {
+  const miss = `governance-kapu: a skill-access-gate hook interpretere nem talalhato (${HOOK_NODE_BIN}). A kapu ezert BLOKKOL. Javitas: inditsd ujra a dashboardot, az ujrairja a hook-utakat.`
+  return `test -f "${scriptPath}" || exit 0; test -x "${HOOK_NODE_BIN}" || { echo "${miss}" >&2; exit 2; }; "${HOOK_NODE_BIN}" "${scriptPath}"`
+}
+
 // Idempotently wire the skill-access-gate PreToolUse hook. Applied to ALL agents
 // so that any agent trying to invoke a restricted skill is blocked regardless of
 // their own settings. The gate reads store/skill-access.json at call-time; no
@@ -1094,9 +1112,7 @@ export function injectSkillAccessGate(existing: Record<string, unknown>): void {
     ? existing.hooks
     : (existing.hooks = {})) as Record<string, unknown>
   const scriptPath = join(PROJECT_ROOT, 'scripts', 'hooks', 'skill-access-gate.mjs')
-  // Bash-guarded form matches the settings.json.template entry: fail-open when
-  // the hook script is absent so a missing file never silently blocks skill calls.
-  const command = `bash -c '[ -f ${scriptPath} ] && exec node ${scriptPath}; exit 0'`
+  const command = skillAccessGateCommand(scriptPath)
   if (isUnsafeHookCommand(command)) return
   const entry = {
     matcher: 'Skill',
@@ -1110,13 +1126,19 @@ export function injectSkillAccessGate(existing: Record<string, unknown>): void {
 }
 
 export function ensureSkillAccessGate(name: string): boolean {
+  // #1305: never write fleet hooks into the shared ~/.claude/settings.json.
+  // Also a genuine no-op for the main agent even without #1305: gateDecision
+  // always allows agentId === null (main agent / any cwd outside agents/<name>),
+  // so wiring this hook there enforces nothing while still risking the exact
+  // owner-session leak #1305 closed for the other gates in this file.
+  if (refuseMainAgentHookWrite(name, 'ensureSkillAccessGate')) return false
   const settingsPath = agentSettingsPath(name)
   let settings: Record<string, unknown> = {}
   if (existsSync(settingsPath)) {
     try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { return false }
   }
   const scriptPath = join(PROJECT_ROOT, 'scripts', 'hooks', 'skill-access-gate.mjs')
-  const command = `bash -c '[ -f ${scriptPath} ] && exec node ${scriptPath}; exit 0'`
+  const command = skillAccessGateCommand(scriptPath)
   const hooks = (settings.hooks && typeof settings.hooks === 'object')
     ? settings.hooks as Record<string, unknown>
     : {}
