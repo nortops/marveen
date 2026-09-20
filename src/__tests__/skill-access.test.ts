@@ -2,7 +2,7 @@
 // and for the gate-logic exports from scripts/hooks/skill-access-gate.mjs.
 //
 // STORE_DIR is never reached because readFileSync is stubbed; no config mock needed.
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 
 let _mockFsContent: string | null = null
 
@@ -17,8 +17,11 @@ vi.mock('node:fs', async (orig) => {
   }
 })
 
+import { spawnSync } from 'node:child_process'
+import { mkdirSync, rmSync, writeFileSync, existsSync, unlinkSync, copyFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { readSkillAccessConfig } from '../web/routes/skills.js'
-import { MAIN_AGENT_ID } from '../config.js'
+import { MAIN_AGENT_ID, PROJECT_ROOT } from '../config.js'
 // @ts-expect-error -- plain .mjs hook script, no types
 import { deriveAgentIdFromCwd, gateDecision } from '../../scripts/hooks/skill-access-gate.mjs'
 
@@ -136,5 +139,52 @@ describe('gateDecision', () => {
   it('handles a missing skill name as allow', () => {
     expect(gateDecision('Skill', {}, 'talosz', { '': ['atlas'] })).toEqual({ allow: true })
     expect(gateDecision('Skill', null, 'talosz', {})).toEqual({ allow: true })
+  })
+})
+
+// End-to-end: the hook script as Claude Code actually invokes it (Szotasz
+// upstream review on #1368, point 5a). Everything above tests the exported
+// gate-logic functions in isolation; this runs the real script file with a
+// real stdin payload and a real cwd, so a wiring mistake between them (wrong
+// stdin field name, wrong stdout shape, wrong exit path) would fail here even
+// if every unit test above stayed green.
+describe('skill-access-gate.mjs end-to-end (real process, real stdin, real cwd)', () => {
+  const agentDir = join(PROJECT_ROOT, 'agents', 'e2e-skill-gate-test-agent')
+  const configPath = join(PROJECT_ROOT, 'store', 'skill-access.json')
+  const backupPath = `${configPath}.e2e-test-backup`
+  const restrictedSkill = '__e2e_test_restricted_skill__'
+  let hadConfig = false
+
+  beforeEach(() => {
+    mkdirSync(agentDir, { recursive: true })
+    mkdirSync(join(PROJECT_ROOT, 'store'), { recursive: true })
+    hadConfig = existsSync(configPath)
+    // copyFileSync, not readFileSync: this suite's top-level vi.mock('node:fs')
+    // stubs readFileSync globally (for the readSkillAccessConfig tests above),
+    // so reading the real file back for restore must go through a call the
+    // mock leaves untouched.
+    if (hadConfig) copyFileSync(configPath, backupPath)
+    writeFileSync(configPath, JSON.stringify({ [restrictedSkill]: [MAIN_AGENT_ID] }))
+  })
+
+  afterEach(() => {
+    if (hadConfig) { copyFileSync(backupPath, configPath); unlinkSync(backupPath) }
+    else unlinkSync(configPath)
+    rmSync(agentDir, { recursive: true, force: true })
+  })
+
+  it('DENIES with a permissionDecision JSON on stdout for a restricted skill called from a non-listed cwd-derived agent', () => {
+    const payload = JSON.stringify({ tool_name: 'Skill', tool_input: { skill: restrictedSkill } })
+    const result = spawnSync(process.execPath, [join(PROJECT_ROOT, 'scripts', 'hooks', 'skill-access-gate.mjs')], {
+      cwd: agentDir,
+      input: payload,
+      encoding: 'utf-8',
+    })
+
+    expect(result.status).toBe(0) // deny is communicated via stdout JSON, not the exit code
+    const out = JSON.parse(result.stdout)
+    expect(out.hookSpecificOutput.hookEventName).toBe('PreToolUse')
+    expect(out.hookSpecificOutput.permissionDecision).toBe('deny')
+    expect(out.hookSpecificOutput.permissionDecisionReason).toContain(restrictedSkill)
   })
 })
