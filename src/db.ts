@@ -1541,11 +1541,38 @@ export function buildFtsMatchExpression(query: string, join: 'AND' | 'OR' = 'AND
  *
  * A single-token query has nothing to relax, so it runs once.
  */
-function ftsWithOrFallback<T>(query: string, run: (terms: string) => T[]): { rows: T[]; relaxed: boolean } {
+/**
+ * Strict AND first, then -- only when the caller allows it -- an OR pass.
+ *
+ * The OR pass is genuinely useful and genuinely dangerous, and which one it is
+ * depends entirely on whether the caller is told it happened. Measured: a query
+ * whose every real term matched nothing still returned a row, because dropping
+ * the terms left two ordinary filler words that occur in unrelated memories.
+ * A caller reading that answer sees a recall; there was none.
+ *
+ * So the relaxation STAYS ON by default, and the strictness is what a caller
+ * opts into. That order matters and was measured the hard way: the relaxation
+ * exists because a naturally phrased question ("meddig tart a felmondasi ido")
+ * found nothing while the memory sat there, and turning it off by default
+ * would bring that back -- a false negative on real knowledge, which is worse
+ * than a generous answer that says it was generous.
+ *
+ * What was missing is not strictness, it is the LABEL: whether a relaxation
+ * happened has to reach the caller, so "we have no memory of this" can be
+ * distinguished from "the search worked hard to find something". Callers that
+ * need the hard answer pass allowRelaxed=false and get silence when there is
+ * no strict match.
+ */
+function ftsWithOrFallback<T>(
+  query: string,
+  run: (terms: string) => T[],
+  allowRelaxed = true,
+): { rows: T[]; relaxed: boolean } {
   const strict = buildFtsMatchExpression(query)
   if (!strict) return { rows: [], relaxed: false }
   const rows = run(strict)
   if (rows.length > 0) return { rows, relaxed: false }
+  if (!allowRelaxed) return { rows, relaxed: false }
   const relaxedTerms = buildFtsMatchExpression(query, 'OR')
   if (relaxedTerms === strict) return { rows, relaxed: false }
   return { rows: run(relaxedTerms), relaxed: true }
@@ -1604,19 +1631,25 @@ function withoutRank<T extends { rank: number }>(rows: T[]): Omit<T, 'rank'>[] {
   return rows.map(({ rank: _rank, ...rest }) => rest)
 }
 
-export function searchMemories(query: string, chatId: string, limit = 3): Memory[] {
+export function searchMemories(query: string, chatId: string, limit = 3, allowRelaxed = true, category?: string): Memory[] {
   try {
     const { rows } = ftsWithOrFallback(query, (terms) =>
-      db
-        .prepare(
-          `SELECT m.*, f.rank AS rank FROM memories m
-           JOIN memories_fts f ON m.id = f.rowid
-           WHERE f.content MATCH ? AND m.chat_id = ?
-           ORDER BY rank
-           LIMIT ?`
-        )
-        .all(terms, chatId, limit * RECENCY_OVERSAMPLE) as (Memory & { rank: number })[]
-    )
+      (category
+        ? db.prepare(
+            `SELECT m.*, f.rank AS rank FROM memories m
+             JOIN memories_fts f ON m.id = f.rowid
+             WHERE f.content MATCH ? AND m.chat_id = ? AND m.category = ?
+             ORDER BY rank
+             LIMIT ?`
+          ).all(terms, chatId, category, limit * RECENCY_OVERSAMPLE)
+        : db.prepare(
+            `SELECT m.*, f.rank AS rank FROM memories m
+             JOIN memories_fts f ON m.id = f.rowid
+             WHERE f.content MATCH ? AND m.chat_id = ?
+             ORDER BY rank
+             LIMIT ?`
+          ).all(terms, chatId, limit * RECENCY_OVERSAMPLE)) as (Memory & { rank: number })[]
+      , allowRelaxed)
     return withoutRank(reRankByRecency(rows, limit)) as Memory[]
   } catch {
     return []
@@ -1770,22 +1803,50 @@ export function getAgentMemories(agentId: string, limit: number = 20, category?:
   return result
 }
 
-export function searchAgentMemories(agentId: string, query: string, limit: number = 10, trace?: { relaxed: boolean }): Memory[] {
+// MEMKERESVAK917: `category` is a filter on the QUERY, not on the answer.
+// It used to be applied by the route AFTER this function had already cut the
+// result to `limit`, so a filtered search silently truncated: measured on the
+// owner store, q=billingo&category=warm returned 9 rows at limit=50 and 39 at
+// limit=200, while 38 warm rows contain the word. The caller was told
+// `relaxed=false` -- "matched as asked" -- on an answer missing three quarters
+// of its matches. Pushing it down makes the limit mean rows the caller asked
+// for, and it is also less work: the oversample now fills with candidates that
+// can survive the filter instead of being thrown away after ranking.
+export function searchAgentMemories(
+  agentId: string,
+  query: string,
+  limit: number = 10,
+  trace?: { relaxed: boolean },
+  allowRelaxed = true,
+  category?: string,
+): Memory[] {
   try {
     const { rows, relaxed } = ftsWithOrFallback(query, (terms) =>
-      db.prepare(
-        `SELECT m.*, f.rank AS rank FROM memories m
-         JOIN memories_fts f ON m.id = f.rowid
-         WHERE f.memories_fts MATCH ? AND (m.agent_id = ? OR m.category = 'shared')
-         ORDER BY rank LIMIT ?`
-      ).all(terms, agentId, limit * RECENCY_OVERSAMPLE) as (Memory & { rank: number })[]
-    )
+      (category
+        ? db.prepare(
+            `SELECT m.*, f.rank AS rank FROM memories m
+             JOIN memories_fts f ON m.id = f.rowid
+             WHERE f.memories_fts MATCH ? AND (m.agent_id = ? OR m.category = 'shared')
+               AND m.category = ?
+             ORDER BY rank LIMIT ?`
+          ).all(terms, agentId, category, limit * RECENCY_OVERSAMPLE)
+        : db.prepare(
+            `SELECT m.*, f.rank AS rank FROM memories m
+             JOIN memories_fts f ON m.id = f.rowid
+             WHERE f.memories_fts MATCH ? AND (m.agent_id = ? OR m.category = 'shared')
+             ORDER BY rank LIMIT ?`
+          ).all(terms, agentId, limit * RECENCY_OVERSAMPLE)) as (Memory & { rank: number })[]
+    , allowRelaxed)
     if (trace) trace.relaxed = relaxed
     return withoutRank(reRankByRecency(rows, limit)) as Memory[]
   } catch {
-    return db.prepare(
-      "SELECT * FROM memories WHERE (agent_id = ? OR category = 'shared') AND (content LIKE ? OR keywords LIKE ?) ORDER BY accessed_at DESC LIMIT ?"
-    ).all(agentId, `%${query}%`, `%${query}%`, limit) as Memory[]
+    return (category
+      ? db.prepare(
+          "SELECT * FROM memories WHERE (agent_id = ? OR category = 'shared') AND category = ? AND (content LIKE ? OR keywords LIKE ?) ORDER BY accessed_at DESC LIMIT ?"
+        ).all(agentId, category, `%${query}%`, `%${query}%`, limit)
+      : db.prepare(
+          "SELECT * FROM memories WHERE (agent_id = ? OR category = 'shared') AND (content LIKE ? OR keywords LIKE ?) ORDER BY accessed_at DESC LIMIT ?"
+        ).all(agentId, `%${query}%`, `%${query}%`, limit)) as Memory[]
   }
 }
 
@@ -2840,6 +2901,19 @@ export function createAgentMessage(
   }
 }
 
+// The router's pre-delivery re-read: the CURRENT status of one row, or null if
+// the row is gone.
+//
+// Deliberately not getAgentMessage(): that is a SELECT * on a table whose
+// `content` column routinely holds thousands of characters, and the delivery
+// loop needs exactly one short string. This keeps the check to an indexed
+// primary-key lookup of a single column, so it can sit on the hot path without
+// being felt.
+export function getMessageStatus(id: number): string | null {
+  const row = db.prepare('SELECT status FROM agent_messages WHERE id = ?').get(id) as { status: string } | undefined
+  return row ? row.status : null
+}
+
 export function getPendingMessages(toAgent?: string): AgentMessage[] {
   if (toAgent) {
     return db.prepare("SELECT * FROM agent_messages WHERE status = 'pending' AND to_agent = ? ORDER BY created_at ASC")
@@ -3546,10 +3620,16 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB))
 }
 
-function vectorSearch(agentId: string, queryEmbedding: number[], limit: number = 10): Memory[] {
-  const rows = db.prepare(
-    "SELECT * FROM memories WHERE embedding IS NOT NULL AND (agent_id = ? OR category = 'shared')"
-  ).all(agentId) as Memory[]
+function vectorSearch(agentId: string, queryEmbedding: number[], limit: number = 10, category?: string): Memory[] {
+  // Same push-down as searchAgentMemories: this branch scores EVERY embedded
+  // row in JS, so filtering in SQL is both correct and strictly less work.
+  const rows = (category
+    ? db.prepare(
+        "SELECT * FROM memories WHERE embedding IS NOT NULL AND (agent_id = ? OR category = 'shared') AND category = ?"
+      ).all(agentId, category)
+    : db.prepare(
+        "SELECT * FROM memories WHERE embedding IS NOT NULL AND (agent_id = ? OR category = 'shared')"
+      ).all(agentId)) as Memory[]
 
   // A vector written by a DIFFERENT model has a different length, and the
   // cosine loop walks the QUERY's length: the missing entries read as undefined
@@ -3592,16 +3672,20 @@ export async function hybridSearch(
   query: string,
   limit: number = 10,
   trace?: HybridSearchTrace,
+  category?: string,
 ): Promise<Memory[]> {
   const k = 60 // RRF constant
 
   // FTS5 results
   const ftsTrace = { relaxed: false }
-  const ftsResults = searchAgentMemories(agentId, query, limit * 2, ftsTrace)
+  // Relaxed on purpose, and unchanged by the strict default introduced for the
+  // endpoint: the hybrid answer fuses two rankings and already reports which
+  // branch produced it, so a loose lexical hit here is labelled, not silent.
+  const ftsResults = searchAgentMemories(agentId, query, limit * 2, ftsTrace, true, category)
 
   // Vector results
   const queryEmbedding = await generateEmbedding(query)
-  const vecResults = queryEmbedding ? vectorSearch(agentId, queryEmbedding, limit * 2) : []
+  const vecResults = queryEmbedding ? vectorSearch(agentId, queryEmbedding, limit * 2, category) : []
 
   if (trace) {
     trace.ftsHits = ftsResults.length

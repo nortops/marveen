@@ -323,6 +323,15 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     requiresRestart: true,
   },
   {
+    key: 'MEMORY_IMPORT_CATEGORIZE_MODEL',
+    type: 'string',
+    default: '',
+    description: 'Memória-importkor ezzel az Ollama modellel sorolja be az emlékeket (hot/warm/cold/shared), pl. gemma3:4b. FELÜLBÍRÁLÁS: ha be van állítva, pontosan ez a modell fut, helyettesítés nincs. Üres = a telepített gemma4 felismerése; ha nincs gemma4 és nincs beállítás, minden emlék warm, modellhívás nélkül. 4 GB VRAM-on a gemma3:4b bevált; gondolkodó modell (pl. qwen3) nagyon lassú.',
+    module: 'system',
+    secret: false,
+    requiresRestart: true,
+  },
+  {
     key: 'TELEGRAM_PROGRESS_MODE',
     type: 'string',
     default: 'indicator',

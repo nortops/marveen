@@ -32,6 +32,15 @@ KOORDINATORHOZ (marveen) -- kimondva, a kimeneten es az uzenet elso soraban is.
 KOMMENT-ONLY MOD (KARTYAIRASESZKOZ905, 2026-09-05): komment egy MEGLEVO kartyara,
 ERTESITES NELKUL, ugyanazokkal a kapukkal es kotelezo visszaolvasassal:
   kartya-es-ertesites.py --id X905 --comment-file /path --author Samu [--dry-run]
+
+A MEZOK, AMIKET EBBEN A MODBAN MOZGATNI LEHET: --status, --priority, --title, --assignee es
+2026-09-19 ota a --desc-file is (EKEZETKAPU919). A leiras eddig az EGYETLEN kartya-mezo volt,
+amit letrehozas utan senki nem tudott javitani: egy elsore rosszul megirt leiras VEGLEGES volt,
+es ez eloszor egy gazda ele keszulo szovegben okozott kart (rossz hatarido negy helyen).
+A tiltas nem leiras-vedelem volt, hanem hianyzo UPDATE-ut. Amiert megis biztonsagos megnyitni:
+a mozgatas-nyom MINDEN valtozo mezo TELJES regi erteket kiirja egy kommentbe, tehat a csere nem
+TORLI a regi szoveget, hanem HOZZAIRJA a kartyahoz -- a leiras igy nem lesz csendes
+atiras-felulet. Ures --desc-file-t a mozgato ag megtagad.
 Az --author itt KOTELEZO (KARTYADRYRUN907, 2026-09-08): korabban csendben 'Marveen'-re esett,
 tehat a kartyan MAS neve allt, mint aki irta. A letrehozo agon az alapertelmezes valtozatlan.
 MEZOMOZGATAS (KARTYASTATUSZ906, Boni lelete 2026-09-06): komment-modban a lenti mezok MEGLEVO
@@ -256,6 +265,61 @@ def gepelt_ora_fejlec(text):
     # Datum nelkuli, '--' nelkuli mondat-kozepi ido szabad; csak a MAI datum + ora paros bukik.
     return datum is not None
 
+# GEPI IDOBELYEG-JELZES, NEM KAPU (Marveen sajat hibaja, 2026-09-16; Mira fogta meg).
+# MIERT LETEZIK: a MIODMVALASZ913 lezaro kommentjebe a mio prod DB-bol vett
+# `2026-09-14 07:57:39.706374+00` ertekeket irtam be ORAKENT, zona-jeloles nelkul. Azok UTC-k,
+# CEST-ben 09:57. A szabaly SZO SZERINT ott allt a sajat memoriamban (kanban-kartya-szabalyok,
+# "ha a forras Z-vel/UTC vegzodik, KONVERTALD CEST-re, mielott leirod"), es megis elrontottam --
+# tehat ez nem tudas-hiany, hanem LANCOLAS-hiany, ugyanaz az alak, mint a homoglifanal.
+# A TELL: a masodperc-pontossagu ora (HH:MM:SS) emberi szovegben szinte mindig BEMASOLT gepi
+# ertek, es a `+00` maga a zona-jeloles, amit a bemasolaskor le szoktunk vagni.
+# MIERT NEM BLOKKOL: kommentbe log-reszlet es nyers DB-kimenet is legitim modon kerul, ott a
+# hamis riasztas a kapu lassu kikapcsolasa lenne. Egy jelzes eleg.
+# A JELZES ALAKJA MIRA MERESE UTAN ALLT BE (2026-09-16, msg 25767). Az elso valtozatom
+# HAROM hamis pozitivot adott, es mindharom a TIPIKUS komment-tartalmon: Mira megmerte a `Z`-t
+# es az idotartamot, a `+00`-t pedig en, amikor a jelenteset visszamertem (o csendesnek irta, de
+# a fuggvenyt kozvetlenul hivva JELZETT -- tehat a sajat trigger-listam volt rossz, nem az ové).
+# A HIBA GYOKERE: a `+00`-t TRIGGERKENT hasznaltam, holott az maga a ZONA-JELOLES. Az en eredeti
+# hibam epp az volt, hogy a `+00`-t LEVAGTAM es csupasz orat irtam. Tehat a jelzes helyes alanya
+# a CSUPASZ masodperc-ora: amelyik mellett NINCS zona.
+# MIERT SZAMIT: ez a jelzes azon a feluleten fut, ahova CI-logot es futasi idot masolunk. Harom
+# hamis riasztas utan a kovetkezo olvaso atsiklik rajta, es az igazi talalat is elvesz --
+# "a hamis riasztas a kapu LASSU KIKAPCSOLASA".
+ORA_RX = re.compile(r'(?<![\d:])(\d{1,2}):(\d{2}):(\d{2})(?![\d:])')
+# Kozvetlenul az ora UTAN allo zona: Z, .123Z, +00, +02:00, -05:00, vagy szokoz + zona-szo.
+ORA_UTANI_ZONA_RX = re.compile(r'^(?:\.\d+)?\s*(?:Z\b|[+-]\d{2}(?::?\d{2})?|\s*(?:UTC|GMT|CEST|CET)\b)')
+# Az ora ELOTT kozvetlenul allo datum -- ettol a 00 ora valodi idopont, nem idotartam.
+DATUM_ELOTT_RX = re.compile(r'\d{4}-\d{2}-\d{2}[ T]$')
+ZONA_RX = re.compile(r'\b(CEST|CET|UTC|GMT|helyi ido|helyi oraval|idozona)\b', re.I)
+
+def gepi_idobelyeg_jelzes(szoveg, cimke='komment'):
+    """Jelez (NEM blokkol), ha CSUPASZ masodperc-pontossagu ora all a szovegben: olyan, ami
+    mellett nincs zona-jeloles. A DB/API idok UTC-ben jonnek, a flotta CEST-ben olvas.
+
+    ISMERT HATAR, KIMONDVA: ha a szoveg BARHOL tartalmaz zona-szot (UTC/CEST/...), az egesz
+    komment csendes lesz, akkor is, ha egy MASIK mondatban csupasz ora all. Ez szandekos
+    dokumentum-szintu kibuvo (a zonat magyarazo komment ne riasszon), de valodi lyuk. Azert
+    all igy, mert a jelzes NEM blokkol: a szorosabb, ora-kozeli szabaly tobb hamis riasztast
+    adna, es a hamis riasztas ezt a kaput gyorsabban oli meg, mint ez a lyuk.
+    A LYUK SZO SZERINT (Mira mutatta meg, 2026-09-16) -- ez a komment CSENDES:
+        "A deploy 2026-09-16 09:12:44 CEST-kor futott le.
+         A DM-valasz viszont 07:57:39-kor ment ki, ezt a DB-bol masoltam."
+    Az elso mondat zona-szava elnemiti a masodik mondat csupasz orajat. Mira megmerte a sajat
+    aznapi kommentjein: NULLA eset harapott ra. Ezert nem szigoritottuk -- egy meg nem tortent
+    esemenyre epitett szabaly maga a kronikusan piros alak."""
+    if not szoveg or ZONA_RX.search(szoveg):
+        return
+    for m in ORA_RX.finditer(szoveg):
+        if ORA_UTANI_ZONA_RX.match(szoveg[m.end():m.end()+10]):
+            continue                      # Z / +00 / +02:00 -- a zona ki VAN irva
+        if m.group(1) == '00' and not DATUM_ELOTT_RX.search(szoveg[:m.start()]):
+            continue                      # "runtime 00:03:12" -- idotartam, nem idopont
+        print(f'FIGYELEM: a(z) {cimke} csupasz gepi orat tartalmaz zona-jeloles nelkul: "{m.group(0)}".\n'
+              '  A DB/API idok tobbnyire UTC-ben jonnek, a gazda es a flotta CEST-ben olvas --\n'
+              '  szeptemberben ez 2 ora csuszas, es formailag helyes oranak latszik.\n'
+              '  Nem allitalak meg. Vagy konvertald CEST-re, vagy ird oda a zonat.', file=sys.stderr)
+        return
+
 GEPI_FEJLEC_RX = re.compile(r'^\s*\[[^\]\n]*\d{1,2}:\d{2}, rendszerora\]\s*\n?')
 
 def komment_mod(a):
@@ -269,11 +333,47 @@ def komment_mod(a):
     # MIERT NEM ELEG A HELYES ALAPERTELMEZES: a komment SZERZOJE attribucio, nem kenyelem --
     # a rossz nev irANYA is rossz, mert FELFELE, a koordinatorra mutat, tehat SULYT ad egy
     # mondatnak, amit nem o irt.
+    # EKEZET-JELZES, NEM KAPU (Mira merese, 2026-09-14). A gazda 2026-09-07-i szabalya szerint a
+    # kanban-KOMMENTET EMBER olvassa, tehat teljes magyar ekezettel megy (a kanban-CIM nem).
+    # MERVE: a komment-oldal 2676 sorbol 27 szazalekon all -- a szabaly SEHOL nem volt bekotve az
+    # iras pillanataba, ezert csak egy agens tartotta. Ez ugyanaz az alak, mint a homoglifanal es a
+    # memoria-indexnel: a szabaly megvan, a lepes nincs.
+    # 2026-09-17 OTA KAPU, NEM JELZES -- ES AZ OK A MERES, NEM AZ ELV. A jelzes 2026-09-14 ota allt
+    # itt azzal az indokkal, hogy "egy jelzes eleg". 2026-09-17-en KET agens (Mira es Marveen) futott
+    # bele UGYANAZON A NAPON, es MINDKET ekezet nelkuli szoveg KIMENT. Egy kapu, ami nulla esetben
+    # allit meg semmit, pontosan annyit er, mintha nem lenne ott -- a jelenlete viszont megnyugtat,
+    # es ez a rosszabbik fele. (Mira javaslata, msg 26275; Marveen dontese.)
+    # A REGI ELLENERV VALOS MARAD: kommentbe kod, log-reszlet es nyers DB-ertek is kerul legitim
+    # modon, ott a hamis pozitiv a kapu lassu kikapcsolasa lenne. EZERT NEM "mindig allj meg", hanem
+    # KIMONDOTT FELULBIRALAS: --ekezet-nelkul-szandekos. A surgos eset tovabbra is egy kapcsoloval
+    # megoldhato, de nem VELETLENUL megy ki: aki atengedi, leirja, hogy tudja.
+    # A CIMRE NEM VONATKOZIK: a gazda 2026-09-07-i szabalya szerint a kanban-CIM maradhat ekezet
+    # nelkul, a KOMMENTET viszont EMBER olvassa.
+    # A KAPU AZ IRAS ELE KERULT. Jelzeskent az INSERT UTAN allt, ami megengedheto volt; kapukent
+    # ott ertelmetlen lenne (mar bent van a sor), es rosszabb a mainal: "megallitottalak" uzenetet
+    # adna egy mar megtortent irasra.
+    def _ekezet_kapu(szoveg, szandekos):
+        EK = set('áéíóöőúüűÁÉÍÓÖŐÚÜŰ')
+        if len(szoveg) < 300:
+            return
+        if any(ch in EK for ch in szoveg):
+            return
+        if szandekos:
+            print('FIGYELEM: ekezet nelkuli komment megy be, KIMONDOTT felulbiralassal '
+                  '(--ekezet-nelkul-szandekos).', file=sys.stderr)
+            return
+        sys.exit('MEGTAGADVA: ez a komment EKEZET NELKULI, pedig a kanban-kommentet EMBER olvassa\n'
+                 '  (gazda-szabaly, 2026-09-07). A kanban-CIM maradhat ekezet nelkul, a KOMMENT nem.\n'
+                 '  A komment NEM irodott be. Ird at ekezetesen, es kuldd ujra.\n'
+                 '  Ha kivetelesen indokolt (nyers log, kod-reszlet, surgos eset), add meg\n'
+                 '  kimondottan: --ekezet-nelkul-szandekos')
+
     if a.author is None:
         sys.exit('MEGTAGADVA: komment-modban a szerzo KIMONDOTT: add meg az --author-t\n'
                  '(pl. --author Boni). Korabban ez csendben "Marveen"-re esett vissza, tehat\n'
                  'a kartyan MAS neve allt, mint aki irta -- es a kimenet kozben OK-t mondott.')
     text = open(a.comment_file, encoding='utf-8').read().strip()
+    _ekezet_kapu(text, a.ekezet_nelkul_szandekos)
     if not text:
         sys.exit('MEGTAGADVA: ures komment-fajl.')
     # UJRAPROBALKOZAS-ut (Iris lelete, Mira merese, 19912): ha a szoveg egy KORABBI
@@ -299,6 +399,7 @@ def komment_mod(a):
                  'idopont (pl. "a gazda 10:59-kor irta") szabad.')
     if (h := gyanus(text)):
         sys.exit(f'MEGTAGADVA: vegyes irasrendszeru szo a kommentben: {h[:5]}')
+    gepi_idobelyeg_jelzes(text, 'komment')
 
     # MEZOMOZGATAS (KARTYASTATUSZ906, Boni lelete 20271): a --status/--priority korabban
     # komment-modban SZO NELKUL ELVESZETT. A kimenet OK-t mondott, a kartya nem mozdult, es a
@@ -317,18 +418,37 @@ def komment_mod(a):
         if (h := gyanus(a.title)):
             sys.exit(f'MEGTAGADVA: vegyes irasrendszeru szo a cimben: {h[:5]}')
         _horgony_kapu(a.id, a.title)
+    # A LEIRAS IS MOZGATHATO (EKEZETKAPU919, 2026-09-19). Marveen kikotese: a regi szoveg NE
+    # vesszen el -- ezt nem kulon kod adja, hanem a mar meglevo mozgatas-nyom, ami MINDEN valtozo
+    # mezo TELJES regi erteket kiirja egy kommentbe (lasd lent: `reszletes`). Ezert a leiras ugy
+    # kerul be, mint a tobbi mezo, es nem sajat kulon uton: egy kulon ut pont azt a nyomot kerulne
+    # meg, amiert az egesz engedmeny megadhato.
+    # AMI RAFUT ES AMI NEM: a homoglifa-kapu igen (ugyanaz a hamisitas-felulet, mint a cimen).
+    # A 300 karakteres hatar NEM: az a CIM trigger-levagasa ellen all, a leiras epp a hosszu
+    # szovege. A horgony-kapu sem: az azt meri, hogy a CIM hordozza-e a kartya azonositojat.
+    uj_leiras = None
+    if a.desc_file is not None:
+        uj_leiras = open(a.desc_file, encoding='utf-8').read()
+        if not uj_leiras.strip():
+            sys.exit('MEGTAGADVA: ures --desc-file a mozgato agon. Ez a leiras KIURITESE lenne, es\n'
+                     'egy ures leiras ugyanugy nez ki, mint egy elfelejtett. Ha tenyleg torolni\n'
+                     'akarod a tartalmat, irj be egy sort arrol, MIERT ures (a regi szoveg a\n'
+                     'mozgatas-nyomban akkor is megmarad).')
+        if (h := gyanus(uj_leiras)):
+            sys.exit(f'MEGTAGADVA: vegyes irasrendszeru szo a leirasban: {h[:5]}')
     if a.status is not None and a.status not in STATUSZOK:
         sys.exit(f'MEGTAGADVA: ervenytelen statusz ("{a.status}"). Ervenyes: {", ".join(STATUSZOK)}.')
     if a.priority is not None and a.priority not in PRIORITASOK:
         sys.exit(f'MEGTAGADVA: ervenytelen prioritas ("{a.priority}"). Ervenyes: {", ".join(PRIORITASOK)}.')
 
     db = sqlite3.connect(_db_kapu()); db.execute('PRAGMA busy_timeout=8000')
-    card = db.execute('SELECT id,status,assignee,priority,title FROM kanban_cards WHERE id=?', (a.id,)).fetchone()
+    card = db.execute('SELECT id,status,assignee,priority,title,description FROM kanban_cards WHERE id=?', (a.id,)).fetchone()
     if not card:
         sys.exit(f'MEGTAGADVA: a(z) {a.id} kartya NEM LETEZIK -- komment-only mod csak meglevo kartyara ir.\n'
                  f'Uj kartyahoz a letrehozo mod valo (--assignee/--title).')
     # ELOTTE-PILLANATKEP: enelkul a visszaolvasas nem meres, csak egy ertek felolvasasa.
-    elotte = {'status': card[1], 'priority': card[3], 'title': card[4], 'assignee': card[2]}
+    elotte = {'status': card[1], 'priority': card[3], 'title': card[4], 'assignee': card[2],
+               'description': card[5]}
     # A FELELOS FELOLDASA a kartya ismereteben: a kanonikus alakot hasonlitjuk az elotte-erteknek,
     # kulonben egy "Samu" -> "samu" no-op valodi mozgatasnak latszana.
     uj_felelos = None
@@ -357,7 +477,7 @@ def komment_mod(a):
                          + (f'Hasonlo, MAR LETEZO nevek: {", ".join(kozeli)}\n' if kozeli else '')
                          + 'Ha tenyleg uj nev (pl. uj kulso PR-szerzo), mondd ki: --assignee-uj.')
     mozgatas = {k: v for k, v in (('status', a.status), ('priority', a.priority), ('title', a.title),
-                                  ('assignee', uj_felelos))
+                                  ('assignee', uj_felelos), ('description', uj_leiras))
                 if v is not None}
     valtozik = {k: v for k, v in mozgatas.items() if v != elotte[k]}
     valtozatlan = {k: v for k, v in mozgatas.items() if v == elotte[k]}
@@ -404,8 +524,9 @@ def komment_mod(a):
         sys.exit(f'HIBA: a mezomozgatas {cur.rowcount} sort erintett (1 helyett) -- a komment MAR BEIRT.')
     # FUGGETLEN visszaolvasas: uj SELECT, nem a cursor allitasa. A 0-talalatos UPDATE
     # es a sikeres UPDATE kulonben megkulonboztethetetlen lenne.
-    utana = db.execute('SELECT status,priority,title,assignee FROM kanban_cards WHERE id=?', (a.id,)).fetchone()
-    kapott = {'status': utana[0], 'priority': utana[1], 'title': utana[2], 'assignee': utana[3]}
+    utana = db.execute('SELECT status,priority,title,assignee,description FROM kanban_cards WHERE id=?', (a.id,)).fetchone()
+    kapott = {'status': utana[0], 'priority': utana[1], 'title': utana[2], 'assignee': utana[3],
+              'description': utana[4]}
     for k, v in valtozik.items():
         if kapott[k] != v:
             sys.exit(f'HIBA: a(z) {k} visszaolvasva "{kapott[k]}", nem a kert "{v}". Az iras NEM ert celba.')
@@ -513,7 +634,15 @@ def _elozmeny_figyelmeztetes(db, a, now, dry=False):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--id', required=True); p.add_argument('--assignee')
-    p.add_argument('--title'); p.add_argument('--desc-file')
+    p.add_argument('--title')
+    # A SUGO MONDJA MEG, MIT TUD A KAPCSOLO A KET AGON (Marveen kikotese, EKEZETKAPU919).
+    # A korlatot eddig csak a keveres-kapu uzenete mutatta, amibol NEM derult ki, hogy a
+    # leiras utolag javithatatlan -- aki nekifutott, a megtagadasbol azt olvasta ki, hogy
+    # rossz kapcsolot hasznal, nem azt, hogy nincs ilyen ut.
+    p.add_argument('--desc-file',
+                   help='a kartya leirasa fajlbol. LETREHOZO modban a kezdo leiras; '
+                        '--comment-file mellett a MEGLEVO leiras CSEREJE (a regi szoveg '
+                        'teljes egeszeben bekerul a mozgatas-nyom kommentbe).')
     p.add_argument('--msg-file'); p.add_argument('--priority', default=None)
     # Az alapertelmezes SZANDEKOSAN None (nem 'planned'/'normal'): csak igy lehet
     # megkulonboztetni a KIMONDOTT erteket a nem-adottol. A letrehozo ag lentebb tolti fel.
@@ -529,16 +658,25 @@ def main():
     p.add_argument('--author', default=None, help='a komment szerzoje (komment-modban KOTELEZO)')
     p.add_argument('--from', dest='from_agent', default=None,
                    help='az ertesites feladoja (alapertelmezes: az --author kisbetusitve)')
+    p.add_argument('--ekezet-nelkul-szandekos', action='store_true',
+                   dest='ekezet_nelkul_szandekos',
+                   help='komment-mod: KIMONDOTT felulbiralas, ha a komment szandekosan ekezet nelkuli')
     p.add_argument('--dry-run', action='store_true')
     a = p.parse_args()
 
     if a.comment_file:
         # A KEVERES-KAPUT KI KELL ENGEDNI az uj mezohoz, kulonben az uj kod ELERHETETLEN, es a
         # bovites "kesz"-nek latszik ugy, hogy soha nem fut le (Boni kikotese a cim-bovitesnel).
-        if a.msg_file or a.desc_file:
-            sys.exit('MEGTAGADVA: a --comment-file nem keverheto a letrehozo mod kapcsoloival\n'
-                     '(--desc-file/--msg-file) -- egy futas egy muvelet.\n'
-                     'A --title/--status/--priority/--assignee viszont MOZGATJA a meglevo kartyat.')
+        # A --desc-file 2026-09-19 OTA MOZGATO KAPCSOLO IS (EKEZETKAPU919). Korabban itt allt a
+        # tiltasban, es ettol a LEIRAS volt az egyetlen kartya-mezo, amit letrehozas utan SENKI
+        # nem tudott javitani -- egy elsore rosszul megirt leiras VEGLEGES volt. A tiltas nem
+        # leiras-vedelem volt, hanem hianyzo UPDATE-ut: a mozgato ag egyszeruen nem ismerte a
+        # mezot (merve 2026-09-19, Geri). A --msg-file marad tiltva: az ERTESITES, ami a
+        # letrehozashoz tartozik, nem a kartya allapotahoz.
+        if a.msg_file:
+            sys.exit('MEGTAGADVA: a --comment-file nem keverheto a --msg-file-lal -- az ERTESITES a\n'
+                     'letrehozo agé (uj kartya + gazda-ertesites egy futasban).\n'
+                     'A --title/--status/--priority/--assignee/--desc-file MOZGATJA a meglevo kartyat.')
         komment_mod(a)
         return
     if a.assignee_uj:
@@ -616,6 +754,8 @@ def main():
     for cimke, szoveg in (('cim', a.title), ('leiras', desc), ('uzenet', msg)):
         if (h := gyanus(szoveg)):
             sys.exit(f'MEGTAGADVA: vegyes irasrendszeru szo a(z) {cimke}-ban: {h[:5]}')
+    for cimke, szoveg in (('cim', a.title), ('leiras', desc), ('uzenet', msg)):
+        gepi_idobelyeg_jelzes(szoveg, cimke)
 
     if a.dry_run:
         # PARITAS-KAPU (KARTYADRYRUN907; Mira lelete 2026-09-07, UJRA ELO 2026-09-08 a kiadott
