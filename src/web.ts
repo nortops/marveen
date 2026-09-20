@@ -13,7 +13,7 @@ import { isBlockedCrossOriginWrite, originMatchesServedHost } from './web/csrf-o
 import { json } from './web/http-helpers.js'
 import { detectLanIp } from './web/network-info.js'
 import { AGENTS_BASE_DIR, listAgentNames, listAllAgentNames } from './web/agent-config.js'
-import { ensureAgentHooks, ensureAgentStalenessHook, ensureAgentProvenanceHook, ensureEgressGate, ensureBashEgressDeny, ensureGovernanceGateCommands, ensureTelegramCopyGate, ensureQuarantineReader, watchEgressAllowlistForReaderRender, ensureDefaultScheduledTasks, agentSettingsPath, ensureAutonomySection, ensureSkillAccessGate, ensureSkillsPathTrapSection, ensureSystemDirectiveAuthSection } from './web/agent-scaffold.js'
+import { ensureAgentHooks, ensureAgentStalenessHook, ensureAgentProvenanceHook, ensureEgressGate, ensureBashEgressDeny, ensureGovernanceGateCommands, ensureTelegramCopyGate, ensureQuarantineReader, watchEgressAllowlistForReaderRender, ensureDefaultScheduledTasks, agentSettingsPath, ensureAutonomySection, ensureSkillsPathTrapSection, ensureSystemDirectiveAuthSection } from './web/agent-scaffold.js'
 import { shouldRegisterHooks, pruneStaleHooksFromSettingsFile } from './web/hook-registration-guard.js'
 import { mainAgentConfigDirIfSeparate } from './web/agent-process.js'
 import { refreshMarveenBotUsername } from './web/telegram.js'
@@ -562,7 +562,6 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
       const stalePatched: string[] = []
       const provPatched: string[] = []
       const egressPatched: string[] = []
-      const skillAccessPatched: string[] = []
       const bashEgressPatched: string[] = []
       const bashEgressUncovered: string[] = []
       const govPatched: string[] = []
@@ -586,7 +585,6 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
         if (ensureAgentStalenessHook(agentName)) stalePatched.push(agentName)
         if (ensureAgentProvenanceHook(agentName)) provPatched.push(agentName)
         if (ensureEgressGate(agentName)) egressPatched.push(agentName)
-        if (ensureSkillAccessGate(agentName)) skillAccessPatched.push(agentName)
         // The Bash egress deny needs the main agent's OWN config dir: its
         // nominal settings path is the shared ~/.claude, which is also the
         // operator's own interactive shell, and the operator asked to stay out
@@ -614,7 +612,6 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
       if (stalePatched.length) logger.info({ patched: stalePatched }, 'staleness-guard UserPromptSubmit hook backfilled into agent settings.json')
       if (provPatched.length) logger.info({ patched: provPatched }, 'provenance-gate UserPromptSubmit hook backfilled into agent settings.json')
       if (egressPatched.length) logger.info({ patched: egressPatched }, 'egress-gate WebFetch hook backfilled into agent settings.json')
-      if (skillAccessPatched.length) logger.info({ patched: skillAccessPatched }, 'skill-access-gate PreToolUse hook backfilled into agent settings.json')
       if (bashEgressPatched.length) logger.info({ patched: bashEgressPatched }, 'Bash egress deny rules backfilled into agent settings.json (permissions.deny)')
       if (bashEgressUncovered.length) logger.warn({ agents: bashEgressUncovered },
         'Bash egress deny NOT applied to the main agent: it runs on the shared user config root, which is also the operator\'s own shell. Give it a config dir of its own (MAIN_AGENT_ISOLATED_CONFIG / MAIN_AGENT_CONFIG_DIR) to cover it without covering the operator.')

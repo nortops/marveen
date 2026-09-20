@@ -8,14 +8,12 @@ import {
   injectEmailSendGate,
   injectSelfPaceGate,
   injectEgressGate,
-  injectSkillAccessGate,
   ensureEgressGate,
-  ensureSkillAccessGate,
   ensureGovernanceGateCommands,
   emailGateMatcherStale,
   EMAIL_GATE_MATCHER,
 } from '../web/agent-scaffold.js'
-import { PROJECT_ROOT, MAIN_AGENT_ID } from '../config.js'
+import { PROJECT_ROOT } from '../config.js'
 
 // Review feedback on PR #803, pinned as tests:
 //  1. every injector must write a QUOTED absolute interpreter path -- an
@@ -84,31 +82,6 @@ describe('injectors write a quoted absolute interpreter, never a bare node', () 
   }
 })
 
-// Szotasz upstream review on #1368, point 1: the pre-fix skill-access-gate
-// command was `bash -c '[ -f X ] && exec node X; exit 0'` -- a bare `node`
-// that resolves to nothing on an nvm PATH, so `exec` exits 127 and Claude
-// Code treats that as a non-blocking hook error, i.e. the gate silently never
-// enforces. Pinned here so that shape cannot come back. Unlike the injectors
-// above, the fix keeps a DELIBERATE fail-open branch for the script file being
-// absent (an install that has not picked up this feature yet), so the
-// assertion is scoped to the interpreter half of the command only.
-describe('injectSkillAccessGate writes a quoted absolute interpreter, never a bare node', () => {
-  it('uses HOOK_NODE_BIN, not a bare node, and still fails open when the script is missing', () => {
-    const s: Record<string, unknown> = {}
-    injectSkillAccessGate(s)
-    const commands = ptuCommands(s)
-    expect(commands.length).toBeGreaterThan(0)
-    for (const cmd of commands) {
-      expect(cmd.includes(`"${HOOK_NODE_BIN}" "`)).toBe(true)
-      expect(cmd).not.toMatch(/exec node /)
-      // The script-absent branch must still short-circuit to exit 0, BEFORE
-      // the interpreter is ever probed (point 1 fixes the interpreter check,
-      // it must not remove the original fail-open guarantee).
-      expect(cmd).toMatch(/^test -f "[^"]+" \|\| exit 0;/)
-    }
-  })
-})
-
 describe('hookCommandWired', () => {
   it('finds a freshly injected command (posix path)', () => {
     const s: Record<string, unknown> = {}
@@ -137,15 +110,6 @@ describe('ensure* migrations are idempotent (true, then false)', () => {
     for (const cmd of ptuCommands(written)) {
       expect(cmd.includes(`"${HOOK_NODE_BIN}" "`)).toBe(true)
     }
-  })
-
-  // The gate reads gateDecision(), which always allows agentId === null (the
-  // main agent). Wiring it into the main agent's settings therefore enforces
-  // nothing -- and agentSettingsPath(MAIN_AGENT_ID) is the SHARED
-  // ~/.claude/settings.json (#1305), so doing it anyway would be a pure-risk,
-  // zero-benefit repeat of the owner-session leak the other gates already guard against.
-  it('ensureSkillAccessGate refuses to write the main agent (#1305, and a no-op besides)', () => {
-    expect(ensureSkillAccessGate(MAIN_AGENT_ID)).toBe(false)
   })
 
   it('ensureGovernanceGateCommands upgrades a legacy bare-node entry, then settles', () => {
@@ -226,24 +190,5 @@ describe('emailGateMatcherStale', () => {
     expect(emailGateMatcherStale([{ matcher: 'WebFetch', hooks: [{ type: 'command', command: 'x egress-gate.mjs' }] }])).toBe(false)
     expect(emailGateMatcherStale([])).toBe(false)
     expect(emailGateMatcherStale(undefined)).toBe(false)
-  })
-})
-
-// FIX 3: skill-access-gate must carry a 'Skill' matcher so node is not
-// spawned for every tool call.
-// injectSkillAccessGate guards against /tmp-prefixed paths (isUnsafeHookCommand),
-// so it cannot be called in worktree tests. We verify the matcher is present by
-// inspecting the injector source directly.
-describe('injectSkillAccessGate source: Skill matcher', () => {
-  it('injectSkillAccessGate source wires matcher: Skill on the entry it appends', async () => {
-    const { readFileSync } = await import('node:fs')
-    const { join } = await import('node:path')
-    const src = readFileSync(join(PROJECT_ROOT, 'src', 'web', 'agent-scaffold.ts'), 'utf-8')
-    // The entry written by injectSkillAccessGate must contain matcher: 'Skill'
-    // so node is only spawned on Skill tool calls (FIX 3).
-    const injectFnMatch = src.match(/export function injectSkillAccessGate[\s\S]+?^}/m)
-    expect(injectFnMatch).not.toBeNull()
-    const fnBody = injectFnMatch![0]
-    expect(fnBody).toContain("matcher: 'Skill'")
   })
 })
