@@ -56,7 +56,17 @@ describe('AGENT_LOCAL_BASE_URL: the local-agent endpoint is its own key', () => 
     // re-verified by hand and re-ported to the new shape (2 lines: the config
     // import and the ollama branch's exportsStr). The anchor is now the ollama
     // auth token, which is what actually marks that branch.
-    const line = src.split('\n').find(l => l.includes('ANTHROPIC_AUTH_TOKEN=ollama'))
+    //
+    // SCOPED TO the isOllama branch (2026-09-23, upstream v1.39.0 integration):
+    // this fork's OWN custom-provider no-auth convention (PR #804) ALSO emits
+    // the literal 'ANTHROPIC_AUTH_TOKEN=ollama' as a placeholder token -- both
+    // in buildCustomProviderLaunchEnv AND in resolveProviderEnv's own
+    // customProviderDef branch, which comes BEFORE the isOllama branch in the
+    // same function -- so scoping to the function alone still grabbed the
+    // wrong line. `provider: 'ollama'` is the unique marker of the actual
+    // branch this test pins (custom providers always return `provider: 'custom'`).
+    const ollamaBranchSrc = src.slice(src.indexOf("provider: 'ollama'"))
+    const line = ollamaBranchSrc.split('\n').find(l => l.includes('ANTHROPIC_AUTH_TOKEN=ollama'))
     expect(line, 'the ollama exportsStr line is gone -- upstream restructured it again, re-verify the patch by hand').toBeDefined()
     expect(line).toContain('ANTHROPIC_BASE_URL=${AGENT_LOCAL_BASE_URL}')
     expect(line).not.toContain('${OLLAMA_URL}')
