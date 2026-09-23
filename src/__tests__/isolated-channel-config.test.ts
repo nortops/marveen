@@ -189,8 +189,32 @@ describe('isolated-config launcher wiring', () => {
     // The shared root's rotating credential (macOS Keychain /.credentials.json)
     // wins over a valid CLAUDE_CODE_OAUTH_TOKEN env var, so a shared-root agent
     // 401s whenever it rotates -- the gate must not be hasChannel-only.
-    expect(SRC).toMatch(/const needsFleetOauth = isClaude && authMode !== 'api'/)
-    expect(SRC).toMatch(/\(hasChannel \|\| needsFleetOauth\) && name !== MAIN_AGENT_ID/)
+    expect(SRC).toMatch(/const needsFleetOauth = isClaude && authMode !== 'api' && !isOwnTeam/)
+    expect(SRC).toMatch(/\(hasChannel \|\| needsFleetOauth \|\| isOwnTeam\) && name !== MAIN_AGENT_ID/)
+  })
+
+  it('own_team never exports the fleet token (OWNTEAMVAK914)', () => {
+    // Both export sites must exclude own_team: the shared-home pre-export and
+    // the isolation branch. A fleet-token fallback would silently put the
+    // agent back on the shared identity whenever its own credential expires --
+    // exactly what the operator opted out of by picking own_team.
+    expect(SRC).toMatch(/const isOwnTeam = isClaude && authMode === 'own_team'/)
+    // The shared-home pre-export gate is needsFleetOauth, not a bare !isOwnTeam:
+    // needsFleetOauth already excludes isOwnTeam (see the definition assertion
+    // above) AND excludes authMode 'api'/BYO providers (2026-08-05 401 fix) --
+    // a bare !isOwnTeam here would re-export the token to those, regressing it.
+    expect(SRC).toMatch(/!claudeConfigDir && hasFleetOauthToken\(\) && needsFleetOauth/)
+    // The own_team isolation branch comes BEFORE the hasFleetOauthToken() gate
+    // (isolation must not require the fleet token for own_team) and contains
+    // no token export.
+    const ownTeamBranch = SRC.match(/if \(isOwnTeam\) \{[\s\S]*?\n {6}\} else if \(hasFleetOauthToken\(\)\) \{/)?.[0] ?? ''
+    expect(ownTeamBranch).not.toBe('')
+    expect(ownTeamBranch).not.toMatch(/CLAUDE_CODE_OAUTH_TOKEN/)
+    expect(ownTeamBranch).toMatch(/ensureIsolatedChannelConfigDir\(name, hasChannel \? agentProvider : null\)/)
+  })
+
+  it('own_team isolation failure falls back LOUDLY (shared root = host credential)', () => {
+    expect(SRC).toMatch(/own_team auth: isolated config dir provisioning failed/)
   })
 
   it('passes a null provider for channel-less agents so no plugin gets enabled', () => {
