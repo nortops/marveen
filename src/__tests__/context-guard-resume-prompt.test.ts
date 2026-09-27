@@ -90,19 +90,23 @@ describe('resumePrompt carries the restart-window re-read on every variant', () 
   }
 })
 
-// Review msg 14197: the main agent's channel is the OWNER's Telegram, and
-// session meta must never go there (standing owner preference; a 3am status
-// notice went out exactly this way on 2026-08-05). The closing line is
-// therefore agent-dependent, and this pins BOTH directions so a rewording
-// cannot re-point the main agent at the owner's channel.
-describe('resumePrompt closing line is agent-dependent', () => {
+// Review msg 14197 + msg 2779: session meta must never go to ANY agent's
+// channel, main or sub-agent alike (standing owner preference; a 3am status
+// notice went out this way on 2026-08-05, and sub-agents with their own
+// Telegram bot -- e.g. Hestia -- posted the same wake noise to the
+// owner-visible chat on 2026-09-27 because the closing line used to exempt
+// them). This pins the closing line as agent-INDEPENDENT so a rewording
+// cannot re-introduce that exemption.
+describe('resumePrompt closing line bans channel posting for every agent', () => {
   it('main agent (mocked MAIN_AGENT_ID=marveen): no channel notice, transcript line instead', () => {
     const p = resumePrompt('marveen', '/x/HANDOFF.md', true)
     expect(p).not.toContain('jelezz a csatornádon')
     expect(p).toContain('transzkript')
     expect(p).toContain(CONSTRAINT)
   })
-  it('sub-agent: channel notice stays (their channel is the inter-agent queue)', () => {
-    expect(resumePrompt('samu', '/x/HANDOFF.md', true)).toContain('jelezz a csatornádon')
+  it('sub-agent: no channel notice either, same transcript-line-only formula', () => {
+    const p = resumePrompt('samu', '/x/HANDOFF.md', true)
+    expect(p).not.toContain('jelezz a csatornádon')
+    expect(p).toContain('transzkript')
   })
 })
