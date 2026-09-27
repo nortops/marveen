@@ -66,7 +66,12 @@ export function gateWakePrompt(): string {
     'Olvasd be oket, ellenorizd a kanban tabladat es a hot memoriaidat, es FOLYTASD onnan ahol abbamaradt. ' +
     'Ne kezdd elolrol ami mar kesz, es ne delegald ujra amit mar atadtal. ' +
     'Ha nem volt futo munkad, az is teljes erteku allapot -- olyankor ne talalj ki magadnak feladatot. ' +
-    'Rovid jelzest kuldj a sajat csatornadon, hogy friss kontextussal folytatod.'
+    // Same ban as context-guard-runner.ts resumePrompt(): session-meta must
+    // never reach the agent's channel, main or sub-agent alike (msg 2779,
+    // 2026-09-27 -- sub-agents with their own Telegram bot were posting this
+    // wake-status straight to the owner-visible chat because this line told
+    // them to).
+    'Zarasul egyetlen transzkript-sorban rogzitsd, hogy friss kontextussal folytatod, a csatornadra session-meta nem mehet ki.'
   )
 }
 

@@ -752,13 +752,18 @@ describe('decideWake', () => {
 })
 
 describe('gateWakePrompt', () => {
-  // The nudge exists to produce a turn AND a visible sign of life; a nudge that
-  // only said "you restarted" would leave the owner staring at silence again.
-  it('asks the agent to continue and to report on its channel', () => {
+  // The nudge exists to produce a turn AND a visible sign of life, but that
+  // sign must stay in the transcript -- posting it to the agent's own
+  // channel is exactly the wake noise an owner-visible Telegram bot (e.g.
+  // Hestia) was sending on 2026-09-27 (msg 2779), because an earlier wording
+  // told it to "jelezz a csatornadon" here.
+  it('asks the agent to continue, and bans posting the wake-status to its channel', () => {
     const p = gateWakePrompt()
     expect(p).toContain('[CONTEXT-RESTART-GATE]')
     expect(p.toLowerCase()).toContain('folytasd')
     expect(p.toLowerCase()).toContain('csatorna')
+    expect(p.toLowerCase()).not.toContain('jelzest kuldj a sajat csatornadon')
+    expect(p.toLowerCase()).toContain('nem mehet ki')
   })
 
   // Guard against the nudge itself becoming a source of invented work.
