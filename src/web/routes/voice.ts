@@ -144,7 +144,7 @@ export async function tryHandleVoice(ctx: RouteContext): Promise<boolean> {
     const chatId = ctx.url.searchParams.get('chat') ?? ''
     const fileParam = ctx.url.searchParams.get('file') ?? ''
     if (!agentId || !/^[a-zA-Z0-9_-]+$/.test(agentId)) { json(res, { error: 'Invalid agent' }, 400); return true }
-    if (!chatId || !/^\d+$/.test(chatId)) { json(res, { error: 'Invalid chat_id' }, 400); return true }
+    if (!chatId || !/^-?\d+$/.test(chatId)) { json(res, { error: 'Invalid chat_id' }, 400); return true }
     const voiceCfg = readAgentVoiceConfig(agentId)
     const stateDir = resolveAgentChannelStateDir(agentId, 'telegram')
     const kindParam = ctx.url.searchParams.get('kind') ?? ''
@@ -195,7 +195,7 @@ export async function tryHandleVoice(ctx: RouteContext): Promise<boolean> {
     const chatId = data.chat_id?.trim() ?? ''
     const modality = data.modality?.trim() ?? ''
     if (!agentId || !/^[a-zA-Z0-9_-]+$/.test(agentId)) { json(res, { error: 'Invalid agent_id' }, 400); return true }
-    if (!chatId || !/^\d+$/.test(chatId)) { json(res, { error: 'Invalid chat_id' }, 400); return true }
+    if (!chatId || !/^-?\d+$/.test(chatId)) { json(res, { error: 'Invalid chat_id' }, 400); return true }
     if (modality !== 'voice' && modality !== 'text') { json(res, { error: 'modality must be voice or text' }, 400); return true }
     setLastInboundModality(agentId, chatId, modality as 'voice' | 'text')
     json(res, { ok: true })
@@ -249,7 +249,7 @@ export async function tryHandleVoice(ctx: RouteContext): Promise<boolean> {
     const stateDir = data.state_dir?.trim() ?? ''
 
     if (!text) { json(res, { error: 'text required' }, 400); return true }
-    if (!/^\d+$/.test(chatId)) { json(res, { error: 'Invalid chat_id' }, 400); return true }
+    if (!/^-?\d+$/.test(chatId)) { json(res, { error: 'Invalid chat_id' }, 400); return true }
     if (!isSafeStateDir(stateDir)) { json(res, { error: 'Invalid state_dir' }, 400); return true }
 
     const onnxPath = voiceOnnxPath(voiceModel)
