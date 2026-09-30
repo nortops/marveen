@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { checkAgentPutFields, checkConfigPutFields, AGENT_PUT_WRITABLE_FIELDS, validateCustomProvider } from '../web/agent-put-fields.js'
+import { checkAgentPutFields, checkConfigPutFields, AGENT_PUT_WRITABLE_FIELDS } from '../web/agent-put-fields.js'
 import { DEFAULT_CONTEXT_GUARD } from '../context-guard.js'
 import { DEFAULT_AUTO_RESTART, LEGACY_AUTO_RESTART_FIELDS } from '../auto-restart.js'
 import { EventEmitter } from 'node:events'
@@ -24,9 +24,6 @@ describe('checkAgentPutFields', () => {
     expect(checkAgentPutFields('laci', { claudePlan: '' }).ok).toBe(true)
     expect(checkAgentPutFields('laci', { authMode: 'shared' }).ok).toBe(true)
     expect(checkAgentPutFields('laci', { memoryIsolation: true }).ok).toBe(true)
-    expect(checkAgentPutFields('laci', { customProvider: 'openai' }).ok).toBe(true)
-    expect(checkAgentPutFields('laci', { customProvider: null }).ok).toBe(true)
-    expect(checkAgentPutFields('laci', { modelProfile: 'balanced' }).ok).toBe(true)
     expect(checkAgentPutFields('laci', {}).ok).toBe(true)
   })
 
@@ -68,37 +65,9 @@ describe('checkAgentPutFields', () => {
     expect([...AGENT_PUT_WRITABLE_FIELDS]).toEqual([
       'claudeMd', 'soulMd', 'mcpJson', 'model',
       'authMode', 'apiKey', 'claudePlan', 'memoryIsolation',
-      'customProvider', 'modelProfile',
+      'modelProfile', 'customProvider',
     ])
     expect(AGENT_PUT_WRITABLE_FIELDS).not.toContain('securityProfile')
-  })
-})
-
-describe('validateCustomProvider', () => {
-  const known = ['openai', 'deepseek']
-
-  it('accepts a known provider id', () => {
-    expect(validateCustomProvider('openai', known).ok).toBe(true)
-  })
-
-  it('rejects an unknown provider id with a descriptive error', () => {
-    const r = validateCustomProvider('bogus', known)
-    expect(r.ok).toBe(false)
-    if (r.ok) return
-    expect(r.error).toContain('bogus')
-  })
-
-  it('treats null as a clear operation (always valid)', () => {
-    expect(validateCustomProvider(null, known).ok).toBe(true)
-    expect(validateCustomProvider(null, []).ok).toBe(true)
-  })
-
-  it('treats empty string as a clear operation (always valid)', () => {
-    expect(validateCustomProvider('', known).ok).toBe(true)
-  })
-
-  it('treats undefined as a clear operation (always valid)', () => {
-    expect(validateCustomProvider(undefined, known).ok).toBe(true)
   })
 })
 

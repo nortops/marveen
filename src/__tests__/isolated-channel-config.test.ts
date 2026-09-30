@@ -198,11 +198,14 @@ describe('isolated-config launcher wiring', () => {
     // the isolation branch. A fleet-token fallback would silently put the
     // agent back on the shared identity whenever its own credential expires --
     // exactly what the operator opted out of by picking own_team.
+    //
+    // own_team exclusion is folded into needsFleetOauth (BYOCUSTFOAUTH805:
+    // `isClaude && authMode !== 'api' && !isOwnTeam`) rather than spelled out
+    // as a separate `!isOwnTeam` at the export site -- the same guard also has
+    // to exclude BYO/custom-endpoint agents (Ollama/DeepSeek/OpenRouter/custom),
+    // and one shared boolean keeps both exclusions from drifting apart.
     expect(SRC).toMatch(/const isOwnTeam = isClaude && authMode === 'own_team'/)
-    // The shared-home pre-export gate is needsFleetOauth, not a bare !isOwnTeam:
-    // needsFleetOauth already excludes isOwnTeam (see the definition assertion
-    // above) AND excludes authMode 'api'/BYO providers (2026-08-05 401 fix) --
-    // a bare !isOwnTeam here would re-export the token to those, regressing it.
+    expect(SRC).toMatch(/const needsFleetOauth = isClaude && authMode !== 'api' && !isOwnTeam/)
     expect(SRC).toMatch(/!claudeConfigDir && hasFleetOauthToken\(\) && needsFleetOauth/)
     // The own_team isolation branch comes BEFORE the hasFleetOauthToken() gate
     // (isolation must not require the fleet token for own_team) and contains
@@ -238,7 +241,7 @@ describe('isolated-config launcher wiring', () => {
     expect(SRC).toMatch(/hasFleetOauthToken\(\) && needsFleetOauth/)
   })
 
-  it('channel-isolation token export is wrapped in if(needsFleetOauth) — BYO channel agents keep CLAUDE_CONFIG_DIR but no OAuth token', () => {
+  it('channel-isolation token export is wrapped in if(needsFleetOauth): BYO channel agents keep CLAUDE_CONFIG_DIR but no OAuth token', () => {
     // The oauthTokenEnv assignment inside the channel-isolation block must be
     // wrapped in an if(needsFleetOauth) guard so BYO channel agents (hasChannel=true
     // but isClaude=false) get the isolated CLAUDE_CONFIG_DIR for plugin-slot
@@ -249,7 +252,7 @@ describe('isolated-config launcher wiring', () => {
   // Regression guard for the inherited-token layer of the BYO 401 bug (2026-08-05).
   // The tmux server carries CLAUDE_CODE_OAUTH_TOKEN in its own env;
   // every new agent pane inherits it regardless of whether the launch command exports
-  // it.  Not exporting is not enough — the token must be actively unset at launch for
+  // it.  Not exporting is not enough: the token must be actively unset at launch for
   // BYO/custom-endpoint agents so the CLI forwards ANTHROPIC_API_KEY to the provider
   // instead.
 

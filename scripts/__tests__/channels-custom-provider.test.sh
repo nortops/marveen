@@ -34,9 +34,23 @@ fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1 -- expected: $2, got: $3"; }
 INSTALL_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 REAL_HELPER="$INSTALL_DIR/scripts/main-agent-custom-provider.mjs"
 
+# A silent exit 0 here used to read as a pass in CI without a single case
+# actually running -- an unbuilt tree made this suite report green while
+# testing nothing, and CI (the `test` workflow) never runs `npm run build`
+# before `npm test`, so a hard "FAIL: dist/ not built" turned every CI run
+# red instead. Build it ourselves on demand, and fail only if THAT fails --
+# a setup error still cannot report success, but a plain unbuilt tree (the
+# normal CI/fresh-checkout state) no longer needs a human to build first.
 if [ ! -f "$INSTALL_DIR/dist/web/agent-process.js" ]; then
-  echo "SKIP: dist/ not built (run 'npm run build' first)"
-  exit 0
+  echo "dist/ not built -- building now (npm run build)..." >&2
+  if ! ( cd "$INSTALL_DIR" && npm run build ) >&2; then
+    echo "FAIL: npm run build failed" >&2
+    exit 1
+  fi
+  if [ ! -f "$INSTALL_DIR/dist/web/agent-process.js" ]; then
+    echo "FAIL: dist/web/agent-process.js still missing after npm run build" >&2
+    exit 1
+  fi
 fi
 
 # The isolated root lives INSIDE the project tree so node.js walks up to find
@@ -76,9 +90,11 @@ run() {
   else
     rm -f "$PROVIDERS_PATH"
   fi
-  GOT_OUT="$(node "$root/scripts/main-agent-custom-provider.mjs" 2>/tmp/cp_test_stderr)"
+  _stderr_tmp="$(mktemp "${TMPDIR:-/tmp}/cp_stderr.XXXXXX")"
+  GOT_OUT="$(node "$root/scripts/main-agent-custom-provider.mjs" 2>"$_stderr_tmp")"
   GOT_RC=$?
-  GOT_ERR="$(cat /tmp/cp_test_stderr)"
+  GOT_ERR="$(cat "$_stderr_tmp")"
+  rm -f "$_stderr_tmp"
 }
 
 NONE_PROVIDER='{"providers":[{"id":"litellm-local","label":"LiteLLM","baseUrl":"http://127.0.0.1:4010","authHeader":"none","vaultKey":null}]}'
@@ -126,11 +142,13 @@ else
 fi
 NONE_OUT="$GOT_OUT"
 
-# 5. Env line starts with "unset CLAUDE_CODE_OAUTH_TOKEN &&"
-if printf '%s' "$NONE_OUT" | grep -q '^unset CLAUDE_CODE_OAUTH_TOKEN &&'; then
+# 5. Env line starts with "unset CLAUDE_CODE_OAUTH_TOKEN &&" -- byte-exact on the full
+# none output so a leading contamination line cannot slip through a grep anchor.
+EXPECTED_NONE="unset CLAUDE_CODE_OAUTH_TOKEN && export ANTHROPIC_BASE_URL='http://127.0.0.1:4010' && export ANTHROPIC_AUTH_TOKEN=ollama && unset ANTHROPIC_API_KEY && export ANTHROPIC_MODEL='oc/gpt-5.6-luna' && "
+if [ "$NONE_OUT" = "$EXPECTED_NONE" ]; then
   pass "env line starts with unset CLAUDE_CODE_OAUTH_TOKEN"
 else
-  fail "env line starts with unset CLAUDE_CODE_OAUTH_TOKEN" "starts with 'unset CLAUDE_CODE_OAUTH_TOKEN &&'" "$NONE_OUT"
+  fail "env line starts with unset CLAUDE_CODE_OAUTH_TOKEN" "$EXPECTED_NONE" "$NONE_OUT"
 fi
 
 # 6. ANTHROPIC_MODEL is single-quoted
@@ -194,12 +212,95 @@ fi
 # Already covered by cases 2, 3, 9 above.
 pass "configured-but-broken paths exit 1 (covered by cases 2, 3, 9)"
 
+# --- Bearer happy-path ---
+# Seed the hermetic vault with a Bearer token, then assert byte-exact output.
+# Without this, a swapped env-var name in the Bearer branch (e.g.
+# ANTHROPIC_API_KEY instead of ANTHROPIC_AUTH_TOKEN) would pass all grep checks
+# while silently sending the wrong header.
+TEST_BEARER_KEY='bearer-token-test-1234567890'
+if TEST_ROOT="$root" TEST_KEY="$TEST_BEARER_KEY" node --input-type=module <<'VAULT_SETUP_BEARER' 2>/dev/null
+import { join } from 'node:path'
+const { setSecret } = await import(join(process.env.TEST_ROOT, 'dist', 'web', 'vault.js'))
+setSecret('MY_BEARER_KEY', 'Test Bearer token', process.env.TEST_KEY)
+VAULT_SETUP_BEARER
+then
+  printf '%s\n' '{"customProvider":"bearer-ep","model":"oc/test"}' > "$AGENT_CFG"
+  printf '%s\n' "$BEARER_PROVIDER" > "$PROVIDERS_PATH"
+  # A BAZIS ALATTUNK MEGVALTOZOTT (LATENSKULCSARGV920, #1478): a kulcs mar nem a parancs-sztringbe
+  # kerul, hanem 0600-as fajlba, es a parancsban a `$(cat ...)` HIVATKOZAS all. A teszt SZANDEKA
+  # valtozatlan (egy felcserelt env-nev -- API_KEY az AUTH_TOKEN helyett -- itt bukjon el, ne
+  # csusszon at a grep-eken), ezert a byte-pontos ellenorzes megmarad, csak az uj alakra.
+  EXPECTED_BEARER="unset CLAUDE_CODE_OAUTH_TOKEN && export ANTHROPIC_BASE_URL='http://127.0.0.1:4010' && export ANTHROPIC_AUTH_TOKEN=\"\$(cat '${root}/store/.launch-secrets/${TEST_AGENT}.MY_BEARER_KEY')\" && unset ANTHROPIC_API_KEY && export ANTHROPIC_MODEL='oc/test' && "
+  BEARER_OUT="$(node "$root/scripts/main-agent-custom-provider.mjs" 2>/dev/null)"
+  BEARER_RC=$?
+  if [ "$BEARER_RC" -eq 0 ] && [ "$BEARER_OUT" = "$EXPECTED_BEARER" ]; then
+    pass "Bearer happy-path: byte-exact stdout"
+  else
+    fail "Bearer happy-path: byte-exact stdout" "$EXPECTED_BEARER" "exit=$BEARER_RC stdout='$BEARER_OUT'"
+  fi
+  # ES A LENYEG KULON: a kulcs ERTEKE sehol nem all a kimenetben. A byte-pontos egyezes ezt ma
+  # maga utan vonja, de ha valaki kesobb fellazitja a fenti allitast, ez a sor meg mindig all.
+  if printf '%s' "$BEARER_OUT" | grep -qF "$TEST_BEARER_KEY"; then
+    fail "Bearer: a kulcs ERTEKE nem kerulhet a parancsba" "(a kulcs nem szerepel)" "$BEARER_OUT"
+  else
+    pass "Bearer: a kulcs erteke NINCS a parancs-sztringben (csak a \$(cat ...) hivatkozas)"
+  fi
+  # POZITIV KONTROLL a fenti keresesre: ugyanez a grep a VALODI kulcsra IGAZAT ad, tehat a proba lat.
+  if printf '%s' "export X='${TEST_BEARER_KEY}'" | grep -qF "$TEST_BEARER_KEY"; then
+    pass "pozitiv kontroll: a kulcs-kereses mukodik (a regi alakot megtalalna)"
+  else
+    fail "pozitiv kontroll: a kulcs-kereses mukodik" "(talal)" "(nem talal -- a proba vak)"
+  fi
+  # Clean up so subsequent cases don't pick up the bearer agent config
+  rm -f "$AGENT_CFG" "$PROVIDERS_PATH"
+else
+  fail "Bearer happy-path: vault setup" "setSecret succeeded" "node setup failed"
+  fail "Bearer happy-path: byte-exact stdout" "(skipped)" "(vault setup failed)"
+fi
+
+# --- elavult dist: az agent-process.js megvan, de launchSecretRef EXPORT nelkul ---
+# Samu merese a #1369 rebase review-jan: a vedett import-blokk a MODUL hianyat fogja, az EXPORTET
+# nem. Regi dist eseten a helper korabban TypeError-ral halt volna meg (stack trace, ures stdout),
+# es a channels.sh a nem-nulla koddal megszakitja a fo agens inditasat -- ertelmezhetetlenul.
+if [ -f "$root/dist/web/agent-process.js" ]; then
+  cp "$root/dist/web/agent-process.js" "$root/dist/web/agent-process.js.bak"
+  # az exportot eltuntetjuk, a modul marad: pontosan a "regi dist" alak
+  sed 's/export function launchSecretRef/function launchSecretRef_elavult/' \
+    "$root/dist/web/agent-process.js.bak" > "$root/dist/web/agent-process.js"
+  printf '%s\n' '{"customProvider":"bearer-ep","model":"oc/test"}' > "$AGENT_CFG"
+  printf '%s\n' "$BEARER_PROVIDER" > "$PROVIDERS_PATH"
+  STALE_OUT="$(node "$root/scripts/main-agent-custom-provider.mjs" 2>"$root/stale.err")"
+  STALE_RC=$?
+  STALE_ERR="$(cat "$root/stale.err")"
+  mv "$root/dist/web/agent-process.js.bak" "$root/dist/web/agent-process.js"
+  rm -f "$AGENT_CFG" "$PROVIDERS_PATH" "$root/stale.err"
+  if [ "$STALE_RC" -eq 1 ] && [ -z "$STALE_OUT" ]; then
+    pass "elavult dist (nincs launchSecretRef export) -> exit 1, ures stdout"
+  else
+    fail "elavult dist -> exit 1, ures stdout" "exit=1, stdout ures" "exit=$STALE_RC stdout='$STALE_OUT'"
+  fi
+  # A TEENDOT PARANCSKENT mondja ki, ne kulcsszoval: Samu javaslata a 'rebuild' szo volt, de aki
+  # ezt a sort a naploban latja, annak a PARANCS ER valamit. Ezert erre merunk.
+  if printf '%s' "$STALE_ERR" | grep -q 'npm run build'; then
+    pass "elavult dist -> a stderr a PARANCSOT mondja (npm run build)"
+  else
+    fail "elavult dist -> a stderr a parancsot mondja" "'npm run build' a stderr-ben" "$STALE_ERR"
+  fi
+  if printf '%s' "$STALE_ERR" | grep -q 'TypeError'; then
+    fail "elavult dist -> NEM stack trace" "(kimondott abort)" "$STALE_ERR"
+  else
+    pass "elavult dist -> kimondott abort, nem TypeError-stack"
+  fi
+else
+  fail "elavult dist eset" "dist/web/agent-process.js letezik" "(nincs build)"
+fi
+
 # --- x-api-key path ---
 # Populate the hermetic vault with a known key so the helper can resolve it.
 # vault.js derives PROJECT_ROOT from the imported dist/config.js __dirname, so
 # when dist/ lives inside $root, all vault files land in $root/store/.
 # On Linux the vault auto-creates .vault-key without any logger calls.
-TEST_XAPIKEY='sk-test-xapikey-1234567890abcdef'
+TEST_XAPIKEY='dummy-xapikey-1234567890abcdef'
 if TEST_ROOT="$root" TEST_KEY="$TEST_XAPIKEY" node --input-type=module <<'VAULT_SETUP' 2>/dev/null
 import { join } from 'node:path'
 const { setSecret } = await import(join(process.env.TEST_ROOT, 'dist', 'web', 'vault.js'))
@@ -231,7 +332,8 @@ then
   #
   # Implementation: a fresh temp dir per iteration (no .claude.json at all)
   # so the stamp always writes a new file and exercises the cold path.
-  EXPECTED_XKEY="unset CLAUDE_CODE_OAUTH_TOKEN && export ANTHROPIC_BASE_URL='http://127.0.0.1:4010' && export ANTHROPIC_API_KEY='${TEST_XAPIKEY}' && unset ANTHROPIC_AUTH_TOKEN && export ANTHROPIC_MODEL='oc/test' && "
+  # Ugyanaz a bazis-valtozas, mint a Bearer againal: a parancsban a hivatkozas all, nem az ertek.
+  EXPECTED_XKEY="unset CLAUDE_CODE_OAUTH_TOKEN && export ANTHROPIC_BASE_URL='http://127.0.0.1:4010' && export ANTHROPIC_API_KEY=\"\$(cat '${root}/store/.launch-secrets/${TEST_AGENT}.MY_XAPIKEY_KEY')\" && unset ANTHROPIC_AUTH_TOKEN && export ANTHROPIC_MODEL='oc/test' && "
   XKEY_FAIL=0
   for _i in 1 2 3 4 5; do
     # Fresh cfg dir: no .claude.json present -> cold stamp on every iteration.
