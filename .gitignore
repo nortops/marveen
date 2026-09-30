@@ -41,6 +41,7 @@ research/
 # Test artifacts
 test-results/
 .playwright-mcp/
+tmp.*
 
 # macOS
 .DS_Store

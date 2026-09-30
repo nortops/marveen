@@ -54,6 +54,12 @@ const TMUX = resolveFromPath('tmux')
 // when neither override nor custom provider is in play.
 const WORKER_MODEL_OVERRIDE = process.env.MARVEEN_WORKER_MODEL ?? null
 
+// APRO920 (c)(2): pure so the launch-model log line's source label is unit
+// testable without spinning up a real tmux session.
+export function workerModelSource(env: NodeJS.ProcessEnv = process.env): string {
+  return env.MARVEEN_WORKER_MODEL ? 'env:MARVEEN_WORKER_MODEL' : 'default'
+}
+
 // How long to wait for a freshly launched worker to reach an idle prompt.
 const WORKER_BOOT_TIMEOUT_MS = 90_000
 // Poll cadence while waiting for the <reqid>.done sentinel.
@@ -500,6 +506,15 @@ function startWorkerSessionFor(ctx: WorkerCtx): void {
   // measured on vps47 during the WORKERHOME1 cold-start probe: session created,
   // gone before the first 5s poll). tryResolveFromPath probes the known install
   // dirs; fall back to the bare name so an exotic layout keeps the old behavior.
+  //
+  // CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false (2026-06-29): without it the
+  // worker's empty input box shows a DIM history-based ghost suggestion (e.g.
+  // `❯ Try "refactor channel-monitor.ts"`). isSessionReadyForPrompt scrapes the
+  // pane colourless via capture-pane, so PARKED_INPUT_RX matches the ghost and
+  // detectPaneState returns 'typing' -- the worker reads "not ready" FOREVER and
+  // every agent-create fails with "worker session not ready" (observed: agent-create
+  // failed 4x after a cold start). Mirror the agent-process.ts launcher,
+  // which already disables the suggestion for the same scrape-misread reason.
   // Resolve model and optional custom-provider env prefix.
   // Priority: MARVEEN_WORKER_MODEL override > main-agent custom provider > default.
   let workerModel = WORKER_MODEL_OVERRIDE ?? DEFAULT_AGENT_MODEL
@@ -523,11 +538,20 @@ function startWorkerSessionFor(ctx: WorkerCtx): void {
   const launch =
     (hasFleetOauthToken() ? `export CLAUDE_CODE_OAUTH_TOKEN="$(cat ${shArg(FLEET_OAUTH_TOKEN_PATH)})"; ` : '') +
     `export CLAUDE_CONFIG_DIR=${shArg(ctx.configDir)}; ` +
+    `export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false; ` +
+    // CHANSPARE925: no Agent view (Left would background the worker into the daemon).
+    `export CLAUDE_CODE_DISABLE_AGENT_VIEW=1; ` +
     customEnvPrefix +
     `cd ${shArg(ctx.home)} && ` +
     `${shArg(claudeLaunchBin)} --dangerously-skip-permissions --model ${shArg(workerModel)}`
   execFileSync(TMUX, ['new-session', '-d', '-s', ctx.session, '-c', ctx.home, 'bash', '-lc', launch], { timeout: 8000 })
   logger.info({ session: ctx.session, cwd: ctx.home }, 'agent-worker: launched interactive worker session')
+  // APRO920 (c)(2): same rationale as startAgentProcess's model-resolved log --
+  // which config-chain element supplied the --model value.
+  logger.info(
+    { session: ctx.session, model: workerModel, source: workerModelSource() },
+    'agent-worker: launch model resolved',
+  )
   logWorkerClaudeVersion(ctx)
 }
 
