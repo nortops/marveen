@@ -4,6 +4,7 @@
   "enabled": false,
   "type": "heartbeat",
   "skipIfBusy": true,
+  "preCheck": "{{PROJECT_ROOT}}/scripts/prechecks/memoria-heartbeat-precheck.sh",
   "createdAt": 1775669364,
   "disabledReason": "duplicate of ~/.claude/scheduled-tasks/memoria-heartbeat; project-dir leftover, disabled 2026-06-15 to stop double-runs"
 }
