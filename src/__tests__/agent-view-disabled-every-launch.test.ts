@@ -62,6 +62,7 @@ describe('every fleet launch path disables the Agent view', () => {
       config: mainConfigDecisionForTest(),
       channelStateEnv: { name: 'TELEGRAM_STATE_DIR', dir: '/opt/marveen/.claude/channels/telegram' },
       continueSession: false,
+      customProviderEnv: null,
     })
     expect(cmd).toContain(`export ${FLAG}`)
     expect(cmd.indexOf(FLAG)).toBeLessThan(cmd.indexOf('/usr/local/bin/claude'))

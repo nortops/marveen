@@ -24,6 +24,24 @@ describe('buildMainSessionRespawnCmd call-site parity', () => {
     expect(sites).toBeGreaterThanOrEqual(3)
     expect(wired).toBe(sites)
   })
+
+  // RESPAWNCUSTOMPROVIDER1012: every in-process respawn call site must resolve
+  // and pass the main agent's custom-provider launch env, or a main agent
+  // configured for a non-Claude backend (LiteLLM/OpenCode) comes back up on the
+  // standard Claude/OAuth backend on every nightly restart / recovery resume /
+  // hard restart -- silently, because the launch otherwise succeeds. This is the
+  // same shape of check as the channelStateEnv parity test above, for the SAME
+  // reason: a hand-maintained list of call sites to fix is the bug's shape, not
+  // its guard. customProviderEnv is a REQUIRED field on the builder's opts (see
+  // channel-monitor.ts), so a call site that omits it fails to compile -- this
+  // test additionally pins that every site resolves it from the live source
+  // (buildCustomProviderLaunchEnv(MAIN_AGENT_ID)), not a hardcoded null/stub.
+  it('every call site resolves customProviderEnv from buildCustomProviderLaunchEnv(MAIN_AGENT_ID)', () => {
+    const sites = MONITOR_SRC.split('= buildMainSessionRespawnCmd({').length - 1
+    const wired = MONITOR_SRC.split('customProviderEnv: buildCustomProviderLaunchEnv(MAIN_AGENT_ID)').length - 1
+    expect(sites).toBeGreaterThanOrEqual(3)
+    expect(wired).toBe(sites)
+  })
 })
 
 describe('buildMainSessionRespawnCmd with a non-Telegram provider', () => {
@@ -35,6 +53,7 @@ describe('buildMainSessionRespawnCmd with a non-Telegram provider', () => {
       config: mainConfigDecisionForTest(),
       continueSession: false,
       channelStateEnv: { name: 'DISCORD_STATE_DIR', dir: '/opt/marveen/.claude/channels/discord' },
+      customProviderEnv: null,
     })
     expect(cmd).toContain("export DISCORD_STATE_DIR='/opt/marveen/.claude/channels/discord'")
     expect(cmd).not.toContain('TELEGRAM_STATE_DIR')

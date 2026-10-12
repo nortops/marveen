@@ -33,6 +33,8 @@ import {
   answerFirstRunGates,
   shSingleQuote,
   fleetVenvPathPrefix,
+  buildCustomProviderLaunchEnv,
+  type CustomProviderLaunchEnv,
 } from './agent-process.js'
 import { sendSystemDirective } from './system-directive.js'
 import { isRestartInFlight, beginRestart, endRestart } from './restart-lock.js'
@@ -910,6 +912,27 @@ export function buildMainSessionRespawnCmd(opts: {
    * and channel-watchdog.sh already export it; this is the third launcher.
    */
   channelStateEnv: { name: string; dir: string }
+  /**
+   * The main agent's resolved custom-provider launch env (LiteLLM/OpenCode/etc.),
+   * from buildCustomProviderLaunchEnv(MAIN_AGENT_ID), or null when no customProvider
+   * is configured. RESPAWNCUSTOMPROVIDER1012: this builder used to IGNORE the main
+   * agent's customProvider entirely -- every in-process respawn (nightly restart,
+   * stage-3 recovery resume, staleness watchdog, hard restart) bypasses
+   * scripts/channels.sh, which is the ONLY place that previously injected this env
+   * (via scripts/main-agent-custom-provider.mjs). A main agent configured for a
+   * custom provider therefore came back up on the standard Claude/OAuth backend on
+   * every respawn -- silent, because the launch otherwise succeeds -- and if that
+   * account has no Claude Code subscription, the respawned session is MUTE
+   * (organization has disabled Claude subscription access), with the watchdog
+   * respawning it in a loop. Verified live, 2026-10-12, Melinda/Athena install.
+   * Required (not optional with an implicit default) so a future call site cannot
+   * forget it the way this one did -- resolve it via buildCustomProviderLaunchEnv,
+   * which itself throws when a customProvider is configured but broken (missing
+   * definition/vault key), matching main-agent-custom-provider.mjs's abort
+   * contract: a broken provider must stop the launch, not silently fall back to
+   * the wrong backend.
+   */
+  customProviderEnv: CustomProviderLaunchEnv | null
 }): string {
   return [
     // FLEETVENV923: same venv-first PATH as startAgentProcess and channels.sh.
@@ -955,7 +978,19 @@ export function buildMainSessionRespawnCmd(opts: {
       : opts.config.fleetToken
         ? [`&& export CLAUDE_CODE_OAUTH_TOKEN="$(cat '${FLEET_OAUTH_TOKEN_PATH}')"`]
         : []),
-    '&&', opts.claudePath,
+    // RESPAWNCUSTOMPROVIDER1012: customProviderEnv, when set, is injected AFTER
+    // the config-dir/token block above -- same ordering as scripts/channels.sh's
+    // CFG_ENV followed by CUSTOM_PROVIDER_ENV -- and OVERRIDES it. It starts by
+    // unsetting CLAUDE_CODE_OAUTH_TOKEN because the Claude CLI prefers that var
+    // over ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN: without the unset, a main agent
+    // with BOTH an isolated/fleet token (exported above) AND a customProvider
+    // configured would still authenticate to the standard backend instead of the
+    // provider endpoint. CLAUDE_CONFIG_DIR, if any, is left untouched -- the
+    // provider auth is env-based (no .credentials.json), so the dir is still
+    // where the TUI's own state (onboarding flags, approval stamps) lives.
+    ...(opts.customProviderEnv
+      ? [`&& unset CLAUDE_CODE_OAUTH_TOKEN && ${opts.customProviderEnv.envPrefix}${opts.claudePath}`]
+      : ['&&', opts.claudePath]),
     ...(opts.continueSession ? ['--continue'] : []),
     '--dangerously-skip-permissions',
     // Escape the model id so a value like `claude-opus-4-8[1m]` is not
@@ -1015,6 +1050,7 @@ export function respawnMainSessionFresh(): void {
     // point of the nightly restart (drop the accumulated context).
     continueSession: false,
     config: resolveMainConfigDecision(),
+    customProviderEnv: buildCustomProviderLaunchEnv(MAIN_AGENT_ID),
   })
   // c5296a52: the two reaps above kill the pane's claude, and channels.sh starts the session
   // WITHOUT remain-on-exit -- so the pane and the session can already be gone by the time we get
@@ -1111,6 +1147,7 @@ export async function resumeMarveenSession(): Promise<boolean> {
       // rotating Keychain and 401s. Returns null when isolation is off/no token,
       // preserving the prior shared-root behaviour.
       config: resolveMainConfigDecision(),
+      customProviderEnv: buildCustomProviderLaunchEnv(MAIN_AGENT_ID),
     })
     execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', MAIN_CHANNELS_SESSION, claudeCmd], { timeout: 15000 })
 
@@ -1369,6 +1406,7 @@ function respawnMarveenSessionFresh(): boolean {
       // respawn also skips channels.sh, so it must carry the isolated config
       // itself or it 401s on the rotating macOS Keychain. null when off/no token.
       config: resolveMainConfigDecision(),
+      customProviderEnv: buildCustomProviderLaunchEnv(MAIN_AGENT_ID),
     })
     execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', MAIN_CHANNELS_SESSION, claudeCmd], { timeout: 15000 })
     logger.warn({ provider: provider.type }, 'Hard restart: marveen session respawned fresh (no --continue)')
