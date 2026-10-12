@@ -50,6 +50,7 @@ describe('the main-session recovery respawn (behaviour)', () => {
     config: mainConfigDecisionForTest(),
     channelStateEnv: { name: 'TELEGRAM_STATE_DIR', dir: join(dir, 'state') },
     continueSession: false,
+    customProviderEnv: null,
   })
   it('as root, the claude it launches sees IS_SANDBOX=1', () => {
     expect(runAs(0, cmd)).toContain('claude-sees:1')

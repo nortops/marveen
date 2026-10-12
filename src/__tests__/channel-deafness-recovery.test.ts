@@ -19,7 +19,7 @@ import { mainConfigDecisionForTest } from '../web/main-config-decision.js'
 // it the respawned bun telegram bridge can't be located and the session comes
 // up channel-less. Lock it so a future refactor can't silently drop it.
 describe('buildMainSessionRespawnCmd', () => {
-  const base = { claudePath: '/usr/local/bin/claude', pluginId: 'telegram@claude-plugins-official', model: "claude-opus-4-8[1m]", config: mainConfigDecisionForTest(), channelStateEnv: { name: 'TELEGRAM_STATE_DIR', dir: '/opt/marveen/.claude/channels/telegram' } }
+  const base = { claudePath: '/usr/local/bin/claude', pluginId: 'telegram@claude-plugins-official', model: "claude-opus-4-8[1m]", config: mainConfigDecisionForTest(), channelStateEnv: { name: 'TELEGRAM_STATE_DIR', dir: '/opt/marveen/.claude/channels/telegram' }, customProviderEnv: null }
 
   // #915 regression: without the *_STATE_DIR export the plugin falls back to
   // ~/.claude/channels/<provider>/, finds no .env and exits -- the respawned
@@ -149,6 +149,89 @@ describe('buildMainSessionRespawnCmd', () => {
     expect(cmd).toContain('.claude-oauth-token')
     expect(cmd).toContain('channels-failures.log')
     expect(cmd).toMatch(/_plan_token="\$\(node '[^']*resolve-plan-token-env\.mjs'[^)]*\)" && export CLAUDE_CODE_OAUTH_TOKEN="\$_plan_token"/)
+  })
+})
+
+// RESPAWNCUSTOMPROVIDER1012: buildMainSessionRespawnCmd used to IGNORE the main
+// agent's custom-provider launch env entirely -- every in-process respawn (nightly
+// restart, stage-3 recovery resume, staleness watchdog, hard restart) bypasses
+// scripts/channels.sh, the only place that previously injected it, so a main
+// agent configured for a custom provider (LiteLLM/OpenCode) silently came back up
+// on the standard Claude/OAuth backend on every respawn. Verified live incident,
+// 2026-10-12, Melinda/Athena install: the org had disabled Claude subscription
+// access on that backend, so the respawned session was MUTE and the watchdog
+// respawned it in a loop.
+describe('buildMainSessionRespawnCmd: main-agent custom provider (RESPAWNCUSTOMPROVIDER1012)', () => {
+  const base = { claudePath: '/usr/local/bin/claude', pluginId: 'telegram@claude-plugins-official', model: 'claude-opus-4-8[1m]', config: mainConfigDecisionForTest(), channelStateEnv: { name: 'TELEGRAM_STATE_DIR', dir: '/opt/marveen/.claude/channels/telegram' }, continueSession: false }
+  const providerEnv = {
+    envPrefix: `export ANTHROPIC_BASE_URL="https://litellm.example.internal" && export ANTHROPIC_AUTH_TOKEN="$(cat '/opt/marveen/store/launch-secrets/atlas.LITELLM_KEY')" && export ANTHROPIC_MODEL='oc/gpt-5.6-luna' && `,
+    customApiKeyForApproval: null,
+    model: 'oc/gpt-5.6-luna',
+  }
+
+  it('does NOT contain any provider env or unset when customProviderEnv is null (unchanged contract)', () => {
+    const cmd = buildMainSessionRespawnCmd({ ...base, customProviderEnv: null })
+    expect(cmd).not.toContain('ANTHROPIC_BASE_URL')
+    expect(cmd).not.toContain('unset CLAUDE_CODE_OAUTH_TOKEN')
+  })
+
+  it('injects the provider env (base URL, auth, model) when customProviderEnv is set', () => {
+    const cmd = buildMainSessionRespawnCmd({ ...base, customProviderEnv: providerEnv })
+    expect(cmd).toContain('export ANTHROPIC_BASE_URL="https://litellm.example.internal"')
+    expect(cmd).toContain(`export ANTHROPIC_AUTH_TOKEN="$(cat '/opt/marveen/store/launch-secrets/atlas.LITELLM_KEY')"`)
+    expect(cmd).toContain(`export ANTHROPIC_MODEL='oc/gpt-5.6-luna'`)
+    // Must land BEFORE the claude binary runs, like every other launch env.
+    expect(cmd.indexOf('ANTHROPIC_BASE_URL')).toBeLessThan(cmd.indexOf(base.claudePath))
+  })
+
+  it('unsets CLAUDE_CODE_OAUTH_TOKEN before injecting the provider env (CLI prefers that var otherwise)', () => {
+    const cmd = buildMainSessionRespawnCmd({ ...base, customProviderEnv: providerEnv })
+    expect(cmd).toContain('unset CLAUDE_CODE_OAUTH_TOKEN &&')
+    expect(cmd.indexOf('unset CLAUDE_CODE_OAUTH_TOKEN')).toBeLessThan(cmd.indexOf('ANTHROPIC_BASE_URL'))
+  })
+
+  // THE CORE REGRESSION: a main agent that ALSO has fleet-token/isolated-config
+  // auth configured (the common case -- every install resolves a MainConfigDecision)
+  // must have the custom-provider env OVERRIDE that auth, not race it. The unset
+  // must come AFTER the fleet-token export, same ordering as scripts/channels.sh's
+  // CFG_ENV followed by CUSTOM_PROVIDER_ENV.
+  it('OVERRIDES an exported fleet OAuth token: the unset comes after it, not before', () => {
+    const cmd = buildMainSessionRespawnCmd({
+      ...base,
+      config: mainConfigDecisionForTest({ fleetToken: true }),
+      customProviderEnv: providerEnv,
+    })
+    expect(cmd).toContain('export CLAUDE_CODE_OAUTH_TOKEN="$(cat ')
+    expect(cmd).toContain('unset CLAUDE_CODE_OAUTH_TOKEN')
+    expect(cmd.indexOf('export CLAUDE_CODE_OAUTH_TOKEN="$(cat ')).toBeLessThan(cmd.indexOf('unset CLAUDE_CODE_OAUTH_TOKEN'))
+    expect(cmd.indexOf('unset CLAUDE_CODE_OAUTH_TOKEN')).toBeLessThan(cmd.indexOf('ANTHROPIC_BASE_URL'))
+  })
+
+  // CLAUDE_CONFIG_DIR carries NO credential by itself when the provider env is
+  // active (auth is env-based) -- but it must stay exported, because it is also
+  // where the TUI's own state (onboarding flags, custom-API-key approval stamp)
+  // lives, and buildCustomProviderLaunchEnv's stamp (when authHeader=x-api-key)
+  // targets exactly that dir.
+  it('keeps CLAUDE_CONFIG_DIR exported alongside the provider env (own-credential dir case)', () => {
+    const cmd = buildMainSessionRespawnCmd({
+      ...base,
+      config: mainConfigDecisionForTest({ isolatedConfigDir: '/home/x/.channels-config', ownCredentials: true }),
+      customProviderEnv: providerEnv,
+    })
+    expect(cmd).toContain("export CLAUDE_CONFIG_DIR='/home/x/.channels-config'")
+    expect(cmd).toContain('unset CLAUDE_CODE_OAUTH_TOKEN')
+    expect(cmd).toContain('ANTHROPIC_BASE_URL')
+  })
+
+  // ANTHROPIC_MODEL (from the provider env) is authoritative for a non-Claude
+  // model id, but --model is STILL passed from opts.model -- same two-layer
+  // contract as scripts/main-agent-custom-provider.mjs documents (the TUI
+  // validates --model against the Anthropic catalog and would silently fall
+  // back for an unknown id; ANTHROPIC_MODEL bypasses that gate).
+  it('still passes --model from opts.model, independent of the provider env model', () => {
+    const cmd = buildMainSessionRespawnCmd({ ...base, model: 'claude-opus-4-8[1m]', customProviderEnv: providerEnv })
+    expect(cmd).toContain("--model 'claude-opus-4-8[1m]'")
+    expect(cmd).toContain(`export ANTHROPIC_MODEL='oc/gpt-5.6-luna'`)
   })
 })
 
