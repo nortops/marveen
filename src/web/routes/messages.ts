@@ -16,7 +16,7 @@ import { COORDINATOR_AGENT_ID, VOICE_CHANNEL_AGENT_ID } from '../../channel-coor
 import { SYSTEM_DIRECTIVE_SENDER } from '../system-directive.js'
 import { sanitizeAgentIdent } from '../../prompt-safety.js'
 import { isKnownAgent } from '../agent-config.js'
-import { MAIN_AGENT_ID, HEARTBEAT_AGENT_ID, OWNER_NAME, SYSTEM_SENDER_IDS, parseSystemSenderIds } from '../../config.js'
+import { MAIN_AGENT_ID, HEARTBEAT_AGENT_ID, OWNER_NAME, SYSTEM_SENDER_IDS, parseSystemSenderIds, MESSAGE_URGENT_DEVICE_IDS, parseDeviceKeyIds } from '../../config.js'
 import { isAgentRunning } from '../agent-process.js'
 import { readBody, json, jsonMaybeGzip } from '../http-helpers.js'
 import { normalizeKanbanRefs } from '../kanban-ref-normalize.js'
@@ -51,8 +51,21 @@ export function shouldNotifyDelegator(fromAgent: string, toAgent: string, conten
   return true
 }
 
+/** The result a voice-channel answer is closed with: it is read by the relay, never delivered. */
+export const VOICE_MAILBOX_RESULT = 'voice-channel mailbox: no session delivery; the voice relay reads it'
+
 // Frozen at module load, like the config constant it derives from.
 const SYSTEM_SENDERS = parseSystemSenderIds(SYSTEM_SENDER_IDS, sanitizeAgentIdent)
+// Card 795d1f48 (a): the device keys the install lists for urgent rows (config.ts), frozen the same way.
+const URGENT_DEVICE_KEY_IDS = parseDeviceKeyIds(MESSAGE_URGENT_DEVICE_IDS)
+
+/**
+ * Card 795d1f48 (a): may this request mark a row urgent? Only a FULL device key whose id the install lists. A device
+ * key alone is not enough: the shared dashboard token (the agent API) can mint one. Exported for the unit test.
+ */
+export function mayMarkUrgent(auth: RouteContext['auth'], listedDeviceIds: ReadonlySet<number>): boolean {
+  return auth?.kind === 'device' && auth.scope === 'full' && auth.deviceId !== undefined && listedDeviceIds.has(auth.deviceId)
+}
 
 /**
  * How much of a `result` travels inside the completion notification, and what the recipient
@@ -143,10 +156,25 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
 
   if (path === '/api/messages' && method === 'POST') {
     const body = await readBody(req)
-    const { from, to, content, origin_note } = JSON.parse(body.toString()) as
-      { from: string; to: string; content: string; origin_note?: string }
+    const { from, to, content, origin_note, urgent } = JSON.parse(body.toString()) as
+      { from: string; to: string; content: string; origin_note?: string; urgent?: unknown }
     if (!from?.trim() || !to?.trim() || !content?.trim()) {
       json(res, { error: 'from, to, and content are required' }, 400)
+      return true
+    }
+    // Card 795d1f48 (a): an URGENT row is typed into a BUSY pane by the router (e.g. the save signal a key rotation
+    // sends before it restarts the agents), so a lost or an injected key could interrupt every agent. Who may ask for
+    // one: a FULL device key whose id the install lists in MESSAGE_URGENT_DEVICE_IDS (mayMarkUrgent). Not the shared
+    // dashboard token (the agent API, readable by every sub-agent), and not any device key, since that token can mint
+    // one. The in-process writers set it directly. Checked before anything is written; a non-boolean is a 400, so a
+    // typo does not silently send an ordinary row.
+    if (urgent !== undefined && typeof urgent !== 'boolean') {
+      json(res, { error: 'urgent must be a JSON boolean' }, 400)
+      return true
+    }
+    if (urgent === true && !mayMarkUrgent(ctx.auth, URGENT_DEVICE_KEY_IDS)) {
+      logger.warn({ from: from.trim(), to: to.trim(), authKind: ctx.auth?.kind ?? 'none', deviceId: ctx.auth?.deviceId }, 'Rejected /api/messages POST: urgent without a listed device key')
+      json(res, { error: 'urgent delivery requires a device key listed in MESSAGE_URGENT_DEVICE_IDS; the shared dashboard token (the agent API) cannot send an urgent row' }, 403)
       return true
     }
     // HBTEMPLATELEAK1002: a heartbeat report that still carries its template's
@@ -339,9 +367,35 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     // window, so the sender believed they had been delivered. In the last 30
     // days these were the ONLY non-agent recipients. A registered agent that is
     // merely not running is a different case and keeps the retry path below.
-    if (!storedTo.includes('/') && !isKnownAgent(sanitizeAgentIdent(storedTo))) {
+    // VOICEREPLY1005: the voice channel id is a PULL MAILBOX, not an agent. The
+    // voice relay sends the owner's dictation in as VOICE_CHANNEL_AGENT_ID, and
+    // an answer goes back to the same id; the relay reads it from the sender's
+    // conversation (GET /api/messages?agent=<sender>). No session owns it, so
+    // it must be accepted here even though it is not a registered agent -- the
+    // UNKNOWNTO924 gate below rejected every voice answer (measured 2026-10-05,
+    // 400 "unknown recipient") -- and closed at once below, so the router never
+    // tries to deliver it and raises no [handoff-failure].
+    // EXACT match on the stored id (review #1697): the row is closed at once, so
+    // a near-miss (the voice id plus a stray character, sanitised back to the voice id) would be stored under a
+    // name the relay never reads, and lost without a sound. It gets the 400.
+    const isVoiceMailbox = storedTo === VOICE_CHANNEL_AGENT_ID
+    //
+    // A SYSTEM_SENDER_IDS entry is not unknown either (card 9fc6dc3e): those
+    // ids name the neighbouring systems that talk to the fleet over this API,
+    // and the fleet answers them over the same POST (to=<system id>). Without
+    // this, every reply to such a system would get a 400 since this gate
+    // shipped. Only an id that is neither a registered agent nor a listed
+    // system is rejected.
+    // EXACT match on the stored id (review #1827), like the voice mailbox: the
+    // SYSTEM_SENDERS entries are already normalized, so a near-miss ('cort ex')
+    // that only SANITISES to a listed id would be stored under a name its
+    // system never reads. And the reserved directive sender stays closed on the
+    // recipient side too, even if an operator lists it in SYSTEM_SENDER_IDS
+    // (SYSRESERVED918 reserves it on the sender side above).
+    const isSystemRecipient = storedTo !== SYSTEM_DIRECTIVE_SENDER && SYSTEM_SENDERS.has(storedTo)
+    if (!storedTo.includes('/') && !isVoiceMailbox && !isSystemRecipient && !isKnownAgent(sanitizeAgentIdent(storedTo))) {
       logger.warn({ from: from.trim(), to: storedTo }, 'Rejected /api/messages POST to an unregistered recipient')
-      json(res, { error: `unknown recipient '${storedTo}' -- to must be a registered fleet agent id (or "<system>/<agent>" for federation)` }, 400)
+      json(res, { error: `unknown recipient '${storedTo}' -- to must be a registered fleet agent id, a SYSTEM_SENDER_IDS system id, or "<system>/<agent>" for federation` }, 400)
       return true
     }
     // Code-side enforcement of the kanban-ref convention: rewrite any
@@ -358,7 +412,13 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     // Card 06f062e4: optional attributability tag, self-declared like `from`
     // itself -- capped short so it stays a label, not a second content field.
     const trimmedOriginNote = origin_note?.trim().slice(0, 120) || null
-    const msg = createAgentMessage(from.trim(), storedTo, normalizedContent, trimmedOriginNote)
+    const msg = createAgentMessage(from.trim(), storedTo, normalizedContent, trimmedOriginNote, null, { urgent: urgent === true })
+    if (isVoiceMailbox) {
+      markMessageDone(msg.id, VOICE_MAILBOX_RESULT)
+      logger.info({ id: msg.id, from: msg.from_agent, to: msg.to_agent }, 'Voice-channel answer stored in the mailbox (no session delivery)')
+      json(res, { ...(getAgentMessage(msg.id) ?? msg), mailbox: true })
+      return true
+    }
     // Backpressure, returned WITH the id rather than behind a second call:
     // `{"id":N,"status":"pending"}` alone reads as "sent", and on a busy
     // recipient it can be 80 minutes from true. See getRecipientQueueState for
