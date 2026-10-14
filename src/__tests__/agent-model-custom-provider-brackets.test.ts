@@ -26,6 +26,7 @@ let providersBefore: string | null = null
 
 beforeAll(() => {
   mkdirSync(DIR, { recursive: true })
+  mkdirSync(STORE_DIR, { recursive: true })
   providersBefore = existsSync(PROVIDERS_PATH) ? readFileSync(PROVIDERS_PATH, 'utf-8') : null
   const store = providersBefore ? JSON.parse(providersBefore) : { providers: [] }
   store.providers = [
