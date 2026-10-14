@@ -48,6 +48,8 @@ export interface UpdateStatus {
   upstreamBehind?: number
   upstreamRemote?: string
   error?: string
+  /** The checked-out branch (trackedBranch()), resolved live like `version`. */
+  branch?: string
 }
 
 let updateStatusCache: UpdateStatus = {
@@ -60,7 +62,7 @@ let updateStatusCache: UpdateStatus = {
 }
 
 export function getUpdateStatus(): UpdateStatus {
-  return { ...updateStatusCache, version: currentVersion() }
+  return { ...updateStatusCache, branch: trackedBranch(), version: currentVersion() }
 }
 
 export function currentVersion(root: string = PROJECT_ROOT): string {

@@ -116,7 +116,7 @@ describe('an EXPORTED fleet token is not a risk to warn about (issue #1805)', ()
   // exporting a token that exists. Pin both, so a launcher that stops exporting fails here first.
   it('the shared-root respawn exports the fleet token when there is one, and not otherwise', () => {
     const base = { claudePath: '/bin/true', pluginId: 'telegram@claude-plugins-official', model: '', continueSession: false,
-      channelStateEnv: { name: 'TELEGRAM_STATE_DIR', dir: '/opt/m/.claude/channels/telegram' } }
+      channelStateEnv: { name: 'TELEGRAM_STATE_DIR', dir: '/opt/m/.claude/channels/telegram' }, customProviderEnv: null }
     expect(buildMainSessionRespawnCmd({ ...base, config: mainConfigDecisionForTest({ fleetToken: true }) })).toContain('export CLAUDE_CODE_OAUTH_TOKEN=')
     expect(buildMainSessionRespawnCmd({ ...base, config: mainConfigDecisionForTest() })).not.toContain('CLAUDE_CODE_OAUTH_TOKEN')
   })

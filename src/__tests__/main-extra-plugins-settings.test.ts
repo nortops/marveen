@@ -71,6 +71,7 @@ describe('every main-session launcher carries the flag', () => {
     claudePath: '/usr/local/bin/claude', pluginId: 'telegram@claude-plugins-official', model: 'claude-opus-5',
     continueSession: false, config: mainConfigDecisionForTest(),
     channelStateEnv: { name: 'TELEGRAM_STATE_DIR', dir: '/opt/m/.claude/channels/telegram' },
+    customProviderEnv: null,
   }
 
   it('recovery respawn: --settings with the file, single-quoted', () => {
