@@ -1,8 +1,9 @@
 {
   "id": "researcher",
   "label": "Kutató",
-  "description": "Kutatás, forrásfeltárás, webes és tudományos források olvasása. Prompt injection szempontból kiemelt: külső tartalom CSAK a quarantine-reader sub-agensen át jöhet, adatként. Draft-only: riportot ír a mappájába, nem küld magától kifelé. Ezért a profil csak azt kapja, ami a termékhez kell: az agent-msg.sh / agent-mem.sh helpereket (memória és válasz a koordinátornak), a csak-olvasó shell-eszközöket, a research-inboxot, és a PDF-eszközöket a PONTOS scriptnevükre szűkítve. Nincs benne általános interpreter (python3:*), nyers dashboard-POST, a store/ könyvtár, sem telepítés-függő saját-gépes út. A deny-lista (SSH/AWS/.env, sudo, rm, curl -X POST, git push) változatlan. A permissionMode permissive a gazda 2026-09-07-i döntése szerint (TG 14764): strict alatt az ágens minden tool-hívásnál engedélykérő párbeszédre állt meg, amire nem-interaktív ágensben senki nem válaszol.",
+  "description": "Kutatás, forrásfeltárás, webes és tudományos források olvasása. Prompt injection szempontból kiemelt: külső tartalom CSAK a quarantine-reader sub-agensen át jöhet, adatként. Draft-only: riportot ír a mappájába, nem küld magától kifelé. Ezért a profil csak azt kapja, ami a termékhez kell: az agent-msg.sh / marveen-api.sh helpereket (memória és válasz a koordinátornak), a csak-olvasó shell-eszközöket, a research-inboxot, és a PDF-eszközöket a PONTOS scriptnevükre szűkítve. Nincs benne általános interpreter (python3:*), nyers dashboard-POST, a store/ könyvtár, sem telepítés-függő saját-gépes út. A deny-lista (SSH/AWS/.env, sudo, rm, curl -X POST, git push) változatlan. A permissionMode permissive a gazda 2026-09-07-i döntése szerint (TG 14764): strict alatt az ágens minden tool-hívásnál engedélykérő párbeszédre állt meg, amire nem-interaktív ágensben senki nem válaszol.",
   "permissionMode": "permissive",
+  "ytIngest": true,
   "filesystem": {
     "allow": [
       "Read(${AGENT_DIR}/**)",
@@ -26,9 +27,9 @@
       "Bash(${HOME}/.local/bin/pdf2txt.py:*)",
       "Bash(${HOME}/.local/bin/dumppdf.py:*)",
       "Bash(bash ${PROJECT_ROOT}/scripts/agent-msg.sh:*)",
-      "Bash(bash ${PROJECT_ROOT}/scripts/agent-mem.sh:*)",
-      "Bash(cd ${PROJECT_ROOT} && bash scripts/agent-mem.sh:*)",
-      "Bash(bash scripts/agent-mem.sh:*)",
+      "Bash(bash ${PROJECT_ROOT}/scripts/marveen-api.sh:*)",
+      "Bash(cd ${PROJECT_ROOT} && bash scripts/marveen-api.sh:*)",
+      "Bash(bash scripts/marveen-api.sh:*)",
       "Bash(cd ${PROJECT_ROOT} && bash scripts/agent-msg.sh:*)",
       "Bash(curl -s -H \"Authorization: Bearer $(cat ${PROJECT_ROOT}/store/.dashboard-token)\" \"http://localhost:3420/api/*)",
       "Bash(${PROJECT_ROOT}/scripts/notify.sh:*)",
