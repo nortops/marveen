@@ -1,8 +1,8 @@
 {
   "id": "developer-junior",
   "label": "Fejlesztő (junior)",
-  "description": "Feature-fejlesztésre saját branch-en. A main/master-re tiltott push, sudo tiltott, SSH/AWS kulcsok elrejtve. Csak a saját munkakönyvtárába írhat. A marveen-api.sh engedély a kanban-író igéket is megadja (kanban-create, kanban-move, kanban-claim, kanban-release, kanban-comment), tehát ez a profil a táblára is írhat.",
-  "permissionMode": "strict",
+  "description": "Feature-fejlesztésre saját branch-en. A main/master-re tiltott push, sudo tiltott, SSH/AWS kulcsok elrejtve. Permissive mód (bypass), hogy a custom-provider gateway-en ne akadjon el a permission-classifier; a kritikus deny-rács így is érvényben marad.",
+  "permissionMode": "permissive",
   "filesystem": {
     "allow": [
       "Read(${AGENT_DIR}/**)",

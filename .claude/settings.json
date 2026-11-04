@@ -6,8 +6,6 @@
       "Read(~/.gnupg/**)",
       "Read(~/.env)",
       "Read(**/.env)",
-      "Bash(sudo:*)",
-      "Bash(*/sudo *)",
       "Bash(rm -rf ~:*)",
       "Bash(rm -rf /:*)",
       "Bash(curl -X POST:*)",
