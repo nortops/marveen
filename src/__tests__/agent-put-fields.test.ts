@@ -191,6 +191,9 @@ describe('checkConfigPutFields', () => {
       'dailyHandoffEnabled', 'dailyHandoffTime',
       // Heavy-job gate restart hold bound (context-guard).
       'heavyJobDeferMaxMinutes',
+      // Periodic and task-close tiers (CTXGUARDTIERS1107), same reason as daily.
+      'periodicHandoffEnabled', 'periodicHandoffMinutes', 'periodicHandoffMinTokens',
+      'taskCloseHandoffEnabled',
     ])
   })
 })
@@ -214,8 +217,9 @@ async function putAutoRestart(name: string, body: unknown): Promise<{ status: nu
     ;(req as unknown as EventEmitter).emit('data', Buffer.from(JSON.stringify(body)))
     ;(req as unknown as EventEmitter).emit('end')
   })
+  // The owner's browser login: the auto-restart PUT needs the owner (OWNERGATE3-1104); the gate itself is owner-gate-round3.test.ts.
   const handled = await tryHandleAgents(
-    { req, res, path: url.pathname, method: 'PUT', url } as unknown as RouteContext,
+    { req, res, path: url.pathname, method: 'PUT', url, auth: { kind: 'session' } } as unknown as RouteContext,
     join(PROJECT_ROOT, 'web'),
   )
   expect(handled).toBe(true)

@@ -69,7 +69,11 @@ function postCtx(path: string, payload: unknown): { ctx: RouteContext; out: { st
     end(chunk?: string) { if (chunk) out.body = JSON.parse(chunk) },
   }
   const url = new URL(`http://localhost:3420${path}`)
-  const req = Readable.from(Buffer.from(JSON.stringify(payload)))
+  const req: any = Readable.from(Buffer.from(JSON.stringify(payload)))
+  // A real http.IncomingMessage always has .headers (possibly {}); this fake
+  // stream otherwise lacks it, which routes/voice.ts's content-type sniff
+  // (text/plain vs JSON, #2600) reads unconditionally.
+  req.headers = { 'content-type': 'application/json' }
   const ctx = { req: req as any, res, path: url.pathname, method: 'POST', url } as RouteContext
   return { ctx, out }
 }

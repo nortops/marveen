@@ -34,7 +34,8 @@ plain text. A NON-ZERO EXIT BLOCKS THE PROMPT and deafens the agent (the
 including parse failures and unexpected exceptions.
 
 Tuning lives outside the public repo, in store/provenance-gate-rules.json
-(override with PROVENANCE_GATE_RULES). Shape, all keys optional:
+(always the install's own file: no environment variable points it elsewhere,
+ENVRELAXGATE1104 step 2). Shape, all keys optional:
 
     {
       "enabled": true,
@@ -74,6 +75,11 @@ PROVENANCE_MARKERS = (
     "[Uzenet @",
     "[Uzenet a tavoli @",
     "[Üzenet @",
+    # The TYPED shape of the same prefixes (ENVATLEAK1114): the pane mapping puts a
+    # backslash before every at-sign that follows whitespace, the header's included.
+    "[Uzenet \\@",
+    "[Uzenet a tavoli \\@",
+    "[Üzenet \\@",
 )
 
 # --- the agent's own background-task result -------------------------------
@@ -217,13 +223,33 @@ DIRECTIVE_HEADER_RX = re.compile(
 DIRECTIVE_SENDER = "system"
 
 
+# JavaScript's \s, character for character (ECMAScript WhiteSpace + LineTerminator):
+# Python's \s differs (it has U+001C..U+001F and U+0085, and lacks U+FEFF), and the
+# two sides must escape exactly the same at-signs or a verified directive reads as forged.
+JS_SPACE = "\\t\\n\\v\\f\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff"
+# After review of #2743: a semicolon counts like whitespace (the chunker that types the text appends a space
+# to a chunk ending in ';'), and control characters never reach the pane (C0 without TAB, DEL, C1 become U+FFFD,
+# a lone CR becomes a space; never deleted, a deletion joins what a scrubber saw as two halves), BEFORE the at-sign
+# step, which treats U+FFFD like whitespace. Same rules, same order as src/web/pane-text.ts.
+AT_AFTER_BREAK_RX = re.compile("(^|[" + JS_SPACE + ";\ufffd])@")
+PANE_CONTROL_RX = re.compile("[\\u0000-\\u0008\\u000b-\\u001f\\u007f-\\u009f]")
+
+
 def pane_shape(text):
     """The delivery mapping, EXACTLY as src/web/pane-text.ts applies it: every
     line break becomes one space. Not a general whitespace collapse -- that would
     be a loosening; this is the one deterministic transformation the row goes
     through on its way into the pane. 48 of 492 system rows on this host carry
-    line breaks (measured 2026-09-20), so the multi-line case is real."""
-    return re.sub(r"\r?\n", " ", text or "")
+    line breaks (measured 2026-09-20), so the multi-line case is real.
+
+    ENVATLEAK1114: the mapping has a second step, `neutralizeAtMentions` -- a
+    backslash before every at-sign at the start of the text or after whitespace
+    (JavaScript's whitespace class, spelled out in JS_SPACE above because
+    Python's own whitespace class is a different set) or after a semicolon.
+    Same order as paneTyped(): line breaks, then the control characters, then
+    the at-signs."""
+    one_line = re.sub(r"\r?\n", " ", text or "").replace("\r", " ")
+    return AT_AFTER_BREAK_RX.sub(lambda m: m.group(1) + "\\@", PANE_CONTROL_RX.sub("\ufffd", one_line))
 
 
 # The THIRD known shape (c5d83ffe, 2026-10-08): the Claude Code harness wraps a
@@ -287,7 +313,8 @@ def unwrap_pasted(text):
 # 100x margin over the worst legitimate case; a stale row goes to the
 # UNVERIFIABLE bucket (a real old row is not forgery evidence), and every
 # verified/stale outcome logs the measured age so the bound can be tightened
-# from real data later (env PROVENANCE_DIRECTIVE_MAX_AGE_S overrides).
+# from real data later (the install .env's PROVENANCE_DIRECTIVE_MAX_AGE_S
+# overrides it, capped at DIRECTIVE_MAX_AGE_CAP_S; never the environment).
 # One-shot (consume-on-first-sight) use was rejected on the ARGUMENT, not on
 # a current behaviour: its failure mode is a false alarm on a real emergency
 # directive whenever the same prompt reaches the hook twice -- and that has
@@ -301,20 +328,36 @@ def unwrap_pasted(text):
 # and this install has exactly one provenance-gate entry today. A time bound
 # tightened from logged ages does not depend on that ever staying true.
 DIRECTIVE_MAX_AGE_DEFAULT_S = 1800
+# ENVRELAXGATE1104 step 2: the bound may be tightened freely, loosened at most to
+# 4x the default. A longer window is a longer replay window for an old row.
+DIRECTIVE_MAX_AGE_CAP_S = 7200
 
 
 def directive_max_age_s():
-    """Resolved at call time (env / .env), not at import: _env_setting is defined
-    further down this file, and a NameError at import would silence the WHOLE
-    hook (exit 0 via the top-level except) -- measured on the first draft."""
+    """Resolved at call time, not at import: _env_file_value is defined further
+    down this file, and a NameError at import would silence the WHOLE hook
+    (exit 0 via the top-level except) -- measured on the first draft.
+
+    From the install .env ONLY (ENVRELAXGATE1104 step 2): the hook's environment
+    is the checked agent's own, so it must not choose the window that checks it.
+    A missing, malformed or non-positive value is the default; above the cap,
+    the cap."""
     try:
-        return int(_env_setting("PROVENANCE_DIRECTIVE_MAX_AGE_S", str(DIRECTIVE_MAX_AGE_DEFAULT_S)))
+        raw = _env_file_value("PROVENANCE_DIRECTIVE_MAX_AGE_S")
+        if raw is None or not re.fullmatch(r"[0-9]{1,9}", raw):
+            return DIRECTIVE_MAX_AGE_DEFAULT_S
+        n = int(raw)
+        if n <= 0:
+            return DIRECTIVE_MAX_AGE_DEFAULT_S
+        return min(n, DIRECTIVE_MAX_AGE_CAP_S)
     except Exception:
         return DIRECTIVE_MAX_AGE_DEFAULT_S
 
 
 def _db_path():
-    return os.environ.get("PROVENANCE_GATE_DB") or os.path.join(_install_dir(), "store", "claudeclaw.db")
+    # Always the install's own queue DB (ENVRELAXGATE1104 step 2): the row in it
+    # is what verifies a directive, so the environment must not pick the DB.
+    return os.path.join(_install_dir(), "store", "claudeclaw.db")
 
 
 def derive_agent_id(cwd):
@@ -544,6 +587,32 @@ def _env_setting(key, default):
     return default
 
 
+def _env_file_value(key):
+    """The install .env's value of `key` as src/env-parse.ts reads it: the LAST
+    matching line wins, the value is trimmed and ONE pair of surrounding quotes
+    is stripped; None when the key is absent or the file unreadable. For a
+    security value (ENVRELAXGATE1104 step 2): never os.environ, which is the
+    checked agent's own. Kept local, like _env_setting, so the hook has no
+    import that could fail."""
+    try:
+        with open(os.path.join(_install_dir(), ".env"), encoding="utf-8") as fh:
+            content = fh.read()
+    except Exception:
+        return None
+    found = None
+    for line in content.split("\n"):
+        t = line.strip()
+        if not t or t.startswith("#") or "=" not in t:
+            continue
+        k, v = t.split("=", 1)
+        if k.strip() != key:
+            continue
+        v = v.strip()
+        if v[:1] in ('"', "'") and v.endswith(v[:1]):
+            v = v[1:-1]
+        found = v
+    return found
+
 
 def _fleet_lead():
     """The agent this gate tells the flagged agent to notify.
@@ -566,10 +635,10 @@ def _fleet_lead():
         return lead
     return _env_setting("MAIN_AGENT_ID", "marveen")
 
-_RULES_PATH = os.environ.get(
-    "PROVENANCE_GATE_RULES",
-    os.path.join(_install_dir(), "store", "provenance-gate-rules.json"),
-)
+# Always the install's own rules file (ENVRELAXGATE1104 step 2; since #2492 a
+# sub-agent cannot write it). An environment path would let the checked agent
+# hand the gate rules of its own choosing.
+_RULES_PATH = os.path.join(_install_dir(), "store", "provenance-gate-rules.json")
 
 
 def strip_accents(text):

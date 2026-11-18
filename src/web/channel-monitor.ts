@@ -19,13 +19,14 @@ import {
   agentHasChannel,
   agentSessionName,
   capturePane, capturePaneWithHistory,
-  captureParkedInputView,
+  captureParkedInputView, captureParkedInputViewAsync,
   clearInputBuffer,
   dismissResumeSummaryModalIfPresent,
   dismissModelConsentDialogIfPresent,
   stampFableOverageConsentSharedRoots,
   isAgentRunning,
   isSessionReadyForPrompt,
+  withTmuxBatch,
   sendPromptToSession,
   startAgentProcess,
   stopAgentProcess,
@@ -42,12 +43,14 @@ import {
 } from './agent-process.js'
 import { sendSystemDirective } from './system-directive.js'
 import { isRestartInFlight, beginRestart, endRestart } from './restart-lock.js'
+import { cancelRestartWake } from './restart-wake.js'
 import { paneRunsClaude, scheduleHardRestartVerify } from './hard-restart-verify.js'
 import { freshSupervisor, launchdReloadVerdict, reloadWindowSec, runningChannelsSupervisors, supervisorWaitDecision, type SupervisorWait } from './channels-supervisor.js'
 import { resolveMainConfigDecision, type MainConfigDecision } from './main-config-decision.js'
+import { cfgKindFromDecision, mainAuthConflictText, prepareMainAuth } from './main-auth.js'
 import { runMainContinueRestart, type ContinueRestartResult } from './main-rotation-continue.js'
 import { withSessionSendLock } from './session-send-lock.js'
-import { reapChannelOrphans, reapDetachedChannelClaudes, collectPollerEvidence, reapForeignMainPollers } from './channel-poller-reap.js'
+import { reapChannelOrphans, reapDetachedChannelClaudes, collectPollerEvidence, reapForeignMainPollers, reapGromzoOrphans, scheduleGromzoOrphanReap } from './channel-poller-reap.js'
 import { probeTelegramConflict } from './channel-conflict-probe.js'
 import { schedulePluginUnlockAfterRespawn, wasPluginConfirmedAbsent, clearPluginAbsent } from './channel-plugin-unlock.js'
 import { getInjectedPrompt, matchesInjectedPrompt } from './injected-prompt-registry.js'
@@ -88,6 +91,10 @@ import { ROOT_SANDBOX_ENV } from './root-sandbox-env.js'
 import { exactTmuxTarget } from '../tmux-target.js'
 import { beginMainRespawn } from './main-respawn-hold.js'
 import { whileNotFrozen } from './fleet-freeze.js'
+import { filterMainGromzoIds, mainGromzoPrimaryReady, mainGromzoSlug, MAIN_GROMZO_PLUGIN_ID } from './main-gromzo-launch.js'
+import { mainChannelUnconfigured, mainSessionRunsUnconfigured } from './main-channel-configured.js'
+import { flushGromzoPendingOwnerAlerts, setGromzoMainLive } from '../notify.js'
+import { gromzoTokenExport, gromzoTokenFile } from './agent-extra-channels.js'
 
 // Lazily resolved (see makeLazyBinResolver): a module-level `resolveFromPath`
 // const throws at IMPORT time, so any environment where the binary is not
@@ -107,6 +114,46 @@ const claudeBin = makeLazyBinResolver('claude')
 // header and PR #1304 review (c).
 const RESOLVE_PLAN_TOKEN_PATH = join(PROJECT_ROOT, 'scripts', 'resolve-plan-token-env.mjs')
 const CHANNELS_FAILURES_LOG_PATH = join(PROJECT_ROOT, 'store', 'channels-failures.log')
+// APIKEYSCOPE1107: the 0600 file channels.sh writes for the main pane (TOKENARGV929): the token, and the key whenever
+// .env has one (the main agent's own mode is a later change). A respawn sources it too (below), since the key no
+// longer rides the tmux global env off a key-only install.
+export const PANE_AUTH_PATH = join(PROJECT_ROOT, 'store', '.channels-pane-auth')
+// MAINAUTH1107: sourced right AFTER the config branch (api: the token unset, subscription: the key unset), so neither
+// CFG_ENV nor the tmux global env can add the other credential back. Written by main-auth.ts for every launch.
+export const PANE_AUTH_POST_PATH = join(PROJECT_ROOT, 'store', '.channels-pane-auth-post')
+
+/** GROMZONEEDSAUTH1109 (Samu 74033, 74110; Dani 74108): the step of a respawn command that takes Claude Code's cached
+ *  needs-auth entry for the Gromzo server out of the config dir the respawned claude will read, with the same helper as
+ *  channels.sh (why, and what it never touches: gromzo-needs-auth.ts). It runs IN the pane, right before claude: after
+ *  respawn-pane -k killed the old claude (so that one cannot write the entry back) and after the command's own exports,
+ *  so "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" is exactly the dir this claude reads. The line goes to channels-failures.log;
+ *  a missing helper or a failure never stops the respawn. The same group as gromzo_needs_auth_pane_step in
+ *  scripts/gromzo-needs-auth-pane.sh (a test keeps the two equal). */
+export function gromzoNeedsAuthPaneStep(projectRoot: string = PROJECT_ROOT): string {
+  const helper = shSingleQuote(join(projectRoot, 'scripts', 'gromzo-needs-auth-clear.mjs'))
+  const log = shSingleQuote(join(projectRoot, 'store', 'channels-failures.log'))
+  return `{ [ ! -f ${helper} ] || node ${helper} "\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}" 2>>${log} || true; }`
+}
+
+/** MAINAUTH1107: the config decision of a dashboard respawn, with the main agent's credential decided and written for
+ *  it first (pane-auth file, post-file, key approval). A respawn-pane does not run channels.sh, so without this a
+ *  mode the owner switched would not reach the pane until the next channels.sh boot. A failed step is logged loudly;
+ *  the respawn still goes ahead (a pane that comes up is the better outcome than none, and the owner sees why). */
+export function mainRespawnConfigWithAuth(): MainConfigDecision {
+  const config = resolveMainConfigDecision()
+  try {
+    const { decision, result } = prepareMainAuth(cfgKindFromDecision(config), config.isolatedConfigDir)
+    const conflict = mainAuthConflictText(decision.conflict)
+    if (!result.ok || (decision.configured === 'api' && conflict)) {
+      logger.error({ configured: decision.configured, effective: decision.effective, conflict, failed: result.failed }, 'main-auth: the main agent does not run on the credential its mode asks for')
+    } else {
+      logger.info({ configured: decision.configured, effective: decision.effective }, 'main-auth applied for the respawn')
+    }
+  } catch (err) {
+    logger.error({ err }, 'main-auth: could not decide the main agent credential; the respawn keeps the files of the last launch')
+  }
+  return config
+}
 
 // How long the agent's claude process has been running. Returns -1 when it
 // cannot be determined, which the restart policy treats as "do not restart".
@@ -174,6 +221,8 @@ export function isWithinRestartGrace(name: string, nowMs: number = Date.now()): 
 // and drowned the log). First detection warns; repeats drop to debug. Cleared
 // when a token appears so a later un-bind is announced again.
 const agentNoTokenWarned: Set<string> = new Set()
+// CHANNELUNCONF1110: the main session's "no channel configured" spell was logged (reset when it ends).
+let mainUnconfiguredNoted = false
 // Sessions whose busy-deferral cap has already been reported to the operator, so
 // the alert fires once per down-spell instead of every sweep. Cleared when the
 // plugin recovers (or when the agent is restarted after it goes idle).
@@ -619,7 +668,12 @@ export async function recoverStuckInputForSession(
   // Ghost-stripped capture: a dim autocomplete hint in an empty box must NOT
   // read as parked input, or the recovery below would re-type + submit it
   // (phantom prompt-injection). See captureParkedInputView / stripGhostSuggestion.
-  const pane = captureParkedInputView(session)
+  const pre = await captureParkedInputViewAsync(session)
+  // Something looks parked: read the pane again synchronously, so the read that drives the
+  // decision and the lane acquisition in performStuckInputAction run in one synchronous
+  // stretch (no other writer can take and release the lane in between). The common case,
+  // nothing parked, stays off the event loop.
+  const pane = pre != null && stuckInputSignature(pre) != null ? captureParkedInputView(session) : pre
   const sig = pane != null ? stuckInputSignature(pane) : null
   const decision = decideStuckInputRecovery(sig, prev, Date.now(), thresholds)
   if (decision.recover && pane != null) {
@@ -1058,7 +1112,15 @@ export function readConfiguredMainModel(projectRoot: string = PROJECT_ROOT): str
 // Since BOOTSTAGGER1007 (b) the co-listen plugins are probed too
 // (checkMainColistenChannels / main-colisten-health.ts).
 export function readExtraChannelPluginIds(projectRoot: string = PROJECT_ROOT): string[] {
-  return readEnvValue(projectRoot, 'CHANNEL_PLUGINS_EXTRA').split(/\s+/).filter(Boolean)
+  // GROMZOMAINAGENT1106: the main agent's gromzo-channel id stays only with a usable agent.sock and a valid
+  // mxd slug, exactly as scripts/main-gromzo-launch.sh filters it for the shell launchers. Every caller (the
+  // three respawns, the isolated main config) then sees the same list as channels.sh.
+  return filterMainGromzoIds(readMainAgentIdRaw(projectRoot), readEnvValue(projectRoot, 'CHANNEL_PLUGINS_EXTRA').split(/\s+/).filter(Boolean))
+}
+
+/** The .env MAIN_AGENT_ID as written (the shell launchers read the same raw value for MXD_AGENT). */
+export function readMainAgentIdRaw(projectRoot: string = PROJECT_ROOT): string {
+  return readEnvValue(projectRoot, 'MAIN_AGENT_ID')
 }
 
 // Build the claude command used to (re)spawn the main channels session via
@@ -1071,6 +1133,16 @@ export function readExtraChannelPluginIds(projectRoot: string = PROJECT_ROOT): s
 // NOTE: inbound from `--channels` also goes through the allowlist at
 // /etc/claude-code/managed-settings.json (allowedChannelPlugins); a plugin not
 // listed there has its MCP notifications silently dropped. See channels.sh.
+/** CHANNELUNCONF1110: the respawns launch the primary channel only when it is configured
+ *  (main-channel-configured.ts, the twin of the launchers' shell rule). */
+function mainPrimaryConfigured(providerType: string): boolean {
+  return !mainChannelUnconfigured(providerType)
+}
+/** The ids the respawn's --settings file enables: the primary only when configured, then the extras. */
+function mainLaunchPluginIds(provider: { type: string; pluginId: string }): string[] {
+  return [...(mainPrimaryConfigured(provider.type) ? [provider.pluginId] : []), ...readExtraChannelPluginIds()]
+}
+
 export function buildMainSessionRespawnCmd(opts: {
   claudePath: string
   pluginId: string
@@ -1137,10 +1209,42 @@ export function buildMainSessionRespawnCmd(opts: {
    * SLACKDMVESZT1006: the --settings file that ENABLES the extras for this
    * session only (writeMainExtraPluginsSettings). Without it a recovery
    * respawn lists the extras on --channels while the project scope keeps them
-   * disabled, and the extra bot comes up deaf. null/absent = no flag.
+   * disabled, and the extra bot comes up deaf. INSTALLDIRTYTREE1103: it carries
+   * the PRIMARY plugin too -- the tracked project settings.json is no longer
+   * written at launch, and it ships slack-channel false. null/absent = no flag.
    */
   extraSettingsPath?: string | null
+  /**
+   * GROMZOMAINAGENT1106: the .env MAIN_AGENT_ID (readMainAgentIdRaw). When `extraPluginIds` carries the
+   * gromzo-channel id, the respawn exports MXD_AGENT=<this slug> and MXD_SCOPE=both for the plugin, in
+   * this command only (never a settings file). Absent: the boot-time MAIN_AGENT_ID.
+   */
+  mainAgentId?: string
+  /** MXDAGENTSOCKID1106: the main agent's token file (gromzoTokenFile); absent: looked up for the slug. */
+  gromzoTokenFile?: string | null
+  /** GROMZONOPROVIDER1108: test seam for mainGromzoPrimaryReady when the primary is the Gromzo plugin. */
+  gromzoPrimaryReady?: boolean
+  /**
+   * CHANNELUNCONF1110: false when the primary is a token provider with no token (mainPrimaryConfigured): the respawn
+   * then comes back WITHOUT the primary channel, exactly as channels.sh, channel-watchdog.sh and stuck-modal-guard.sh
+   * launch it. Absent: configured (the launch as before).
+   */
+  channelConfigured?: boolean
 }): string {
+  // GROMZONOPROVIDER1108: on a gromzo install the Gromzo plugin is the PRIMARY (never also an extra). It comes back only
+  // when the main agent can take it (mainGromzoPrimaryReady); otherwise this respawn is a gromzo-pending session with
+  // no Gromzo channel, exactly as channels.sh, stuck-modal-guard.sh and channel-watchdog.sh launch it.
+  const primaryIsGromzo = opts.pluginId === MAIN_GROMZO_PLUGIN_ID
+  const extras = (opts.extraPluginIds ?? []).filter((p) => !(primaryIsGromzo && p === MAIN_GROMZO_PLUGIN_ID))
+  const primaryReady = primaryIsGromzo
+    ? (opts.gromzoPrimaryReady ?? mainGromzoPrimaryReady(opts.mainAgentId ?? MAIN_AGENT_ID))
+    : (opts.channelConfigured ?? true)
+  const primary = primaryReady ? opts.pluginId : null
+  const gromzoSlug = (primaryIsGromzo && primaryReady) || extras.includes(MAIN_GROMZO_PLUGIN_ID)
+    ? mainGromzoSlug(opts.mainAgentId ?? MAIN_AGENT_ID)
+    : null
+  const channelsList = [...(primary ? [`plugin:${primary}`] : []), ...extras.map((p) => `plugin:${p}`)]
+  const gromzoToken = gromzoSlug ? gromzoTokenExport(opts.gromzoTokenFile !== undefined ? opts.gromzoTokenFile : gromzoTokenFile(gromzoSlug)) : ''
   return [
     // FLEETVENV923: same venv-first PATH as startAgentProcess and channels.sh.
     `export PATH="${fleetVenvPathPrefix()}/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"`,
@@ -1160,6 +1264,11 @@ export function buildMainSessionRespawnCmd(opts: {
     // ROOTRESPAWN1001: the recovery respawn on a root host died with "cannot be used
     // with root/sudo privileges" whenever the tmux server lacked IS_SANDBOX.
     `&& ${ROOT_SANDBOX_ENV}`,
+    // APIKEYSCOPE1107: the main session's credentials from the same pane-auth file channels.sh launched it with,
+    // not only from the tmux server global env (where a subscription install's key no longer is). BEFORE the config
+    // branch, so an own-login dir unsets both again and an isolated/token dir exports its own token over it. A
+    // missing file keeps the chain going.
+    `&& { [ ! -f ${shSingleQuote(PANE_AUTH_PATH)} ] || . ${shSingleQuote(PANE_AUTH_PATH)}; }`,
     // macOS main-agent config isolation -- parity with channels.sh CFG_ENV. The
     // token is read at launch via $(cat) so the secret never lands in argv/`ps`.
     // An own-credential dir (explicit or a rotated claude-plans entry) gets NO
@@ -1181,17 +1290,25 @@ export function buildMainSessionRespawnCmd(opts: {
           // The pane inherits the tmux global env, which carries the fleet
           // token, and an env token outranks the dir's own login (the
           // inference-only setup-token hid the claude.ai connectors,
-          // measured 2026-10-16) -- so drop it explicitly. channels.sh also puts
-          // ANTHROPIC_API_KEY in the tmux global env when .env has one, and that
+          // measured 2026-10-16) -- so drop it explicitly. The pane-auth file sourced above
+          // (and, on a key-only install, the tmux global env) carries ANTHROPIC_API_KEY, and that
           // outranks a /login credential as well (Claude Code docs, "Authentication
           // precedence"): this dir authenticates with its own login only.
-          ? [`&& export CLAUDE_CONFIG_DIR='${opts.config.isolatedConfigDir}' && unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY`]
+          ? [`&& export CLAUDE_CONFIG_DIR=${shSingleQuote(opts.config.isolatedConfigDir)} && unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY`]
           : opts.config.tokenSecretId
-            ? [`&& export CLAUDE_CONFIG_DIR='${opts.config.isolatedConfigDir}' && _plan_token="$(node '${RESOLVE_PLAN_TOKEN_PATH}' '${opts.config.tokenSecretId}' '${FLEET_OAUTH_TOKEN_PATH}' '${CHANNELS_FAILURES_LOG_PATH}')" && export CLAUDE_CODE_OAUTH_TOKEN="$_plan_token"`]
-            : [`&& export CLAUDE_CONFIG_DIR='${opts.config.isolatedConfigDir}' && export CLAUDE_CODE_OAUTH_TOKEN="$(cat '${FLEET_OAUTH_TOKEN_PATH}')"`])
+            ? [`&& export CLAUDE_CONFIG_DIR=${shSingleQuote(opts.config.isolatedConfigDir)} && _plan_token="$(node '${RESOLVE_PLAN_TOKEN_PATH}' '${opts.config.tokenSecretId}' '${FLEET_OAUTH_TOKEN_PATH}' '${CHANNELS_FAILURES_LOG_PATH}')" && export CLAUDE_CODE_OAUTH_TOKEN="$_plan_token"`]
+            : [`&& export CLAUDE_CONFIG_DIR=${shSingleQuote(opts.config.isolatedConfigDir)} && export CLAUDE_CODE_OAUTH_TOKEN="$(cat '${FLEET_OAUTH_TOKEN_PATH}')"`])
       : opts.config.fleetToken
         ? [`&& export CLAUDE_CODE_OAUTH_TOKEN="$(cat '${FLEET_OAUTH_TOKEN_PATH}')"`]
         : []),
+    // MAINAUTH1107: the post-file right AFTER the config branch (a static piece: no mode logic in this builder).
+    `&& { [ ! -f ${shSingleQuote(PANE_AUTH_POST_PATH)} ] || . ${shSingleQuote(PANE_AUTH_POST_PATH)}; }`,
+    // GROMZOMAINAGENT1106: the plugin names itself with MXD_AGENT (main-gromzo-launch.ts).
+    // MXDAGENTSOCKID1106: and its token file, so a protected main agent's hello is not refused.
+    ...(gromzoSlug ? [`&& export MXD_AGENT="${gromzoSlug}" MXD_SCOPE="both"`] : []),
+    ...(gromzoToken ? [`&& ${gromzoToken.replace(/ && $/, '')}`] : []),
+    // GROMZONEEDSAUTH1109: in the pane, after the kill and the exports, right before claude (gromzoNeedsAuthPaneStep).
+    ...(channelsList.includes(`plugin:${MAIN_GROMZO_PLUGIN_ID}`) ? [`&& ${gromzoNeedsAuthPaneStep()}`] : []),
     // RESPAWNCUSTOMPROVIDER1012: customProviderEnv, when set, is injected AFTER
     // the config-dir/token block above -- same ordering as scripts/channels.sh's
     // CFG_ENV followed by CUSTOM_PROVIDER_ENV -- and OVERRIDES it. It starts by
@@ -1215,7 +1332,7 @@ export function buildMainSessionRespawnCmd(opts: {
     // allowlist is the belt, this is the braces). shSingleQuote makes the value
     // one inert shell word. See model-id-injection.test.ts.
     ...(opts.model ? ['--model', shSingleQuote(opts.model)] : []),
-    [`--channels plugin:${opts.pluginId}`, ...(opts.extraPluginIds ?? []).map((p) => `plugin:${p}`)].join(' '),
+    ...(channelsList.length > 0 ? [['--channels', ...channelsList].join(' ')] : []),
   ].join(' ')
 }
 
@@ -1288,13 +1405,15 @@ export function respawnMainSessionFresh(): void {
       claudePath: claudeBin(),
       pluginId: provider.pluginId,
       extraPluginIds: readExtraChannelPluginIds(),
-      extraSettingsPath: writeMainExtraPluginsSettings(PROJECT_ROOT, readExtraChannelPluginIds()),
+      mainAgentId: readMainAgentIdRaw(),
+      channelConfigured: mainPrimaryConfigured(provider.type),
+      extraSettingsPath: writeMainExtraPluginsSettings(PROJECT_ROOT, mainLaunchPluginIds(provider)),
       channelStateEnv: mainChannelStateEnv(provider.type),
       model: readConfiguredMainModel(),
       // The main session always starts a new conversation -- this is the whole
       // point of the nightly restart (drop the accumulated context).
       continueSession: false,
-      config: resolveMainConfigDecision(),
+      config: mainRespawnConfigWithAuth(),
       customProviderEnv: buildCustomProviderLaunchEnv(MAIN_AGENT_ID),
     })
     // c5296a52: the two reaps above kill the pane's claude, and channels.sh starts the session
@@ -1310,6 +1429,8 @@ export function respawnMainSessionFresh(): void {
     // that is a success for our purposes (something IS coming up), not a failure to retry.
     if (mainChannelsSessionExists()) {
       execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), claudeCmd], { timeout: 15000 })
+      // MXDAGENTSOCKID1106 (b): the old claude's gromzo plugin outlives it (it ignores a closed stdin); sweep it once the respawn landed.
+      scheduleGromzoOrphanReap('main-respawn', tmuxBin())
     } else {
       // A fresh session starts its own claude: the respawn-specific follow-ups below
       // (identity, plugin unlock) are channels.sh's job on this path, not ours.
@@ -1394,7 +1515,9 @@ export async function resumeMarveenSession(opts: { byMonitor?: boolean } = {}): 
       claudePath: claudeBin(),
       pluginId: provider.pluginId,
       extraPluginIds: readExtraChannelPluginIds(),
-    extraSettingsPath: writeMainExtraPluginsSettings(PROJECT_ROOT, readExtraChannelPluginIds()),
+      mainAgentId: readMainAgentIdRaw(),
+    channelConfigured: mainPrimaryConfigured(provider.type),
+    extraSettingsPath: writeMainExtraPluginsSettings(PROJECT_ROOT, mainLaunchPluginIds(provider)),
       channelStateEnv: mainChannelStateEnv(provider.type),
       model: readConfiguredMainModel(),
       continueSession: true,
@@ -1402,11 +1525,13 @@ export async function resumeMarveenSession(opts: { byMonitor?: boolean } = {}): 
       // isolated CLAUDE_CONFIG_DIR (macOS), else it re-authenticates from the
       // rotating Keychain and 401s. Returns null when isolation is off/no token,
       // preserving the prior shared-root behaviour.
-      config: resolveMainConfigDecision(),
+      config: mainRespawnConfigWithAuth(),
       customProviderEnv: buildCustomProviderLaunchEnv(MAIN_AGENT_ID),
     })
     if (opts.byMonitor) monitorMainRespawnAt = Date.now()
     execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), claudeCmd], { timeout: 15000 })
+    // MXDAGENTSOCKID1106 (b): the old claude's gromzo plugin outlives it (it ignores a closed stdin); sweep it once the respawn landed.
+    scheduleGromzoOrphanReap('main-respawn', tmuxBin())
 
     // --continue replays the last conversation. When the prior session is large
     // (>200k tokens) Claude Code opens with a "Resume from summary" modal that
@@ -1702,17 +1827,21 @@ function respawnMarveenSessionFresh(): boolean {
       claudePath: claudeBin(),
       pluginId: provider.pluginId,
       extraPluginIds: readExtraChannelPluginIds(),
-    extraSettingsPath: writeMainExtraPluginsSettings(PROJECT_ROOT, readExtraChannelPluginIds()),
+      mainAgentId: readMainAgentIdRaw(),
+    channelConfigured: mainPrimaryConfigured(provider.type),
+    extraSettingsPath: writeMainExtraPluginsSettings(PROJECT_ROOT, mainLaunchPluginIds(provider)),
       channelStateEnv: mainChannelStateEnv(provider.type),
       model: readConfiguredMainModel(),
       continueSession: false,
       // Same channels.sh-bypass concern as resumeMarveenSession: this fresh
       // respawn also skips channels.sh, so it must carry the isolated config
       // itself or it 401s on the rotating macOS Keychain. null when off/no token.
-      config: resolveMainConfigDecision(),
+      config: mainRespawnConfigWithAuth(),
       customProviderEnv: buildCustomProviderLaunchEnv(MAIN_AGENT_ID),
     })
     execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), claudeCmd], { timeout: 15000 })
+    // MXDAGENTSOCKID1106 (b): the old claude's gromzo plugin outlives it (it ignores a closed stdin); sweep it once the respawn landed.
+    scheduleGromzoOrphanReap('main-respawn', tmuxBin())
     logger.warn({ provider: provider.type }, 'Hard restart: marveen session respawned fresh (no --continue)')
     // Re-establish /rename on the fresh process (see note in resumeMarveenSession).
     // scheduleIdentitySetup only schedules delayed timers -> fire-and-forget.
@@ -1870,6 +1999,10 @@ function verifyHardRestartLater(): void {
 }
 
 export function hardRestartMarveenChannels(): { ok: boolean; error?: string } {
+  // MAINRESTARTWAKE1115 (review C3): a manual restart may have left a wake pending for the main
+  // session. Any restart of that session drops it here; the two manual routes schedule their own
+  // AFTER this call, so a guard or recovery restart inside the grace gets its own directive only.
+  cancelRestartWake(MAIN_AGENT_ID)
   // FABLEFALL1: the restarted session boots from the main/worker shared config
   // roots, which the per-agent spawn-time stamp never covers -- stamp them now
   // so the model consent dialog cannot render on the fresh boot (change-only,
@@ -2465,6 +2598,16 @@ export function sendAlert(text: string, meta?: AlertMeta): void {
   notifyChannel(text, meta).catch(() => {})
 }
 
+// GAVEUPRELOAD1033: the give-up stage's last /reload-plugins, only into a main
+// input box PROVEN empty (see the call site). Run inside the send lane.
+function sendGaveUpReloadIfIdle(): 'sent' | 'not-idle' {
+  const plain = capturePane(MAIN_CHANNELS_SESSION)
+  const dimStripped = plain != null && detectPaneState(plain) === 'typing' ? captureParkedInputView(MAIN_CHANNELS_SESSION) : null
+  if (!mainInputBoxProvenEmpty(plain, dimStripped)) return 'not-idle'
+  execFileSync(tmuxBin(), ['send-keys', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), '/reload-plugins', 'Enter'], { timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] })
+  return 'sent'
+}
+
 async function handleMarveenDown(): Promise<void> {
   const now = Date.now()
   const providerLabel = getMainAgentProvider()
@@ -2578,6 +2721,34 @@ async function handleMarveenDown(): Promise<void> {
   if (marveenDownState.stage === 'hard') {
     marveenDownState.stage = 'gave_up'
     marveenDownState.lastAlertAt = now
+    // GAVEUPRELOAD1033: the independent channel-watchdog that takes over after
+    // tryReleaseOwnRespawnStamp below only respawns channels.sh -- it never
+    // sends /reload-plugins, which is the one thing measured to actually bring
+    // a confirmed-absent plugin back (RELOADPLUGINSABSENT1032 in
+    // channel-plugin-unlock.ts). Without this, the plugin stayed dead for ~1.5h
+    // of watchdog-only respawns until a human typed /reload-plugins by hand
+    // (measured 2026-11-01 02:45-04:20). Fire one last fire-and-forget attempt
+    // here, under the send lane so it can't splice into a live delivery; a
+    // skipped or failed attempt must not block the give-up path below.
+    //
+    // The lane only excludes deliveries, not a draft parked in the input box:
+    // typed into a non-empty box, the command would be appended to the draft
+    // and Enter would submit both. So, inside the lane, the box must be PROVEN
+    // empty first (the same readiness rule the stuck-input ladder uses, and
+    // what channels.sh's probe_pane_input_state == idle checks); anything else
+    // (parked text, busy, unreadable) skips the attempt.
+    try {
+      const res = await withSessionSendLock(MAIN_CHANNELS_SESSION, null, 'recover', async () => sendGaveUpReloadIfIdle())
+      if (res.ran && res.value === 'sent') {
+        logger.warn({ provider: providerLabel }, 'channel-monitor: giving-up stage sent one last /reload-plugins attempt before releasing respawn grace (GAVEUPRELOAD1033)')
+      } else if (res.ran) {
+        logger.info({ provider: providerLabel }, 'channel-monitor: giving-up stage skipped the last /reload-plugins attempt, input box not proven empty (GAVEUPRELOAD1033)')
+      } else {
+        logger.info({ provider: providerLabel }, 'channel-monitor: giving-up stage skipped the last /reload-plugins attempt, send lane busy (GAVEUPRELOAD1033)')
+      }
+    } catch (err) {
+      logger.warn({ site: 'channel-monitor.gaveUpReloadPlugins', err, session: MAIN_CHANNELS_SESSION, tmux: tmuxStderr(err), provider: providerLabel }, 'channel-monitor: giving-up stage failed to send /reload-plugins (GAVEUPRELOAD1033)')
+    }
     logger.error({ provider: providerLabel }, 'Marveen channel plugin still down after hard restart -- giving up auto-recovery')
     const serviceCmd = process.platform === 'linux'
       ? `\`systemctl --user status ${SERVICE_ID}-channels\``
@@ -2728,16 +2899,22 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
 
     type Target = { session: string; isMarveen: boolean; agentName?: string; provider: ChannelProviderType }
     const targets: Target[] = [{ session: MAIN_CHANNELS_SESSION, isMarveen: true, provider: mainProvider }]
-    for (const a of listAgentNames()) {
-      if (isAgentRunning(a) && agentHasChannel(a)) {
-        targets.push({
-          session: agentSessionName(a),
-          isMarveen: false,
-          agentName: a,
-          provider: resolveAgentProvider(a),
-        })
+    // One list-sessions for the whole per-agent read: every isAgentRunning()
+    // below asks the identical read-only query, and withTmuxBatch answers all
+    // of them from one memoized spawn while this (synchronous) loop runs. No
+    // session state changes inside -- the loop only builds the target list.
+    withTmuxBatch(() => {
+      for (const a of listAgentNames()) {
+        if (isAgentRunning(a) && agentHasChannel(a)) {
+          targets.push({
+            session: agentSessionName(a),
+            isMarveen: false,
+            agentName: a,
+            provider: resolveAgentProvider(a),
+          })
+        }
       }
-    }
+    })
 
     // Pane-level thinking-block error detection. Independent of channel
     // plugin liveness: a session can keep a live plugin yet be wedged on
@@ -2788,10 +2965,14 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
     // the first-run answers (the same answerFirstRunGates) and NEVER the
     // generic Escape below -- on that dialog Escape quits the TUI.
     const menuTargets: Array<{ session: string; isMarveen: boolean; agentName?: string; gateOnly?: boolean }> = [...targets]
-    for (const a of listAgentNames()) {
-      if (agentHasChannel(a) || !readAgentWorksourceChannel(a) || readAgentRemoteHost(a) || !isAgentRunning(a)) continue
-      menuTargets.push({ session: agentSessionName(a), isMarveen: false, agentName: a, gateOnly: true })
-    }
+    // Same dedupe as the targets loop above: this second per-agent
+    // isAgentRunning() pass reads the identical query, answered once.
+    withTmuxBatch(() => {
+      for (const a of listAgentNames()) {
+        if (agentHasChannel(a) || !readAgentWorksourceChannel(a) || readAgentRemoteHost(a) || !isAgentRunning(a)) continue
+        menuTargets.push({ session: agentSessionName(a), isMarveen: false, agentName: a, gateOnly: true })
+      }
+    })
     for (const t of menuTargets) {
       const pane = capturePane(t.session)
       menuTargetsWalked++
@@ -2962,6 +3143,8 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           if (lastRestart && Date.now() - lastRestart < AGENT_RESTART_GRACE_MS) continue
         }
         if (t.isMarveen) {
+          // GROMZONOPROVIDER1108 (Dani 73601): no claude, so no live Gromzo plugin either -> owner alerts are kept.
+          if (t.provider === 'gromzo') setGromzoMainLive(false)
           // The claude pid is gone. WHY decides recovery: a session that no
           // longer exists at all must be recreated from scratch (respawn-pane,
           // the only tool the down-cascade has on Linux, cannot resurrect a
@@ -2993,6 +3176,25 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
       const openDownSpell = t.isMarveen
         ? marveenSuspectFirstSeen !== null || marveenDownState !== null || marveenRecreatedOutage !== null
         : agentDownSince.has(t.session) || (t.agentName !== undefined && agentRestartFailures.has(t.agentName))
+      // GROMZONOPROVIDER1108: a gromzo-pending main session runs WITHOUT its Gromzo channel on purpose (mxd's socket
+      // not usable or the main agent not enrolled yet); channels.sh restarts it once it is ready. Not a dead plugin.
+      if (t.isMarveen && t.provider === 'gromzo' && !mainGromzoPrimaryReady(readMainAgentIdRaw())) {
+        logger.debug({ session: t.session }, 'Main session is gromzo-pending -- no Gromzo channel expected yet, no liveness action')
+        setGromzoMainLive(false)
+        continue
+      }
+      // CHANNELUNCONF1110: channels.sh launched the main session WITHOUT its primary channel (a token provider with no
+      // token: store/.channel-unconfigured), and the rule still says so (a false marker alone does nothing, Dani K1).
+      // An absent plugin is the expected state, not a dead one: no liveness action, no down ladder, nothing typed into
+      // the session; channels.sh restarts it once the token is set. Said once per unconfigured spell.
+      if (t.isMarveen && mainSessionRunsUnconfigured(t.provider)) {
+        if (!mainUnconfiguredNoted) {
+          mainUnconfiguredNoted = true
+          logger.info({ session: t.session, provider: t.provider }, 'Main session runs without its channel: no token configured -- no liveness action until one is set')
+        }
+        continue
+      }
+      if (t.isMarveen) mainUnconfiguredNoted = false
       const liveness = await probeChannelPluginLivenessAsync(claudePid, t.provider, t.agentName, { confirmAlive: openDownSpell }, sweepSnapshot ?? undefined)
       if (liveness === 'unknown') {
         // The PROBE failed (ps timed out, state dir unreadable) -- that is not
@@ -3005,6 +3207,12 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
       if (liveness === 'alive') {
         if (t.isMarveen) {
           handleMarveenUp()
+          // GROMZONOPROVIDER1108 (Samu 73588, Dani 73601): the Gromzo plugin is alive in THIS session, so a relayed alert
+          // reaches the owner now; the alerts kept while it was not go out. Ready alone is not enough (see notify.ts).
+          if (t.provider === 'gromzo') {
+            setGromzoMainLive(true)
+            try { flushGromzoPendingOwnerAlerts() } catch (err) { logger.warn({ err }, 'gromzo pending alerts flush failed') }
+          }
           // Process-alive does NOT prove the inbound MCP pipe is healthy (the
           // deafness blind spot). Cross-check the keep-alive freshness.
           checkMainKeepaliveStaleness()
@@ -3038,6 +3246,8 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
         continue
       }
       if (t.isMarveen) {
+        // GROMZONOPROVIDER1108 (Dani 73601): no live Gromzo plugin -> an owner alert is kept, not relayed into it.
+        if (t.provider === 'gromzo') setGromzoMainLive(false)
         if (shouldEscalateMarveenDown()) await handleMarveenDown()
       } else {
         if (!agentDownSince.has(t.session)) {
@@ -3270,6 +3480,13 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
         }
       } catch (err) {
         logger.warn({ err }, 'channel-monitor: periodic detached-claude reap failed')
+      }
+      // MXDAGENTSOCKID1106 (b): after the detached claudes are gone, their gromzo plugins are orphans; sweep them.
+      try {
+        const killed = reapGromzoOrphans({ tmuxPath: tmuxBin() })
+        if (killed.length > 0) logger.warn({ killed }, 'channel-monitor: periodic reap removed orphaned gromzo-channel plugin(s)')
+      } catch (err) {
+        logger.warn({ err }, 'channel-monitor: periodic gromzo-orphan reap failed')
       }
       // Also sweep foreign MAIN-token pollers (a thief that never fully tripped
       // the down cascade -- flapping getUpdates when a local-agent-mode subagent

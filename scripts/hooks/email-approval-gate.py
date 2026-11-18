@@ -113,8 +113,12 @@ import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(os.path.dirname(_HERE))
-STORE_DIR = os.environ.get("EMAIL_APPROVAL_GATE_STORE",
-                           os.path.join(_ROOT, "store"))
+# Always the install's own store (ENVRELAXGATE1104): the hook runs in the
+# checked agent's own environment, so no environment variable may choose the
+# store whose config, approvals and lists this gate decides by. A test runs the
+# hook from a tmp install (<tmp>/scripts linked to the repo's scripts/;
+# abspath, not realpath, keeps <tmp> as the root).
+STORE_DIR = os.path.join(_ROOT, "store")
 DB_PATH = os.path.join(STORE_DIR, "claudeclaw.db")
 CONFIG_PATH = os.path.join(STORE_DIR, "autonomy-config.json")
 # EMAILALLANDOCIMZETT926: a standing recipient list, consulted at level 2 ONLY.
@@ -125,20 +129,13 @@ CONFIG_PATH = os.path.join(STORE_DIR, "autonomy-config.json")
 STANDING_PATH = os.path.join(STORE_DIR, "email-standing-recipients.json")
 
 
-def _window_from_env():
-    """(seconds, error). HOOKDEPLOAD1008: a non-integer override used to
-    raise at module load, before the __main__ net: exit 1, which PreToolUse
-    treats as NON-blocking. The error is kept here, and the send path denies
-    with it."""
-    raw = os.environ.get("EMAIL_APPROVAL_WINDOW_S", "1800")
-    try:
-        return int(raw), None
-    except ValueError:
-        return None, f"EMAIL_APPROVAL_WINDOW_S={raw!r} nem egesz szam"
-
-
-# ~30 minutes from approval (resolved_at) to send; env override is for tests.
-WINDOW_S, _WINDOW_ERR = _window_from_env()
+# The window from approval (resolved_at) to send: a fixed 1800 s, the SAME
+# value as the dashboard's (src/web/routes/approvals.ts APPROVAL_WINDOW_S; a
+# test pins the two). No environment override (ENVRELAXGATE1104): the hook runs
+# in the agent's own environment, and a longer window is a longer life for an
+# approval. Should it ever need tuning, it becomes a registry setting.
+APPROVAL_WINDOW_S = 1800
+WINDOW_S = APPROVAL_WINDOW_S
 
 # GMAILCONNECTOR914: the claude.ai Gmail connector's send-shaped tools carry
 # neither word (mcp__claude_ai_Gmail__send_message / reply / forward), so the
@@ -149,8 +146,15 @@ WINDOW_S, _WINDOW_ERR = _window_from_env()
 # let through BEFORE the load: every name the classifier can put in scope holds
 # one of these words, so this is a superset of it, and a read-only call never
 # needs the module (classify_tool below).
+# EMAILMESSAGESMUX1108: `email__messages` holds NONE of these words -- the tool is
+# `messages` and its send action is `new` -- so the gate exited 0 before the
+# classifier was ever asked, and a real letter went out unapproved on the live
+# install (2026-11-08). This is the superset test, so a name the classifier can
+# put in scope must appear HERE too; the word list and classify_mail_tool have to
+# be extended together, and the test file pins both.
 _MAYBE_MAIL_TOOL = re.compile(
-    r"send|reply|forward|draft|manage_email|update[-_]mail[-_]message|update[-_]shared[-_]mailbox[-_]message",
+    r"send|reply|forward|draft|manage_email|email__messages"
+    r"|update[-_]mail[-_]message|update[-_]shared[-_]mailbox[-_]message",
     re.I)
 
 # manage_email is a MULTIPLEXER, not a send tool: the same MCP tool searches the
@@ -166,7 +170,39 @@ _MAYBE_MAIL_TOOL = re.compile(
 # passes, drafts included (MANAGEDRAFT905). Fail-closed on doubt: a missing or
 # unreadable operation counts as a send, because that is the case where we
 # cannot prove it is not one. `send_email` needs no such test -- it only sends.
-_MANAGE_EMAIL_SEND_OPS = {"send", "reply", "reply_all", "replyall", "forward"}
+# "new" and the `action` key come from the `email` MCP server's `messages`
+# multiplexer (EMAILMESSAGESMUX1108): there the send operations are new / reply /
+# forward and the key is `action`, not `operation`. Adding them here rather than
+# in a second code path keeps ONE send test for every multiplexer.
+_MANAGE_EMAIL_SEND_OPS = {"send", "new", "reply", "reply_all", "replyall", "forward"}
+# The keys a multiplexer may name its operation with.
+_MANAGE_EMAIL_OP_KEYS = ("operation", "action")
+# EMAILMUXFOLLOWUP1111 (Dani's #2635 review F3, Samu 75811): the `email` server's
+# `messages` tool is judged by an ALLOW list of the operations measured as reads
+# on the live install (the #2635 test list). Its full operation list is not in
+# this repo, so a deny list of send words let an unknown one (`send_draft`,
+# `compose`) through; here every operation not on this list is a send.
+_EMAIL_MUX_READ_OPS = frozenset({
+    "search", "read", "mark_read", "mark_unread", "flag", "unflag", "move", "archive", "trash"})
+
+
+def _is_email_messages_mux(tool_name) -> bool:
+    """The `email` MCP server's `messages` multiplexer (email_extract.is_email_messages_mux, same test)."""
+    return str(tool_name or "").lower().replace("-", "_").endswith("email__messages")
+
+
+def _multiplexer_ops(tool_input: dict) -> list:
+    """Every operation the call names, normalised (lower case, '-' -> '_'), from EVERY op key.
+
+    F1 of the #2635 review: reading only the first non-empty key let a decoy
+    `operation: "search"` hide `action: "new"` (the key the `email` server reads).
+    A key is judged whatever the server reads, so all of them are collected."""
+    ops = []
+    for key in _MANAGE_EMAIL_OP_KEYS:
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            ops.append(value.strip().lower().replace("-", "_"))
+    return ops
 
 
 def _is_explicit_draft(tool_input: dict) -> bool:
@@ -210,8 +246,7 @@ def owner_cc_address() -> str:
     up in the launch environment would switch the gate off with no trace (the
     mail senders read their recipient settings from .env only for the same
     reason). The .env is the one next to the store this gate uses, i.e. the
-    install root in production, and the test's own root when a test points
-    EMAIL_APPROVAL_GATE_STORE at a temporary store."""
+    install root (a test's tmp install is its own root)."""
     try:
         with open(os.path.join(os.path.dirname(STORE_DIR), ".env"), encoding="utf-8") as fh:
             for line in fh:
@@ -305,10 +340,11 @@ def owner_cc_scope(tool: str, kind, tool_input: dict):
     its letter was checked where the draft was written."""
     if kind == "unclassified":
         return _draft_tool(tool), bool(_OWNER_CC_SEND_FALLBACK.search(tool))
-    is_draft = (kind == "draft" and _draft_tool(tool)) or (
-        kind == "manage_email" and _is_explicit_draft(tool_input))
     is_send = kind in ("send_email", "connector_send") or (
-        kind == "manage_email" and manage_email_is_send(tool_input))
+        kind == "manage_email" and manage_email_is_send(tool_input, tool))
+    is_draft = (kind == "draft" and _draft_tool(tool)) or (
+        kind == "manage_email" and not is_send and _is_explicit_draft(tool_input)
+        and not _is_email_messages_mux(tool))
     return is_draft, is_send
 
 
@@ -334,7 +370,7 @@ def owner_cc_gate(tool_input: dict, is_draft_only: bool, tool: str = "") -> None
          "levelrol masolatot ker (MAIL_OWNER_CC az install .env-jeben).")
 
 
-def manage_email_is_send(tool_input: dict) -> bool:
+def manage_email_is_send(tool_input: dict, tool_name: str = "") -> bool:
     """Is this manage_email call a send? Unreadable operation -> True (closed).
 
     MANAGEDRAFT905: the send OPERATIONS are also the only way to write a
@@ -349,10 +385,20 @@ def manage_email_is_send(tool_input: dict) -> bool:
     to stop the SEND. Fail-closed stays: only an explicit draft:true passes,
     a missing/ambiguous flag is a send.
     """
-    op = tool_input.get("operation")
-    if not isinstance(op, str) or not op.strip():
+    ops = _multiplexer_ops(tool_input)
+    if not ops:
         return True
-    if op.strip().lower().replace("-", "_") not in _MANAGE_EMAIL_SEND_OPS:
+    if _is_email_messages_mux(tool_name):
+        # F3: allow list -- a read only when EVERY named operation is a measured read.
+        # A non-string `action` next to a read `operation` is unreadable: a send (closed).
+        action = tool_input.get("action")
+        if action is not None and not (isinstance(action, str) and action.strip()):
+            return True
+        # F2: no draft:true exemption here. It is measured for manage_email only
+        # (MANAGEDRAFT905); nothing shows this server keeps a letter as a draft.
+        return not all(op in _EMAIL_MUX_READ_OPS for op in ops)
+    # F1: a send when ANY key names a send operation.
+    if not any(op in _MANAGE_EMAIL_SEND_OPS for op in ops):
         return False
     return not _is_explicit_draft(tool_input)
 
@@ -399,6 +445,24 @@ def _load_script_run_sends():
              "levelet kuld-e, ezert minden Bash-hivas tiltva, amig a modul nem javul. A javitas "
              "fajl-szerkeszto eszkozzel mehet: ez a kapu csak a Bash- es a levelezo "
              "eszkozokon fut.")
+
+
+def draft_hint_note(cmd: str, cwd) -> str:
+    """COPYGATEDRAFTFP1104 (Samu 69345): the fix to name when a python run with an address is a send only because the
+    interpreter was not isolated (outgoing-copy-gate.draft_isolation_hint). A hint, never a decision: any failure
+    gives no hint."""
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "outgoing_copy_gate_hint", os.path.join(_HERE, "outgoing-copy-gate.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if not mod.draft_isolation_hint(cmd, cwd):
+            return ""
+    except Exception:  # noqa: BLE001 -- a hint only
+        return ""
+    return ("(Ha ez a szkript csak piszkozatot ir, futtasd igy: python3 -I -S <szkript> ... -- akkor a kapu a szkript "
+            "tartalma alapjan dont, es egy csak a piszkozat-iro modulokat hasznalo szkript nem kuldes. A -I -S nelkul "
+            "az indulaskor futo kod (.pth, sitecustomize) nem latszik, ezert a cimmel futtatott szkript kuldes.)\n")
 
 
 def read_email_level():
@@ -543,7 +607,7 @@ def _env_file_setting(key: str, default: str = "") -> str:
     For a setting that decides who may receive a letter: a sender runs in the
     agent's own shell, where `KEY=... python3 ...` sets the environment. The
     .env is the one next to the store this gate reads (<root>/.env for
-    <root>/store), so a test that points the store elsewhere brings its own."""
+    <root>/store; a test's tmp install brings its own)."""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(STORE_DIR)), ".env"), encoding="utf-8") as fh:
             for line in fh:
@@ -917,7 +981,7 @@ def ledger_gate(kind: str, tool_input: dict, cmd: str, tool: str = "") -> None:
 # runs some other mailer or a sender copy elsewhere is levelled here exactly as
 # before.
 _SENDER_FLAGS = {
-    "send.py": ({"--to", "--cc", "--subject", "--body"}, {"--no-owner-cc", "--html", "--html-wrap"}),
+    "send.py": ({"--to", "--cc", "--subject", "--body", "--attach"}, {"--no-owner-cc", "--html", "--html-wrap"}),
     "graph-mail.ts": ({"--to", "--cc", "--subject", "--body", "--attach"}, {"--html"}),
 }
 _CANONICAL_RELATIVE = {"scripts/support-mail/send.py": "send.py", "scripts/graph-mail.ts": "graph-mail.ts"}
@@ -1105,6 +1169,9 @@ def names_own_sender(cmd: str, cwd) -> bool:
     try:
         lexer = shlex.shlex(cmd, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
+        # MAINGATENLCOMMENT1104: shlex starts a comment at a `#` inside a word and runs it to the end of the line, so
+        # `echo a#b; python3 scripts/send.py` hid the sender's name; this check only denies, so every word is kept.
+        lexer.commenters = ""
         words = list(lexer)
     except ValueError:
         words = cmd.split()
@@ -1139,6 +1206,18 @@ def canonical_forms_text() -> str:
             "`npx tsx scripts/graph-mail.ts send --flag 'ertek' ...` a projekt gyokerebol, cd "
             "nelkul, vagy ugyanez a projekt abszolut (szimlink nelkuli) utvonalaval; a torzs "
             "literal, vagy <<'EOF' heredoc, utana semmi mas parancs")
+
+
+def pass_with_warning(msg: str) -> str:
+    """A non-blocking warning, for BOTH readers. `systemMessage` is shown on
+    the host's terminal only and never enters the model's request; the agent
+    that just made the call learns of it only through
+    `hookSpecificOutput.additionalContext` (measured 2026-11-08 on our own
+    transcripts: systemMessage 0/6, PreToolUse additionalContext 7/7)."""
+    return json.dumps({
+        "systemMessage": msg,
+        "hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": msg},
+    })
 
 
 def deny(msg: str):
@@ -1258,13 +1337,15 @@ def main():
             sys.exit(0)  # a draft puts nothing on the wire; the level stops SENDS
         # A multiplexer tool is in scope only when the call is a send; a search,
         # a read or a draft is not what email_send levels.
-        if kind == "manage_email" and not manage_email_is_send(tool_input):
+        if kind == "manage_email" and not manage_email_is_send(tool_input, tool):
             sys.exit(0)
 
     level, note = read_email_level()
     prefix = f"({note})\n" if note else ""
     if level >= 3:
         sys.exit(0)
+    if tool == "Bash":
+        prefix += draft_hint_note(cmd, payload.get("cwd"))
     if level <= 1:
         deny(prefix +
              "Az email_send autonomia-szint 1 (csak jelez): a kuldes tiltott.\n"
@@ -1275,9 +1356,9 @@ def main():
         # itself (sender_check.py) on the envelope it delivers, standing list
         # included, and consumes the approval there. Not consuming here keeps
         # exactly one consumption per send.
-        print(json.dumps({"systemMessage":
+        print(pass_with_warning(
             "email-approval-gate: email_send level 2 -- a kuldo maga ellenorzi a jovahagyast "
-            "(vagy az allando cimzett-listat), es elutasitaskor kiirja a level horgonyat."}))
+            "(vagy az allando cimzett-listat), es elutasitaskor kiirja a level horgonyat."))
         sys.exit(0)
     if tool == "Bash" and names_own_sender(cmd, payload.get("cwd")):
         deny(prefix +
@@ -1299,9 +1380,6 @@ def main():
              "azzal kerj jovahagyast, es a jovahagyas utan ugyanaz a hivas atmegy.")
 
     # level 2: CHECK-BEFORE-SEND
-    if _WINDOW_ERR:
-        deny(prefix + f"A kapu beallitasa hibas ({_WINDOW_ERR}) -- fail-closed, "
-             "a level nem mehet ki.")
     env = _load_collect_email_envelope()(tool, tool_input)
     if env["unreadable_reason"]:
         deny(prefix +
@@ -1371,9 +1449,9 @@ def main():
                 f"{os.path.basename(STANDING_LOG)} rogzitette a kuldest ES az ertesites "
                 "hianyat is, de a gazda ettol meg nem tud rola -- ha a level fontos, "
                 "szolj neki a csatornan.")
-        print(json.dumps({"systemMessage":
+        print(pass_with_warning(
             f"email-approval-gate: {hit} allando cimzett, a kuldes jovahagyas nelkul "
-            f"mehet. Minden mas cimzett tovabbra is jovahagyas-koteles. {note}"}))
+            f"mehet. Minden mas cimzett tovabbra is jovahagyas-koteles. {note}"))
         sys.exit(0)
 
     anchor = content_anchor(env)
@@ -1390,9 +1468,9 @@ def main():
                      "kapu maga hasznalja fel a jovahagyast. A projekt kuldoinek alakja: "
                      f"{canonical_forms_text()}.")
     if verdict == "allowed":
-        print(json.dumps({"systemMessage":
+        print(pass_with_warning(
             f"email-approval-gate: jovahagyas {detail} felhasznalva (egyszer-hasznalatos), a kuldes mehet."
-            + copy_note}))
+            + copy_note))
         sys.exit(0)
 
     reasons = {

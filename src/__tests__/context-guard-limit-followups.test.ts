@@ -59,6 +59,7 @@ vi.mock('../web/agent-process.js', async () => {
   const { vi } = await import('vitest')
   h.restartAgentProcess = vi.fn(async () => ({ ok: true }))
   return {
+    withTmuxBatch: (fn: () => unknown) => fn(),
     agentRunState: () => 'running',
     agentSessionName: (n: string) => `agent-${n}`,
     restartAgentProcess: (...a: unknown[]) => h.restartAgentProcess(...a),
@@ -105,7 +106,12 @@ vi.mock('../web/active-model.js', async () => {
 })
 vi.mock('../web/main-agent.js', () => ({ MAIN_CHANNELS_SESSION: 'marveen-channels' }))
 vi.mock('../notify.js', () => ({ notifyChannel: async () => {} }))
-vi.mock('../db.js', () => ({ createAgentMessage: () => ({ id: 1 }) }))
+vi.mock('../db.js', () => ({
+  createAgentMessage: () => ({ id: 1 }),
+  // Card 2e1a5659: the resume send reads pending rows through the drain;
+  // empty here = byte-identical legacy resume, which is what these tests measure.
+  getPendingMessages: () => [],
+}))
 
 const MIN = 60_000
 const T0 = 1_790_000_000_000

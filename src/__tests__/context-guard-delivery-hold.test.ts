@@ -44,6 +44,7 @@ vi.mock('../web/context-guard-store.js', async () => {
   return { readContextGuardConfig: () => normalizeContextGuardConfig({ idleFlushEnabled: true, idleMinutes: 20 }) }
 })
 vi.mock('../web/agent-process.js', () => ({
+  withTmuxBatch: (fn: () => unknown) => fn(),
   agentRunState: () => 'running',
   agentSessionName: (n: string) => `agent-${n}`,
   restartAgentProcess: async () => { h.restartAt = Date.now(); return { ok: true } },
@@ -90,6 +91,12 @@ vi.mock('../db.js', () => ({
     if (tag === 'context-guard restart notice') h.messages.push(content)
     return { id: 1 }
   },
+  // Card 2e1a5659: the resume send now goes through resume-queue-drain, which
+  // reads the recipient's pending rows before falling back to the plain
+  // directive send. Empty pending = byte-identical legacy resume, which is the
+  // scenario these hold-semantics tests exercise; without this export the
+  // drain throws on an undefined db call and the resume never lands.
+  getPendingMessages: () => [],
 }))
 
 type Runner = typeof import('../web/context-guard-runner.js')
@@ -108,6 +115,7 @@ async function boot(): Promise<{ runner: Runner; hold: Hold }> {
 }
 
 beforeEach(() => {
+  vi.stubEnv('ROUTER_BATCH_INJECT_AGENTS', 'some-other-agent')
   h.ready = false
   h.sendGate = null
   h.resumeSends = 0
@@ -123,6 +131,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.unstubAllEnvs()
   for (const t of timers) clearInterval(t)
   timers = []
   vi.clearAllTimers()

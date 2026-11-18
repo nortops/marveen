@@ -68,7 +68,23 @@ MAX_ESCAPES=4                                  # ensure_modal_closed bound
 # makes claude exit immediately while the alert would falsely say "respawned".
 # %q-quoted at interpolation (like the model id), so a hostile value can't break
 # out of the respawn shell-string.
-RESPAWN_PLUGIN="${STUCK_MODAL_PLUGIN:-plugin:telegram@claude-plugins-official}"
+# GROMZONOPROVIDER1108 (EGM review): the default follows the install's CHANNEL_PROVIDER, mapped EXACTLY as
+# channels.sh's resolve_plugin_ids() does. It used to be telegram for every install, so a respawn on a Slack, Teams,
+# Discord or Gromzo install came back on the Telegram plugin.
+_smg_provider="$(grep -E '^CHANNEL_PROVIDER=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"'\r ')"
+case "$_smg_provider" in
+  slack)    _smg_default="plugin:slack-channel@marveen-marketplace" ;;
+  whatsapp) _smg_default="plugin:whatsapp@marveen-marketplace" ;;
+  teams)    _smg_default="plugin:teams@marveen-marketplace" ;;
+  discord)  _smg_default="plugin:discord@claude-plugins-official" ;;
+  gromzo)   _smg_default="plugin:gromzo-channel@gromzo-local" ;;
+  *)        _smg_default="plugin:telegram@claude-plugins-official" ;;
+esac
+RESPAWN_PLUGIN="${STUCK_MODAL_PLUGIN:-$_smg_default}"
+# CHANNELUNCONF1110: kept for the respawn below (the unconfigured rule is asked per provider, only for the default).
+SMG_PROVIDER="${_smg_provider:-telegram}"
+SMG_DEFAULT_PLUGIN="$_smg_default"
+unset _smg_provider _smg_default
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$LOG_TAG] $*" || true; }
 
@@ -78,6 +94,58 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$LOG_TAG] $*" || true; }
 # respawn grace and the backoff never held (MODELCONFIRM1005).
 file_mtime() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
+}
+
+# --- live footer line (PANEFOOTEROUTSIDE1114) -----------------------------------
+# A PORT of liveFooterLine / idleFooterIndex in src/pane-state.ts, over a plain
+# `capture-pane -p` text on stdin. Prints the live idle footer line, or nothing.
+# The rule, the same as the TypeScript one:
+#   - skip trailing blank lines; the last non-blank line is `last`;
+#   - the last column-0 input-box rule (ten or more `─`) at or above `last`;
+#     if there is one, the footer is the FIRST line under it, up to `last`, that
+#     carries the footer words AND starts like the live footer (blanks, then the
+#     mode glyph ⏵ / ⏸ once or twice and a blank, or `? for shortcuts`);
+#   - with no rule on screen only `last` can be that line;
+#   - otherwise `last` still counts when it is the tmux-clipped footer or the
+#     bare background-count footer.
+# A parity test (src/__tests__/pane-footer-port-parity.test.ts) runs this, the
+# Python port and the TypeScript original over one corpus and fails on any
+# difference. Portable on purpose: no interval repetition (mawk and the BSD awk
+# lack it), byte semantics under LC_ALL=C, whitespace is ASCII. The guard is a
+# recovery path, so it must not need node or the built tree.
+live_footer_line() {
+  LC_ALL=C awk '
+    function strip(s) {
+      gsub(/\033\[[^@-~]*[@-~]/, "", s)
+      sub(/\033\[[^@-~]*$/, "", s)
+      gsub(/\033/, "", s)
+      return s
+    }
+    function words(l) {
+      return l ~ /[A-Za-z][A-Za-z0-9_-]* on( \(shift\+tab to cycle\)| · .*(ctrl\+t|↓ to manage|← for agents))/ || l ~ /\? for shortcuts/
+    }
+    function starts(l) {
+      return strip(l) ~ /^[ \t\r\f\v]*(⏵⏵ |⏵⏸ |⏸⏵ |⏸⏸ |⏵ |⏸ |\? for shortcuts)/
+    }
+    function clipped(l) {
+      return l ~ /[A-Za-z][A-Za-z0-9_-]* on · .*·.*…[ \t\r\f\v]*$/
+    }
+    function shelltail(l) {
+      return l ~ /^[ \t\r\f\v]*(⏵⏵|⏵⏸|⏸⏵|⏸⏸|⏵|⏸) [A-Za-z][A-Za-z0-9_-]* ([A-Za-z][A-Za-z0-9_-]* )?([A-Za-z][A-Za-z0-9_-]* )?on( \(shift\+tab to cycle\))? · [0-9]+ (shells|shell|monitors|monitor)(( ·|,) [0-9]+ (shells|shell|monitors|monitor))*[ \t\r\f\v]*$/
+    }
+    { L[NR] = $0 }
+    END {
+      last = NR
+      while (last >= 1 && L[last] ~ /^[ \t\r\f\v]*$/) last--
+      if (last < 1) exit
+      sep = last
+      while (sep >= 1 && L[sep] !~ /^──────────/) sep--
+      if (sep >= 1) {
+        for (i = sep + 1; i <= last; i++) if (words(L[i]) && starts(L[i])) { print L[i]; exit }
+      } else if (words(L[last]) && starts(L[last])) { print L[last]; exit }
+      if (clipped(L[last]) || shelltail(L[last])) print L[last]
+    }
+  '
 }
 
 # --- pure classifier (mirrors src/pane-state.ts detectPaneState) ---------------
@@ -97,9 +165,14 @@ classify_pane() {
   if printf '%s' "$pane" | grep -qE 'esc to interrupt|\([0-9]+s (·|\.)'; then
     echo busy; return
   fi
-  # 3. idle footer present -> idle (healthy prompt)
-  if printf '%s' "$pane" | grep -qaF 'bypass permissions on' \
-     || printf '%s' "$pane" | grep -qaF '? for shortcuts'; then
+  # 3. the LIVE idle footer -> idle (healthy prompt). PANEFOOTEROUTSIDE1114:
+  #    read where the UI draws it (live_footer_line, the port of pane-state's
+  #    liveFooterLine), in EVERY permission mode. The old whole-pane grep for
+  #    'bypass permissions on' / '? for shortcuts' read a dialog as idle when a
+  #    line above or inside it quoted those words, and read the real, empty
+  #    footer of the plan, auto, accept edits and don't ask modes as stuck
+  #    (measured on 2.1.325 captures).
+  if [ -n "$(printf '%s\n' "$pane" | live_footer_line)" ]; then
     echo idle; return
   fi
   # 4. neither -> the idle footer is hidden by a modal overlay and no live turn
@@ -191,7 +264,7 @@ alert_owner() {
   # /dev/null: a skipped alert must say why (no DM entry, several DM entries,
   # no access.json). Not captured with 2>&1 -- any stderr noise on the success
   # path would then become part of the chat id.
-  chat="$(resolve_owner_chat_id "$INSTALL_DIR/.env")" || chat=""
+  chat="$(resolve_alert_chat_id "$INSTALL_DIR/.env")" || chat=""
   if [ -z "$token" ] || [ -z "$chat" ]; then
     log "ALERT (no bot token or owner chat id configured): $msg"; return 1
   fi
@@ -359,6 +432,67 @@ run_guard() {
   CLAUDE_Q="$(printf '%q' "$CLAUDE")"
   # W2: %q-quote the (config-overridable) plugin id, same treatment as the model.
   local PLUGIN_Q; PLUGIN_Q="$(printf '%q' "$RESPAWN_PLUGIN")"
+  # INSTALLDIRTYTREE1103: the primary plugin is no longer enabled in the tracked
+  # project settings.json -- channels.sh passes it in a launch-time --settings
+  # file instead. A respawn without that flag would come back with the Slack /
+  # WhatsApp / Teams primary disabled by the shipped project false (deaf main).
+  # GROMZOMAINAGENT1106: the co-listen extras, derived EXACTLY as channels.sh and channel-watchdog.sh do. This
+  # respawn used to pass the primary alone, so it half-muted every extra (Slack co-listen, the main agent's
+  # Gromzo channel) until the next full restart. The gromzo id passes only with a usable agent.sock and a valid
+  # mxd slug, and its MXD_AGENT/MXD_SCOPE go in as exports of this command (scripts/main-gromzo-launch.sh).
+  local _extra _gz_main GROMZO_ENV="" EXTRA_Q="" _p
+  _extra="$(grep -E '^CHANNEL_PLUGINS_EXTRA=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+  _gz_main="$(grep -E '^MAIN_AGENT_ID=' "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+  local CHAN_ARG=""
+  if [ "$RESPAWN_PLUGIN" = "plugin:gromzo-channel@gromzo-local" ]; then
+    # GROMZONOPROVIDER1108: the Gromzo plugin is the PRIMARY; as in channels.sh it is never also an extra, and it
+    # comes back only when the main agent can take it (main_gromzo_primary_ready); otherwise the respawn is a
+    # gromzo-pending session (no Gromzo channel), and channels.sh's poll restarts it once it is ready.
+    _extra="$(printf '%s\n' $_extra | grep -vxF 'gromzo-channel@gromzo-local' | tr '\n' ' ')"
+    for _p in $_extra; do
+      [ -n "$_p" ] && EXTRA_Q="$EXTRA_Q $(printf '%q' "plugin:$_p")"
+    done
+    if . "$INSTALL_DIR/scripts/main-gromzo-launch.sh" 2>/dev/null && main_gromzo_primary_ready "$_gz_main"; then
+      GROMZO_ENV="$(main_gromzo_env "$_gz_main" gromzo-channel@gromzo-local)"
+      CHAN_ARG="--channels $PLUGIN_Q${EXTRA_Q}"
+    elif [ -n "$EXTRA_Q" ]; then
+      CHAN_ARG="--channels${EXTRA_Q}"
+    fi
+    EXTRA_Q=""
+    _extra_done=1
+  elif . "$INSTALL_DIR/scripts/main-gromzo-launch.sh" 2>/dev/null; then
+    # shellcheck disable=SC2086 # word-split on purpose: space-separated plugin ids
+    _extra="$(main_gromzo_filter_ids "$_gz_main" $_extra)"
+    # shellcheck disable=SC2086
+    GROMZO_ENV="$(main_gromzo_env "$_gz_main" $_extra)"
+  else
+    # No helper (a half-updated tree): never pass the gromzo id without its exports.
+    _extra="$(printf '%s\n' $_extra | grep -vxF 'gromzo-channel@gromzo-local' | tr '\n' ' ')"
+  fi
+  # CHANNELUNCONF1110: a token provider with no token comes back WITHOUT its primary, exactly as channels.sh launched
+  # it (scripts/main-channel-configured.sh); the extras stay. Only for the provider's own default plugin: an explicit
+  # STUCK_MODAL_PLUGIN override keeps the old launch.
+  local _primary_id="${RESPAWN_PLUGIN#plugin:}"
+  if [ "${_extra_done:-0}" != 1 ]; then
+    for _p in $_extra; do
+      [ -n "$_p" ] && EXTRA_Q="$EXTRA_Q $(printf '%q' "plugin:$_p")"
+    done
+    if [ "$RESPAWN_PLUGIN" = "$SMG_DEFAULT_PLUGIN" ] \
+       && . "$INSTALL_DIR/scripts/main-channel-configured.sh" 2>/dev/null \
+       && main_channel_unconfigured "$SMG_PROVIDER" "$INSTALL_DIR" "${HOME:-}"; then
+      _primary_id=""
+      CHAN_ARG=""
+      [ -n "$EXTRA_Q" ] && CHAN_ARG="--channels${EXTRA_Q}"
+    else
+      CHAN_ARG="--channels $PLUGIN_Q${EXTRA_Q}"
+    fi
+  fi
+  unset _extra_done
+  local SETTINGS_FLAG=""
+  if . "$INSTALL_DIR/scripts/main-extra-plugins-settings.sh" 2>/dev/null; then
+    # shellcheck disable=SC2086
+    SETTINGS_FLAG="$(main_extra_settings_flag "$INSTALL_DIR" "$_primary_id" $_extra)"
+  fi
 
   # CFGDIR686: the main-agent isolated-config decision belongs on EVERY respawn
   # path, not just the watchdog's. PR #686 fixed the 401 outage by giving
@@ -378,8 +512,11 @@ run_guard() {
     # rather than hard-coding 'telegram' -- a renamed install would otherwise get
     # a config dir that belongs to a different channel.
     local _prov="${RESPAWN_PLUGIN#plugin:}"; _prov="${_prov%%@*}"
-    local _cfg_line _cfg_mode _cfg_rest _cfg_dir _cfg_token_secret
-    _cfg_line="$("$NODE_BIN" "$INSTALL_DIR/scripts/main-agent-isolated-config.mjs" "$_prov" 2>>"$STORE/channels-failures.log" || true)"
+    local _cfg_raw _cfg_line _cfg_mode _cfg_rest _cfg_dir _cfg_token_secret _ma_mode _ma_dir _ma_line
+    # The contract rides fd 3 (as in channels.sh and channel-watchdog.sh): a log line the dist module prints on
+    # stdout must not become the mode line (MAINAUTH1107: this caller read stdout until now).
+    _cfg_raw="$("$NODE_BIN" "$INSTALL_DIR/scripts/main-agent-isolated-config.mjs" "$_prov" 3>&1 2>>"$STORE/channels-failures.log" 1>&2 || true)"
+    _cfg_line="$(printf '%s\n' "$_cfg_raw" | grep -m1 -E '^(explicit|rotated|isolated|token)	/' || true)"
     _cfg_mode="${_cfg_line%%	*}"
     _cfg_rest="${_cfg_line#*	}"
     if [ "$_cfg_mode" = "token" ]; then
@@ -391,7 +528,9 @@ run_guard() {
     fi
     if [ -n "$_cfg_line" ] && [ -d "$_cfg_dir" ]; then
       if [ "$_cfg_mode" = "explicit" ] || [ "$_cfg_mode" = "rotated" ]; then
-        CFG_ENV="export CLAUDE_CONFIG_DIR=$(sh_single_quote "$_cfg_dir") && "
+        # APIKEYSCOPE1107: an own login unsets BOTH inherited credentials, as channels.sh and the monitor do;
+        # without it the pane-auth file (sourced first) would hand this login the fleet token and the key.
+        CFG_ENV="export CLAUDE_CONFIG_DIR=$(sh_single_quote "$_cfg_dir") && unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY && "
       elif [ "$_cfg_mode" = "token" ]; then
         # Token-mode rotated plan -- same credential-less dir as `isolated`, but
         # export THAT plan's vault-stored token. See channels.sh's identical
@@ -403,6 +542,13 @@ run_guard() {
       fi
       log "main-agent $_cfg_mode CLAUDE_CONFIG_DIR=$_cfg_dir"
     fi
+    # MAINAUTH1107: the credential this respawn runs on, from the same module the boot and the dashboard use, right
+    # before the respawn (see channel-watchdog.sh). No contract line = the files the last launch wrote stay.
+    _ma_mode=""; _ma_dir=""
+    if [ -n "$CFG_ENV" ]; then _ma_mode="$_cfg_mode"; _ma_dir="$_cfg_dir"; fi
+    _ma_line="$("$NODE_BIN" "$INSTALL_DIR/scripts/main-agent-auth.mjs" "$_ma_mode" "$_ma_dir" 3>&1 2>>"$STORE/channels-failures.log" 1>&2 || true)"
+    _ma_line="$(printf '%s\n' "$_ma_line" | grep -m1 -E '^main-auth	' || true)"
+    [ -n "$_ma_line" ] && log "main-auth $(printf '%s' "$_ma_line" | cut -f2- | tr '\t' ' ')"
   fi
 
   # FLEETVENV923: the fleet venv's bin/ first, exactly as channels.sh boots the
@@ -410,7 +556,19 @@ run_guard() {
   . "$INSTALL_DIR/scripts/fleet-venv-prefix.sh" 2>/dev/null || fleet_venv_prefix() { :; }
   local FLEET_VENV_PREFIX; FLEET_VENV_PREFIX="$(fleet_venv_prefix "$INSTALL_DIR" "$STORE/channels-failures.log")"
   # NATIVECLAUDEFIRST1011: the same order as the channels.sh boot PATH (#1896).
-  local RESPAWN_CMD="export PATH=\"${FLEET_VENV_PREFIX}\$HOME/.local/bin:/opt/homebrew/bin:\$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin\" && export CLAUDE_CODE_DISABLE_AGENT_VIEW=1 && { [ \"\$(id -u)\" != 0 ] || export IS_SANDBOX=1; } && ${CFG_ENV}$CLAUDE_Q --dangerously-skip-permissions ${MODEL_FLAG}--channels $PLUGIN_Q"
+  # APIKEYSCOPE1107: the respawned main session sources the same 0600 pane-auth file channels.sh wrote for it
+  # (TOKENARGV929: the token, and the key whenever .env has one; nothing in argv). Until now a respawn got its
+  # credentials only from the tmux server global env, and the key no longer lives there on a subscription install.
+  # BEFORE CFG_ENV, so an own-login mode (explicit/rotated) unsets both again and an isolated/token mode exports
+  # its own token over it. A missing file is not an error (the chain goes on).
+  local PANE_AUTH_SRC="{ [ ! -f $(sh_single_quote "$INSTALL_DIR/store/.channels-pane-auth") ] || . $(sh_single_quote "$INSTALL_DIR/store/.channels-pane-auth"); } && "
+  # MAINAUTH1107: the post-file right AFTER CFG_ENV (see channel-watchdog.sh).
+  local PANE_AUTH_POST="{ [ ! -f $(sh_single_quote "$INSTALL_DIR/store/.channels-pane-auth-post") ] || . $(sh_single_quote "$INSTALL_DIR/store/.channels-pane-auth-post"); } && "
+  # GROMZONEEDSAUTH1109: the Gromzo needs-auth cleanup in the pane, after the kill and the exports, right before claude
+  # (scripts/gromzo-needs-auth-pane.sh). No helper (a half-updated tree): no step, the respawn as before.
+  . "$INSTALL_DIR/scripts/gromzo-needs-auth-pane.sh" 2>/dev/null || gromzo_needs_auth_pane_step() { :; }
+  local GROMZO_NA_STEP; GROMZO_NA_STEP="$(gromzo_needs_auth_pane_step "$INSTALL_DIR" "$CHAN_ARG")"
+  local RESPAWN_CMD="export PATH=\"${FLEET_VENV_PREFIX}\$HOME/.local/bin:/opt/homebrew/bin:\$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin\" && export CLAUDE_CODE_DISABLE_AGENT_VIEW=1 && { [ \"\$(id -u)\" != 0 ] || export IS_SANDBOX=1; } && ${PANE_AUTH_SRC}${CFG_ENV}${PANE_AUTH_POST}${GROMZO_ENV}${GROMZO_NA_STEP}$CLAUDE_Q --dangerously-skip-permissions${SETTINGS_FLAG} ${MODEL_FLAG}${CHAN_ARG}"
 
   log "stuck modal not cleared by Escape -- respawn-pane $SESSION (respawn #$((count+1)))"
   # G: alert ONLY after the respawn-pane actually succeeds, so a failed respawn
@@ -429,6 +587,7 @@ run_guard() {
 
 case "${1:-}" in
   classify)       classify_pane ;;
+  footer-line)    live_footer_line ;;
   decide)         decide_action "${2:-}" "${3:-0}" "${4:-0}" ;;
   sanitize-model) sanitize_model "${2:-}" ;;
   mtime)          file_mtime "${2:-}" ;;

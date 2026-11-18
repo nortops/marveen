@@ -153,6 +153,7 @@ Every dashboard-editable setting is a registry entry with the following fields:
 | `OLLAMA_URL` | string | `http://localhost:11434` | Ollama API base URL | yes |
 | `MEMORY_IMPORT_CATEGORIZE_MODEL` | string | (empty) | Ollama model that tiers memories on import (override); empty = auto-detect an installed `gemma4`, else all warm | yes |
 | `MEMORY_CONTENT_FILTER_STRICT_COMMANDS` | boolean | `0` (off) | Strict command-syntax group of the memory content filter (curl http(s), bash -c, eval(, exec(, import subprocess, rm -rf) on memory POST/PUT/PATCH; cost: prose that only quotes a command form is a 400 too | yes |
+| `CLI_INVENTORY_DIRS` | string | (empty) | Comma-separated absolute or `~/` folders whose subfolders the CLI inventory (Connections > CLI page, `GET /api/cli-inventory`) reads as tools (one `manifest.json` per subfolder), at most 16, no spaces, no `..`, e.g. `~/printing-press/library`. Empty (the default) means the inventory is off and nothing runs. The inventory starts the `*-pp-cli` files it finds there with the dashboard user's rights (`agent-context` or `--help`, with a timeout and a scrubbed environment): configure only folders you trust. Only the owner's dashboard session starts a run; any other caller gets the saved inventory. Only the owner may set it (dashboard login), not the shared agent token, and a .env line does not count, because whoever changes it chooses what the dashboard runs. See [cli-inventory](cli-inventory.md) | no |
 | `OSS_INVENTORY_NOTES_DIRS` | string | `research` | Comma-separated folder names inside each agent folder whose `*.md` research notes the adopted open-source inventory (Connectors page, `GET /api/opensource-inventory`) reads for star counts and measured before/after effects, e.g. `research,kutatas`; plain names only (no `/`, no `..`) | no |
 | `OSS_INVENTORY_OWN_OWNERS` | string | (empty) | Comma-separated repository owner names for the adopted open-source inventory, e.g. your own GitHub account(s). Clones the scan reaches that have a readable http(s) or ssh origin are listed unless their origin owner name is in OSS_INVENTORY_OWN_OWNERS. The scan does not look inside another clone, node_modules, caches, virtual environments, unpacked vendor packages or symlinked folders. The owner name is the first path segment of the clone's own origin URL, matched on any host (the host is not compared); a matched clone, a fork of third-party code kept under such an owner included, is counted (`summary.unlisted_clones`), not listed. Ownership is not inferred from the installation's remotes. Clones without a readable http(s) or ssh origin are counted, not listed | no |
 
@@ -183,6 +184,7 @@ Every dashboard-editable setting is a registry entry with the following fields:
 |-----|------|---------|----------|---------|
 | `MAIN_AGENT_ISOLATED_CONFIG` | boolean | `0` (off) | macOS only | yes |
 | `TELEGRAM_TOPICS_ENABLED` | boolean | `0` (off) | all | yes (channel start) |
+| `TELEGRAM_REPLY_BUTTONS` | boolean | `1` (on) | all | yes (channel start) |
 
 #### `MAIN_AGENT_ISOLATED_CONFIG` -- main-agent config isolation (macOS)
 
@@ -302,6 +304,20 @@ the plugin file is byte for byte what it was before the patch.
 anchors of the patch do not match, the whole patch is left out (one loud line in
 `store/channels-failures.log`, and `/status` says so); answers then land outside the
 topic, and the channel itself keeps working.
+
+#### `TELEGRAM_REPLY_BUTTONS`: answer buttons on Telegram
+
+**What it is for.** On (the default), an agent may put one-tap answer buttons under a
+question: the reply tool's `buttons` field. Off, no agent sends buttons. A non-empty
+`buttons` list is dropped by the channel, the message goes out without buttons, and the
+tool result warns the agent to ask in plain text. An empty list (`buttons: []`) still
+takes off a keyboard left earlier under the input field. A button sent before the switch
+still answers once when tapped.
+
+**Turning it off.** Dashboard: *Settings → Channels → `TELEGRAM_REPLY_BUTTONS`*, or
+`TELEGRAM_REPLY_BUTTONS=0` in `.env`. The next channel start rewrites the plugin source.
+Running agents keep the old code until their own plugin process restarts: restarting the
+session brings it to them.
 
 **API endpoints:**
 

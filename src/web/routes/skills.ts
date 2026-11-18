@@ -1,4 +1,4 @@
-import { createReadStream, existsSync, readdirSync, mkdirSync, unlinkSync, rmSync, statSync } from 'node:fs'
+import { createReadStream, existsSync, lstatSync, readdirSync, realpathSync, mkdirSync, unlinkSync, rmSync, statSync } from 'node:fs'
 import { join, sep, basename } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
@@ -18,7 +18,7 @@ import { readBody, json } from '../http-helpers.js'
 import { sanitizeSkillName } from '../sanitize.js'
 import { serializeSkillsDir } from '../skills-dir-queue.js'
 import type { RouteContext } from './types.js'
-import { mayActAsOwner, OWNER_SESSION_REQUIRED } from './auth.js'
+import { mayActAsOwner, refuseOwner } from './auth.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -67,6 +67,34 @@ function getSkillAgents(skillDirName: string): string[] {
     if (existsSync(agentSkillDir)) agents.push(agentName)
   }
   return agents
+}
+
+/**
+ * SKILLPUTSCOPE1114: the SKILL.md of `skillDir` as a real path, only when the skill folder, followed through every
+ * link, stays inside `base` (followed too), and the SKILL.md, if it is there, stays inside that folder. null when the
+ * folder does not exist or anything points out.
+ *
+ * Why followed and not refused: links inside the base are in real use (measured 2026-11-14 on a live install: five
+ * global skills are links to a sibling folder under the same skills root; one agent's skills are links into its own
+ * `.agents/skills`). What must not happen is the dashboard process reading or writing, through a link an agent placed
+ * in its own skills folder, a file the agent's own rules keep it from: another agent's folder, the store, a key file.
+ *   - base: the global skills root; the main agent's `.claude/skills`; a sub-agent's OWN folder (its links go there).
+ *   - A SKILL.md that is missing is fine (a write creates it); one that is a link must stay in the skill folder.
+ */
+function skillMdWithin(skillDir: string, base: string): { dir: string; md: string } | null {
+  try {
+    const realBase = realpathSync(base)
+    const realDir = realpathSync(skillDir)
+    if (!realDir.startsWith(realBase + sep)) return null
+    const md = join(realDir, 'SKILL.md')
+    let exists = true
+    try { lstatSync(md) } catch { exists = false }
+    if (!exists) return { dir: realDir, md }
+    const realMd = realpathSync(md)
+    return realMd.startsWith(realDir + sep) ? { dir: realDir, md: realMd } : null
+  } catch {
+    return null
+  }
 }
 
 export async function tryHandleSkills(ctx: RouteContext): Promise<boolean> {
@@ -282,13 +310,13 @@ export async function tryHandleSkills(ctx: RouteContext): Promise<boolean> {
   if (pendingActionMatch && method === 'POST') {
     // The decision on a quarantined skill is the owner's, never the shared token every agent holds
     // (an agent could otherwise put its own quarantined skill live, fleet-wide). The same predicate
-    // as issuing credentials (mayIssueCredentials, #2163): the owner's session, also when the
-    // browser sends the stored token alongside it; the bare token only before the first dashboard
-    // login exists. Reject is held to the same bar, so an agent cannot discard what is waiting for
-    // the owner's review either.
+    // as issuing credentials (mayActAsOwner, #2163): the owner's session, also when the browser
+    // sends the stored token alongside it; the bare token never, not even before the first dashboard
+    // login exists (OWNERGATE4-1104). Reject is held to the same bar, so an agent cannot discard what
+    // is waiting for the owner's review either.
     if (!mayActAsOwner(ctx.auth, req)) {
       logger.warn({ id: pendingActionMatch[1], action: pendingActionMatch[2], auth: ctx.auth?.kind, agent: ctx.auth?.agent }, 'Pending skill decision refused: no owner session')
-      json(res, OWNER_SESSION_REQUIRED, 403)
+      refuseOwner(res, 'Deciding on a quarantined skill needs the dashboard login (an owner session).')
       return true
     }
     const id = decodeURIComponent(pendingActionMatch[1])
@@ -314,6 +342,8 @@ export async function tryHandleSkills(ctx: RouteContext): Promise<boolean> {
 
   const globalSkillDetailMatch = path.match(/^\/api\/skills\/([^/]+)$/)
   if (globalSkillDetailMatch && method === 'GET') {
+    // SKILLPUTSCOPE1114: the agent and the global branch read SKILL.md through skillMdWithin, so a skill folder (or a
+    // SKILL.md) that is a link to somewhere else is not read through the dashboard.
     const skillName = decodeURIComponent(globalSkillDetailMatch[1])
 
     // When ?agent=<id> is supplied, resolve from that agent's local skills dir.
@@ -332,13 +362,15 @@ export async function tryHandleSkills(ctx: RouteContext): Promise<boolean> {
         json(res, { error: 'Skill not found' }, 404)
         return true
       }
-      const skillMdPath = join(skillDir, 'SKILL.md')
-      if (!existsSync(skillMdPath)) { json(res, { error: 'Skill not found' }, 404); return true }
-      const content = readFileOr(skillMdPath, '')
+      // A sub-agent's skill links point into its own folder (measured), so that folder is the base; the main agent's
+      // base is its .claude/skills, never PROJECT_ROOT (the store and the keys are there).
+      const within = skillMdWithin(skillDir, agentParam === MAIN_AGENT_ID ? agentSkillsRoot : agentDir(agentParam))
+      if (within === null || !existsSync(within.md)) { json(res, { error: 'Skill not found' }, 404); return true }
+      const content = readFileOr(within.md, '')
       const files: string[] = []
-      try { for (const entry of readdirSync(skillDir)) files.push(entry) } catch { /* no-op */ }
+      try { for (const entry of readdirSync(within.dir)) files.push(entry) } catch { /* no-op */ }
       let agentDetailMtime = 0
-      try { agentDetailMtime = statSync(skillMdPath).mtimeMs } catch { /* no-op */ }
+      try { agentDetailMtime = statSync(within.md).mtimeMs } catch { /* no-op */ }
       json(res, {
         name: skillName,
         description: parseSkillDescription(content),
@@ -392,18 +424,18 @@ export async function tryHandleSkills(ctx: RouteContext): Promise<boolean> {
       json(res, { error: 'Skill not found' }, 404)
       return true
     }
-    if (!existsSync(skillDir)) { json(res, { error: 'Skill not found' }, 404); return true }
+    const within = skillMdWithin(skillDir, GLOBAL_SKILLS_DIR)
+    if (within === null) { json(res, { error: 'Skill not found' }, 404); return true }
 
-    const skillMdPath = join(skillDir, 'SKILL.md')
-    const content = readFileOr(skillMdPath, '')
+    const content = readFileOr(within.md, '')
     const description = parseSkillDescription(content)
     const keywords = parseSkillKeywords(content)
     let userDetailMtime = 0
-    try { userDetailMtime = statSync(skillMdPath).mtimeMs } catch { /* no-op */ }
+    try { userDetailMtime = statSync(within.md).mtimeMs } catch { /* no-op */ }
 
     const files: string[] = []
     try {
-      for (const entry of readdirSync(skillDir)) files.push(entry)
+      for (const entry of readdirSync(within.dir)) files.push(entry)
     } catch { /* empty */ }
 
     json(res, {
@@ -453,7 +485,7 @@ export async function tryHandleSkills(ctx: RouteContext): Promise<boolean> {
     const off = !quarantineOn()
     const r = queueProposedSkill(name, skillMd, { proposedBy, reason, files: parsed.files, ...(off ? { mayReplacePending: () => true } : {}) })
     if (!r.ok) { json(res, { error: r.error }, r.status); return true }
-    logger.info({ name, id: r.meta.id, replaces: !!r.meta.replaces, files: r.meta.proposedFiles?.length ?? 0, proposedBy, supersedes: r.waiting }, 'Global skill proposed and queued for approval')
+    logger.info({ name, id: r.meta.id, target: r.meta.target.scope, replaces: !!r.meta.replaces, files: r.meta.proposedFiles?.length ?? 0, proposedBy, supersedes: r.waiting }, 'Skill proposed and queued for approval')
     const lp = await liveOrPending(r.meta.id, serializeSkillsDir)
     const { hash: _h, ...answer } = lp
     let superseded: string | undefined
@@ -468,7 +500,7 @@ export async function tryHandleSkills(ctx: RouteContext): Promise<boolean> {
       if (old) {
         superseded = r.waiting
         appendSkillAudit({
-          at: new Date().toISOString(), event: 'superseded_unquarantined', id: r.waiting, name, source: 'propose', target: { scope: 'global' },
+          at: new Date().toISOString(), event: 'superseded_unquarantined', id: r.waiting, name, source: 'propose', target: r.meta.target,
           proposedBy: old.proposedBy, hash: old.hash, replaces: false, findings: {}, findingsTruncated: false,
           supersededBy: { id: r.meta.id, hash: lp.hash ?? null, proposedBy: proposedBy ?? null },
         })
@@ -476,7 +508,7 @@ export async function tryHandleSkills(ctx: RouteContext): Promise<boolean> {
         logger.error({ name, waiting: r.waiting }, 'skill: the superseded proposal could not be archived; it is still listed as waiting')
       }
     }
-    json(res, { ok: true, name, ...answer, id: r.meta.id, replaces: !!r.meta.replaces, files: r.meta.proposedFiles ?? [], ...(superseded ? { superseded } : {}) })
+    json(res, { ok: true, name, ...answer, id: r.meta.id, target: r.meta.target.scope, replaces: !!r.meta.replaces, files: r.meta.proposedFiles ?? [], ...(superseded ? { superseded } : {}) })
     return true
   }
 
@@ -536,6 +568,13 @@ export async function tryHandleSkills(ctx: RouteContext): Promise<boolean> {
   const globalSkillAssignMatch = path.match(/^\/api\/skills\/([^/]+)\/assign$/)
   if (globalSkillAssignMatch && method === 'POST') {
     const skillName = decodeURIComponent(globalSkillAssignMatch[1])
+    // OWNERGATE3-1104: copies a global skill into the named agents' own .claude/skills AND removes that skill's
+    // directory from every other agent (rmSync), with no quarantine or approval queue on this route; owner-only,
+    // before any lookup, the body, the copy or a removal.
+    if (!mayActAsOwner(ctx.auth, req)) {
+      refuseOwner(res, 'Assigning a skill to agents needs the dashboard login (an owner session).')
+      return true
+    }
     const GLOBAL_SKILLS_DIR = join(homedir(), '.claude', 'skills')
     const globalSkillDir = join(GLOBAL_SKILLS_DIR, skillName)
 
@@ -579,6 +618,17 @@ export async function tryHandleSkills(ctx: RouteContext): Promise<boolean> {
 
   const globalSkillPutMatch = path.match(/^\/api\/skills\/([^/]+)$/)
   if (globalSkillPutMatch && method === 'PUT') {
+    // SKILLPUTSCOPE1114: EVERY branch of this edit is owner-only, with ONE gate before anything is looked up or read:
+    // the global SKILL.md (every agent loads it, outside the propose/quarantine queue), the main agent's (its folder is
+    // every sub-agent's ancestor), and a sub-agent's (otherwise any holder of the shared token -- every agent -- could
+    // rewrite ANOTHER agent's skill through the dashboard, which its own file rules would not let it do). The only
+    // caller is the dashboard's skill editor in the owner's session (measured: no fleet script or skill calls it); an
+    // agent edits its own skills on disk. A per-agent token never reaches this route (not in AGENT_TOKEN_ALLOWLIST).
+    // The gate first also means a non-owner learns nothing (no 404 telling which agent names exist).
+    if (!mayActAsOwner(ctx.auth, req)) {
+      refuseOwner(res, 'Editing a skill needs the dashboard login (an owner session).')
+      return true
+    }
     const skillName = decodeURIComponent(globalSkillPutMatch[1])
     if (skillName.includes(':')) {
       json(res, { error: 'Plugin skills cannot be edited' }, 403)
@@ -601,11 +651,12 @@ export async function tryHandleSkills(ctx: RouteContext): Promise<boolean> {
         return true
       }
       if (!existsSync(skillDir)) { json(res, { error: 'Skill not found' }, 404); return true }
-      const skillMdPath = join(skillDir, 'SKILL.md')
+      const within = skillMdWithin(skillDir, agentPutParam === MAIN_AGENT_ID ? agentSkillsRoot : agentDir(agentPutParam))
+      if (within === null) { json(res, { error: 'The skill folder points outside its own skills folder' }, 400); return true }
       const body = await readBody(req)
       const { content } = JSON.parse(body.toString()) as { content: string }
       if (typeof content !== 'string') { json(res, { error: 'content is required' }, 400); return true }
-      atomicWriteFileSync(skillMdPath, content)
+      atomicWriteFileSync(within.md, content)
       logger.info({ skillName, agentId: agentPutParam }, 'Agent-local skill updated via dashboard')
       json(res, { ok: true })
       return true
@@ -618,11 +669,12 @@ export async function tryHandleSkills(ctx: RouteContext): Promise<boolean> {
       return true
     }
     if (!existsSync(skillDir)) { json(res, { error: 'Skill not found' }, 404); return true }
-    const skillMdPath = join(skillDir, 'SKILL.md')
+    const within = skillMdWithin(skillDir, GLOBAL_SKILLS_DIR)
+    if (within === null) { json(res, { error: 'The skill folder points outside its own skills folder' }, 400); return true }
     const body = await readBody(req)
     const { content } = JSON.parse(body.toString()) as { content: string }
     if (typeof content !== 'string') { json(res, { error: 'content is required' }, 400); return true }
-    atomicWriteFileSync(skillMdPath, content)
+    atomicWriteFileSync(within.md, content)
     logger.info({ skillName }, 'Skill updated via dashboard')
     json(res, { ok: true })
     return true

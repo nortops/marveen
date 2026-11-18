@@ -39,6 +39,7 @@ import { logger } from '../logger.js'
 import type { ChannelProviderType } from '../channel-provider.js'
 import { tryAcquireSessionSendLane } from './session-send-lock.js'
 import { exactTmuxTarget } from '../tmux-target.js'
+import { stripAllAnsi, stripGhostSuggestion, idleConsideringDimGhost, liveFooterLine } from '../pane-state.js'
 
 const TMUX = resolveFromPath('tmux')
 
@@ -149,17 +150,50 @@ function isSessionReadyForUnlock(session: string): boolean {
       timeout: 3000,
       encoding: 'utf-8',
     })
-    // Idle footer: claude renders this footer line once the TUI is ready
-    // for input. Matches the empirical signature used by detectPaneState
-    // for the 'idle' state.
-    if (!/bypass permissions on/.test(pane)) return false
-    // Refuse if any modal is visible.
-    if (/Resume from summary/.test(pane)) return false
-    if (/Open System Settings/.test(pane)) return false
-    return true
+    return unlockPaneReady(pane)
   } catch (err) {
     logger.warn({ err, session }, 'channel-plugin-unlock: capture-pane failed')
     return false
+  }
+}
+
+/**
+ * The readiness rule of isSessionReadyForUnlock over a plain capture, pure so
+ * it is testable. Idle footer: claude renders it once the TUI is ready for
+ * input. PANEFOOTEROUTSIDE1114: read on the LIVE footer line only
+ * (liveFooterLine, the anchor detectPaneState uses). Searching the whole pane
+ * let a line that merely quoted the footer -- in a message, or in an open
+ * permission dialog's command -- mark a dialog as ready, and the unlock then
+ * typed `/mcp` and Enter into it.
+ */
+export function unlockPaneReady(pane: string): boolean {
+  const footer = liveFooterLine(pane)
+  if (footer === null || !/bypass permissions on/.test(footer)) return false
+  // Refuse if any modal is visible.
+  if (/Resume from summary/.test(pane)) return false
+  if (/Open System Settings/.test(pane)) return false
+  return true
+}
+
+// Same verdict as channels.sh probe_pane_input_state == "idle": a COLOURED
+// capture, judged by the readiness rule over both the plain view and the
+// dim-stripped view (a dim placeholder in an empty box is not text). Pure over
+// the capture so the decision is unit-testable; null (unreadable) is not idle.
+export function unlockPaneInputIdle(colouredPane: string | null): boolean {
+  if (colouredPane == null) return false
+  return idleConsideringDimGhost(stripAllAnsi(colouredPane), stripGhostSuggestion(colouredPane))
+}
+
+function captureColouredPane(session: string): string | null {
+  try {
+    return execFileSync(TMUX, ['capture-pane', '-t', exactTmuxTarget(session), '-e', '-p'], {
+      timeout: 3000,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch (err) {
+    logger.warn({ site: 'channel-plugin-unlock.captureColouredPane', session, tmux: tmuxStderr(err) }, 'channel-plugin-unlock: coloured capture-pane failed')
+    return null
   }
 }
 
@@ -194,6 +228,38 @@ function sendUnlockKeystrokes(session: string, provider: ChannelProviderType): v
       // after one restart instead of looping fresh-restarts that cannot help.
       markPluginAbsent(session)
       try { execFileSync(TMUX, ['send-keys', '-t', exactTmuxTarget(session), 'Escape'], { timeout: 5000 }) } catch { /* ignore */ }
+      // RELOADPLUGINSABSENT1032: an absent (never-loaded) plugin is not what
+      // Enable/Reconnect fixes -- there is no menu entry for it -- but a manual
+      // `/reload-plugins` reliably brought it back (measured 2026-10-31, after
+      // channels-respawn.log showed 157 consecutive never-started cycles that no
+      // soft-reconnect/resume/hard-restart stage repaired on its own). Send the
+      // same command here: it reloads skills+agents+hooks+MCP servers in one
+      // shot from the main prompt, so there is no list position to get wrong.
+      //
+      // Only into a pane PROVEN back at an empty idle prompt: if the single
+      // Escape above left a menu level open (the other branch below needs two
+      // to get out), the command would be typed into the menu. Re-probe after
+      // the Escape; if not idle, send ONE more Escape and re-probe again. The
+      // second Escape is conditional on purpose: at an already idle prompt a
+      // double Escape is not a no-op in Claude Code. Still not idle -> skip,
+      // never type blind.
+      try {
+        execFileSync('/bin/sleep', [String(KEYSTROKE_SETTLE_MS / 1000)], { timeout: KEYSTROKE_SETTLE_MS + 2000 })
+        let idle = unlockPaneInputIdle(captureColouredPane(session))
+        if (!idle) {
+          execFileSync(TMUX, ['send-keys', '-t', exactTmuxTarget(session), 'Escape'], { timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] })
+          execFileSync('/bin/sleep', [String(KEYSTROKE_SETTLE_MS / 1000)], { timeout: KEYSTROKE_SETTLE_MS + 2000 })
+          idle = unlockPaneInputIdle(captureColouredPane(session))
+        }
+        if (!idle) {
+          logger.warn({ session, provider }, 'channel-plugin-unlock: pane not back at an empty idle prompt after leaving /mcp -- skipping /reload-plugins after confirmed-absent plugin')
+        } else {
+          execFileSync(TMUX, ['send-keys', '-t', exactTmuxTarget(session), '/reload-plugins', 'Enter'], { timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] })
+          logger.warn({ session, provider }, 'channel-plugin-unlock: sent /reload-plugins after confirmed-absent plugin')
+        }
+      } catch (err) {
+        logger.error({ site: 'channel-plugin-unlock.reloadAfterAbsent', err, session, tmux: tmuxStderr(err) }, 'channel-plugin-unlock: failed to send /reload-plugins after confirmed-absent plugin')
+      }
       return
     }
 

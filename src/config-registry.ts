@@ -1,5 +1,7 @@
 import { homedir } from 'node:os'
-import { expandAndValidateConfigDir } from './config-dir-path.js'
+import { CLAUDE_CONFIG_DIR_ALLOWED, expandAndValidateConfigDir, hasParentTraversal } from './config-dir-path.js'
+import { alertChatFormatError, alertChatProviderOf, OWNER_ALERT_CHAT_KEY } from './alert-chat-format.js'
+import { readEnvFile } from './env.js'
 // Single source of truth for settings the dashboard's "Beallitasok" page can
 // show and edit. Each entry describes one .env-backed config key: its type
 // (drives the input widget + validation), default, human description, the
@@ -90,6 +92,44 @@ export interface SettingDefinition {
    * control constrains could switch it off for itself (BASHSANDBOX1022 security review).
    */
   loosens?: (oldValue: string, newValue: string) => boolean
+  /**
+   * Optional: the key is OVERRIDES-ONLY (ENVRELAXGATE1104 step 2). Its value comes from the owner's override, else
+   * the registry default; a `.env` line counts only when it TIGHTENS (`loosens(default, envValue)` is false). The
+   * `.env` is a file a process can write without the dashboard's owner check, so it must never loosen a control.
+   * Every key with `loosens`, and every `module: 'security'` key, is overrides-only without this flag (isOverridesOnly).
+   */
+  overridesOnly?: boolean
+  /**
+   * Optional (NETTARGETENV1104): ANY change of this key through the Settings route needs the owner (an owner session or
+   * a full-scope device key), not the shared fleet token. Unlike `loosens` it does NOT make the key overrides-only: its
+   * .env line keeps working. For keys that choose a TARGET (where the token, a prompt or memory text is sent) and whose
+   * .env form is documented and used by remote installs.
+   */
+  ownerGated?: boolean
+}
+
+// ENVRELAXGATE1104 step 2: the keys whose `.env` value may only tighten. A `loosens` function marks a security
+// control, and the `security` module holds them by definition; the explicit flag covers a control with no loosens.
+export function isOverridesOnly(def: SettingDefinition): boolean {
+  return def.overridesOnly === true || typeof def.loosens === 'function' || def.module === 'security'
+}
+
+// Does this `.env` value count for an overrides-only key? Only when it does not loosen the registry default. A key
+// with no `loosens` function cannot tell a tightening from a loosening, so its `.env` value never counts.
+export function envValueTightens(def: SettingDefinition, envValue: string): boolean {
+  if (typeof def.loosens !== 'function') return false
+  return !def.loosens(String(def.default), envValue)
+}
+
+// Pure parse rule for STORE_WATCH_EXCLUDE. Entries are trimmed; an entry is dropped (never read generously) when it is
+// empty, '.', '..', or contains '/', '\\' or a NUL character.
+export function parseStoreWatchExclude(raw: string | undefined): Set<string> {
+  return new Set(
+    (raw ?? '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(s => s !== '' && s !== '.' && s !== '..' && !/[\/\\\0]/.test(s))
+  )
 }
 
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/
@@ -103,7 +143,8 @@ function validUnitFraction(v: string): string | null {
 }
 
 // A '' (nobody) or a comma-separated list of agent names, e.g. "pm,reviewer".
-const AGENT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,49}$/
+// Exported for the sub-agent rotation stage (claude-plan-subagent-rotation.ts), which puts a name into a heartbeat line.
+export const AGENT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,49}$/
 function validAgentNameList(v: string): string | null {
   const t = v.trim()
   if (t === '') return null
@@ -117,6 +158,29 @@ function validKeepAlive(v: string): string | null {
   if (t === '') return null
   if (/^-?\d+$/.test(t)) return Number.isSafeInteger(Number(t)) ? null : 'Túl nagy szám.'
   return /^-?(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/.test(t) ? null : 'Egész szám (másodperc) vagy időtartam szükséges, pl. 30m, 1h, -1.'
+}
+
+// CLI_INVENTORY_DIRS: comma-separated folders the CLI inventory reads, each
+// holding one tool per subfolder (the Printing Press library layout). Each item
+// is an absolute or ~/ path from the config-dir character set, without a '..'
+// segment. '' (the default) is the empty list: the inventory is off, because it
+// starts the binaries it finds, so the owner turns it on by naming a folder they
+// trust. Returns the list, or null when an item is invalid. Shared by the
+// validator and the inventory route.
+const CLI_INVENTORY_MAX_DIRS = 16
+const CLI_INVENTORY_MAX_DIR_LENGTH = 512
+export function parseCliInventoryDirs(raw: string): string[] | null {
+  const dirs = raw.split(',').map((d) => d.trim()).filter((d) => d !== '')
+  if (dirs.length > CLI_INVENTORY_MAX_DIRS) return null
+  for (const d of dirs) {
+    const rooted = d.startsWith('/') || d.startsWith('~/')
+    if (!rooted || d.length > CLI_INVENTORY_MAX_DIR_LENGTH || !CLAUDE_CONFIG_DIR_ALLOWED.test(d) || hasParentTraversal(d)) return null
+  }
+  return [...new Set(dirs)]
+}
+
+function validCliInventoryDirs(v: string): string | null {
+  return parseCliInventoryDirs(v) ? null : 'Vesszővel elválasztott abszolút vagy ~/ kezdetű mappák kellenek (pl. ~/printing-press/library), legfeljebb 16, szóköz és .. nélkül.'
 }
 
 // OSS_INVENTORY_NOTES_DIRS: comma-separated folder names under each agent
@@ -165,6 +229,23 @@ function validFusionWeight(v: string): string | null {
   const n = Number(t)
   return Number.isFinite(n) && n >= 0 && n <= 10 ? null : '0 és 10 közötti szám szükséges (pl. 0.5).'
 }
+
+// The Claude models an agent / worker setting may pick. Shared by DEFAULT_AGENT_MODEL and
+// MARVEEN_WORKER_MODEL_FAST so the two pickers can never drift apart (WORKERMODELFAST1109).
+export const AGENT_MODEL_CHOICES: readonly string[] = [
+  // Opus 5.5: ONLY the 1M variant is offered (owner decision 2026-09-23, Marveen 28541).
+  'claude-opus-5-5[1m]',
+  'claude-opus-5',
+  'claude-opus-5[1m]',
+  'claude-sonnet-5-5',
+  'claude-sonnet-5',
+  'claude-fable-5',
+  'claude-fable-5-1',
+  'claude-fable-5-2',
+  'claude-opus-4-8[1m]',
+  'claude-haiku-5-5',
+  'claude-haiku-4-5-20251001',
+]
 
 export const SETTINGS_REGISTRY: SettingDefinition[] = [
   {
@@ -403,6 +484,8 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     module: 'system',
     secret: false,
     requiresRestart: true,
+    // NETTARGETENV1104: a network target (where the token, a prompt or memory text goes): owner-gated on the route.
+    ownerGated: true,
   },
   {
     key: 'AGENT_API_ORIGIN',
@@ -412,6 +495,8 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     module: 'system',
     secret: false,
     requiresRestart: true,
+    // NETTARGETENV1104: a network target (where the token, a prompt or memory text goes): owner-gated on the route.
+    ownerGated: true,
   },
   {
     key: 'FLEET_PYTHON_VENV',
@@ -430,6 +515,22 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     module: 'system',
     secret: false,
     requiresRestart: true,
+  },
+  {
+    key: 'CLI_INVENTORY_DIRS',
+    type: 'string',
+    default: '',
+    description: 'A CLI-nyilvántartás (Kapcsolatok > CLI oldal) ezekben a mappákban keresi az eszközöket, almappánként egyet (a Printing Press könyvtár elrendezése): vesszővel elválasztott abszolút vagy ~/ kezdetű útvonalak, pl. ~/printing-press/library. Üres (alapállapot) = a nyilvántartás ki van kapcsolva, semmi nem fut. A leltár az itt talált *-pp-cli fájlokat a dashboard jogával ELINDÍTJA (csak leíró hívás: agent-context vagy --help, időkorláttal, tisztított környezettel), ezért csak olyan mappát adj meg, amelynek a binárisaiban megbízol. A futást (frissítés, elavult leltár újragenerálása) csak a gazda dashboard-munkamenete indítja, más hívó a mentett leltárt kapja. Csak a gazda állíthatja (dashboard-belépéssel), a közös ügynök-token nem, és a .env-ben álló érték nem érvényesül: aki ezt átírja, az dönti el, mit futtat a dashboard. A következő leltár-frissítéskor érvényes, a kikapcsolás azonnal.',
+    module: 'system',
+    secret: false,
+    requiresRestart: false,
+    validate: validCliInventoryDirs,
+    // This key chooses which binaries the dashboard process STARTS with its own rights, outside the agent hooks'
+    // gates. Any change is treated as loosening (the OWNER_DRIVE_FOLDER form): through the Settings route only the
+    // owner may set or reset it (the shared fleet token gets 403), and the key is overrides-only, so a .env line
+    // that differs from the default never counts (ENVRELAXGATE1104). Not ownerGated: that flag keeps the .env line
+    // working, which is exactly what must not happen here.
+    loosens: (oldValue: string, newValue: string) => oldValue.trim() !== newValue.trim(),
   },
   {
     key: 'OSS_INVENTORY_NOTES_DIRS',
@@ -459,6 +560,8 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     module: 'system',
     secret: false,
     requiresRestart: true,
+    // NETTARGETENV1104: a network target (where the token, a prompt or memory text goes): owner-gated on the route.
+    ownerGated: true,
   },
   {
     key: 'EMBED_URL',
@@ -468,6 +571,8 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     module: 'system',
     secret: false,
     requiresRestart: true,
+    // NETTARGETENV1104: a network target (where the token, a prompt or memory text goes): owner-gated on the route.
+    ownerGated: true,
   },
   {
     key: 'EMBED_MODEL',
@@ -497,6 +602,8 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     module: 'system',
     secret: false,
     requiresRestart: true,
+    // NETTARGETENV1104: a network target (where the token, a prompt or memory text goes): owner-gated on the route.
+    ownerGated: true,
   },
   {
     key: 'MEMORY_VECTOR_MIN_MARGIN',
@@ -614,6 +721,9 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     module: 'system',
     secret: false,
     requiresRestart: false,
+    // Where the owner's deliverables go: any change re-routes them, so it is overrides-only and a .env line never
+    // counts (ENVRELAXGATE1104 follow-up, Samu 68119).
+    loosens: (oldValue: string, newValue: string) => oldValue.trim() !== newValue.trim(),
   },
   // --- Heartbeat module (hot-reload via settings-store) ---
   {
@@ -732,6 +842,19 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     loosens: (oldValue: string, newValue: string) => oldValue.trim() === 'enforce' && newValue.trim() !== 'enforce',
   },
   {
+    // VAULTSZELES826 PR-A: the observation week for sub-agent OWN tokens (AGENT_TOKENS). enforce is the code default and
+    // today's behaviour; audit is set by the owner for the week before the per-secret list exists (Samu 74555).
+    key: 'VAULT_ACL_AGENT_MODE',
+    type: 'string',
+    default: 'enforce',
+    valueSet: ['enforce', 'audit'],
+    description: 'Az al-ügynök SAJÁT tokenjének (AGENT_TOKENS) vault-olvasási szabálya. enforce (alapértelmezés) = csak a store/vault-acl.json-ban neki engedett titkot kapja meg; audit = megfigyelési hét: minden olvasás átmegy és naplózódik azzal, hogy enforce mellett tiltva lenne-e, ebből javasolható a titkonkénti lista (scripts/vault-acl-suggest.mjs). Az SSH-anyag és a vault al-erőforrásai mindkét állásban tiltottak. Az audit lazítás: csak dashboard-belépéssel állítható. Nyom és hozzáférés-szabály, nem elzárás.',
+    module: 'audit',
+    secret: false,
+    requiresRestart: false,
+    loosens: (oldValue: string, newValue: string) => oldValue.trim() !== 'audit' && newValue.trim() === 'audit',
+  },
+  {
     // SKILLAPPROVALOFF1101 (owner, Slack 2026-11-01 22:35): switchable, OFF by default. The scan, the hash binding and
     // an audit line run in both positions; only the hold for the owner's approval is what the switch turns on.
     key: 'SKILL_QUARANTINE',
@@ -752,6 +875,23 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     secret: false,
     requiresRestart: false,
     loosens: (oldValue: string, newValue: string) => ['1', 'true', 'yes', 'on'].includes(oldValue.trim().toLowerCase()) && !['1', 'true', 'yes', 'on'].includes(newValue.trim().toLowerCase()),
+  },
+  // STOREWATCHEXCL1111 review B1: adding a name loosens the audit, so this key is overrides-only (a loosening .env line is ignored).
+  {
+    key: 'STORE_WATCH_EXCLUDE',
+    type: 'string',
+    default: '',
+    description: 'A store/ alatti felső szintű könyvtárak, amelyeket a store-figyelő (az ügynökök által a store/-ban létrehozott fájlok naplója) induláskor nem jár be és nem figyel. Nagy, gyorsan változó futásidejű fákra való: Linuxon a figyelő minden fájlra és könyvtárra külön inotify-figyelést tesz. Csak könyvtárnevek, perjel nélkül, vesszővel elválasztva (pl. build-cache,old-runs). Üresen (alapértelmezés) minden figyelve marad. Egy név felvétele lazítás, mert a kizárt fában létrehozott fájl nem kerül a naplóba: csak dashboard-belépéssel állítható, és a .env-ben álló érték nem érvényesül. A dashboard újraindítása után lép életbe.',
+    module: 'audit',
+    secret: false,
+    requiresRestart: true,
+    validate: (v) => v.split(',').map(s => s.trim()).filter(Boolean).some(s => s === '.' || s === '..' || /[/\\\0]/.test(s))
+      ? 'Csak felső szintű könyvtárnevek, vesszővel elválasztva; perjel, "." és ".." nem lehet.'
+      : null,
+    loosens: (oldValue, newValue) => {
+      const prev = parseStoreWatchExclude(oldValue)
+      return [...parseStoreWatchExclude(newValue)].some((n) => !prev.has(n))
+    },
   },
   // --- Token usage module ---
   {
@@ -827,6 +967,8 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     module: 'system',
     secret: false,
     requiresRestart: true,
+    // Switching it ON removes the curl/wget denies: a loosening (ENVRELAXGATE1104 step 2, EGM M4).
+    loosens: (oldValue: string, newValue: string) => !['1', 'true', 'yes', 'on'].includes(oldValue.trim().toLowerCase()) && ['1', 'true', 'yes', 'on'].includes(newValue.trim().toLowerCase()),
   },
   {
     key: 'BASH_SANDBOX_AGENTS',
@@ -862,6 +1004,9 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     module: 'channels',
     secret: false,
     requiresRestart: false,
+    // Where every alert goes FIRST (slack-notify.mjs): any change re-routes them, like NOTIFY_SLACK_TARGET (Dani's #2500
+    // review). So it is overrides-only, and a .env line never counts.
+    loosens: (oldValue: string, newValue: string) => oldValue.trim() !== newValue.trim(),
   },
   {
     key: 'NOTIFY_TELEGRAM',
@@ -908,6 +1053,24 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     loosens: (oldValue: string, newValue: string) => oldValue.trim() !== newValue.trim(),
   },
   {
+    // OWNERAUTHGUESS1106 (Samu 71849): the owner of the Telegram chat commands. With several paired DMs and the
+    // installer's ALLOWED_CHAT_ID=0 nobody is guessed any more: the commands stop until this is set. Not the memory key
+    // (ALLOWED_CHAT_ID), not OWNER_ALERT_CHAT_ID (a delivery target).
+    key: 'TELEGRAM_OWNER_USER_ID',
+    type: 'string',
+    default: '',
+    description: 'A gazda Telegram-felhasználói azonosítója (pozitív szám, a saját chated száma): ő futtathatja a chat-parancsokat (/status, /model ...). Üresen a régi szabály marad: egy pozitív ALLOWED_CHAT_ID, vagy ha az nincs, a fő bot egyetlen párosított DM-je. Ha több DM van párosítva (pl. gazda és családtag) és az ALLOWED_CHAT_ID nincs kitöltve, a rendszer nem találgat: a chat-parancsok addig nem futnak, amíg ezt be nem állítod. Csak azt dönti el, ki a gazda a parancsoknál: hova menjenek a riasztások, azt az OWNER_ALERT_CHAT_ID mondja meg, az emlékek pedig változatlanok.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: false,
+    // a positive Telegram user id or empty; refused otherwise, never stored and ignored later
+    validate: (v: string) => (v.trim() === '' || /^[1-9][0-9]{0,19}$/.test(v.trim())
+      ? null
+      : 'Pozitív Telegram-felhasználói azonosító kell (a saját chated száma, pl. 1268077055); csoport (negatív szám) nem lehet. / A positive Telegram user id is required (your own chat number, e.g. 1268077055); a group (a negative number) is not allowed.'),
+    // whose chat commands run: ANY change needs the owner's session, as SLACK_OWNER_USER_ID
+    loosens: (oldValue: string, newValue: string) => oldValue.trim() !== newValue.trim(),
+  },
+  {
     key: 'APPROVAL_SLACK_REACTIONS',
     type: 'string',
     default: 'off',
@@ -920,6 +1083,18 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     loosens: (oldValue: string, newValue: string) => oldValue.trim().toLowerCase() !== 'on' && newValue.trim().toLowerCase() === 'on',
   },
   {
+    key: 'APPROVAL_SLACK_REPLIES',
+    type: 'string',
+    default: 'off',
+    description: 'Slack-válaszos jóváhagyás (APPROVALSLACK1030 B): bekapcsolva (on) a jóváhagyás-kérés a gazda Slack-DM-jébe EGY üzenetként megy, és a gazda beírt "mehet" (jóváhagy) vagy "nem" (elutasít) válaszát a szerver maga olvassa el: a kérés szálában, vagy közvetlenül a kérés után, ha közben senki más nem írt. Csak kifejezett SLACK_OWNER_USER_ID mellett. Leírás-alapú kérésnél a gazda a kérő ügynök leírását hagyja jóvá (vállalt kockázat). Az állandó kategóriák, a data_delete és a boríték nélküli levél a dashboardon marad. Alapból KI; a bekapcsolás a gazda döntése.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: false,
+    validate: (v: string) => (['on', 'off'].includes(v.trim().toLowerCase()) ? null : 'on vagy off'),
+    // Switching it ON opens one more way to approve: that needs the owner's session (Samu 67693: the owner's own step).
+    loosens: (oldValue: string, newValue: string) => oldValue.trim().toLowerCase() !== 'on' && newValue.trim().toLowerCase() === 'on',
+  },
+  {
     key: 'SCHEDULED_DELIVERY_CHANNEL',
     type: 'string',
     default: '',
@@ -927,6 +1102,28 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     module: 'channels',
     secret: false,
     requiresRestart: false,
+    // Where the main agent's scheduled results go: any change re-routes them, so it is overrides-only and a .env line
+    // never counts (ENVRELAXGATE1104 follow-up, Samu 68119).
+    loosens: (oldValue: string, newValue: string) => oldValue.trim() !== newValue.trim(),
+  },
+  {
+    // ISSUE2556X (marveen#2556): with two paired DMs and the installer's ALLOWED_CHAT_ID=0 the alert resolver refuses
+    // to guess, and every system alert was lost. This names the chat outright. Delivery only: it never makes anyone
+    // the owner (the command gate and the ledger keep ALLOWED_CHAT_ID / the sole DM entry), and the memory key stays
+    // ALLOWED_CHAT_ID.
+    key: OWNER_ALERT_CHAT_KEY,
+    type: 'string',
+    default: '',
+    description: 'Hova menjenek a rendszer-riasztások és a gazdának szóló értesítések (kvóta, lemez, beragadt munkamenet, biztonsági esemény, ütemezett feladat hibája, napi napló), a beállított csatornán (CHANNEL_PROVIDER) belül a gazda SZEMÉLYES chatjének azonosítójával: Telegramon a saját chated pozitív száma, Slacken a DM (D...) vagy a felhasználód (U...) azonosítója, Discordon a DM-csatornád azonosítója (ott az alakból nem látszik, hogy DM-e). Csoport vagy csatorna nem lehet, mert ott a riasztásokat és a jóváhagyások szövegét mindenki látná. Üresen (alapértelmezés) a mostani szabály marad: az ALLOWED_CHAT_ID, vagy ha az nincs beállítva, az egyetlen párosított DM. Akkor kell, ha a fő bothoz több ember is párosítva van, és az ALLOWED_CHAT_ID nincs kitöltve: ilyenkor a rendszer nem találgat, és e nélkül a riasztás elveszik. Csak a kézbesítést állítja: senkit nem tesz gazdává, a parancsok és az emlékek változatlanok.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: false,
+    // the provider's own shape, read from the install .env as config.ts reads CHANNEL_PROVIDER (this module may not
+    // import config.ts); a wrong shape is refused here, never stored and silently ignored later
+    validate: (v: string) => alertChatFormatError(alertChatProviderOf(readEnvFile(['CHANNEL_PROVIDER'])['CHANNEL_PROVIDER']), v),
+    // Where the owner's alerts go: any change re-routes them (a security alert included), so it is overrides-only and
+    // a .env line never counts, as SCHEDULED_DELIVERY_CHANNEL (Samu 71763).
+    loosens: (oldValue: string, newValue: string) => oldValue.trim() !== newValue.trim(),
   },
   {
     key: 'MAIN_AGENT_CONFIG_DIR',
@@ -993,6 +1190,24 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     requiresRestart: true,
   },
   {
+    key: 'TELEGRAM_REPLY_BUTTONS',
+    type: 'boolean',
+    default: '1',
+    description: 'Válasz-gombok a Telegramon: bekapcsolva az ügynök egy kérdés alá egy koppintással választható gombokat tehet (a reply tool buttons mezője). Kikapcsolva egy ügynök sem küld gombot: a nem üres buttons listát a csatorna eldobja, az üzenet gombok nélkül megy ki, és az ügynök a válaszban figyelmeztetést kap, hogy a választást sima szövegben kérje. Az üres lista ekkor is leveszi a korábban fent ragadt billentyűzetet. A kapcsolót a csatorna-indítás a Telegram plugin forrására teszi (scripts/patch-telegram-plugin.py). Alapértelmezés: bekapcsolva. A módosítás a csatorna következő indításakor lép életbe; a már futó ügynökök a saját újraindításukig a régi viselkedéssel futnak.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: true,
+  },
+  {
+    key: 'TELEGRAM_INBOUND_REPLAY_ENABLED',
+    type: 'boolean',
+    default: '0',
+    description: 'Elveszett Telegram-üzenetek pótlása: ha egy csatornás al-ügynök újraindul, a Telegram plugin már a Claude Code kézfogása előtt átveheti az üzenetet, és ilyenkor a Claude Code némán eldobja. A dashboard percenként összeveti az ügynök inbound-evidence naplóját (az utolsó 15 perc) az átirataival, és amit a session sosem kapott meg, azt egyszer, a channel-coordinator keretezésével kézbesíti. Ha az átirat nem olvasható, nem küld semmit. Korlát: a naplót az ügynök saját OS-felhasználója írja, így egy ugyanazzal a felhasználóval futó ügynök vagy szkript is írhat bele, és amit beír, az csatornaüzenetként jut el az ügynökhöz. Az írókapu (db-write-gate) az al-ügynökök eszközhívásaiban a felismert parancsformákat tiltja erre a naplóra, de ez csak szöveg-fék, nem OS-határ: például egy korábban megírt szkriptfájl vagy egy értelmezőben futás közben összerakott útvonal átmegy rajta. Ezért alapból kikapcsolva; akkor kapcsold be, ha az ugyanazzal az OS-felhasználóval futó ügynökökben megbízol. A módosítás a következő percben életbe lép.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: false,
+  },
+  {
     key: 'PERMISSION_ALERT_MARKS',
     type: 'string',
     default: '15m,30m,1h,2h,8h,24h',
@@ -1041,19 +1256,17 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     module: 'agents',
     secret: false,
     requiresRestart: true,
-    valueSet: [
-      // Opus 5.5: ONLY the 1M variant is offered (owner decision 2026-09-23, Marveen 28541).
-      'claude-opus-5-5[1m]',
-      'claude-opus-5',
-      'claude-opus-5[1m]',
-      'claude-sonnet-5-5',
-      'claude-sonnet-5',
-      'claude-fable-5',
-      'claude-fable-5-1',
-      'claude-opus-4-8[1m]',
-      'claude-haiku-5-5',
-      'claude-haiku-4-5-20251001',
-    ],
+    valueSet: [...AGENT_MODEL_CHOICES],
+  },
+  {
+    key: 'MARVEEN_WORKER_MODEL_FAST',
+    type: 'string',
+    default: '',
+    description: 'A GYORS háttér-worker session modellje. Üresen ugyanaz a lánc dönt, mint a lassú workernél, tehát a beállítás nélkül semmi nem változik. A gyors session rövid, társalgási feladatokat kap, azokra elég egy kisebb modell. A CLI-indíthatósági őr erre is lefut. A módosítás a szolgáltatás újraindításakor lép életbe.',
+    module: 'agents',
+    secret: false,
+    requiresRestart: true,
+    valueSet: ['', ...AGENT_MODEL_CHOICES],
   },
   // --- Claude plans module (PR2b/PR2c) ---
   // Gates BOTH POST /api/claude-plans/rotate (returns 409 while off) and the

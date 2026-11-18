@@ -24,6 +24,9 @@ import { PROJECT_ROOT } from '../config.js'
 // so before this change a broken gate let every call through (af12a1d3 73814: rc 1 on all eight security
 // hooks). The gate commands now keep 0 and 2 and turn every other status into 2, with the reason on stderr.
 
+// AGENTEGRESS1111: spawned hooks must not inherit the running agent's vendor exceptions.
+delete process.env.BASH_EGRESS_AGENT_VENDOR_HOSTS
+
 const HAS_TIMEOUT = spawnSync('/bin/sh', ['-c', 'command -v timeout'], { encoding: 'utf-8' }).status === 0
 const SHELLS = ['/bin/sh', '/bin/bash']
 
@@ -142,7 +145,8 @@ describe('the builders', () => {
     expect(cmd.endsWith(failClosedGateRun(`"${HOOK_NODE_BIN}" "/some/dir/gate.mjs"`, 'gate.mjs', 10))).toBe(true)
     const py = pythonHookCommand('/some/dir/gate.py')
     expect(py).toMatch(/^command -v python3 >\/dev\/null 2>&1 \|\| /)
-    expect(py.endsWith(failClosedGateRun('python3 "/some/dir/gate.py"', 'gate.py', 10))).toBe(true)
+    // SITEPKGPLANT1104 (1): the gate runs isolated (-I -S): no start-up code from site-packages or the user site
+    expect(py.endsWith(failClosedGateRun('python3 -I -S "/some/dir/gate.py"', 'gate.py', 10))).toBe(true)
   })
 
   it('the deadline is two seconds inside the hook timeout, never below one second', () => {
@@ -254,7 +258,9 @@ describe('the real security gates on a disposable copy', () => {
     const entries = (settings.hooks.PreToolUse as { matcher: string; hooks: { command: string }[] }[])
       .flatMap((e) => e.hooks.map((h) => ({ matcher: e.matcher, command: h.command })))
     const security = entries.filter((e) => /outgoing-copy-gate\.py|email-approval-gate\.py|egress-gate\.mjs/.test(e.command))
-    expect(security.length).toBe(15)
+    // 17 since EMAILMESSAGESMUX1108: both email gates gained a `.*email__messages.*`
+    // entry for the `email` server's send multiplexer.
+    expect(security.length).toBe(17)
     for (const e of security) {
       expect(e.command, e.matcher).toContain(GATE_FAIL_CLOSED_TAG)
       const rel = e.command.match(/scripts\/(hooks\/[a-z-]+\.(?:py|mjs))/)![1]

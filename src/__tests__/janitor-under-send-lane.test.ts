@@ -36,16 +36,20 @@ const h = vi.hoisted(() => {
   return { PARKED, MODAL, pane: PARKED, calls: [] as string[][] }
 })
 
-vi.mock('node:child_process', async (orig) => ({
-  ...(await orig() as object),
-  execFileSync: vi.fn((_file: string, args?: string[]) => {
-    if (Array.isArray(args)) {
-      h.calls.push(args)
-      if (args.includes('capture-pane')) return h.pane
-    }
-    return ''
-  }),
-}))
+vi.mock('node:child_process', async (orig) => {
+  const { execFileFromSync } = await import('./helpers/exec-file-from-sync.js')
+  const mocked = {
+    ...(await orig() as object),
+    execFileSync: vi.fn((_file: string, args?: string[]) => {
+      if (Array.isArray(args)) {
+        h.calls.push(args)
+        if (args.includes('capture-pane')) return h.pane
+      }
+      return ''
+    }),
+  }
+  return { ...mocked, execFile: execFileFromSync(mocked.execFileSync) }
+})
 vi.mock('../notify.js', () => ({ alertIsRedirected: () => false, notifyChannel: vi.fn(async () => {}), notifyTelegram: vi.fn(async () => {}) }))
 
 import { clearStaleParkedInput, clearFeedbackModalAndRecheck } from '../web/agent-process.js'
@@ -104,12 +108,10 @@ describe('clearFeedbackModalAndRecheck under the send lane', () => {
     expect(sentKeys().length).toBe(0)
   })
 
-  it('positive control: with the lane free the dismissal keys fire (C-u, Down; never a digit)', async () => {
+  it('positive control: with the lane free the dismissal key fires (one "0", no other digit)', async () => {
     h.pane = h.MODAL
     await clearFeedbackModalAndRecheck('subagent-modal-free')
     const keys = sentKeys().map(a => a[a.length - 1])
-    expect(keys).toContain('C-u')
-    expect(keys).toContain('Down')
-    expect(keys.some(k => /^\d$/.test(k))).toBe(false)
+    expect(keys.filter(k => /^\d$/.test(k))).toEqual(['0'])
   }, 15_000)
 })

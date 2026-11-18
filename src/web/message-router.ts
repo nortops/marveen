@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { logger } from '../logger.js'
-import { MAIN_AGENT_ID, VOICE_TRANSCRIBE_INBOUND } from '../config.js'
+import { MAIN_AGENT_ID, VOICE_TRANSCRIBE_INBOUND, APP_TZ } from '../config.js'
+import { formatBacklogTimestamp } from './backlog-timestamp.js'
 import { resolveAgentChannelStateDir } from './voice-directive.js'
 import {
   getPendingMessages,
@@ -37,15 +38,18 @@ import {
   sessionExistsOnHost,
   capturePane,
   clearFeedbackModalAndRecheck,
+  withTmuxBatch,
 } from './agent-process.js'
-import { detectPaneState, detectQuotaWall, detectsBlockingMenu, detectsFirstRunGate, detectsHeldPeerMessage, detectsPermissionDialog, permissionPromptSummary, type FirstRunGateKind, type PaneState, type PermissionPromptSummary, type QuotaWall } from '../pane-state.js'
+import { detectPaneState, detectQuotaWall, detectsBlockingMenu, detectsFirstRunGate, detectsHeldPeerMessage, detectsPermissionDialog, footerWordsOffAnchor, permissionPromptSummary, type FirstRunGateKind, type PaneState, type PermissionPromptSummary, type QuotaWall } from '../pane-state.js'
 import { setLastInboundModality } from './voice-modality.js'
 import { classifyAgentMessage, wrapAgentMessageForDelivery } from './agent-message-wrap.js'
 import { shouldNotifySenderOfFailure } from './requeue-notice.js'
 import { composeBatchInjection, batchInjectCapFor } from './batch-inject.js'
 import { maybeWakeSubAgentsForTelegram } from './telegram-inbox-wake.js'
 import { isStopMessage, isUrgentDelivery, selectTickWindow } from './message-router-window.js'
+import { busyRowAction, type BusyMemo } from './router-busy-skip.js'
 import { deliveryHoldFor, type DeliveryHold } from './delivery-hold.js'
+import { shouldInterruptForUnblock, buildUnblockInterruptContent } from './unblocks-interrupt.js'
 
 import { MESSAGE_ABANDON_WINDOW_MS } from './message-abandon.js'
 import { whileNotFrozen } from './fleet-freeze.js'
@@ -110,6 +114,7 @@ export function formatStuckSessionAlert(
   permissionAsk: PermissionPromptSummary | null = null,
   quotaWall: QuotaWall | null = null,
   lastProgressAgoMs: number | null = null,
+  footerOffAnchor = false,
 ): string | null {
   if (agent === mainAgentId) return null
   const min = Math.round(stuckMs / 60000)
@@ -151,12 +156,19 @@ export function formatStuckSessionAlert(
     const resume = quotaWall.resetsAt ? `The CLI resumes by itself at ${quotaWall.resetsAt} (as the pane prints it).` : 'The banner does not say when it resets.'
     return `[session-stuck] Agent '${agent}' (tmux ${session}) is at the PLAN USAGE LIMIT (quota wall) for ${min} min with ${queue}. ${resume} Banner: "${quotaWall.banner}". Not wedged and not a question: a restart on the same key does not lift the limit, only the reset or a key switch does. One alert per wall: the same banner is not alerted again for 5 h.`
   }
+  // PANEFOOTEROUTSIDE1114: the footer words are on the screen, but no live
+  // footer is where the UI draws it -- a quoted footer above an open dialog, or
+  // a footer shape this version does not know. The October outages were this
+  // shape; a bare "not-ready" sent the reader to a restart guess first.
+  if (footerOffAnchor) {
+    return `[session-stuck] Agent '${agent}' (tmux ${session}) has been not-ready for ${min} min with ${queue}. The footer words are on screen, but NOT where the live footer is drawn: either a line quotes the footer above an open dialog, or the footer has a shape this version does not recognise. Look at the pane first (tmux attach -t ${session}): an open dialog needs an answer, not a restart; an unrecognised footer is a reader bug to report.`
+  }
   return `[session-stuck] Agent '${agent}' (tmux ${session}) has been not-ready for ${min} min with ${queue}. Run the delivery-stall diagnosis: check the pane (busy vs idle vs full context) and restart the agent if it is wedged.`
 }
 
-function notifyOrchestratorOfStuckSession(agent: string, session: string, stuckMs: number, pendingCount: number, paneState: PaneState | null, awaitingPermission = false, permissionAsk: PermissionPromptSummary | null = null, quotaWall: QuotaWall | null = null, lastProgressAgoMs: number | null = null): void {
+function notifyOrchestratorOfStuckSession(agent: string, session: string, stuckMs: number, pendingCount: number, paneState: PaneState | null, awaitingPermission = false, permissionAsk: PermissionPromptSummary | null = null, quotaWall: QuotaWall | null = null, lastProgressAgoMs: number | null = null, footerOffAnchor = false): void {
   try {
-    const alert = formatStuckSessionAlert(agent, MAIN_AGENT_ID, session, stuckMs, pendingCount, paneState, awaitingPermission, permissionAsk, quotaWall, lastProgressAgoMs)
+    const alert = formatStuckSessionAlert(agent, MAIN_AGENT_ID, session, stuckMs, pendingCount, paneState, awaitingPermission, permissionAsk, quotaWall, lastProgressAgoMs, footerOffAnchor)
     if (!alert) return
     createAgentMessage('system', MAIN_AGENT_ID, alert)
     logger.info({ agent, session, stuckMs, pendingCount, paneState, awaitingPermission, quotaWall: quotaWall != null, resetsAt: quotaWall?.resetsAt ?? null }, 'session-stuck surfaced to orchestrator')
@@ -749,7 +761,7 @@ function batchDeliverBacklog(agent: string, agentPending: AgentMessage[], now: n
   for (const m of old) {
     const sender = m.from_agent || 'unknown'
     senders.set(sender, (senders.get(sender) ?? 0) + 1)
-    const dt = new Date(m.created_at * 1000).toISOString().replace('T', ' ').slice(0, 19)
+    const dt = formatBacklogTimestamp(m.created_at, APP_TZ)
     const preview = m.content.length > 120 ? m.content.slice(0, 120) + '…' : m.content
     lines.push(`[${dt}] ${sender}: ${preview}`)
   }
@@ -853,20 +865,27 @@ export async function runMessageRouterTick(): Promise<void> {
     const presentNow = new Set<string>()
     // agent -> {exists: bool, host, session} cached lookup for the main loop.
     const agentSessionCache = new Map<string, {host: string | null, session: string, exists: boolean, worksource: boolean}>()
-    for (const agent of receiversInTick) {
-      const host = readAgentRemoteHost(agent)
-      const session = agentSessionName(agent)
-      const exists = sessionExistsOnHost(host, session)
-      // Read once per receiver per tick, not once per message: the flag decides
-      // the whole delivery path below and a per-message read would re-open the
-      // same config file for every queued item.
-      agentSessionCache.set(agent, { host, session, exists, worksource: readAgentWorksourceChannel(agent) })
-      if (exists) {
-        presentNow.add(agent)
-      } else {
-        absentNow.add(agent)
+    // One list-sessions for the whole receiver pass: every local receiver's
+    // sessionExistsOnHost() asks the identical read-only query, and
+    // withTmuxBatch answers all of them from one memoized spawn while this
+    // (synchronous) loop runs. The per-agent answer is unchanged -- each agent
+    // is classified from the same session list the spawns would have returned.
+    withTmuxBatch(() => {
+      for (const agent of receiversInTick) {
+        const host = readAgentRemoteHost(agent)
+        const session = agentSessionName(agent)
+        const exists = sessionExistsOnHost(host, session)
+        // Read once per receiver per tick, not once per message: the flag decides
+        // the whole delivery path below and a per-message read would re-open the
+        // same config file for every queued item.
+        agentSessionCache.set(agent, { host, session, exists, worksource: readAgentWorksourceChannel(agent) })
+        if (exists) {
+          presentNow.add(agent)
+        } else {
+          absentNow.add(agent)
+        }
       }
-    }
+    })
     // Reconnect detection: agent was absent on the last tick, now present.
     for (const agent of presentNow) {
       // Worksource agents are exempt: backlog batching exists because a tmux
@@ -922,6 +941,10 @@ export async function runMessageRouterTick(): Promise<void> {
     // on their own budget so neither queue starves the other.
     await deliverFederatedBatch(federatedPending, now)
 
+    // Card 3b00596e: recipients found not-ready earlier in THIS tick. Per tick only.
+    const busyThisTick = new Map<string, BusyMemo>()
+    // Recipients whose stale-parked-input janitor already ran this tick; survives the memo being cleared.
+    const janitorTriedThisTick = new Set<string>()
     for (const msg of pending) {
       // Skip messages already batched by the reconnect pre-pass: they are
       // 'done' in the DB now but still appear in our snapshot slice.
@@ -1057,10 +1080,35 @@ export async function runMessageRouterTick(): Promise<void> {
       // Card 795d1f48 (a): an authenticated urgent row takes the same path (isUrgentDelivery),
       // with the same pane checks.
       const isStop = isUrgentDelivery(msg, MAIN_AGENT_ID)
-      const urgentLabel = isStopMessage(msg, MAIN_AGENT_ID) ? 'STOP' : 'URGENT'
+      const busyAction = busyRowAction(busyThisTick.get(msg.to_agent), msg, ageMs, worksourceServing, JANITOR_PARKED_MIN_AGE_MS, MAIN_AGENT_ID)
+      if (busyAction !== 'check') {
+        const memo = busyThisTick.get(msg.to_agent)!
+        if (busyAction === 'janitor') {
+          memo.janitorTried = true
+          janitorTriedThisTick.add(msg.to_agent)
+          if (await clearStaleParkedInput(session, host)) {
+            busyThisTick.delete(msg.to_agent)
+            routerLoggedMisses.delete(msg.id)
+            continue // input cleared; deliver on the next tick
+          }
+        }
+        if (!routerLoggedMisses.has(msg.id)) {
+          logger.warn({ id: msg.id, to: msg.to_agent, session }, 'Agent message target session busy, will retry')
+          routerLoggedMisses.add(msg.id)
+        }
+        continue
+      }
+      // Card 3b00596e (review R1): a full check decides this recipient afresh. Only its final
+      // "busy, will retry" re-memoizes it; the janitor history is kept in janitorTriedThisTick.
+      busyThisTick.delete(msg.to_agent)
       const paneNotReady = !worksourceServing && !(await isSessionReadyForPrompt(session, host))
+      // UNBLOCKS925: the one named case besides STOP/urgent that may reach a busy pane: a row the main agent
+      // flagged affects_current_work = 'unblocks'. It takes the urgent path below (same pane-hold check, same
+      // last look before the first key), but sends a SHORT notice instead of the full text.
+      const unblockPass = !isStop && shouldInterruptForUnblock(msg, !paneNotReady, MAIN_AGENT_ID)
+      const urgentLabel = isStopMessage(msg, MAIN_AGENT_ID) ? 'STOP' : unblockPass ? 'UNBLOCK' : 'URGENT'
       let stopPassesBusyPane = false
-      if (isStop && !worksourceServing) {
+      if ((isStop || unblockPass) && !worksourceServing) {
         const stopPane = capturePane(session, host)
         const hold = detectUrgentPaneHold(stopPane)
         if (hold) {
@@ -1139,7 +1187,7 @@ export async function runMessageRouterTick(): Promise<void> {
               }, 'message-router: session at the plan usage limit -- this wall was already alerted, staying quiet')
             } else {
               if (wallStep.kind === 'alert') agentQuotaWallAlerted.set(msg.to_agent, { key: wallStep.key, at: now })
-              notifyOrchestratorOfStuckSession(msg.to_agent, session, stuckMs, pendingMsgCount, paneState, awaitingPermission, permissionAsk, wallStep.kind === 'alert' ? quotaWall : null, lastProgressAt != null ? now - lastProgressAt : null)
+              notifyOrchestratorOfStuckSession(msg.to_agent, session, stuckMs, pendingMsgCount, paneState, awaitingPermission, permissionAsk, wallStep.kind === 'alert' ? quotaWall : null, lastProgressAt != null ? now - lastProgressAt : null, pane != null && footerWordsOffAnchor(pane))
             }
             // Reset timer so we don't spam every tick; re-escalate after another window.
             agentStuckSince.set(msg.to_agent, now)
@@ -1170,6 +1218,9 @@ export async function runMessageRouterTick(): Promise<void> {
           logger.warn({ id: msg.id, to: msg.to_agent, session }, 'Agent message target session busy, will retry')
           routerLoggedMisses.add(msg.id)
         }
+        const janitorTried = janitorTriedThisTick.has(msg.to_agent) || ageMs > JANITOR_PARKED_MIN_AGE_MS
+        if (janitorTried) janitorTriedThisTick.add(msg.to_agent)
+        busyThisTick.set(msg.to_agent, { janitorTried })
         continue
       }
 
@@ -1289,13 +1340,14 @@ export async function runMessageRouterTick(): Promise<void> {
         // channel-inbound carries the STT-applied deliveryContent; the agent
         // wrap (trusted/untrusted) carries the raw content. Single-source frame.
         // msgId passed so receiving agents can write back via PUT /api/messages/:id.
-        const content = isChannelInbound ? deliveryContent : msg.content
+        const content = isChannelInbound ? deliveryContent : unblockPass ? buildUnblockInterruptContent(msg.content, msg.id) : msg.content
         // Freshness/supersession signal: only meaningful for inter-agent
         // messages (channel-inbound are user messages with no sender-supersede
         // concept). Skip the DB count for channel-inbound to avoid needless work.
+        // REPLAYNOENVELOPE1114: a row put back by requeueDeliveredOpenForAgent says it is a redelivery.
         const freshness = isChannelInbound
           ? undefined
-          : { ageMs, newerFromSameSender: countNewerMessagesFromSameSender(msg.from_agent, msg.to_agent, msg.id) }
+          : { ageMs, newerFromSameSender: countNewerMessagesFromSameSender(msg.from_agent, msg.to_agent, msg.id), redelivered: msg.redelivered_at != null }
         const { prefix, wrapped } = wrapAgentMessageForDelivery(category, safeFromAgent, msg.from_agent, content, msg.id, msg.origin_note, freshness, { urgent: msg.urgent === 1 })
         // What the recipient inherits as trace context after this delivery:
         // the head's, unless a multi-envelope batch below ends on a later row.
@@ -1341,7 +1393,10 @@ export async function runMessageRouterTick(): Promise<void> {
           // own envelope. Opt-in per recipient (ROUTER_BATCH_INJECT_AGENTS), so
           // it is measured on one agent before it is widened. Channel-inbound
           // rows (user messages, possibly voice/STT) stay on the serial path.
-          const mates = collectBatchMates(pending, msg, now, agentSessionCache)
+          // An unblock notice goes alone, like a STOP: its mates must keep waiting for an idle pane.
+          const mates = unblockPass
+            ? { items: [], rows: [], remaining: 0, lastTraceCtx: null }
+            : collectBatchMates(pending, msg, now, agentSessionCache)
           if (mates.items.length > 0) {
             const text = composeBatchInjection([{ prefix, wrapped }, ...mates.items], mates.remaining)
             await sendPromptToSession(session, text, host)
@@ -1370,7 +1425,7 @@ export async function runMessageRouterTick(): Promise<void> {
             // right before the first key and again right before the submitting Enter (#2143):
             // a running turn can open a permission prompt between the check above and either
             // of them (urgentEmitRefusal).
-            if (isStop) {
+            if (isStop || unblockPass) {
               const outcome = await sendPromptToSession(session, prefix + wrapped, host, { waitForIdle: false, emitGuard: urgentEmitRefusal })
               if (outcome === 'aborted-guard' || outcome === 'aborted-guard-typed') {
                 const typed = outcome === 'aborted-guard-typed'
@@ -1381,7 +1436,7 @@ export async function runMessageRouterTick(): Promise<void> {
                 if (hold) noticeUrgentHold(msg, session, hold, urgentLabel, now, typed)
                 continue
               }
-              logger.info({ id: msg.id, to: msg.to_agent, urgent: msg.urgent === 1 }, 'message-router: urgent or STOP row sent without waiting for an idle pane')
+              logger.info({ id: msg.id, to: msg.to_agent, urgent: msg.urgent === 1, unblock: unblockPass }, 'message-router: urgent, STOP or unblock row sent without waiting for an idle pane')
             } else {
               await sendPromptToSession(session, prefix + wrapped, host)
             }
@@ -1502,7 +1557,7 @@ function collectBatchMates(
     const effective = m.trace_id && m.span_id
       ? { trace_id: m.trace_id, span_id: m.span_id }
       : stampTraceOnMessage(m, now)
-    const freshness = { ageMs: now - m.created_at * 1000, newerFromSameSender: countNewerMessagesFromSameSender(m.from_agent, m.to_agent, m.id) }
+    const freshness = { ageMs: now - m.created_at * 1000, newerFromSameSender: countNewerMessagesFromSameSender(m.from_agent, m.to_agent, m.id), redelivered: m.redelivered_at != null }
     const { prefix, wrapped } = wrapAgentMessageForDelivery(cls.category, cls.safeFrom, m.from_agent, m.content, m.id, m.origin_note, freshness)
     items.push({ prefix, wrapped })
     rows.push(m)
