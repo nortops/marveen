@@ -6,9 +6,9 @@ import { fileURLToPath } from 'node:url'
 import { readEnvFile } from './env.js'
 import { parseLabelPalette } from './css-color.js'
 import { resolveFleetVenvDir } from './fleet-venv.js'
-import { DISTRIBUTION_DEFAULT_AGENT_MODEL } from './config-registry.js'
-import { FIXED_RESERVED_AGENT_IDS } from './web/sanitize.js'
-import { getProviderType, getChannelToken, getChannelChatId, type ChannelProviderType } from './channel-provider.js'
+import { DISTRIBUTION_DEFAULT_AGENT_MODEL, getSettingDefinition, isOverridesOnly } from './config-registry.js'
+import { FIXED_RESERVED_AGENT_IDS, MESSAGE_LAYER_RESERVED_AGENT_IDS } from './web/sanitize.js'
+import { getProviderType, getMainChannelToken, getChannelChatId, type ChannelProviderType } from './channel-provider.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -39,7 +39,12 @@ function readConfigOverrides(): Record<string, unknown> {
 const overrides = readConfigOverrides()
 // Effective raw value for a registry-backed key consumed at boot:
 // config-overrides.json wins, then .env. Callers apply their own default.
-function cfg(key: string): string | undefined {
+export function cfg(key: string): string | undefined {
+  // ENVRELAXGATE1104 step 2: cfg() has its own override > .env order, so an overrides-only (security) key read here
+  // would let a loosening .env line count. Such a key goes through the settings store; refusing here keeps a future
+  // boot-time reader from bypassing the rule.
+  const def = getSettingDefinition(key)
+  if (def && isOverridesOnly(def)) throw new Error(`cfg(): ${key} is overrides-only; read it through the settings store`)
   const ov = overrides[key]
   if (ov !== undefined && ov !== null && String(ov).length > 0) return String(ov)
   return env[key]
@@ -150,6 +155,12 @@ export const DEFAULT_AGENT_MODEL =
 // configured value is the operator's choice and is never replaced.
 export const DEFAULT_AGENT_MODEL_IS_DISTRIBUTION = !cfg('DEFAULT_AGENT_MODEL')
 
+// WORKERMODELFAST1109: the FAST worker session's model. Empty means the same chain
+// as the slow worker, so nothing changes until it is set. A separate key because the
+// fast session only gets short conversational jobs (under 300 characters, no
+// analysis keyword -- classifyPriority), for which the strongest model is overkill.
+export const WORKER_MODEL_FAST = cfg('MARVEEN_WORKER_MODEL_FAST') || ''
+
 export const TELEGRAM_BOT_TOKEN = env['TELEGRAM_BOT_TOKEN'] ?? ''
 export const ALLOWED_CHAT_ID = env['ALLOWED_CHAT_ID'] ?? ''
 
@@ -166,8 +177,9 @@ export const OWNER_NAME_PLACEHOLDER = 'Owner'
 export const OWNER_NAME = env['OWNER_NAME'] ?? OWNER_NAME_PLACEHOLDER
 // Shared Google Drive folder ID the fleet writes deliverables into. Empty by
 // default (distribution-safe: no owner-specific folder is baked into a fresh
-// install's generated agent CLAUDE.md); set OWNER_DRIVE_FOLDER in .env to wire
-// the default shared drive for this install.
+// install's generated agent CLAUDE.md). The generator reads the setting through
+// the settings store (agent-scaffold.ts), where it is overrides-only: set it on
+// the Settings page, a .env line no longer counts (ENVRELAXGATE1104).
 export const OWNER_DRIVE_FOLDER = env['OWNER_DRIVE_FOLDER'] ?? ''
 export const BOT_NAME = env['BOT_NAME'] ?? 'Marveen'
 
@@ -338,7 +350,10 @@ export function resolveVoiceChannelId(raw: string | undefined, taken: VoiceChann
   const ident = (s: string) => s.replace(/[^a-zA-Z0-9_-]/g, '')
   const systemSenders = parseSystemSenderIds(taken.systemSenderIds, ident)
   const collision = (id: string): string | undefined => {
-    if (FIXED_RESERVED_AGENT_IDS.includes(id)) return 'a system id'
+    // The message layer's ids only, NOT the route names (AGENTROUTERESERVED1114): the voice channel id names a
+    // sender and has no /api/agents/<id> address, and widening this check would switch an install that already
+    // runs its voice lane under such an id back to the default on upgrade.
+    if (MESSAGE_LAYER_RESERVED_AGENT_IDS.includes(id)) return 'a system id'
     if (systemSenders.has(id)) return 'a SYSTEM_SENDER_IDS entry'
     if (id === taken.mainAgentId) return 'the main agent id'
     if (id === ident(taken.ownerName)) return "the owner's name"
@@ -369,8 +384,9 @@ export const VOICE_CHANNEL_ID_INVALID = voiceChannel.invalid
 export const VOICE_CHANNEL_DISABLED_BY = voiceChannel.disabledBy
 
 // The full reserved-id list (FLEETRESERVEDNAME1021): the fixed ids from
-// web/sanitize.ts plus the voice channel id in effect (none when the lane is
-// off). No main agent or sub-agent may take one of these.
+// web/sanitize.ts (the message layer's ids and the agents API's fixed route
+// names, AGENTROUTERESERVED1114) plus the voice channel id in effect (none when
+// the lane is off). No main agent or sub-agent may take one of these.
 export const RESERVED_AGENT_IDS: readonly string[] =
   VOICE_CHANNEL_ID === null ? FIXED_RESERVED_AGENT_IDS : [...FIXED_RESERVED_AGENT_IDS, VOICE_CHANNEL_ID]
 
@@ -540,7 +556,7 @@ export const KANBAN_LABEL_COLORS_REJECTED = kanbanLabelPalette.rejected
 export const KANBAN_LABEL_COLORS_OVERFLOW = kanbanLabelPalette.overflow
 
 export const CHANNEL_PROVIDER: ChannelProviderType = getProviderType(env['CHANNEL_PROVIDER'])
-export const CHANNEL_TOKEN = getChannelToken(CHANNEL_PROVIDER, env)
+export const CHANNEL_TOKEN = getMainChannelToken(CHANNEL_PROVIDER, env)
 export const CHANNEL_CHAT_ID = getChannelChatId(CHANNEL_PROVIDER, env)
 // Where OPERATIONAL alerts go (watchdog respawns, stuck sessions, restart
 // notices). Empty = the owner chat; set it when the person who runs the

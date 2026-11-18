@@ -1,3 +1,4 @@
+import { allowTargetSessionsForTest } from './helpers/allow-target-sessions.js'
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'node:events'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -43,8 +44,9 @@ vi.mock('../web/schedule-registry.js', () => ({
 }))
 
 vi.mock('node:child_process', async (importOriginal) => {
+  const { execFileFromSync } = await import('./helpers/exec-file-from-sync.js')
   const real = await importOriginal<typeof import('node:child_process')>()
-  return {
+  const mocked = {
     ...real,
     spawn: vi.fn(() => {
       preCheckRuns++
@@ -61,6 +63,7 @@ vi.mock('node:child_process', async (importOriginal) => {
       return child
     }),
   }
+  return { ...mocked, execFile: execFileFromSync(mocked.execFileSync) }
 })
 
 vi.mock('../logger.js', () => ({
@@ -106,6 +109,7 @@ vi.mock('../web/scheduled-tasks-io.js', () => ({
 }))
 
 vi.mock('../web/agent-process.js', () => ({
+  withTmuxBatch: (fn: () => unknown) => fn(),
   clearFeedbackModalAndRecheck: () => false,
   agentSessionName: (name: string) => `agent-${name}`,
   isAgentRunning: () => true,
@@ -114,6 +118,7 @@ vi.mock('../web/agent-process.js', () => ({
   startAgentProcess: vi.fn(() => ({ ok: true })),
   sessionExistsOnHost: () => true,
   capturePane: () => null,
+  capturePaneAsync: async () => null,
   sendEnterToSession: vi.fn(),
   clearStaleParkedInput: vi.fn(() => false),
   resolveAgentProvider: () => 'telegram',
@@ -243,3 +248,6 @@ describe('schedule runner: a pending retry re-reads the task and the row after i
     expect(mockUpdatePendingRetry).not.toHaveBeenCalled()
   })
 })
+
+// OWNEREXEC1109: these fixtures route by made-up session names; the runner types only into fleet sessions, so exactly these are listed (helpers/allow-target-sessions.ts).
+allowTargetSessionsForTest(['plain-session', 'retry-test-session'])

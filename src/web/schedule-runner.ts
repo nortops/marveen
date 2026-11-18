@@ -26,7 +26,7 @@ import {
   CHANNEL_PROVIDER,
   TASK_STALL_TIMEOUT_MS,
 } from '../config.js'
-import { resolveOwnerChatId, configuredOwnerChatFor, normalizeChatId } from '../owner-chat.js'
+import { ownerAlertChatOverride, resolveOwnerChatId, configuredOwnerChatFor, normalizeChatId } from '../owner-chat.js'
 import { getEffectiveSettingValue } from '../settings-store.js'
 import {
   appendTaskRun,
@@ -83,7 +83,7 @@ import { enqueueWorksourceItem, worksourceItemStage, worksourcePendingHead, type
 import { resolveAgentConfigDirForRead } from './claude-plans.js'
 import { readTranscriptMtimeAcrossConfigDirs, projectsDirFor } from './active-model.js'
 import { classifyDelivery, readUserPromptsSince, type DeliveryVerdict, type ReceivedPrompt } from './delivery-integrity.js'
-import { paneOneLine } from './pane-text.js'
+import { paneTyped } from './pane-text.js'
 import { mainConfigRoots } from './inbound-probe.js'
 import { channelStateDir, getProvider, readChannelToken, readTeamsCreds, type ChannelProviderType } from '../channel-provider.js'
 import { sendTeamsMessage } from '../teams-send.js'
@@ -452,6 +452,8 @@ export function checkTaskDeliveryIntegrity(
 // `remote` is true when the run went to a remote agent (entry.host set): no delivery verdict can exist
 // there, so a closed 'done' is the bar (see isOnceRunSuccess). The early return for a non-once task also
 // keeps the "not verified intact" warning off ordinary tasks with a damaged delivery.
+// `worksourceAcked` is true when the run went through the agent's worksource queue and the item reached done/
+// (the agent's work_complete acknowledgement): that path takes no delivery verdict either.
 // Exported for the behaviour tests (schedule-once.test.ts); the sweep is its only production caller.
 export function settleOnceAfterRun(
   taskName: string,
@@ -459,10 +461,11 @@ export function settleOnceAfterRun(
   deliveryVerdict: DeliveryVerdict | undefined,
   now: number,
   remote = false,
+  worksourceAcked = false,
 ): void {
   try {
     if (!readScheduledTask(taskName)?.once) return
-    if (!isOnceRunSuccess(decision, deliveryVerdict, { remote })) {
+    if (!isOnceRunSuccess(decision, deliveryVerdict, { remote, worksourceAcked })) {
       logger.warn(
         { task: taskName, decision, delivery: deliveryVerdict ?? 'unchecked' },
         'Once-task ran but its delivery was not verified intact -- left enabled, so it stays visible',
@@ -470,7 +473,7 @@ export function settleOnceAfterRun(
       return
     }
     if (rewriteRegisteredTask(taskName, 'server:once-disable', () => disableOnceTask(taskName, now))) {
-      logger.info({ task: taskName, delivery: remote ? 'remote-unchecked' : deliveryVerdict }, 'Once-task switched off after its first successful run')
+      logger.info({ task: taskName, delivery: remote ? 'remote-unchecked' : worksourceAcked ? 'worksource-acknowledged' : deliveryVerdict }, 'Once-task switched off after its first successful run')
     }
   } catch (err) {
     logger.warn({ err, task: taskName }, 'Once-task could not be switched off -- left enabled')
@@ -1126,7 +1129,8 @@ export function groupOrChannelTargets(raw: unknown): string[] {
 // had no way to say otherwise. Two knobs, neither of which touches sub-agents
 // unless a task names it explicitly:
 //   - task-config.json `channelProvider`: this task delivers on that provider;
-//   - SCHEDULED_DELIVERY_CHANNEL="<provider>:<chat id>" in the install .env:
+//   - SCHEDULED_DELIVERY_CHANNEL="<provider>:<chat id>" on the Settings page
+//     (overrides-only since ENVRELAXGATE1104: a .env line no longer counts):
 //     the default for the MAIN agent's tasks that pin nothing themselves.
 //
 // Precedence for a scheduled task's delivery target:
@@ -1183,10 +1187,10 @@ const warnedDeliveryDefaults = new Set<string>()
 /**
  * The install's SCHEDULED_DELIVERY_CHANNEL, read fresh on every call: from
  * process.env (an operator or test override), else the settings store
- * (Beallitasok override > install .env > registry default ''). NOT process.env
- * alone: the dashboard runs under launchd and NONE of the .env keys reach its
- * process.env (measured 2026-09-20, see rolloutFlag in batch-inject.ts), so a
- * process.env-only setting would be unreachable through "put it in .env". A
+ * (Beallitasok override > registry default ''; overrides-only since
+ * ENVRELAXGATE1104, so an install .env line does not count). process.env is the
+ * dashboard's own launch environment (launchd: NONE of the .env keys reach it,
+ * measured 2026-09-20, see rolloutFlag in batch-inject.ts). A
  * set but unusable value is warned about once per value and ignored.
  */
 export function readScheduledDeliveryDefault(
@@ -1218,6 +1222,7 @@ export function channelDisplayName(provider: ChannelProviderType): string {
     case 'googlechat': return 'Google Chat'
     case 'teams': return 'Teams'
     case 'telegram': return 'Telegram'
+    case 'gromzo': return 'Gromzo'
   }
 }
 
@@ -1314,6 +1319,8 @@ export function channelDeliveryName(provider: ChannelProviderType): string {
       return "Teamsen";
     case "telegram":
       return "Telegramon";
+    case "gromzo":
+      return "Gromzón";
     // No default: the switch is exhaustive over ChannelProviderType, so a new
     // provider is a compile error here instead of silently reading "Telegramon".
   }
@@ -1897,6 +1904,26 @@ function mcpMissingReason(taskName: string, agentName: string): string {
 // janitor targets the SAME pane the fire path would have written to -- a second
 // copy of this derivation would drift, and a janitor aimed at the wrong session
 // is worse than no janitor at all.
+// OWNEREXEC1109: a targetSession override may name only a fleet session: the main channels session or a known
+// agent's session. sendPromptToSession types into whatever pane it is given and presses Enter, and it does not check
+// that Claude is running there, so an override naming any other tmux session (a shell, a tool) would have the
+// scheduler type the prompt into it. A task whose override is not on this list is not sent (attemptFireTask books an
+// 'error' run and tells the main agent once); the janitor does not touch its pane either. This also covers a task
+// stored before the API gated the field.
+export function allowedTargetSessions(agents: string[] = listAgentNames()): Set<string> {
+  // A test-only list (src/__tests__/helpers/allow-target-sessions.ts) for suites whose fixtures use made-up session
+  // names; production never sets this symbol.
+  const testOnly = (globalThis as Record<symbol, unknown>)[Symbol.for('marveen.schedule.targetSessionAllowForTest')] as Set<string> | undefined
+  return new Set([MAIN_CHANNELS_SESSION, ...agents.map((a) => agentSessionName(a)), ...(testOnly ?? [])])
+}
+export function targetSessionRefused(task: Pick<ScheduledTask, 'targetSession'>, allowed: () => Set<string> = allowedTargetSessions): boolean {
+  return !!task.targetSession && !allowed().has(task.targetSession)
+}
+const refusedTargetNoticeSent = new Set<string>()
+export function refusedTargetSessionNotice(taskName: string, agentName: string, session: string): string {
+  return `[FELHÍVÁS] A(z) "${taskName}" ütemezett feladat (agent: ${agentName}) célsessionje ("${session}") nem flotta-session (sem a fő csatorna-session, sem ismert ágensé), ezért NEM küldtem el. Nézd meg a feladat task-config.json targetSession mezőjét: ha nem te állítottad be, kezeld biztonsági eseményként.`
+}
+
 export function resolveTaskTarget(
   task: Pick<ScheduledTask, 'targetSession'>,
   agentName: string,
@@ -2009,6 +2036,19 @@ async function attemptFireTask(
   lateCatchUpMs?: number,
   occurrence?: ScheduledOccurrence,
 ): Promise<'fired' | 'busy' | 'missing' | 'starting' | 'error' | 'mcp-missing' | 'first-run' | 'respawning' | 'usage-limited'> {
+  // OWNEREXEC1109: an override that names no fleet session is never sent (see allowedTargetSessions).
+  if (targetSessionRefused(task)) {
+    logger.error({ task: task.name, agent: agentName, targetSession: task.targetSession }, 'schedule-runner: targetSession is not a fleet session; prompt NOT sent')
+    const noticeKey = `${task.name}\u0000${task.targetSession}`
+    if (!refusedTargetNoticeSent.has(noticeKey)) {
+      refusedTargetNoticeSent.add(noticeKey)
+      try { createAgentMessage('system', MAIN_AGENT_ID, refusedTargetSessionNotice(task.name, agentName, task.targetSession!)) } catch (err) {
+        logger.warn({ err, task: task.name }, 'schedule-runner: could not queue the refused-target notice')
+      }
+    }
+    appendTaskRun(task.name, agentName, 'error')
+    return 'error'
+  }
   const { session, host } = resolveTaskTarget(task, agentName)
   // resolveTaskTarget() computes this internally but does not expose it (it
   // only returns {session, host}) -- recompute the same cheap check here
@@ -2431,7 +2471,7 @@ async function attemptFireTask(
       runId: firedRunId,
       taskType: task.type,
       // Local agents only: a remote agent's transcript is on its own host.
-      ...(host == null ? { sentText: paneOneLine(fullPrompt), typedAt } : {}),
+      ...(host == null ? { sentText: paneTyped(fullPrompt), typedAt } : {}),
       ...(host != null ? { remoteWorkdir: readAgentRemoteConfig(agentName).workdir ?? undefined } : {}),
       deliveryPending: true,
     }
@@ -2787,8 +2827,9 @@ export function resolveSchedulerAlertToken(
 // Slack install) and the paired fallback from slack/access.json (the live
 // CHANNEL_PROVIDER=slack install has no telegram access.json at all, so the
 // default path returned null and every scheduler alert was suppressed).
+// ISSUE2556X: the owner's OWNER_ALERT_CHAT_ID wins when set (a delivery target only; unset, this is unchanged).
 function resolveSchedulerOwnerChat(): string | null {
-  return resolveOwnerChatId(undefined, configuredOwnerChatFor(CHANNEL_PROVIDER), CHANNEL_PROVIDER)
+  return ownerAlertChatOverride(CHANNEL_PROVIDER) ?? resolveOwnerChatId(undefined, configuredOwnerChatFor(CHANNEL_PROVIDER), CHANNEL_PROVIDER)
 }
 
 // Send a system-level scheduler alert over the MAIN agent's bound channel. The
@@ -3495,7 +3536,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
         // still be silently swallowing prompts.
         if (decision === 'done') {
           lostRedeliveryCounts.delete(`${entry.taskName}@${entry.agentName}`)
-          settleOnceAfterRun(entry.taskName, decision, entry.deliveryVerdict, now, entry.host != null)
+          settleOnceAfterRun(entry.taskName, decision, entry.deliveryVerdict, now, entry.host != null, worksourceStage === 'done')
         }
         // The one moment the system knows how the run ended. Before 2026-08-26
         // this branch only deleted the map entry, so the knowledge died here and
@@ -3708,7 +3749,7 @@ export function startScheduleRunner(): NodeJS.Timeout {
       // emptying the input box. clearStaleParkedInput does the identifying and
       // refuses anything that is genuinely mid-turn; if it clears, the next
       // tick's retry delivers on its own.
-      if (stillPresent && result === 'busy' && view.ageMs > SCHEDULE_JANITOR_PARKED_MIN_AGE_MS) {
+      if (stillPresent && result === 'busy' && view.ageMs > SCHEDULE_JANITOR_PARKED_MIN_AGE_MS && !targetSessionRefused(current)) {
         const { session, host } = resolveTaskTarget(current, row.agent_name)
         if (await clearStaleParkedInput(session, host)) {
           logger.warn(

@@ -4,11 +4,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 // DETACHED child process so it can never starve the dashboard event loop, so we
 // assert on spawn(), not on an inline attemptChannelMcpReconnect call.
 const { mockSpawn } = vi.hoisted(() => ({ mockSpawn: vi.fn() }))
-vi.mock('node:child_process', () => ({
-  execFileSync: vi.fn(),
-  execSync: vi.fn(),
-  spawn: mockSpawn,
-}))
+vi.mock('node:child_process', async (orig) => {
+  const { execFileFromSync } = await import('./helpers/exec-file-from-sync.js')
+  const mocked = {
+    execFileSync: vi.fn(),
+    execSync: vi.fn(),
+    spawn: mockSpawn,
+  }
+  return { ...mocked, execFile: execFileFromSync(mocked.execFileSync) }
+})
 
 vi.mock('../platform.js', () => ({
   resolveFromPath: (name: string) => `/usr/local/bin/${name}`,
@@ -37,11 +41,14 @@ vi.mock('../web/agent-config.js', () => ({
 
 const mockCapturePane = vi.fn<(session: string) => string | null>()
 vi.mock('../web/agent-process.js', () => ({
+  withTmuxBatch: (fn: () => unknown) => fn(),
   // The not-ready-path modal clear: false = no modal, so every caller keeps
   // its existing skip/busy behaviour and these fixtures are unaffected.
   clearFeedbackModalAndRecheck: () => false,
   isAgentRunning: (name: string) => name === 'samu',
   capturePane: (session: string) => mockCapturePane(session),
+  capturePaneAsync: async (session: string) => mockCapturePane(session),
+  captureParkedInputViewAsync: async (session: string) => mockCapturePane(session),
   agentSessionName: (name: string) => `agent-${name}`,
 }))
 

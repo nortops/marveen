@@ -65,6 +65,7 @@ vi.mock('../web/agent-process.js', async () => {
   const { vi } = await import('vitest')
   h.restartAgentProcess = vi.fn(async () => (h.restartOk ? { ok: true } : { ok: false, error: 'boom' }))
   return {
+    withTmuxBatch: (fn: () => unknown) => fn(),
     agentRunState: () => 'running',
     agentSessionName: (n: string) => `agent-${n}`,
     restartAgentProcess: (...a: unknown[]) => h.restartAgentProcess(...a),
@@ -109,7 +110,12 @@ vi.mock('../web/active-model.js', () => ({
 }))
 vi.mock('../web/main-agent.js', () => ({ MAIN_CHANNELS_SESSION: 'marveen-channels' }))
 vi.mock('../notify.js', () => ({ notifyChannel: async () => {} }))
-vi.mock('../db.js', () => ({ createAgentMessage: () => ({ id: 1 }) }))
+vi.mock('../db.js', () => ({
+  createAgentMessage: () => ({ id: 1 }),
+  // Card 2e1a5659: the resume send reads pending rows through the drain;
+  // empty here = byte-identical legacy resume, which is what these tests measure.
+  getPendingMessages: () => [],
+}))
 
 const INITIAL_DELAY_MS = 270_000
 const INTERVAL_MS = 300_000
@@ -141,6 +147,7 @@ function resumeCalls(): unknown[][] {
 }
 
 beforeEach(() => {
+  vi.stubEnv('ROUTER_BATCH_INJECT_AGENTS', 'some-other-agent')
   rmSync(STORE, { recursive: true, force: true })
   mkdirSync(STORE, { recursive: true })
   vi.useFakeTimers()
@@ -154,6 +161,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.unstubAllEnvs()
   for (const t of timers) clearInterval(t)
   timers = []
   vi.clearAllTimers()

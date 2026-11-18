@@ -1,5 +1,5 @@
 import http from 'node:http'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { execFileSync } from 'node:child_process'
@@ -12,6 +12,8 @@ import { createAgentTokenResolver } from './web/agent-tokens.js'
 import { operatorGateDecision } from './web/operator-gate.js'
 import { readOperatorAccess } from './web/operator-access.js'
 import { tryHandleOperatorAccess } from './web/routes/operator-access.js'
+import { tryHandleSupportAccess } from './web/routes/support-access.js'
+import { startSupportReconcile } from './web/support-standby-runtime.js'
 import { tryHandleOperator } from './web/routes/operator.js'
 import { sweepExpiredSessions } from './web/auth-sessions.js'
 import { sweepExpiredDeviceKeys } from './web/auth-device-keys.js'
@@ -21,19 +23,21 @@ import { detectLanIp } from './web/network-info.js'
 import { AGENTS_BASE_DIR, listAgentNames, listAllAgentNames } from './web/agent-config.js'
 import { forEachAgentIsolated } from './web/agent-seed-loop.js'
 import { ensureRotationHeartbeatTask } from './web/claude-rotation-heartbeat.js'
-import { ensureAgentHooks, ensureProjectRootInClaudeMd, ensureAgentStalenessHook, ensureAgentProvenanceHook, ensureEgressGate, ensureBashEgressDeny, ensureBashEgressParser, ensureMainScopeBashEgressParser, ensureGovernanceGateCommands, ensureTelegramCopyGate, ensureChildClaudeGuard, ensureWebSearchEnvelope, ensureExtraHookEntries, ensureQuarantineReader, watchEgressAllowlistForReaderRender, ensureDefaultScheduledTasks, agentSettingsPath, ensureAutonomySection, ensureSkillsPathTrapSection, ensureSystemDirectiveAuthSection, ensureAgentIdHeaderSection, ensureMemorySearchLabelSection, ensureFleetAuthSection, ensureEvidenceSection, ensureMcpListChannelSection, ensureMessageCloseSection, ensureApiHelperSection, ensureBackgroundCheckpointSection } from './web/agent-scaffold.js'
+import { ensureAgentHooks, ensureProjectRootInClaudeMd, ensureAgentStalenessHook, ensureAgentProvenanceHook, ensureEgressGate, ensureBashEgressDeny, ensureBashEgressParser, ensureMainScopeBashEgressParser, ensureGovernanceGateCommands, ensureTelegramCopyGate, ensureChildClaudeGuard, ensureWebSearchEnvelope, ensureExtraHookEntries, ensureQuarantineReader, watchEgressAllowlistForReaderRender, ensureDefaultScheduledTasks, agentSettingsPath, ensureAutonomySection, ensureSkillsPathTrapSection, ensureSystemDirectiveAuthSection, ensureAgentIdHeaderSection, ensureMemorySearchLabelSection, ensureFleetAuthSection, ensureEvidenceSection, ensureMcpListChannelSection, ensureMessageCloseSection, ensureApiHelperSection, ensureBackgroundCheckpointSection, ensurePaneAtEscapeSection } from './web/agent-scaffold.js'
 import { shouldRegisterHooks, shouldRunBackgroundServices, ALLOW_SECOND_INSTANCE_SERVICES_KEY, pruneStaleHooksFromSettingsFile } from './web/hook-registration-guard.js'
 import { mainAgentConfigDirIfSeparate } from './web/agent-process.js'
 import { refreshMarveenBotUsername } from './web/telegram.js'
 import { startMessageRouter } from './web/message-router.js'
 import { createAgentMessage } from './db.js'
-import { setOwnerChatMissingSink } from './notify.js'
+import { setOwnerChatMissingSink, setOwnerRelayLang, setOwnerRelaySink } from './notify.js'
+import { approvalTextLang } from './web/agent-text-lang.js'
 import { startUpdateChecker } from './web/update-checker.js'
 import { startScheduleRunner, startHeartbeatGapGuard } from './web/schedule-runner.js'
 import { startChannelPluginMonitor } from './web/channel-monitor.js'
 import { startInboundProber } from './web/inbound-probe.js'
 import { startChannelHealthMonitor } from './web/channel-health-monitor.js'
 import { startChannelIntakeMonitor } from './web/channel-intake-monitor.js'
+import { startTelegramInboundReplay } from './web/telegram-inbound-replay.js'
 import { startTeamsCredentialMonitor } from './web/teams-credential-monitor.js'
 import { startStuckInputWatcher } from './web/stuck-input-watcher.js'
 import { startMessageSeenSweep } from './web/message-seen-sweep.js'
@@ -74,6 +78,7 @@ import { sweepOrphanTaskStates } from './web/agent-taskstate.js'
 import { tryHandleDailyLog } from './web/routes/daily-log.js'
 import { tryHandlePrLedger } from './web/routes/pr-ledger.js'
 import { tryHandleOpensourceInventory } from './web/routes/opensource-inventory.js'
+import { tryHandleCliInventory } from './web/routes/cli-inventory.js'
 import { tryHandleHomoglyphs } from './web/routes/homoglyphs.js'
 import { tryHandleMemories } from './web/routes/memories.js'
 import { tryHandleMigrate } from './web/routes/migrate.js'
@@ -103,7 +108,7 @@ import { tryHandleAutonomy } from './web/routes/autonomy.js'
 import { tryHandleApprovals, startApprovalTimeoutSweeper, startApprovalReactionSweeper } from './web/routes/approvals.js'
 import { tryHandleDesktopLock, sweepExpiredDesktopLock } from './web/routes/desktop-lock.js'
 import { tryHandleFleetFreeze } from './web/routes/fleet-freeze.js'
-import { tryHandleGromzo } from './web/routes/gromzo.js'
+import { initGromzoConsentWatch, tryHandleGromzo } from './web/routes/gromzo.js'
 import { tryHandleTokenUsage } from './web/routes/token-usage.js'
 import { tryHandleCosts, startCostsSyncTask } from './web/routes/costs.js'
 import { tryHandleIdeas } from './web/routes/ideas.js'
@@ -235,6 +240,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleAuth(routeCtx)) return
       if (await tryHandleOperatorAccess(routeCtx)) return
       if (await tryHandleOperator(routeCtx, WEB_DIR)) return
+      if (await tryHandleSupportAccess(routeCtx)) return
       if (await tryHandleSecurity(routeCtx)) return
       if (await tryHandleBridgeServicePorts(routeCtx)) return
       if (await tryHandleProfiles(routeCtx)) return
@@ -243,6 +249,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleDailyLog(routeCtx)) return
       if (await tryHandlePrLedger(routeCtx)) return
       if (await tryHandleOpensourceInventory(routeCtx)) return
+      if (await tryHandleCliInventory(routeCtx)) return
       if (await tryHandleHomoglyphs(routeCtx)) return
       if (await tryHandleMemories(routeCtx)) return
       if (await tryHandleMigrate(routeCtx)) return
@@ -451,11 +458,36 @@ export function startWebServer(port = 3420): http.Server {
   if (servicesOff && !webOnly) logger.warn({ reason: services.reason }, 'Second instance: background services disabled (start it with ' + ALLOW_SECOND_INSTANCE_SERVICES_KEY + '=1 in the environment to run them)')
   if (services.override) logger.warn({ reason: services.reason }, 'Second instance with ' + ALLOW_SECOND_INSTANCE_SERVICES_KEY + '=1: background services RUN (schedule runner included)')
 
+  // GROMZOBRIDGEWIZARD1107 D1: a pending Gromzo approval comes back after a restart; the server checks it on its own only
+  // with the background services on (finishing a switch restarts a live session).
+  initGromzoConsentWatch({ watch: !servicesOff })
+
   const routerInterval = servicesOff ? undefined : startMessageRouter()
   if (!servicesOff) logger.info('Agent message router started (5s poll)')
   // Card 3ed09d25: an alert whose owner chat cannot be resolved reaches the main
   // agent's inbox (once an hour) instead of vanishing; the log line fires every time.
   if (!servicesOff) setOwnerChatMissingSink((text) => { createAgentMessage('system', MAIN_AGENT_ID, text) })
+  // GROMZONOPROVIDER1108: on a gromzo install every owner alert goes to the main agent, which relays it over Gromzo.
+  if (!servicesOff) setOwnerRelaySink((text) => { createAgentMessage('system', MAIN_AGENT_ID, text) })
+  setOwnerRelayLang(() => approvalTextLang())
+  // GROMZONOPROVIDER1108: update.sh's provider migration leaves a marker; the owner hears it once, through the main
+  // agent (the install now talks through Gromzo). The marker is renamed after the notice, so it is said once.
+  if (!servicesOff) {
+    const marker = join(STORE_DIR, 'gromzo-provider-migrated.json')
+    if (existsSync(marker)) {
+      try {
+        createAgentMessage('system', MAIN_AGENT_ID, approvalTextLang() === 'en'
+          ? '[owner-notice] Tell the owner over Gromzo, in one sentence: Marveen\'s channel is Gromzo from now on (it was a ' +
+            'Telegram setting with no token, so the main session kept restarting). To undo: CHANNEL_PROVIDER_PREV in the install settings.'
+          : '[owner-notice] Tájékoztasd a tulajdonost a Gromzón, egy mondatban: a Marveen csatornája mostantól a Gromzo ' +
+            '(korábban egy Telegram-beállítás volt token nélkül, ezért a fő munkamenet újra és újra elindult). ' +
+            'Visszaállítás: CHANNEL_PROVIDER_PREV a telepítés beállításaiban.')
+        renameSync(marker, `${marker}.notified`)
+      } catch (err) {
+        logger.warn({ err }, 'gromzo provider migration notice could not be queued')
+      }
+    }
+  }
 
   const scheduleInterval = servicesOff ? undefined : startScheduleRunner()
   if (!servicesOff) logger.info('Schedule runner started (60s poll)')
@@ -494,6 +526,8 @@ export function startWebServer(port = 3420): http.Server {
   }
 
   const pluginMonitorInterval = servicesOff ? undefined : startChannelPluginMonitor()
+  // SUPPORTKULCS1109 (terv-v7 3.8): the support reconcile, shortly after the start and then daily.
+  if (!servicesOff) startSupportReconcile()
   if (!servicesOff) logger.info('Channel plugin health monitor started (60s poll)')
 
   // Userbot inbound-probe (gold-standard deafness detector). Safe no-op until
@@ -515,6 +549,10 @@ export function startWebServer(port = 3420): http.Server {
   // only signal a silently deaf poller leaves behind.
   const channelIntakeInterval = servicesOff ? undefined : startChannelIntakeMonitor(PROJECT_ROOT)
   if (!servicesOff) logger.info('Channel intake monitor started (5min poll, 100s offset)')
+  // A message that reaches a sub-agent's Telegram plugin before Claude Code has registered its channel handler (the
+  // first seconds after every restart) is dropped silently; this re-delivers it from the plugin's own inbound log.
+  const stopTelegramInboundReplay = servicesOff ? undefined : startTelegramInboundReplay()
+  if (!servicesOff) logger.info('Telegram inbound replay started (60s poll, 90s offset)')
   const teamsCredentialInterval = servicesOff ? undefined : startTeamsCredentialMonitor()
   if (!servicesOff) logger.info('Teams credential monitor started (daily, 5min offset)')
 
@@ -655,6 +693,8 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
     // VOICETOKENLEAK1101 PR-A2 (Samu 65192, Marveen 65196): the helper recipes as a marker block only; the body is untouched.
     ensureApiHelperSection(MAIN_AGENT_ID)
     ensureBackgroundCheckpointSection(MAIN_AGENT_ID)
+    // ENVATLEAK1114: the backslash the delivery layer puts before an at-sign, explained to the reader.
+    ensurePaneAtEscapeSection(MAIN_AGENT_ID)
   }
 
   // Owner slash commands (CMD920, spec D-4): the registry the main session's
@@ -799,6 +839,7 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
     try {
       const seeded = ensureRotationHeartbeatTask({ respectRemoval: true })
       if (seeded === 'created') logger.info('Claude rotation heartbeat task created')
+      if (seeded === 'upgraded') logger.info('Claude rotation heartbeat prompt upgraded (sub-agent lines)')
     } catch (err) {
       logger.warn({ err }, 'Claude rotation heartbeat seed skipped')
     }
@@ -827,6 +868,7 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
     if (workerLivenessInterval) clearInterval(workerLivenessInterval)
     clearInterval(channelHealthInterval)
     if (channelIntakeInterval) clearInterval(channelIntakeInterval)
+    if (stopTelegramInboundReplay) stopTelegramInboundReplay()
     if (teamsCredentialInterval) clearInterval(teamsCredentialInterval)
     if (costsSyncInterval) clearInterval(costsSyncInterval)
     clearInterval(stuckInputInterval)

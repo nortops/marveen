@@ -34,6 +34,7 @@ export const KNOWN_HOOK_SCRIPTS: readonly string[] = [
   'email-send-gate.mjs',
   'self-pace-gate.mjs',
   'db-write-gate.mjs',
+  'mxd-path-gate.mjs',
   'telegram_progress.py',
   'telegram_progress_clear.py',
   'telegram_progress_watchdog.py',
@@ -44,6 +45,10 @@ export const KNOWN_HOOK_SCRIPTS: readonly string[] = [
   'slack_progress_clear.py',
   'slack_progress_reply_clear.py',
   'slack_progress_watchdog.py',
+  // PELENKAGCHAT1113: one script on two events (UserPromptSubmit records the
+  // inbound's thread, PreToolUse judges the Google Chat reply), in both the
+  // project settings and the sub-agent template.
+  'googlechat-thread-guard.py',
   'inbox-drain.py',
   'channel-inbox-drain.py',
   'ledger-capture.py',

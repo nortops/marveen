@@ -1,7 +1,7 @@
 // FLEETIMPORTGATE1022 (4): once a dashboard login exists, raising an autonomy level takes the
 // owner's session. The fleet's one shared token reaches POST /api/autonomy from every agent, and
 // email_send at 3 lets the mail approval gate wave every send through. Lowering (and setting
-// the same level) stays on the token; the token keeps everything for the first-run setup.
+// the same level) stays on the token. OWNERGATE4-1104: before the first login the token no longer raises either.
 import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest'
 import type http from 'node:http'
 import { Readable } from 'node:stream'
@@ -76,10 +76,15 @@ beforeEach(() => {
   seed()
 })
 
-describe('first-run setup (no dashboard user yet): the token still raises', () => {
-  it('raises email_send to 3', async () => {
-    expect((await setLevel(TOKEN_AUTH, 'email_send', 3)).status).toBe(200)
-    expect(levelOf('email_send')).toBe(3)
+describe('first-run setup (no dashboard user yet): the token cannot raise either', () => {
+  // OWNERGATE4-1104: raising a level is no first-run path; refuseOwner says to create the login first.
+  it('a raise of email_send to 3 is refused with setup_required and nothing is written', async () => {
+    const r = await setLevel(TOKEN_AUTH, 'email_send', 3)
+    expect(r.status).toBe(403)
+    expect(r.json().code).toBe('owner_session_required')
+    expect(r.json().setup_required).toBe(true)
+    expect(levelOf('email_send')).toBe(2)
+    expect(h.writes).toBe(0)
   })
 })
 
@@ -126,5 +131,41 @@ describe('once a login exists, the token cannot raise a level', () => {
     const cookie = `${SESSION_COOKIE_NAME}=${createSession({ userId: u.id, username: u.username })}`
     expect((await setLevel(TOKEN_AUTH, 'email_send', 3, { cookie })).status).toBe(200)
     expect(levelOf('email_send')).toBe(3)
+  })
+})
+
+// EMAILMAX3-1115: with the shipped seed (email_send level 1, ceiling 3) the new ceiling is reachable only
+// by the owner: the shared token still gets 403 for 2 and for 3, the owner's session reaches 3.
+describe('the shipped seed: email_send ceiling 3, raising it stays the owner', () => {
+  const SHIPPED = (() => {
+    const real = vi.importActual<typeof import('node:fs')>('node:fs')
+    return real.then((fs) => fs.readFileSync(new URL('../../seed-config/autonomy-config.json', import.meta.url), 'utf8') as string)
+  })()
+
+  beforeEach(async () => {
+    expect((await addUser(TOKEN_AUTH, 'owner')).status).toBe(201)
+    h.file = await SHIPPED
+    h.writes = 0
+  })
+
+  it('the seed under test is the shipped one: level 1, ceiling 3', () => {
+    const e = (JSON.parse(h.file).categories as Array<{ key: string; level: number; maxLevel: number }>).find((c) => c.key === 'email_send')!
+    expect([e.level, e.maxLevel]).toEqual([1, 3])
+  })
+
+  it('the token cannot raise to 2 or to 3: 403, nothing written', async () => {
+    for (const level of [2, 3]) {
+      const r = await setLevel(TOKEN_AUTH, 'email_send', level)
+      expect(r.status, String(level)).toBe(403)
+      expect(r.json().code).toBe('owner_session_required')
+    }
+    expect(levelOf('email_send')).toBe(1)
+    expect(h.writes).toBe(0)
+  })
+
+  it('the owner session raises to 3, and not past it', async () => {
+    expect((await setLevel(SESSION_AUTH, 'email_send', 3)).status).toBe(200)
+    expect(levelOf('email_send')).toBe(3)
+    expect((await setLevel(SESSION_AUTH, 'email_send', 4)).status).toBe(400)
   })
 })

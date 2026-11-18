@@ -115,7 +115,7 @@
 // their only gate), and a nesting too deep to read, which denies. Every DENY is appended to the block log.
 import { readFileSync, appendFileSync, realpathSync, mkdirSync, lstatSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { dirname, join, resolve } from 'node:path'
+import { isAbsolute, dirname, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { maskInertLiterals } from '../self-pace-gate.mjs'
 
@@ -127,7 +127,11 @@ export const BLOCK_LOG = process.env.BASH_EGRESS_BLOCK_LOG || join(ROOT, 'store'
 // `x.api.elevenlabs.io` are other hosts. A missing or unreadable file, or an entry that is not
 // a plain DNS name, means no exception: today's behaviour (deny). This is NOT
 // store/egress-allowlist.json -- that one is the WebFetch / quarantine-reader list.
+// AGENTEGRESS1111: BASH_EGRESS_AGENT_VENDOR_HOSTS adds the agent's hosts and domains to the
+// global lists. BASH_EGRESS_VENDOR_HOSTS still only overrides the global path; the agent list
+// never replaces it, and only an absolute path to a regular file contributes exceptions.
 export const VENDOR_HOSTS_PATH = process.env.BASH_EGRESS_VENDOR_HOSTS || join(ROOT, 'store', 'egress-vendor-hosts.json')
+export const AGENT_VENDOR_HOSTS_PATH = process.env.BASH_EGRESS_AGENT_VENDOR_HOSTS || ''
 // EGRESSCURLK1020: the one file a curl config may take its Authorization header from (see
 // curlConfigFromPrintf). STORE_DIR is always <root>/store. Tests point it elsewhere.
 // A relative path is resolved against the hook's cwd (the payload's), set by the entry point.
@@ -166,6 +170,16 @@ export function parseVendorDomains(raw) {
 }
 export function loadVendorDomains(path = VENDOR_HOSTS_PATH) {
   try { return parseVendorDomains(JSON.parse(readFileSync(path, 'utf-8'))) } catch { return new Set() }
+}
+// AGENTEGRESS1111: read both keys from the same object, rejecting symlinks and relative paths.
+export function loadAgentVendorLists(path = AGENT_VENDOR_HOSTS_PATH) {
+  try {
+    if (path && isAbsolute(path) && lstatSync(path).isFile()) {
+      const raw = JSON.parse(readFileSync(path, 'utf-8'))
+      return { hosts: parseVendorHosts(raw), domains: parseVendorDomains(raw) }
+    }
+  } catch { /* AGENTEGRESS1111: an unreadable agent list adds no exceptions. */ }
+  return { hosts: new Set(), domains: new Set() }
 }
 export function hostInDomains(host, domains) {
   for (const d of domains) if (host === d || host.endsWith(`.${d}`)) return true
@@ -1664,7 +1678,11 @@ export function classify(command, depth = 0, vendorHosts = new Set(), vendorDoma
   if (inners.length && depth >= MAX_DEPTH) return NESTING_LIMIT
   // Also with quotes and backslashes taken out: `cu''rl` and `c\url` run curl.
   const fetches = /\b(?:curl|wget)\b/.test(norm) || /\b(?:curl|wget)\b/.test(norm.replace(/['"\\]/g, ''))
-  let masked = maskInertLiterals(orig)
+  // GATECOMMENTQUOTE1104: a shell comment is inert in the mask, and taken out of the text read for words too, so its
+  // words are neither a call of a function nor a curl argument
+  const comments = []
+  let masked = maskInertLiterals(orig, undefined, false, comments)
+  if (masked !== null && masked.length === orig.length && comments.length) orig = blankRanges(orig, comments.map((k) => [k.start, k.end]))
   if (masked === null || masked.length !== orig.length) {
     for (const inner of inners) { const r = classify(inner, depth + 1, vendorHosts, vendorDomains); if (r.deny) return r }
     // Since curl https:// and wget can leave the deny list, this hook is their only gate: a command
@@ -1982,7 +2000,12 @@ if (isInvokedDirectly()) {
       process.exit(0)
     } catch { /* not on record: fall through to classify(), which denies the measure host */ }
   }
-  try { r = classify(payload?.tool_input?.command, 0, loadVendorHosts(), loadVendorDomains()) } catch (e) {
+  try {
+    const agent = loadAgentVendorLists()
+    const hosts = new Set([...loadVendorHosts(), ...agent.hosts])
+    const domains = new Set([...loadVendorDomains(), ...agent.domains])
+    r = classify(payload?.tool_input?.command, 0, hosts, domains)
+  } catch (e) {
     // Since curl https:// and wget left the deny list, this hook is the ONLY thing between them and an
     // external host, so an internal error on a command naming either verb denies instead of allowing.
     // Any other command keeps the old fail-open: a parser bug must not stop the fleet's ordinary work.
