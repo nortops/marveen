@@ -379,6 +379,8 @@ fi
 # session starts (see scripts/lib/channel-net-wait.sh for the measured boot).
 # shellcheck source=lib/channel-net-wait.sh
 . "$INSTALL_DIR/scripts/lib/channel-net-wait.sh"
+# shellcheck source=lib/channel-extra-state-dir.sh
+. "$INSTALL_DIR/scripts/lib/channel-extra-state-dir.sh"
 
 # Test seams, exiting before the store or a session is touched:
 #   --channel-wait-hosts <primary> [extra plugin ids...]  prints the hosts the
@@ -395,6 +397,14 @@ if [ "${1:-}" = "--channel-net-wait" ]; then
   shift
   wait_for_channel_hosts "$@"
   exit $?
+fi
+# --channel-extra-state-dirs <install_dir> <primary_state_var> [extra ids...]
+#   prints the VAR=dir pairs the launch below exports for co-listen extras
+#   (one per line). See scripts/__tests__/channels-extra-state-dir.test.sh.
+if [ "${1:-}" = "--channel-extra-state-dirs" ]; then
+  shift
+  channel_extra_state_dirs "$@"
+  exit 0
 fi
 
 # CHANSPARE925: is the process that owns bot.pid OURS? Measured 2026-09-25: a
@@ -1641,6 +1651,30 @@ STATE_DIR_ENV="export ${STATE_ENV_VAR}=$(sh_single_quote "$MAIN_CHAN_DIR") && "
 # gromzo has no channel state dir (no token, no access.json): nothing to export (GROMZONOPROVIDER1108).
 [ "$CHANNEL_PROVIDER" = "gromzo" ] && STATE_DIR_ENV=""
 
+# CHANNELEXTRASTATEDIR1111: CHANNEL_PLUGINS_EXTRA co-listen providers (e.g.
+# Discord alongside a Telegram primary) need their OWN *_STATE_DIR exported
+# too -- same reasoning as #915 above, but for the extra's plugin server, not
+# the primary's. Without it the extra's MCP server falls back to
+# ~/.claude/channels/<provider>/.env (absent on an install-scoped setup) and
+# exits "<PROVIDER>_BOT_TOKEN required" at startup, so that bot never comes
+# online even though the primary is fine. STATE_DIR_ENV above still carries
+# only the primary; EXTRA_STATE_DIR_ENV adds every extra to the same
+# launch-command prefix, and the export below makes this shell's own env (and
+# anything it execs before the tmux launch) see them too.
+EXTRA_STATE_DIR_ENV=""
+EXTRA_STATE_UNSET_FLAGS=""
+# shellcheck disable=SC2086 # word-split on purpose: space-separated plugin ids
+_extra_state_dirs="$(channel_extra_state_dirs "$INSTALL_DIR" "$STATE_ENV_VAR" $CHANNEL_PLUGINS_EXTRA)"
+if [ -n "$_extra_state_dirs" ]; then
+  while IFS='=' read -r _extra_var _extra_dir; do
+    [ -n "$_extra_var" ] || continue
+    export "$_extra_var"="$_extra_dir"
+    EXTRA_STATE_DIR_ENV="${EXTRA_STATE_DIR_ENV}export ${_extra_var}=$(sh_single_quote "$_extra_dir") && "
+    EXTRA_STATE_UNSET_FLAGS="${EXTRA_STATE_UNSET_FLAGS} -u ${_extra_var}"
+  done <<< "$_extra_state_dirs"
+fi
+unset _extra_state_dirs _extra_var _extra_dir
+
 # P1 FIX: put the Claude auth token into the tmux SERVER global env BEFORE
 # new-session. A new session inherits the tmux SERVER's global environment, not
 # this shell's. The tmux server is SHARED across every agent, so if a sub-agent
@@ -1715,7 +1749,8 @@ _tmux_set_auth_globals() {
 # global env: every session created before the -g -u below inherits the main
 # session's channel dir, and the server process itself matches the reap's env
 # needle for its whole life (measured with tmux 3.4 on an isolated socket).
-env -u "$STATE_ENV_VAR" $TMUX start-server 2>/dev/null || true
+# shellcheck disable=SC2086 # word-split on purpose: space-separated -u flags
+env -u "$STATE_ENV_VAR" $EXTRA_STATE_UNSET_FLAGS $TMUX start-server 2>/dev/null || true
 # APIKEYSCOPE1107 (Samu 72223): ONCE after the update, when .env holds an API key, the owner hears what changed and
 # what to do, through the usual alert path. The stamp is written only after notify.sh succeeded (a failed send is
 # tried again on the next start). In the background: a slow channel must not hold the launch. The key's value is
@@ -1933,8 +1968,9 @@ esac
 # the server's global environment, so every sub-agent session inherited the
 # MAIN session's channel state dir. The -g -u after the launch cleans a server
 # polluted earlier.
-env -u "$STATE_ENV_VAR" $_AKM_ENV_UNSET $TMUX new-session -d -s "$SESSION" -c "$INSTALL_DIR" \
-  "${AUTH_PANE_ENV}${STATE_DIR_ENV}${MCP_BATCH_ENV}${CFG_ENV}${AUTH_POST_ENV}${CUSTOM_PROVIDER_ENV}${GROMZO_ENV}$CLAUDE --dangerously-skip-permissions${EXTRA_SETTINGS_FLAG} ${MODEL_FLAG}${CHANNELS_ARG}"
+# shellcheck disable=SC2086 # word-split on purpose: space-separated -u flags
+env -u "$STATE_ENV_VAR" $EXTRA_STATE_UNSET_FLAGS $_AKM_ENV_UNSET $TMUX new-session -d -s "$SESSION" -c "$INSTALL_DIR" \
+  "${AUTH_PANE_ENV}${STATE_DIR_ENV}${EXTRA_STATE_DIR_ENV}${MCP_BATCH_ENV}${CFG_ENV}${AUTH_POST_ENV}${CUSTOM_PROVIDER_ENV}${GROMZO_ENV}$CLAUDE --dangerously-skip-permissions${EXTRA_SETTINGS_FLAG} ${MODEL_FLAG}${CHANNELS_ARG}"
 # The server certainly exists now: see CHANNELSAUTHRACE923 above.
 _tmux_set_auth_globals
 # remain-on-exit: without this, if the pane's claude process dies for ANY
@@ -2035,8 +2071,9 @@ while [ "$i" -lt "$_boot_guard_s" ]; do
         # invasive change (a stable fallback dir + a seeded ~/.claude.json project
         # entry); see the PR description / card 7EB18437.
         [ -e "$INSTALL_DIR/CLAUDE.md" ] && ln -sf "$INSTALL_DIR/CLAUDE.md" "$_CHANNELS_STARTDIR/CLAUDE.md" 2>/dev/null || true
-        env -u "$STATE_ENV_VAR" $_AKM_ENV_UNSET $TMUX new-session -d -s "$SESSION" -c "$_CHANNELS_STARTDIR" \
-          "${AUTH_PANE_ENV}${STATE_DIR_ENV}${MCP_BATCH_ENV}${CFG_ENV}${AUTH_POST_ENV}${CUSTOM_PROVIDER_ENV}${GROMZO_ENV}$CLAUDE --dangerously-skip-permissions${EXTRA_SETTINGS_FLAG} ${MODEL_FLAG}${CHANNELS_ARG}"
+        # shellcheck disable=SC2086 # word-split on purpose: space-separated -u flags
+        env -u "$STATE_ENV_VAR" $EXTRA_STATE_UNSET_FLAGS $_AKM_ENV_UNSET $TMUX new-session -d -s "$SESSION" -c "$_CHANNELS_STARTDIR" \
+          "${AUTH_PANE_ENV}${STATE_DIR_ENV}${EXTRA_STATE_DIR_ENV}${MCP_BATCH_ENV}${CFG_ENV}${AUTH_POST_ENV}${CUSTOM_PROVIDER_ENV}${GROMZO_ENV}$CLAUDE --dangerously-skip-permissions${EXTRA_SETTINGS_FLAG} ${MODEL_FLAG}${CHANNELS_ARG}"
         # See the primary new-session above: remain-on-exit keeps the pane
         # (and session) alive if claude dies early, so the scheduled relaunch
         # can always find it. This is the /tmp-fallback launch path, same fix.
