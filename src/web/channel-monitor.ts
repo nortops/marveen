@@ -1185,6 +1185,20 @@ export function buildMainSessionRespawnCmd(opts: {
    */
   channelStateEnv: { name: string; dir: string }
   /**
+   * CHANNELEXTRASTATEDIR1111 (respawn side; #73 wired channels.sh's own
+   * launch, this closes the gap for the three in-process respawns): the
+   * *_STATE_DIR export every CO-LISTEN extra also needs, from
+   * mainExtraChannelStateEnvs(). Omitting an extra here is the half-mute
+   * #915 bug all over again, one provider later: the primary's plugin finds
+   * its token fine, the extra's plugin falls back to
+   * ~/.claude/channels/<provider>/, finds no .env and exits
+   * ("<PROVIDER>_BOT_TOKEN required") on every nightly restart, recovery
+   * resume and hard restart -- not just the boot channels.sh already covers.
+   * Optional (defaults to none) so existing single-provider call shapes keep
+   * compiling; every real call site passes it (see the wiring test).
+   */
+  extraChannelStateEnvs?: { name: string; dir: string }[]
+  /**
    * The main agent's resolved custom-provider launch env (LiteLLM/OpenCode/etc.),
    * from buildCustomProviderLaunchEnv(MAIN_AGENT_ID), or null when no customProvider
    * is configured. RESPAWNCUSTOMPROVIDER1012: this builder used to IGNORE the main
@@ -1249,6 +1263,7 @@ export function buildMainSessionRespawnCmd(opts: {
     // FLEETVENV923: same venv-first PATH as startAgentProcess and channels.sh.
     `export PATH="${fleetVenvPathPrefix()}/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"`,
     `&& export ${opts.channelStateEnv.name}=${shSingleQuote(opts.channelStateEnv.dir)}`,
+    ...(opts.extraChannelStateEnvs ?? []).map((e) => `&& export ${e.name}=${shSingleQuote(e.dir)}`),
     // MCP startup-batch tuning (parity with channels.sh + startAgentProcess):
     // the --channels plugin is a stdio MCP server; the main session runs the
     // most MCP servers (filesystem/playwright/chrome + claude.ai connectors +
@@ -1343,6 +1358,17 @@ export function mainChannelStateEnv(provider: ChannelProviderType): { name: stri
   return { name: channelStateDirEnvVar(provider), dir: channelStateDir(provider) }
 }
 
+// CHANNELEXTRASTATEDIR1111 (respawn side): the same *_STATE_DIR exports, one per
+// CO-LISTEN extra, for every in-process respawn (buildMainSessionRespawnCmd's
+// extraChannelStateEnvs). Reuses colistenProviders -- the primary excluded, each
+// provider once, an id no provider owns dropped, and gromzo dropped because it is
+// not in ALL_PROVIDER_TYPES (GROMZONOPROVIDER1108: no state dir, no token to isolate)
+// -- so this cannot drift from checkMainColistenChannels's own reading of
+// CHANNEL_PLUGINS_EXTRA.
+export function mainExtraChannelStateEnvs(primary: ChannelProviderType, extraPluginIds: string[]): { name: string; dir: string }[] {
+  return colistenProviders(primary, extraPluginIds, ALL_PROVIDER_TYPES.map((t) => getProvider(t))).map(mainChannelStateEnv)
+}
+
 // 45b778e9: the relaunch branch of respawnMainSessionFresh, with its two effects injected so the
 // "no silent success" promise is held by BEHAVIOUR. The source-only asserts in
 // channel-monitor-respawn-session-gone.test.ts let a real mutation of the call site
@@ -1409,6 +1435,7 @@ export function respawnMainSessionFresh(): void {
       channelConfigured: mainPrimaryConfigured(provider.type),
       extraSettingsPath: writeMainExtraPluginsSettings(PROJECT_ROOT, mainLaunchPluginIds(provider)),
       channelStateEnv: mainChannelStateEnv(provider.type),
+      extraChannelStateEnvs: mainExtraChannelStateEnvs(provider.type, readExtraChannelPluginIds()),
       model: readConfiguredMainModel(),
       // The main session always starts a new conversation -- this is the whole
       // point of the nightly restart (drop the accumulated context).
@@ -1519,6 +1546,7 @@ export async function resumeMarveenSession(opts: { byMonitor?: boolean } = {}): 
     channelConfigured: mainPrimaryConfigured(provider.type),
     extraSettingsPath: writeMainExtraPluginsSettings(PROJECT_ROOT, mainLaunchPluginIds(provider)),
       channelStateEnv: mainChannelStateEnv(provider.type),
+      extraChannelStateEnvs: mainExtraChannelStateEnvs(provider.type, readExtraChannelPluginIds()),
       model: readConfiguredMainModel(),
       continueSession: true,
       // Parity with channels.sh: a recovery respawn must also land on the
@@ -1831,6 +1859,7 @@ function respawnMarveenSessionFresh(): boolean {
     channelConfigured: mainPrimaryConfigured(provider.type),
     extraSettingsPath: writeMainExtraPluginsSettings(PROJECT_ROOT, mainLaunchPluginIds(provider)),
       channelStateEnv: mainChannelStateEnv(provider.type),
+      extraChannelStateEnvs: mainExtraChannelStateEnvs(provider.type, readExtraChannelPluginIds()),
       model: readConfiguredMainModel(),
       continueSession: false,
       // Same channels.sh-bypass concern as resumeMarveenSession: this fresh

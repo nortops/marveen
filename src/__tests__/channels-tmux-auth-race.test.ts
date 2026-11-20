@@ -315,7 +315,9 @@ describe.skipIf(!HAS_TMUX)('channels.sh start-server leaves the state-dir var ou
 })
 
 describe('channels.sh tmux auth wiring (source pin)', () => {
-  const launches = SH.split('\n').filter(l => /^\s*(env -u "\$STATE_ENV_VAR" (\$_AKM_ENV_UNSET )?)?\$TMUX new-session -d -s "\$SESSION"/.test(l))
+  // CHANNELEXTRASTATEDIR1111 (#73): $EXTRA_STATE_UNSET_FLAGS (the co-listen extras'
+  // own *_STATE_DIR unset) now sits between the state-dir unset and $_AKM_ENV_UNSET.
+  const launches = SH.split('\n').filter(l => /^\s*(env -u "\$STATE_ENV_VAR" (\$EXTRA_STATE_UNSET_FLAGS )?(\$_AKM_ENV_UNSET )?)?\$TMUX new-session -d -s "\$SESSION"/.test(l))
 
   // TOKENARGV929: no secret on a new-session argv; the pane sources it first.
   it('neither channels new-session call site passes an -e secret, and both pane commands source the auth file first', () => {
@@ -325,7 +327,7 @@ describe('channels.sh tmux auth wiring (source pin)', () => {
       expect(l).not.toMatch(/\s-e\s/)
     }
     expect(SH).not.toContain('TMUX_AUTH_ENV')
-    const paneCmds = SH.split('\n').filter(l => l.includes('${STATE_DIR_ENV}${MCP_BATCH_ENV}${CFG_ENV}'))
+    const paneCmds = SH.split('\n').filter(l => l.includes('${STATE_DIR_ENV}${EXTRA_STATE_DIR_ENV}${MCP_BATCH_ENV}${CFG_ENV}'))
     expect(paneCmds).toHaveLength(2)
     for (const l of paneCmds) expect(l.trim().startsWith('"${AUTH_PANE_ENV}${STATE_DIR_ENV}')).toBe(true)
   })
@@ -337,14 +339,16 @@ describe('channels.sh tmux auth wiring (source pin)', () => {
   it('both channels new-session call sites strip the state-dir var from the tmux client env', () => {
     expect(launches).toHaveLength(2)
     // APIKEYSCOPE1107: $_AKM_ENV_UNSET (the key off key-only) sits between the state-dir unset and $TMUX.
-    for (const l of launches) expect(l.trim().startsWith('env -u "$STATE_ENV_VAR" $_AKM_ENV_UNSET $TMUX new-session')).toBe(true)
+    // CHANNELEXTRASTATEDIR1111 (#73): $EXTRA_STATE_UNSET_FLAGS sits one slot earlier.
+    for (const l of launches) expect(l.trim().startsWith('env -u "$STATE_ENV_VAR" $EXTRA_STATE_UNSET_FLAGS $_AKM_ENV_UNSET $TMUX new-session')).toBe(true)
     expect(SH).toContain('$TMUX set-environment -g -u "$STATE_ENV_VAR"')
   })
 
   it('the start-server call strips the state-dir var as well', () => {
     expect(START_SERVER_LINES).toHaveLength(1)
-    expect(START_SERVER_LINES[0].trim().startsWith('env -u "$STATE_ENV_VAR" $TMUX start-server')).toBe(true)
-    expect(SH.indexOf('env -u "$STATE_ENV_VAR" $TMUX start-server')).toBeGreaterThan(SH.indexOf('export "$STATE_ENV_VAR"="$MAIN_CHAN_DIR"'))
+    // CHANNELEXTRASTATEDIR1111 (#73): $EXTRA_STATE_UNSET_FLAGS sits before $TMUX here too.
+    expect(START_SERVER_LINES[0].trim().startsWith('env -u "$STATE_ENV_VAR" $EXTRA_STATE_UNSET_FLAGS $TMUX start-server')).toBe(true)
+    expect(SH.indexOf('env -u "$STATE_ENV_VAR" $EXTRA_STATE_UNSET_FLAGS $TMUX start-server')).toBeGreaterThan(SH.indexOf('export "$STATE_ENV_VAR"="$MAIN_CHAN_DIR"'))
   })
 
   it('the auth globals are set again right after the primary new-session', () => {
