@@ -138,7 +138,9 @@ describe('channels.sh: a new-session that creates the server gets no key off key
   it('both new-session calls carry the mode\'s env unset', () => {
     const calls = src.split('\n').filter((l) => /\$TMUX new-session -d -s "\$SESSION"/.test(l))
     expect(calls.length).toBe(2)
-    for (const l of calls) expect(l).toContain('env -u "$STATE_ENV_VAR" $_AKM_ENV_UNSET $TMUX new-session')
+    // CHANNELEXTRASTATEDIR1111 (#73): $EXTRA_STATE_UNSET_FLAGS now sits between the two, for the
+    // co-listen extras' own *_STATE_DIR vars -- same env, same reason, one var earlier.
+    for (const l of calls) expect(l).toContain('env -u "$STATE_ENV_VAR" $EXTRA_STATE_UNSET_FLAGS $_AKM_ENV_UNSET $TMUX new-session')
     expect(src).toContain('[ "$KEY_MODE" = keyonly ] || _AKM_ENV_UNSET="-u ANTHROPIC_API_KEY"')
   })
 })

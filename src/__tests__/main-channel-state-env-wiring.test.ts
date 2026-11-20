@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { buildMainSessionRespawnCmd, mainChannelStateEnv } from '../web/channel-monitor.js'
+import { buildMainSessionRespawnCmd, mainChannelStateEnv, mainExtraChannelStateEnvs } from '../web/channel-monitor.js'
 import { mainConfigDecisionForTest } from '../web/main-config-decision.js'
 
 // #1554 follow-up. The builder tests in channel-deafness-recovery.test.ts pass
@@ -42,6 +42,19 @@ describe('buildMainSessionRespawnCmd call-site parity', () => {
     expect(sites).toBeGreaterThanOrEqual(3)
     expect(wired).toBe(sites)
   })
+
+  // CHANNELEXTRASTATEDIR1111 (respawn side): the same bug shape as the two checks
+  // above, one provider later. A respawn that resolves the primary's *_STATE_DIR
+  // but forgets a co-listen extra's comes back half-mute: the primary's plugin
+  // finds its token, the extra's plugin falls back to ~/.claude/channels/<provider>/
+  // and exits "<PROVIDER>_BOT_TOKEN required" -- on every nightly restart, recovery
+  // resume and hard restart, not just the boot channels.sh already covers (#73).
+  it('every call site resolves extraChannelStateEnvs from mainExtraChannelStateEnvs(provider.type, ...)', () => {
+    const sites = MONITOR_SRC.split('= buildMainSessionRespawnCmd({').length - 1
+    const wired = MONITOR_SRC.split('extraChannelStateEnvs: mainExtraChannelStateEnvs(provider.type, readExtraChannelPluginIds())').length - 1
+    expect(sites).toBeGreaterThanOrEqual(3)
+    expect(wired).toBe(sites)
+  })
 })
 
 describe('buildMainSessionRespawnCmd with a non-Telegram provider', () => {
@@ -58,6 +71,55 @@ describe('buildMainSessionRespawnCmd with a non-Telegram provider', () => {
     expect(cmd).toContain("export DISCORD_STATE_DIR='/opt/marveen/.claude/channels/discord'")
     expect(cmd).not.toContain('TELEGRAM_STATE_DIR')
     expect(cmd.indexOf('DISCORD_STATE_DIR')).toBeLessThan(cmd.indexOf('/usr/local/bin/claude'))
+  })
+})
+
+describe('buildMainSessionRespawnCmd with a co-listen extra', () => {
+  it('exports the extra state dir too, after the primary and before claude', () => {
+    const cmd = buildMainSessionRespawnCmd({
+      claudePath: '/usr/local/bin/claude',
+      pluginId: 'telegram@claude-plugins-official',
+      extraPluginIds: ['discord@claude-plugins-official'],
+      model: '',
+      config: mainConfigDecisionForTest(),
+      continueSession: false,
+      channelStateEnv: { name: 'TELEGRAM_STATE_DIR', dir: '/opt/marveen/.claude/channels/telegram' },
+      extraChannelStateEnvs: [{ name: 'DISCORD_STATE_DIR', dir: '/opt/marveen/.claude/channels/discord' }],
+      customProviderEnv: null,
+    })
+    expect(cmd).toContain("export TELEGRAM_STATE_DIR='/opt/marveen/.claude/channels/telegram'")
+    expect(cmd).toContain("export DISCORD_STATE_DIR='/opt/marveen/.claude/channels/discord'")
+    expect(cmd.indexOf('TELEGRAM_STATE_DIR')).toBeLessThan(cmd.indexOf('DISCORD_STATE_DIR'))
+    expect(cmd.indexOf('DISCORD_STATE_DIR')).toBeLessThan(cmd.indexOf('/usr/local/bin/claude'))
+  })
+
+  it('omits nothing (no extras) without throwing -- the field is optional', () => {
+    const cmd = buildMainSessionRespawnCmd({
+      claudePath: '/usr/local/bin/claude',
+      pluginId: 'telegram@claude-plugins-official',
+      model: '',
+      config: mainConfigDecisionForTest(),
+      continueSession: false,
+      channelStateEnv: { name: 'TELEGRAM_STATE_DIR', dir: '/s' },
+      customProviderEnv: null,
+    })
+    expect(cmd).not.toContain('_STATE_DIR=undefined')
+  })
+})
+
+describe('mainExtraChannelStateEnvs', () => {
+  it('names one STATE_DIR per extra provider, primary excluded', () => {
+    const envs = mainExtraChannelStateEnvs('telegram', ['discord@claude-plugins-official', 'slack-channel@marveen-marketplace'])
+    expect(envs.map((e) => e.name).sort()).toEqual(['DISCORD_STATE_DIR', 'SLACK_STATE_DIR'])
+  })
+
+  it('drops gromzo (no state dir) and an extra that is also the primary', () => {
+    const envs = mainExtraChannelStateEnvs('telegram', ['gromzo-channel@gromzo-local', 'telegram@claude-plugins-official'])
+    expect(envs).toEqual([])
+  })
+
+  it('no extras configured -> empty, not every provider', () => {
+    expect(mainExtraChannelStateEnvs('telegram', [])).toEqual([])
   })
 })
 

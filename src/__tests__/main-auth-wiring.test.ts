@@ -45,7 +45,9 @@ describe('every main launch path applies main-auth and sources the post-file rig
   })
 
   it('channels.sh: both new-session lines source the post-file right after CFG_ENV', () => {
-    const lines = readSrc('scripts', 'channels.sh').split('\n').filter((l) => l.includes('${STATE_DIR_ENV}${MCP_BATCH_ENV}${CFG_ENV}'))
+    // CHANNELEXTRASTATEDIR1111 (#73): ${EXTRA_STATE_DIR_ENV} now sits between STATE_DIR_ENV and
+    // MCP_BATCH_ENV, for the co-listen extras' own *_STATE_DIR exports.
+    const lines = readSrc('scripts', 'channels.sh').split('\n').filter((l) => l.includes('${STATE_DIR_ENV}${EXTRA_STATE_DIR_ENV}${MCP_BATCH_ENV}${CFG_ENV}'))
     expect(lines).toHaveLength(2)
     for (const l of lines) expect(l).toContain('${CFG_ENV}${AUTH_POST_ENV}${CUSTOM_PROVIDER_ENV}')
   })
