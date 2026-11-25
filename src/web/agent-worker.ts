@@ -1,6 +1,7 @@
 import { tmuxStderr } from './tmux-stderr.js'
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync, readdirSync, lstatSync, symlinkSync, realpathSync } from 'node:fs'
+import { writeMcpJsonFile } from './atomic-write.js'
 import { join } from 'node:path'
 import { homedir, tmpdir, userInfo } from 'node:os'
 import { createHash } from 'node:crypto'
@@ -146,6 +147,16 @@ const WORKER_MODEL_FAST_OVERRIDE: string | null =
 const WORKER_BOOT_TIMEOUT_MS = 90_000
 // Poll cadence while waiting for the <reqid>.done sentinel.
 const CAPTURE_POLL_MS = 1_500
+// How often to re-check the pane while waiting for /clear to return an idle prompt.
+const CLEAR_READY_POLL_MS = 400
+// Total budget for that pane-state wait before failing open (delivery must go out).
+const CLEAR_READY_BUDGET_MS = 8_000
+// Settle before the FIRST readiness poll after Enter. Until the TUI actually reads
+// the queued Enter, the pane still shows the pre-/clear idle prompt (the R1 review
+// corner: both confirm captures can land in that stale window), so the first poll
+// must not end before the old fixed 0.5s sleep would have -- delivery is never
+// earlier than the pre-change code in any path, and strictly later in the corner.
+const CLEAR_READY_SETTLE_MS = 500
 // Channel plugins to force-disable in the worker's isolated settings.json.
 const WORKER_DISABLED_PLUGINS = ['telegram', 'slack-channel']
 // ~/.claude entries NOT symlinked into the isolated config dir:
@@ -366,7 +377,10 @@ function clearWorkerKeychainEntry(ctx: WorkerCtx): void {
  */
 function seedWorkerCredentials(ctx: WorkerCtx): boolean {
   if (process.platform === 'darwin') clearWorkerKeychainEntry(ctx)
-  const credentialsJson = readClaudeCodeOauthJson()
+  // WORKERLOGOUTWARN1121: with a fleet setup-token the worker is launched with CLAUDE_CODE_OAUTH_TOKEN from it (see the
+  // launch line), so a Keychain miss is not a logged-out worker: no warning then (seen on a standard user started
+  // without a GUI session: the read failed and the warning fired although the worker had its token).
+  const credentialsJson = readClaudeCodeOauthJson({ warnOnMiss: !hasFleetOauthToken() })
   if (!credentialsJson) return false
   if (!existsSync(ctx.configDir)) mkdirSync(ctx.configDir, { recursive: true })
   writeFileSync(join(ctx.configDir, '.credentials.json'), credentialsJson, { mode: 0o600 })
@@ -493,7 +507,7 @@ export function withFleetFreezeGate(settings: WorkerSettings): WorkerSettings {
   const hooks = (settings.hooks && typeof settings.hooks === 'object' && !Array.isArray(settings.hooks) ? settings.hooks : {}) as Record<string, unknown>
   const pre = (Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse : []) as unknown[]
   const preToolUse = [
-    { matcher: '*', hooks: [{ type: 'command', command: WORKER_FREEZE_GATE_CMD, timeout: 5 }] },
+    { matcher: '*', hooks: [{ type: 'command', command: WORKER_FREEZE_GATE_CMD, timeout: 15 }] },
     ...pre.filter((e) => !JSON.stringify(e).includes('fleet-freeze-gate.sh')),
   ]
   return { ...settings, hooks: { ...hooks, PreToolUse: preToolUse } }
@@ -568,7 +582,7 @@ export function ensureWorkerCwd(ctx: WorkerCtx = ctxSlow): void {
   if (!existsSync(ctx.scratchDir)) mkdirSync(ctx.scratchDir, { recursive: true })
 
   const mcpPath = join(ctx.home, '.mcp.json')
-  if (!existsSync(mcpPath)) writeFileSync(mcpPath, '{"mcpServers":{}}\n')
+  if (!existsSync(mcpPath)) writeMcpJsonFile(mcpPath, '{"mcpServers":{}}\n')
 
   if (!existsSync(ctx.configDir)) mkdirSync(ctx.configDir, { recursive: true })
 
@@ -1142,12 +1156,29 @@ function restartWorkerSession(ctx: WorkerCtx): void {
 }
 
 // Reset context between requests so unrelated one-shots never share/grow context.
-function clearWorkerContext(ctx: WorkerCtx): void {
+async function clearWorkerContext(ctx: WorkerCtx): Promise<void> {
   try {
     execFileSync(TMUX, ['send-keys', '-t', exactTmuxTarget(ctx.session), '-l', '/clear'], { timeout: 5000 })
     execFileSync('/bin/sleep', ['0.2'], { timeout: 2000 })
     execFileSync(TMUX, ['send-keys', '-t', exactTmuxTarget(ctx.session), 'Enter'], { timeout: 5000 })
-    execFileSync('/bin/sleep', ['0.5'], { timeout: 2000 })
+    // Typed-ahead floor (R1 review corner): see CLEAR_READY_SETTLE_MS. The pane can
+    // still show the pre-/clear idle prompt until the TUI reads the Enter, so the
+    // first readiness poll runs only after the old fixed-sleep floor has passed.
+    // Async on purpose: these waits are up to the 8s budget long, and a synchronous
+    // /bin/sleep here would block the dashboard event loop (42b085b3).
+    await sleepMs(CLEAR_READY_SETTLE_MS)
+    // Loaded TUIs can take ~3.5s to process /clear (0038ce9c), so poll the pane
+    // state instead of sleeping a fixed time. Fail open past the budget: a dispatch
+    // must deliver, the request is never dropped here (the exhaustion is logged).
+    const clearDeadline = Date.now() + CLEAR_READY_BUDGET_MS
+    let clearReady = false
+    while (Date.now() < clearDeadline) {
+      if (await isSessionReadyForPrompt(ctx.session)) { clearReady = true; break }
+      await sleepMs(CLEAR_READY_POLL_MS)
+    }
+    if (!clearReady) {
+      logger.warn({ session: ctx.session }, 'agent-worker: /clear did not return an idle prompt within budget (continuing)')
+    }
   } catch (err) {
     logger.warn({ err }, 'agent-worker: /clear failed (continuing)')
   }
@@ -1179,6 +1210,11 @@ async function runWorkerAttempt(ctx: WorkerCtx, message: string, timeoutMs: numb
   const reqId = nextReqId()
   const outPath = join(ctx.scratchDir, `${reqId}.out`)
   const donePath = join(ctx.scratchDir, `${reqId}.done`)
+  // The whole request closes on the .done sentinel appearing in scratchDir; if
+  // that dir is missing (worker home wiped while the tmux session stayed up),
+  // the worker cannot ever write it and the request is silently lost to a
+  // timeout. Idempotent no-op when the dir is already there.
+  try { mkdirSync(ctx.scratchDir, { recursive: true }) } catch { /* best effort */ }
   for (const p of [outPath, donePath]) { try { rmSync(p, { force: true }) } catch { /* none */ } }
 
   // PANEWRITERS805: /clear + prompt-send is ONE atomic delivery. Unlocked, the
@@ -1187,7 +1223,7 @@ async function runWorkerAttempt(ctx: WorkerCtx, message: string, timeoutMs: numb
   // cleared context ahead of ours. Deliver mode (not recover): a dispatch must
   // deliver; on a wedged holder we fail open past the budget, logged.
   const sendRes = await withSessionSendLock(ctx.session, null, 'deliver', async () => {
-    clearWorkerContext(ctx)
+    await clearWorkerContext(ctx)
     await sendPromptToSession(ctx.session, buildWorkerPrompt(message, outPath, donePath), null, { lockMode: 'held' })
   })
   if (sendRes.failedOpen) {

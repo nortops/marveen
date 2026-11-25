@@ -440,6 +440,8 @@ export function allowlistBashSegmentAllowed(seg, ctx) {
 //   bash-sandbox-write-paths.json  -- where a sandboxed agent may write (#2149)
 //   email-standing-recipients.json -- an address on it (once activated) takes letters with
 //                                     no per-letter approval (email-approval-gate.py)
+//   agent-send-exceptions.json     -- the named-script draft/send grants themselves, which a
+//                                     sub-agent must not write for itself (card f2ccb0bb)
 //   .approval-bot-token, .approval-bot-key -- the owner's approval bot and the key its button data is
 //                                     signed with (src/approval-bot.ts, #2160)
 // Their writers are the owner, the main agent and, for config-overrides.json, the dashboard
@@ -452,15 +454,22 @@ export const PROTECTED_STORE_FILES = new Set([
   'config-overrides.json',
   'bash-sandbox-write-paths.json',
   'email-standing-recipients.json',
+  'agent-send-exceptions.json',
   '.approval-bot-token',
   '.approval-bot-key',
 ])
 // The file, or a glob that starts on its name. The prefixes are long enough that this gate's
 // and the features' own sources (bash-sandbox.ts, config-registry.ts) stay out of it; the
 // approval-bot files need their leading dot, so a source or doc named approval-bot-key-*.md or a
-// glob over src/approval-bot* stays out too.
+// glob over src/approval-bot* stays out too. The send-exception family (card f2ccb0bb) needs the
+// plural "exceptions" in its exact name, so the gates' own sources and tests
+// (email-send-gate.mjs, email-approval-gate.py, email-send-gate-script-exception.test.ts,
+// agent-scaffold-send-exception.test.ts) and the shared corpus fixture
+// (agent-send-exception-cases.json, singular) stay out of it; its glob prefix drops only that
+// word, so a glob over the store file (store/agent-send*) is caught -- a glob over the fixture
+// (agent-send-exception-*) is then caught too, the same trade the email-standing prefix makes.
 const PROTECTED_MENTION_RX =
-  /(?:egress[-_]?vendor[-_]?hosts(?:[-_][\w.-]*)?|config[-_]?overrides|bash[-_]?sandbox[-_]?write[-_]?paths|email[-_]?standing[-_]?recipients)\.json|\.approval[-_]?bot[-_]?(?:token|key)\b|(?:egress[-_]?vendor|config[-_]?overrid|bash[-_]?sandbox[-_]?write|email[-_]?standing|\.approval[-_]?bot)[\w.-]*[*?[]/i
+  /(?:egress[-_]?vendor[-_]?hosts(?:[-_][\w.-]*)?|config[-_]?overrides|bash[-_]?sandbox[-_]?write[-_]?paths|email[-_]?standing[-_]?recipients|agent[-_]?send[-_]?exceptions)\.json|\.approval[-_]?bot[-_]?(?:token|key)\b|(?:egress[-_]?vendor|config[-_]?overrid|bash[-_]?sandbox[-_]?write|email[-_]?standing|\.approval[-_]?bot|agent[-_]?send)[\w.-]*[*?[]/i
 
 // One rule for every protected store object: a segment that mentions it may only be a plain
 // READ, and no output redirect in it may point at it (or at a target built at runtime).
@@ -494,6 +503,62 @@ function readOnlyMentionAllowed(seg, mentions, rgConfigNamed = false) {
     const target = m[1]
     if (/^&?\d+$/.test(target) || target === '/dev/null') continue // 2>&1, >/dev/null
     if (mentions(target) || /[$`]/.test(target)) return false
+  }
+  return true
+}
+
+// HMACINBOUND1125 (Dani, #3117 review 1): the key the server signs agent_messages rows with is a SECRET, not a
+// setting. A sub-agent that reads it can sign a row in the owner's voice, so a Bash segment that names it is denied
+// even as a plain read (the #2876 secret-store pattern). The native Read tool is stopped by the settings deny
+// (SUBAGENT_INBOUND_SIG_KEY_DENY in agent-scaffold.ts); a write by any agent by db-write-gate's protected paths.
+//
+// #3117 review (Samu): read on the segment as written AND with its shell quoting removed (quotes and backslashes split
+// a name without changing what the shell opens: `.inbound''-sig-key`, `.inbound"-sig"-key`, `.inbound\-sig-key`), and
+// every glob word is matched against the file's name as the shell or find would (`store/.inb*key`, `-name '.inbound*'`).
+// A variable set to a literal earlier in the same command is substituted first (definiteAssignments).
+// THE LIMIT: a text brake, not an OS boundary. A name built at run time in a way the gate cannot resolve (a variable
+// from another command or the environment, a command substitution), a string built inside an interpreter, or a reader
+// that is never told the name (`grep -r . store/`, `xargs`) passes. The same class: a read of the whole store directory
+// without the name carries the key too (`cp -r store/ x`, `grep -ra . store/`, `zip -r x store/`; `tar` is denied, but by
+// db-write-gate, not by this rule). inbound-sig.test.ts lists them as documented passes. The key is a file of the same OS user, as src/inbound-sig.ts says.
+const INBOUND_SIG_KEY_NAME = '.inbound-sig-key'
+const INBOUND_SIG_KEY_MENTION_RX = /\.inbound[-_]?sig[-_]?key\b|\.inbound[-_]?sig[\w.-]*[*?[]/i
+
+/** A shell glob (one path component) as an anchored regex: `*`, `?` and `[...]` classes, case-insensitive. */
+function globComponentRegex(glob) {
+  let rx = ''
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i]
+    if (c === '*') rx += '.*'
+    else if (c === '?') rx += '.'
+    else if (c === '[') {
+      const end = glob.indexOf(']', i + 2)
+      if (end < 0) { rx += '\\['; continue }
+      const body = glob.slice(i + 1, end).replace(/^!/, '^').replace(/\\/g, '\\\\')
+      rx += `[${body}]`
+      i = end
+    } else rx += c.replace(/[.+^${}()|\\]/g, '\\$&')
+  }
+  try { return new RegExp(`^${rx}$`, 'i') } catch { return null }
+}
+
+export function inboundSigKeyBashSegmentAllowed(seg, definite) {
+  // A variable the same command set to a literal earlier (`F=.inbound-sig; cat store/$F-key`) is read as its value,
+  // the definiteAssignments the other protected-file checks use (Dani, #3117 delta).
+  const raw = substituteDefinite(String(seg ?? ''), definite)
+  const unquoted = raw.replace(/\$(?=['"])|["'\\]/g, '')
+  if (INBOUND_SIG_KEY_MENTION_RX.test(raw) || INBOUND_SIG_KEY_MENTION_RX.test(unquoted)) return false
+  const words = unquoted.split(/\s+/)
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i]
+    if (!/[*?[]/.test(w)) continue
+    const last = w.replace(/\/+$/, '').split('/').pop() ?? ''
+    // A shell glob reaches a dotfile only when its last component starts with a dot; find's -name / -iname / -path
+    // match the leading dot with any pattern.
+    const afterFindName = /^-(?:i?name|i?path|i?wholename)$/.test(words[i - 1] ?? '')
+    if (!afterFindName && !last.startsWith('.')) continue
+    const rx = globComponentRegex(last)
+    if (rx && rx.test(INBOUND_SIG_KEY_NAME)) return false
   }
   return true
 }
@@ -555,7 +620,7 @@ export function protectedSegments(command) {
 
 // protectedSegments plus what the definite-assignment rule needs: the separator after each segment ('' after the
 // last) and the mask. `quoteAware` false = the naive fallback, where no separator is known.
-function protectedSplit(command) {
+export function protectedSplit(command) {
   const src = String(command ?? '').replace(/\\\r?\n/g, ' ')
   const heredocs = []
   const masked = maskInertLiterals(src, heredocs)
@@ -586,7 +651,7 @@ function protectedSplit(command) {
 //     export, local, declare, typeset, readonly, let, `printf -v`;
 //   - the name is assigned exactly ONCE in the whole command (NAME= or NAME+=, quoted text excluded), in a segment
 //     that is only literal NAME=value words, and the use comes after it;
-//   - the name is not one the shell itself sets or rewrites (SHELL_MANAGED_NAMES, any BASH*/ZSH*: Dani 71554);
+//   - the name is not one the shell itself sets or rewrites (SHELL_MANAGED_NAMES: every special name of zsh and bash; any BASH*/ZSH*/COMP_*/READLINE_*/LC_*: Dani 71554);
 //   - every separator from that assignment to the use is && or ; (or a newline);
 //   - from the last ; before the assignment up to it there is no || (`a || F=x && use $F` can run use without F);
 //   - the separator right before the assignment is not a pipe or & (that would run it in a subshell).
@@ -595,11 +660,44 @@ const COMPOUND_WORDS = new Set(['if', 'then', 'elif', 'else', 'fi', 'for', 'whil
 // Names the SHELL itself sets or rewrites: an assignment to one is no definite literal. `PWD=/tmp/q; cd .; cp -R x/.
 // $PWD` copies into the real cwd (cd resets PWD; measured in bash and zsh, Dani 71554), `cd /` resets OLDPWD, and $_,
 // RANDOM, SECONDS, LINENO ... change on their own. zsh's lower-case twins (dirstack, cdpath, ...) are listed too; any
-// BASH* / ZSH* name is excluded by prefix.
-const SHELL_MANAGED_NAMES = new Set(['PWD', 'OLDPWD', 'DIRSTACK', 'dirstack', 'CDPATH', 'cdpath', 'IFS', 'RANDOM', 'SRANDOM',
-  'SECONDS', 'LINENO', 'EPOCHSECONDS', 'EPOCHREALTIME', 'HISTCMD', 'PPID', 'UID', 'EUID', 'GROUPS', 'SHLVL', 'OPTIND', 'OPTARG',
-  'REPLY', 'PIPESTATUS', 'pipestatus', 'FUNCNAME', 'COLUMNS', 'LINES', 'HOME', 'PATH', 'path', 'argv', 'status', 'psvar',
-  'TMOUT', 'HOSTNAME', 'MACHTYPE', 'OSTYPE', 'HOSTTYPE', 'COPROC', 'MAPFILE', '_'])
+// BASH* / ZSH* / COMP_* / READLINE_* / LC_* name is excluded by prefix.
+//
+// The list is NOT grown name by name: every name either shell treats as special stays unresolved. Some zsh special
+// parameters accept an assignment, keep running and hold ANOTHER value (KEYBOARD_HACK keeps one character, HISTCHARS /
+// histchars three, USERNAME its old value), so the gate would read `$NAME<install>` as a place the shell never writes to.
+// zsh: the special parameters of zsh 5.9 (112 names), generated with
+//   for k in ${(ko)parameters}; do [[ ${parameters[$k]} == *special* ]] && print -r -- $k; done
+// A test compares this list with the running zsh's own list (skipped where there is no zsh), so a newer zsh that adds
+// a special parameter turns it red on a machine that has one.
+export const ZSH_SPECIAL_NAMES = Object.freeze([
+  '!', '#', '$', '*', '-', '0', '?', '@', 'ARGC', 'CDPATH', 'COLUMNS', 'EGID', 'EUID', 'FIGNORE', 'FPATH', 'FUNCNEST', 'GID',
+  'HISTCHARS', 'HISTCMD', 'HISTSIZE', 'HOME', 'IFS', 'KEYBOARD_HACK', 'LINENO', 'LINES', 'MAILPATH', 'MANPATH', 'MODULE_PATH',
+  'NULLCMD', 'OPTARG', 'OPTIND', 'PATH', 'PPID', 'PROMPT', 'PROMPT2', 'PROMPT3', 'PROMPT4', 'PS1', 'PS2', 'PS3', 'PS4',
+  'PSVAR', 'RANDOM', 'READNULLCMD', 'SAVEHIST', 'SECONDS', 'SHLVL', 'SPROMPT', 'TERM', 'TRY_BLOCK_ERROR',
+  'TRY_BLOCK_INTERRUPT', 'TTYIDLE', 'UID', 'USERNAME', 'WATCH', 'WORDCHARS', 'ZSH_EVAL_CONTEXT', 'ZSH_SUBSHELL', '_',
+  'aliases', 'argv', 'builtins', 'cdpath', 'commands', 'dirstack', 'dis_aliases', 'dis_builtins', 'dis_functions',
+  'dis_functions_source', 'dis_galiases', 'dis_patchars', 'dis_reswords', 'dis_saliases', 'fignore', 'fpath', 'funcfiletrace',
+  'funcsourcetrace', 'funcstack', 'functions', 'functions_source', 'functrace', 'galiases', 'histchars', 'history',
+  'historywords', 'jobdirs', 'jobstates', 'jobtexts', 'keymaps', 'mailpath', 'manpath', 'module_path', 'modules', 'nameddirs',
+  'options', 'parameters', 'patchars', 'path', 'pipestatus', 'prompt', 'psvar', 'reswords', 'saliases', 'status', 'termcap',
+  'terminfo', 'userdirs', 'usergroups', 'watch', 'widgets', 'zsh_eval_context', 'zsh_scheduled_events',
+])
+// bash: the variables the shell sets, rewrites or reads for its own behaviour (the "Shell Variables" chapter of the bash
+// manual). BASH* / COMP_* / READLINE_* / LC_* names are excluded by prefix below.
+export const BASH_SPECIAL_NAMES = Object.freeze([
+  'CDPATH', 'CHILD_MAX', 'COLUMNS', 'COMPREPLY', 'COPROC', 'DIRSTACK', 'EMACS', 'ENV', 'EPOCHREALTIME', 'EPOCHSECONDS', 'EUID',
+  'EXECIGNORE', 'FCEDIT', 'FIGNORE', 'FUNCNAME', 'FUNCNEST', 'GLOBIGNORE', 'GLOBSORT', 'GROUPS', 'HISTCMD', 'HISTCONTROL',
+  'HISTFILE', 'HISTFILESIZE', 'HISTIGNORE', 'HISTSIZE', 'HISTTIMEFORMAT', 'HOME', 'HOSTFILE', 'HOSTNAME', 'HOSTTYPE', 'IFS',
+  'IGNOREEOF', 'INPUTRC', 'INSIDE_EMACS', 'LANG', 'LINENO', 'LINES', 'MACHTYPE', 'MAIL', 'MAILCHECK', 'MAILPATH', 'MAPFILE',
+  'OLDPWD', 'OPTARG', 'OPTERR', 'OPTIND', 'OSTYPE', 'PATH', 'PIPESTATUS', 'POSIXLY_CORRECT', 'PPID', 'PROMPT_COMMAND',
+  'PROMPT_DIRTRIM', 'PS0', 'PS1', 'PS2', 'PS3', 'PS4', 'PWD', 'RANDOM', 'REPLY', 'SECONDS', 'SHELL', 'SHELLOPTS', 'SHLVL',
+  'SRANDOM', 'TERM', 'TIMEFORMAT', 'TMOUT', 'TMPDIR', 'UID', '_', 'auto_resume', 'histchars',
+])
+const SHELL_MANAGED_NAMES = new Set([...ZSH_SPECIAL_NAMES, ...BASH_SPECIAL_NAMES, 'PWD', 'OLDPWD', 'DIRSTACK', 'dirstack', 'CDPATH',
+  'cdpath', 'IFS', 'RANDOM', 'SRANDOM', 'SECONDS', 'LINENO', 'EPOCHSECONDS', 'EPOCHREALTIME', 'HISTCMD', 'PPID', 'UID', 'EUID',
+  'GROUPS', 'SHLVL', 'OPTIND', 'OPTARG', 'REPLY', 'PIPESTATUS', 'pipestatus', 'FUNCNAME', 'COLUMNS', 'LINES', 'HOME', 'PATH', 'path',
+  'argv', 'status', 'psvar', 'TMOUT', 'HOSTNAME', 'MACHTYPE', 'OSTYPE', 'HOSTTYPE', 'COPROC', 'MAPFILE', '_'])
+const SHELL_MANAGED_PREFIX_RX = /^(?:BASH|ZSH|COMP_|READLINE_|LC_)/
 const VAR_SETTERS = new Set(['source', '.', 'eval', 'read', 'mapfile', 'readarray', 'getopts', 'unset', 'export', 'local', 'declare', 'typeset', 'readonly', 'let'])
 export function definiteAssignments(split) {
   const none = split.segs.map(() => new Map())
@@ -632,7 +730,7 @@ export function definiteAssignments(split) {
       if (/[$`\u0000]/.test(v)) return
       pairs.push([m[1], v])
     }
-    for (const [name, value] of pairs) if (counts.get(name) === 1 && !SHELL_MANAGED_NAMES.has(name) && !/^(?:BASH|ZSH)_?/.test(name)) defs.push({ at, name, value })
+    for (const [name, value] of pairs) if (counts.get(name) === 1 && !SHELL_MANAGED_NAMES.has(name) && !SHELL_MANAGED_PREFIX_RX.test(name)) defs.push({ at, name, value })
   })
   const out = split.segs.map(() => new Map())
   for (const d of defs) {
@@ -654,6 +752,181 @@ export function definiteAssignments(split) {
     }
   }
   return out
+}
+
+// VARDEFDB1121: the command with every DEFINITE literal variable use (definiteAssignments) put in as its
+// value, for a gate that does not follow variables itself (db-write-gate: `W=/abs/wt; git -C $W ...`, `S=/abs; cd $S/x`).
+// Only a LIVE use is replaced (not one in single quotes or $'...'; a double-quoted one is live), only `$NAME` /
+// `${NAME}` (no `${NAME:-x}`), not one followed by `[` or `:` (zsh subscript / modifier: `$W[1]`, `$W:h`), and only an
+// ABSOLUTE value of plain path characters (`/...`: a relative one goes through CDPATH in a cd): no space, quote, glob,
+// `$`, backslash or `~`, so the value reads the same quoted or not; and nothing at all when the command names IFS.
+// Everything else keeps its unresolved reading. Unchanged when the quoting cannot be followed or nothing is definite.
+const DEFINITE_SAFE_VALUE_RX = /^\/[A-Za-z0-9_./@%+=,-]*$/
+// VARDEFDB1121: definiteAssignments proves a name is ASSIGNED once, not that nothing
+// else SETS it. A setter can hide behind a precommand word (`builtin read W`, `\builtin source f`, `time source f`, zsh
+// `repeat 1 source f`), run code later (`trap 'W=...' ERR`) or name the variable without `NAME=` (`W[0]=x`, `printf
+// -vW`, `print -v W`, `set -A W`, `builtin unset W`). Two fail-closed rules, the self-pace decision itself unchanged:
+//   (A) no replacement at all when a segment's first word (quotes and backslashes dropped) is a precommand or
+//       indirect-execution word below, a VAR_SETTERS word, or not a plain command name (`$B`, `>out`, `2>x`);
+//   (B) a name is not replaced when it occurs anywhere else than its one `NAME=` assignment and its `$NAME` /
+//       `${NAME}` uses: quoted, as an argument, subscripted, `+=`, in a `${NAME<op>...}` expansion, or glued to an
+//       option (`-vW`).
+const INDIRECT_FIRST_WORDS = new Set(['builtin', 'command', 'exec', 'noglob', 'nocorrect', '-', 'repeat', 'time', '!',
+  'trap', 'alias', 'enable', 'autoload', 'fc', 'emulate', 'zmodload'])
+const PLAIN_COMMAND_RX = /^(?:[A-Za-z0-9_./][A-Za-z0-9_./:+@%,-]*|\[)$/
+// a redirection in front of the command word (after the NAME=value prefix words): `2>/dev/null x`, `</tmp/p read W`
+// (every prefix word ends in \s+, so a run of `a=a=a=...` has ONE way to split: no backtracking blowup)
+const LEADING_REDIRECT_RX = /^\s*(?:[A-Za-z_]\w*\+?=(?:'[^']*'|"[^"]*"|\\.|[^\s'"\\])*\s+)*\d*[<>]/
+function firstWordBlocks(seg) {
+  if (LEADING_REDIRECT_RX.test(String(seg))) return true // the quote-aware reader drops redirections: keep this reading
+  // the quote-aware reader, not a split on blanks: `X='a b' source f` is ONE prefix word, then `source`
+  const w = shellWords(seg)
+  if (w === null) return true // the quoting cannot be followed: fail closed
+  let i = 0
+  while (i < w.length && /^[A-Za-z_]\w*\+?=/.test(w[i].value)) i++
+  if (i >= w.length) return false
+  const bare = w[i].value
+  if (bare === '') return true
+  return INDIRECT_FIRST_WORDS.has(bare) || VAR_SETTERS.has(bare) || !PLAIN_COMMAND_RX.test(bare)
+}
+// VARDEFDB1121: a NAME can be BUILT from pieces the raw-text rule (B) cannot see:
+// `W''T`, `"W"T`, `W\T`, `${n}T`, `$a$b`. So no name is replaced in a command where an identifier character or an
+// expansion touches another identifier character or expansion ACROSS a quoting boundary inside one word. A clean word
+// (`$W`, `"$W"`, `${W}/x`, `--format='%H'`, `NAME='a b'`) has no such joint; fail-closed otherwise (no replacement).
+function hasGluedPieces(src) {
+  const ID = /[A-Za-z0-9_]/
+  let lastId = false
+  let lastPiece = -1
+  let piece = 0
+  let q = null
+  const emit = (isId) => {
+    if (isId && lastId && lastPiece !== piece) return true
+    lastId = isId
+    lastPiece = piece
+    return false
+  }
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i]
+    if (q === "'") {
+      if (c === "'") { q = null; piece++; continue }
+      if (emit(ID.test(c))) return true
+      continue
+    }
+    if (c === '\\') {
+      piece++
+      const n = src[i + 1] ?? ''
+      i++
+      const bad = emit(ID.test(n) || n === '$')
+      piece++
+      if (bad) return true
+      continue
+    }
+    if (c === '"') { q = q === '"' ? null : '"'; piece++; continue }
+    if (c === "'" && q === null) { q = "'"; piece++; continue }
+    if (c === '$') {
+      let j = i + 1
+      if (src[j] === '{') { const e = src.indexOf('}', j); j = e < 0 ? src.length : e + 1 } else if (ID.test(src[j] ?? '')) { while (j < src.length && ID.test(src[j])) j++ } else j = Math.min(j + 1, src.length)
+      piece++
+      const bad = emit(true)
+      piece++
+      i = j - 1
+      if (bad) return true
+      continue
+    }
+    if (q === null && /[\s;&|<>()]/.test(c)) { lastId = false; continue }
+    if (emit(ID.test(c))) return true
+  }
+  return false
+}
+function nameSetIndirectly(src, name) {
+  let assigns = 0
+  for (const m of src.matchAll(new RegExp(`(?<![A-Za-z0-9_])(-[A-Za-z]*)?${name}(?![A-Za-z0-9_])`, 'g'))) {
+    if (m[1]) return true // glued to an option: -vW
+    const before = src.slice(0, m.index)
+    // a use is exactly `$NAME` or `${NAME}`; any other `${NAME<op>` (zsh `${W::=x}`, `${W:=x}`) may assign
+    if (before.endsWith('${')) { if (src[m.index + name.length] === '}') continue; return true }
+    if (before.endsWith('$')) continue // a use
+    if (src[m.index + name.length] === '=' && /(?:^|[\s;&|])$/.test(before)) { assigns++; continue }
+    return true
+  }
+  return assigns !== 1
+}
+export function substituteDefiniteCommand(command) {
+  const src = String(command ?? '').replace(/\\\r?\n/g, ' ')
+  // a command that names IFS may split the value: no replacement at all
+  if (/(?<![\w$])IFS(?!\w)/.test(src)) return String(command ?? '')
+  // a line continuation joins names (`"$W\<newline>X"` is $WX) and $'...' has its own escapes (`$'\'$W'`): no
+  // replacement in such a command at all
+  if (/\\\r?\n/.test(String(command ?? '')) || src.includes("$'")) return String(command ?? '')
+  const split = protectedSplit(src)
+  if (!split.quoteAware) return String(command ?? '')
+  if (split.segs.some(firstWordBlocks)) return String(command ?? '') // rule (A)
+  if (hasGluedPieces(src)) return String(command ?? '') // a name built from pieces, class level
+  const definite = definiteAssignments(split).map((m) => new Map([...m].filter(([n]) => !nameSetIndirectly(src, n))))
+  if (!definite.some((m) => m.size)) return String(command ?? '')
+  // The replacement is only for the SIMPLE form, by an ALLOWLIST (a blocklist of glob characters misses zsh
+  // extendedglob `W#T`, `^X`). Outside quotes only these characters may occur: [A-Za-z0-9_./@%+=,:-], blanks (space,
+  // tab, newline), the separators ; & |, a standalone `[` `[[` `]` `]]` word (a test), and a `$` that is a plain
+  // `$NAME` / `${NAME}` use of a name replaced here. Inside double quotes only that `$` use is allowed, and no
+  // backtick. No redirection `<` `>`: zsh runs an assignment that has only redirections as a prefix of NULLCMD, so in
+  // `W=/x &>/dev/null </dev/null; git -C "$W"` W is unset there. Anything else (`#`, `^`, `~`, `!`, `?`, `*`, a
+  // backslash, `(`, `$n:u`, `$(..)`, `${W:-x}`, `$1`, another name's use) could build or set the target name, which
+  // the text rules cannot see: no replacement at all, the denying behaviour of the unpatched gate.
+  const replaced = new Set(definite.flatMap((m) => [...m].filter(([, v]) => DEFINITE_SAFE_VALUE_RX.test(v)).map(([n]) => n)))
+  if (!replaced.size) return String(command ?? '')
+  const UNCHANGED = String(command ?? '')
+  for (let i = 0, q = null; i < src.length; i++) {
+    const c = src[i]
+    if (q === "'") { if (c === "'") q = null; continue }
+    if (c === '"') { q = q === '"' ? null : '"'; continue }
+    if (c === "'" && q === null) { q = "'"; continue }
+    if (c === '$') {
+      const u = /^\$\{([A-Za-z_]\w*)\}|^\$([A-Za-z_]\w*)(?![\w[:])/.exec(src.slice(i))
+      if (!u || !replaced.has(u[1] ?? u[2])) return UNCHANGED
+      i += u[0].length - 1
+      continue
+    }
+    if (q === '"') {
+      if (c === '`') return UNCHANGED
+      if (c === '\\') i++ // an escaped character inside double quotes cannot start a name or an expansion of its own here
+      continue
+    }
+    if (/[A-Za-z0-9_./@%+=,: \t\n;&|-]/.test(c)) continue
+    if (c === '[' || c === ']') {
+      const w = /^(?:\[\[?|\]\]?)(?=[ \t\n;&|]|$)/.exec(src.slice(i))
+      if (w && /(?:^|[ \t\n;&|])$/.test(src.slice(0, i))) { i += w[0].length - 1; continue }
+    }
+    return UNCHANGED
+  }
+  const bounds = []
+  let start = 0
+  for (const m of split.masked.matchAll(SEGMENT_SEP_RX)) { bounds.push([start, m.index]); start = m.index + m[0].length }
+  bounds.push([start, src.length])
+  if (bounds.length !== definite.length) return String(command ?? '')
+  let out = ''
+  let at = 0
+  bounds.forEach(([a, b], k) => {
+    const defs = definite[k]
+    if (!defs.size) return
+    // the quoting is followed here: a single-quoted (or $'...') `$W` is text, a double-quoted one expands
+    let q = null
+    for (let i = a; i < b; i++) {
+      const c = src[i]
+      if (q === "'") { if (c === "'") q = null; continue }
+      if (c === '\\') { i++; continue }
+      if (c === '"') { q = q === '"' ? null : '"'; continue }
+      if (c === "'" && q === null) { q = "'"; continue }
+      if (c !== '$') continue
+      const m = /^\$\{([A-Za-z_]\w*)\}|^\$([A-Za-z_]\w*)(?![\w[:])/.exec(src.slice(i, b))
+      if (!m) continue
+      const v = defs.get(m[1] ?? m[2])
+      if (v == null || !DEFINITE_SAFE_VALUE_RX.test(v)) continue
+      out += src.slice(at, i) + v
+      at = i + m[0].length
+      i = at - 1
+    }
+  })
+  return at === 0 ? String(command ?? '') : out + src.slice(at)
 }
 
 function substituteDefinite(text, definite) {
@@ -808,8 +1081,15 @@ function protectedPatternWord(text, ctx) {
   const words = src.replace(UNRESOLVED_EXPANSION_RX, UNRESOLVED).replace(/[\\'"]/g, '').split(/[\s;&|<>()]+/).filter(Boolean)
   const cwdReal = ctx?.cwd ? pathKey(ctx.cwd) : null
   const cwdProtected = !!cwdReal && (sameKey(cwdReal, ctx.root) || sameKey(cwdReal, ctx.store))
-  const cmd = (words.find((w) => !/^[A-Za-z_]\w*=/.test(w)) ?? '').replace(/^.*\//, '')
-  if (ctx && DIR_WRITERS.has(cmd)) {
+  // The writer need not be the first word (#3001: it was read as the first non-assignment word). A reserved word (`for ..; do tar .. -C store`,
+  // `if ..; then cp x store`, `{ cp x store; }`, `case k in k) cp x store;;`), a wrapper (env, nice, time, timeout, sudo,
+  // command, exec, nohup ..) or a runner (xargs, find -exec) puts it later, and the first-word reading let every one of
+  // them write a name of its own into the store dir or the root. Read the other way round: a dir writer named ANYWHERE in
+  // the segment, with the store dir or the root as an argument, makes the segment a mention. No list of prefixes to keep up
+  // to date: an unknown wrapper or runner is on the denying side. A mention is not yet a denial: a segment that a reader
+  // leads (`grep -rn install .`) is still a plain read in readOnlyMentionAllowed, unless it redirects onto a target built at
+  // runtime, which is the price of this reading.
+  if (ctx && words.some((w) => DIR_WRITERS.has(w.replace(/^.*\//, '')))) {
     for (const w of words) {
       const v = w.replace(/^--?[\w-]+=/, '').replace(/^-[A-Za-z](?=[/~.])/, '')
       if (!v || v.startsWith('-') || v.includes(UNRESOLVED) || /[*?[{]/.test(v)) continue
@@ -1426,10 +1706,19 @@ const SCHEDULE_SQL_WRITE_RX = /\b(?:insert(?:\s+or\s+\w+)?\s+into|replace\s+into
 // `surface: 'security'` mode, for every agent including the main one.
 // approval_slack_posts (APPROVALSLACK1030 (2)): the posted Slack request the server checks the owner's reaction
 // against; an agent that could write it could point a request at a message it controls.
+// agent_create_specs (AGENTCREATEPR2-1119): the spec an agent_create approval is bound to; an agent that could write
+// it could swap the agent the owner approved for another one, or mark a spec consumed so it never runs.
 // support_consents and support_password_state (SUPPORTKULCS1109, D5): the owner's consent to support access, with
 // how and why it ended, and the support password bucket. An agent that could write them could forge or erase the
 // trail of an enabling, or lift the lock that stands in front of enabling.
-export const SECURITY_TABLES = ['approvals', 'approval_events', 'approval_slack_posts', 'auth_sessions', 'dashboard_users', 'device_keys', 'vault_ssh_keys', 'support_consents', 'support_password_state']
+// approver_scopes (DELEGAPPROVER1123): what a delegated human approver may decide; an agent that could write it could
+// widen an approver's reach to its own requests.
+// custom_commands (CHANINBOUNDFORGE1125): the owner's custom slash commands. A prompt command's body is queued as the
+// channel coordinator (custom-commands.ts sendPrompt), so an agent that could rewrite a body would speak in the owner's
+// voice the next time the owner runs that command. The dashboard's owner-gated CRUD is the only writer.
+// inbound_sig_log (HMACINBOUND1125): how many times each server-signed agent_messages row was delivered and how many
+// times the server allowed; an agent that could write it could re-arm a delivered owner-voiced row or an old STOP.
+export const SECURITY_TABLES = ['approvals', 'approval_events', 'approval_slack_posts', 'approval_teams_cards', 'approval_gromzo_posts', 'agent_create_specs', 'auth_sessions', 'colleague_sessions', 'dashboard_users', 'device_keys', 'vault_ssh_keys', 'support_consents', 'support_password_state', 'approver_scopes', 'custom_commands', 'inbound_sig_log']
 // An SQL write on one of them. The table name is read wherever the statement
 // names its target: after a schema prefix (`main.approvals`, an ATTACHed
 // `x.approvals`), in [brackets], with SQL comments or line breaks between the
@@ -1461,6 +1750,210 @@ export const SECURITY_SQL_WRITE_RX = new RegExp(
   String.raw`|\bpragma${SQL_GAP}+(?:\[?\w+\]?${SQL_GAP}*\.${SQL_GAP}*)?\[?writable_schema\b`,
   'i',
 )
+
+// CHANINBOUNDFORGE1125: agent_messages stays writable (agents mark their queue rows done, and the skills do), but not
+// in the ways that forge who is speaking. The message router frames a row as the owner speaking (channel-inbound) or
+// as a system directive by its from_agent column ALONE (message-router.ts classifyAgentMessage; the directive check
+// reads the row's from_agent), and it honours stop_authorized / urgent / priority / affects_current_work as stored.
+// /api/messages refuses those senders and those flags to the shared token; a direct SQL write skipped all of that.
+// So, on agent_messages:
+//   - INSERT / REPLACE: only `INTO agent_messages (<columns>) VALUES (<literals>)[, (...)]`, no flag column, and
+//     every row's from_agent a plain quoted literal naming a sender the API would also take from the shared token:
+//     the main agent or an existing agents/<id>/ directory, never a reserved sender. Anything the gate cannot read
+//     (no column list, INSERT .. SELECT, a parameter, a shell or f-string expansion, concatenation, an UPSERT)
+//     is denied.
+//   - UPDATE: never from_agent or a flag column; content or to_agent only with a WHERE pinned to one plain,
+//     allowed from_agent literal (your own pending row, the interagent-queue-lag skill's recipe), no OR, no subquery.
+//     A status / result / timestamp update stays free.
+//   - no DROP / ALTER / CREATE TABLE|VIEW, no trigger or index on it, no trigger that writes it.
+// THE LIMIT, as for the security tables: a text-based brake, not an OS boundary; a program that builds the statement
+// at run time passes. The real lock is a server-side mark on the row (HMACINBOUND1125, decided separately).
+// Reserved senders: the message layer's reserved ids (sanitize.ts MESSAGE_LAYER_RESERVED_AGENT_IDS), the voice
+// channel's default id and the one this install's .env names (VOICE_CHANNEL_ID). A NEW owner-voice sender is
+// reserved there too, and agent-messages-forge.test.ts fails until it is listed here as well: the desktop companion
+// (sanitize.ts COMPANION_SENDER_ID, FIGURAKULCS1125) is.
+export const AGENT_MESSAGES_RESERVED_SENDERS = ['system', 'heartbeat', 'telegram-coordinator', 'channel-coordinator', 'hanna', 'desktop-companion']
+const AGENT_MESSAGES_FLAG_COLUMNS = new Set(['stop_authorized', 'urgent', 'priority', 'affects_current_work'])
+const AM_IDENT = sqlIdent(['agent_messages'])
+const AM_ROW_WRITE_RX = new RegExp(
+  String.raw`\b(?:insert(?:${SQL_GAP}+or${SQL_GAP}+\w+)?${SQL_GAP}+into|replace${SQL_GAP}+into|update(?:${SQL_GAP}+or${SQL_GAP}+\w+)?)${SQL_GAP}+${AM_IDENT}`,
+  'gi',
+)
+const AM_SCHEMA_WRITE_RX = new RegExp(
+  String.raw`\b(?:drop${SQL_GAP}+(?:table|view)(?:${SQL_GAP}+if${SQL_GAP}+exists)?|alter${SQL_GAP}+table|create${SQL_GAP}+(?:temp\w*${SQL_GAP}+)?(?:table|view)(?:${SQL_GAP}+if${SQL_GAP}+not${SQL_GAP}+exists)?)${SQL_GAP}+${AM_IDENT}` +
+  String.raw`|\bcreate${SQL_GAP}+(?:(?:temp\w*|unique)${SQL_GAP}+)?(?:trigger|index)\b[\s\S]{0,300}?\bon${SQL_GAP}+${AM_IDENT}` +
+  String.raw`|\bcreate${SQL_GAP}+(?:temp\w*${SQL_GAP}+)?trigger\b[\s\S]*?\b(?:insert|replace|update)\b[\s\S]{0,60}?${AM_IDENT}`,
+  'i',
+)
+
+/** The statement that starts at `i`: up to a `;` or a `"` outside a single-quoted SQL literal, or the end. */
+function sqlStatementAt(text, i) {
+  let inLit = false
+  for (let j = i; j < text.length; j++) {
+    const c = text[j]
+    if (inLit) {
+      if (c === "'") {
+        if (text[j + 1] === "'") { j++; continue }
+        inLit = false
+      }
+      continue
+    }
+    if (c === "'") inLit = true
+    else if (c === ';' || c === '"') return text.slice(i, j)
+  }
+  return inLit ? null : text.slice(i)
+}
+
+/** Split on top-level commas (outside quotes and parentheses); null when the quotes or parentheses do not balance. */
+function splitTopLevel(s) {
+  const out = []
+  let depth = 0
+  let inLit = false
+  let last = 0
+  for (let j = 0; j < s.length; j++) {
+    const c = s[j]
+    if (inLit) {
+      if (c === "'") { if (s[j + 1] === "'") { j++; continue } inLit = false }
+      continue
+    }
+    if (c === "'") inLit = true
+    else if (c === '(') depth++
+    else if (c === ')') { if (--depth < 0) return null }
+    else if (c === ',' && depth === 0) { out.push(s.slice(last, j)); last = j + 1 }
+  }
+  if (inLit || depth !== 0) return null
+  out.push(s.slice(last))
+  return out
+}
+
+const sqlColumnName = (c) => c.trim().replace(/^["`[]|["`\]]$/g, '').toLowerCase()
+
+/** The senders this install allows by SQL: the main agent and existing agent directories, never a reserved id. */
+function agentMessagesSenderOk(id, root) {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) return false
+  const env = root ? readEnvFileValues(join(root, '.env')) : {}
+  const reserved = new Set(AGENT_MESSAGES_RESERVED_SENDERS)
+  if (env.VOICE_CHANNEL_ID) reserved.add(env.VOICE_CHANNEL_ID.trim().toLowerCase())
+  if (reserved.has(id.toLowerCase())) return false
+  if (id === (env.MAIN_AGENT_ID?.trim() || 'marveen')) return true
+  if (!root) return false
+  try { return lstatSync(join(root, 'agents', id)).isDirectory() } catch { return false }
+}
+
+function readEnvFileValues(path) {
+  const out = {}
+  let raw = ''
+  try { raw = readFileSync(path, 'utf8') } catch { return out }
+  for (const line of raw.split('\n')) {
+    const m = /^\s*(MAIN_AGENT_ID|VOICE_CHANNEL_ID)\s*=\s*(.*)$/.exec(line)
+    if (m) out[m[1]] = m[2].replace(/^["']|["']\s*$/g, '').trim()
+  }
+  return out
+}
+
+const PLAIN_SENDER_LITERAL_RX = /^'([A-Za-z0-9_-]{1,64})'$/
+
+/** INSERT / REPLACE INTO agent_messages: true when it could forge the sender or a flag (or cannot be read). */
+function agentMessagesInsertForges(stmt, root) {
+  const head = new RegExp(String.raw`^(?:insert(?:${SQL_GAP}+or${SQL_GAP}+\w+)?${SQL_GAP}+into|replace${SQL_GAP}+into)${SQL_GAP}+${AM_IDENT}${SQL_GAP}*\(([^()]*)\)${SQL_GAP}*values${SQL_GAP}*`, 'i').exec(stmt)
+  if (!head) return true // no column list, INSERT .. SELECT, DEFAULT VALUES, or unreadable
+  const cols = head[1].split(',').map(sqlColumnName)
+  if (cols.some((c) => AGENT_MESSAGES_FLAG_COLUMNS.has(c))) return true
+  const fromAt = cols.indexOf('from_agent')
+  if (fromAt < 0) return true
+  let rest = stmt.slice(head[0].length)
+  let rows = 0
+  while (rest.length) {
+    if (rest[0] !== '(') return true
+    let depth = 0
+    let inLit = false
+    let end = -1
+    for (let j = 0; j < rest.length; j++) {
+      const c = rest[j]
+      if (inLit) { if (c === "'") { if (rest[j + 1] === "'") { j++; continue } inLit = false } continue }
+      if (c === "'") inLit = true
+      else if (c === '(') depth++
+      else if (c === ')' && --depth === 0) { end = j; break }
+    }
+    if (end < 0) return true
+    const vals = splitTopLevel(rest.slice(1, end))
+    if (!vals || vals.length !== cols.length) return true
+    const sender = PLAIN_SENDER_LITERAL_RX.exec(vals[fromAt].trim())
+    if (!sender || !agentMessagesSenderOk(sender[1], root)) return true
+    rows++
+    rest = rest.slice(end + 1).replace(new RegExp(`^${SQL_GAP}*`), '')
+    if (rest.startsWith(',')) { rest = rest.slice(1).replace(new RegExp(`^${SQL_GAP}*`), ''); continue }
+    break
+  }
+  // nothing may follow the rows: an UPSERT (ON CONFLICT .. DO UPDATE SET from_agent ..) or anything unread
+  return rows === 0 || rest.trim() !== ''
+}
+
+/** UPDATE agent_messages: true when it could forge the sender, a flag, or rewrite another sender's row. */
+function agentMessagesUpdateForges(stmt, root) {
+  const head = new RegExp(String.raw`^update(?:${SQL_GAP}+or${SQL_GAP}+\w+)?${SQL_GAP}+${AM_IDENT}${SQL_GAP}+set${SQL_GAP}+`, 'i').exec(stmt)
+  if (!head) return true
+  const body = stmt.slice(head[0].length)
+  if (body.trimStart().startsWith('(')) return true // SET (a, b) = (...): row-value assignment, not read
+  // the first top-level WHERE (outside literals) ends the SET list
+  let whereAt = -1
+  let inLit = false
+  for (let j = 0; j < body.length; j++) {
+    const c = body[j]
+    if (inLit) { if (c === "'") { if (body[j + 1] === "'") { j++; continue } inLit = false } continue }
+    if (c === "'") { inLit = true; continue }
+    if (/\s/.test(c) && /^\swhere\b/i.test(body.slice(j))) { whereAt = j; break }
+  }
+  const setPart = whereAt < 0 ? body : body.slice(0, whereAt)
+  const wherePart = whereAt < 0 ? '' : body.slice(whereAt).replace(/^\s*where\b/i, '')
+  if (/\bfrom\b/i.test(setPart.replace(/'(?:[^']|'')*'/g, "''"))) return true // UPDATE .. FROM
+  const assigns = splitTopLevel(setPart)
+  if (!assigns) return true
+  const cols = []
+  for (const a of assigns) {
+    const m = /^\s*(\[?["`]?\w+["`]?\]?)\s*=/.exec(a)
+    if (!m) return true
+    cols.push(sqlColumnName(m[1]))
+  }
+  if (cols.some((c) => c === 'from_agent' || AGENT_MESSAGES_FLAG_COLUMNS.has(c))) return true
+  if (cols.some((c) => c === 'content' || c === 'to_agent')) {
+    const bare = wherePart.replace(/'(?:[^']|'')*'/g, "''")
+    if (/\bor\b|\bselect\b|\bnot\b/i.test(bare)) return true
+    const pins = [...wherePart.matchAll(/(?<![<>!=\w])\[?["`]?from_agent["`]?\]?\s*==?\s*('[^']*')/gi)]
+    if (pins.length !== 1) return true
+    const sender = PLAIN_SENDER_LITERAL_RX.exec(pins[0][1])
+    if (!sender || !agentMessagesSenderOk(sender[1], root)) return true
+  }
+  return false
+}
+
+/**
+ * CHANINBOUNDFORGE1125: does this text write agent_messages in a way that could forge the sender or a delivery flag?
+ * Read on the escape-decoded text WITH its quotes (the SQL literals are the evidence); a statement the gate cannot
+ * read is a forge (fail closed).
+ */
+export function agentMessagesForgeWrite(text, opts = {}) {
+  const joined = String(text ?? '').replace(/\\\r?\n/g, '')
+  const decoded = decodeEscapes(decodeEscapes(joined))
+  // cheap pre-test, so the hook pays nothing for the many texts that never name the table: the decoded text, and the
+  // same with shell quoting removed (a name split by quotes, "agent_""messages", closes up there)
+  const closed = decoded.replace(/\$\{IFS\}|\$IFS\b/g, '').replace(/[\\'"`]/g, '')
+  if (!/agent_messages/i.test(decoded) && !/agent_messages/i.test(closed)) return false
+  const vs = scheduleSurfaceVariants(text)
+  for (const v of [decoded, ...vs]) if (AM_SCHEMA_WRITE_RX.test(v)) return true
+  const root = opts.projectRoot ?? null
+  for (const m of decoded.matchAll(AM_ROW_WRITE_RX)) {
+    const stmt = sqlStatementAt(decoded, m.index)
+    if (stmt === null) return true
+    const forges = /^update/i.test(m[0]) ? agentMessagesUpdateForges(stmt, root) : agentMessagesInsertForges(stmt, root)
+    if (forges) return true
+  }
+  // a write the decoded text hides (quotes or escapes split the keywords) but an unquoted variant shows: unreadable
+  const shown = (s) => (s.match(AM_ROW_WRITE_RX) ?? []).length
+  const seen = shown(decoded)
+  return vs.some((v) => shown(v) > seen)
+}
+
 // The dashboard database file (and its WAL/SHM/journal). Reads by any program
 // stay allowed (a worker reads the board with sqlite3 SELECT); a FILE-level
 // write -- a redirect onto it, cp/mv/tee/dd/rm/ln/... naming it, or a sqlite3
@@ -1506,7 +1999,14 @@ export function scheduleSurfaceVariants(text) {
   return [joined, unquoted, glued, joinedLiterals]
 }
 
-export function globMatchesName(glob, name) {
+// A bracket class whose range runs backwards (`[x-1]`, as in the Python index `row[x-1000]`) is a SyntaxError for a JS
+// RegExp, which the catch in globMatchesName read as "unreadable glob: matches everything": a read-only measuring script
+// (python heredoc, `lum[y-1000]`) was denied as an egress-allowlist write (kodolo2, 2026-11-19). bash and dash expand a
+// reversed range to nothing (measured), so it names no file. The retry reads such a range as the SWAPPED one (`1-x`),
+// a superset of every plausible reading (nothing, the two endpoints, the span between them), so it still matches
+// whatever any shell could. A NEGATED class (`[!x-1]`) is left as it was: swapping would shrink the set it excludes, so
+// it stays unreadable and fail-closed.
+function globToRegexSource(glob, swapReversed) {
   let rx = ''
   for (let i = 0; i < glob.length; i++) {
     const c = glob[i]
@@ -1515,11 +2015,17 @@ export function globMatchesName(glob, name) {
     else if (c === '[') {
       const j = glob.indexOf(']', i + 1)
       if (j === -1) { rx += '\\['; continue }
-      rx += '[' + glob.slice(i + 1, j).replace(/^!/, '^').replace(/\\/g, '\\\\') + ']'
+      let body = glob.slice(i + 1, j)
+      if (swapReversed && !body.startsWith('!') && !body.includes('\\')) body = body.replace(/(.)-(.)/gs, (m, a, b) => (a > b ? `${b}-${a}` : m))
+      rx += '[' + body.replace(/^!/, '^').replace(/\\/g, '\\\\') + ']'
       i = j
     } else rx += c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   }
-  try { return new RegExp(`^${rx}$`, 'i').test(name) } catch { return true } // unreadable glob: fail closed
+  return rx
+}
+export function globMatchesName(glob, name) {
+  try { return new RegExp(`^${globToRegexSource(glob, false)}$`, 'i').test(name) } catch { /* retry below */ }
+  try { return new RegExp(`^${globToRegexSource(glob, true)}$`, 'i').test(name) } catch { return true } // unreadable glob: fail closed
 }
 
 // Bash brace expansion of one word: `api/sch{e,}dules` -> [api/schedules,
@@ -1718,7 +2224,7 @@ export function scheduleSurfaceRefs(text, opts) {
       api: false,
       dir: false,
       cli: false,
-      sql: vs.some((v) => SECURITY_SQL_WRITE_RX.test(v)),
+      sql: vs.some((v) => SECURITY_SQL_WRITE_RX.test(v)) || agentMessagesForgeWrite(text, opts),
       db: vs.some((v) => DASHBOARD_DB_REF_RX.test(v)) || globRefs(text, opts).db,
     }
   }
@@ -1835,12 +2341,26 @@ function resolveCatSubst(cmd, opts) {
 // case to guard any more: a cd/pushd/popd into the store denies the whole
 // command (scheduleSurfaceDeny, rule 1).
 const FLAT_SUBST_RX = /\$\(([^()'"`$\\]*)\)/g
+// DBGATESUBST1125 (Marveen's kanban audit, memory 5737): `echo "$(date -r $LAST)"` next to a read-only
+// `sqlite3 ... "SELECT ..."` was denied, because a variable inside the substitution kept it out of FLAT_SUBST_RX and
+// the quoted, unresolved substitution made the whole command unparsable. A variable is allowed in ONE narrow shape:
+// a flat substitution whose command is a pure formatter that neither writes a file nor runs code (date, basename,
+// dirname), every `$` a plain `$NAME` / `${NAME}`. Its output is run-time data like any other marker's. Anything
+// else with an expansion inside (sqlite3, cat, an interpreter, a pipe, a redirect) stays as it was.
+const VAR_SUBST_RX = /\$\(\s*((?:date|basename|dirname)(?=[\s)])[^()'"`\\<>|;&]*)\)/g
+const PLAIN_VAR_RX = /\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})/g
 function resolveFlatSubst(cmd, opts) {
-  return cmd.replace(FLAT_SUBST_RX, (full, inner) => {
-    // opts.keepSubst: a caller's own reference (db-write-gate: a protected install
-    // path) keeps the substitution as written, so the word stays unparsable there
-    return strongRef(scheduleSurfaceRefs(inner, opts)) || opts?.keepSubst?.(inner) ? full : NONCONTENT_MARKER
-  })
+  const keep = (inner) => strongRef(scheduleSurfaceRefs(inner, opts)) || opts?.keepSubst?.(inner)
+  return cmd
+    .replace(FLAT_SUBST_RX, (full, inner) => {
+      // opts.keepSubst: a caller's own reference (db-write-gate: a protected install
+      // path) keeps the substitution as written, so the word stays unparsable there
+      return keep(inner) ? full : NONCONTENT_MARKER
+    })
+    .replace(VAR_SUBST_RX, (full, inner) => {
+      if (inner.replace(PLAIN_VAR_RX, '').includes('$')) return full // $(..), $((..)), $'..', $1 ... : not plain
+      return keep(inner) ? full : NONCONTENT_MARKER
+    })
 }
 
 // Split a command into the segments the SHELL would see: separators inside
@@ -2158,29 +2678,478 @@ function isPipeSink(words, name) {
 // its -c/-e code; a script that only takes the file as data (the kanban tool's --comment-file) does not.
 const FILE_INTERPRETERS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'node', 'nodejs', 'deno', 'bun', 'ruby',
   'perl', 'php', 'osascript', 'tsx'])
-// The rest run or hand on whatever file they name.
-const FILE_RUNNERS = new Set(['sqlite3', 'sqlite', 'source', '.', 'chmod', 'env', 'xargs', 'exec', 'eval', 'npx'])
+// The rest run or hand on whatever file they name. chmod is NOT here (47eeb016): it changes metadata, it does not run
+// the file; `chmod <protected>` itself is denied through the DIR_CHANGER rule. `env` runs a target only through the
+// command it starts (envRunsTarget below), never through an assignment value alone.
+const FILE_RUNNERS = new Set(['sqlite3', 'sqlite', 'source', '.', 'env', 'xargs', 'exec', 'eval', 'npx'])
 const isInterpreter = (name) => FILE_INTERPRETERS.has(name) || /^python[0-9.]*$/.test(name)
 const isFileRunner = (name) => FILE_RUNNERS.has(name) || isInterpreter(name)
 const escapeRx = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-export function laterRuns(segs, k, targets) {
+const SHELL_NAME_RX = /^(?:(?:ba|z|da|k)?sh|ash)$/
+/** GATEPATHNORM1118 F5: the script word of a shell run, given the words after the program: options start with - or +,
+ *  an option cluster ending in o or O (-o, +o, -eo, -O, +O) takes the next word as its argument, -- ends the options.
+ *  null for another program, or when no script word is left (the shell reads stdin, or -c gives the code). */
+export function shellScriptWord(name, args) {
+  if (!SHELL_NAME_RX.test(name)) return null
+  for (let i = 0; i < args.length; i++) {
+    const v = args[i]
+    if (v === '--') return args[i + 1] ?? null
+    if (v === '-' || !/^[-+]/.test(v)) return v === '-' ? null : v
+    if (/^[-+][A-Za-z]*c[A-Za-z]*$/.test(v)) return null
+    if (/^[-+][A-Za-z]*[oO]$/.test(v)) i++
+    // F6: bash's long options that take the next word (--rcfile RC, --init-file RC); --name=value holds its own
+    else if (v === '--rcfile' || v === '--init-file') i++
+  }
+  return null
+}
+
+/** F6: the rc files a shell run names (--rcfile RC, --init-file RC, --rcfile=RC): an interactive shell runs them. */
+export function shellRcFiles(name, args) {
+  if (!SHELL_NAME_RX.test(name)) return []
+  const out = []
+  for (let i = 0; i < args.length; i++) {
+    const v = args[i]
+    if (v === '--') break
+    if (v === '--rcfile' || v === '--init-file') { if (args[i + 1] !== undefined) out.push(args[i + 1]); i++; continue }
+    const m = /^--(?:rcfile|init-file)=(.+)$/.exec(v)
+    if (m) out.push(m[1])
+    else if (!/^[-+]/.test(v)) break
+  }
+  return out
+}
+
+// 47eeb016 round 12: an empty quoted string ('' "" $'' $"") adds nothing to a shell word, so `< ''<f>` and
+// `< <f-head>''<f-tail>` read <f>. The text is matched both as written and with those dropped (fail-closed union).
+// A regex cannot follow every quoting; real tokenising is card fdc1ce07.
+const dropEmptyQuotes = (s) => s.replace(/\$?(?:''|"")/g, '')
+const stdinFromTarget = (own, targets) =>
+  [own, dropEmptyQuotes(own)].some((text) => targets.some((t) => new RegExp(`(?:^|[^<])<\\s*['"]?${escapeRx(t)}`).test(text)))
+// 47eeb016: `env [-opts] [NAME=VALUE ...] CMD`: true only when the target is the command word.
+const ENV_LONG_OPTS = ['split-string', 'unset', 'chdir', 'argv0', 'file']
+// One env option word at words[i] (starts with '-', not bare '--'): how many words it consumes, and the -S/--split-string
+// value when it has one (GNU re-parses that text as a command line).
+function envOption(words, i) {
+  const v = words[i].value
+  const next = words[i + 1]?.value
+  if (v.startsWith('--')) {
+    const eq = v.indexOf('=')
+    const name = eq < 0 ? v.slice(2) : v.slice(2, eq)
+    const opt = name ? ENV_LONG_OPTS.find((l) => l.startsWith(name)) : undefined
+    if (!opt) return { n: 1 }
+    const val = eq < 0 ? next : v.slice(eq + 1)
+    return { n: eq < 0 ? 2 : 1, split: opt === 'split-string' ? (val ?? '') : undefined }
+  }
+  for (let c = 1; c < v.length; c++) {
+    if (!'uCafS'.includes(v[c])) continue
+    const rest = v.slice(c + 1)
+    const val = rest || next
+    return { n: rest ? 1 : 2, split: v[c] === 'S' ? (val ?? '') : undefined }
+  }
+  return { n: 1 }
+}
+const SHELL_INTERPRETERS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh', 'ash', 'fish'])
+// A command wrapper started by env runs whatever command follows it (47eeb016 round 9): it gets the same
+// conservative reading as an interpreter -- a BASH_ENV/ENV assignment that held a target, or ANY later word
+// that contains a target, makes it a run.
+const ENV_COMMAND_WRAPPERS = new Set(['nice', 'timeout', 'gtimeout', 'nohup', 'stdbuf', 'setsid', 'time', 'sudo',
+  'command', 'builtin', 'chrt', 'ionice', 'taskset', 'doas', 'parallel'])
+// An interpreter started by env runs a target when a shell startup file (BASH_ENV/ENV) holds it, its stdin reads it,
+// or ANY later word contains it (the base gate's conservative reading: no per-interpreter option table).
+function envRunsTarget(words, targets, own, depth = 0, inheritedStartupFile = false, inheritedTargetAssign = false) {
+  if (depth > 8) return true
+  let ws = words
+  let i = 1
+  let splices = 0
+  let ended = false // after a bare `--` no word is an option
+  let startupFile = inheritedStartupFile // BASH_ENV / ENV assignment whose value holds a target (also from an outer env)
+  let targetAssign = inheritedTargetAssign // ANY assignment whose value holds a target (NODE_OPTIONS, PERL5OPT ...; also from an outer env)
+  while (i < ws.length) {
+    const v = ws[i].value
+    if (!ended && v.startsWith('-') && v !== '--') {
+      const o = envOption(ws, i)
+      if (o.split !== undefined) {
+        if (targets.some((t) => o.split.includes(t))) return true
+        if (++splices > 8) return true
+        const toks = shellWords(o.split)
+        if (!toks) return true
+        ws = [...toks, ...ws.slice(i + o.n)]
+        i = 0
+        ended = false
+        continue
+      }
+      i += o.n
+      continue
+    }
+    if (v === '--' && !ended) { ended = true; i++; continue }
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(v)
+    if (m) {
+      if ((m[1] === 'BASH_ENV' || m[1] === 'ENV') && targets.some((t) => v.includes(t))) startupFile = true
+      if (targets.some((t) => v.includes(t))) targetAssign = true
+      i++
+      continue
+    }
+    break
+  }
+  const rest = ws.slice(i)
+  if (!rest.length) return false
+  const cmd = rest[0].value
+  if (targets.some((t) => cmd === t || cmd.includes(t))) return true
+  const name = baseName(cmd)
+  if (name === 'env') return envRunsTarget(rest, targets, own, depth + 1, startupFile, targetAssign)
+  if (FILE_RUNNERS.has(name)) return true
+  if (ENV_COMMAND_WRAPPERS.has(name)) {
+    // What the wrapper starts (47eeb016 round 11): a later word -- or the first word of an env -S value -- that is
+    // an interpreter, env, a runner or another wrapper can load a startup file / an assignment or read stdin.
+    const starts = rest.slice(1).some((w) => {
+      const b = baseName(w.value.trim().split(/\s+/)[0])
+      return isInterpreter(b) || b === 'env' || FILE_RUNNERS.has(b) || ENV_COMMAND_WRAPPERS.has(b)
+    })
+    if (starts && (startupFile || targetAssign)) return true
+    if (starts && own !== undefined && stdinFromTarget(own, targets)) return true
+    return rest.slice(1).some((w) => targets.some((t) => w.value.includes(t)))
+  }
+  if (isInterpreter(name)) {
+    if (startupFile && SHELL_INTERPRETERS.has(name)) return true
+    if (targetAssign) return true
+    if (own !== undefined && stdinFromTarget(own, targets)) return true
+    return rest.slice(1).some((w) => targets.some((t) => w.value.includes(t)))
+  }
+  return false
+}
+// PR #2883 review B1 (47eeb016 round 13): chmod is not a run, but a later command can run the written file without
+// spelling its path as the command word -- `cd <dir> && ./<base>`, `find <dir> ... -exec {} \;`, a command wrapper
+// (`timeout 5 <f>`, `nohup ./<base>`). runsByName looks at the RUN POSITIONS only (the command word after the
+// leading assignments, a wrapper's later words, find's -exec family), so a file named as data (`cat <base>`, an
+// assignment value, a find with no action) stays allowed.
+// 47eeb016 R2 B1/B2: the run positions are now read by an executable-position analysis, not a broad scan of every
+// word -- the round-13 wrapper branch denied `timeout 5 cat ./<base>` (cat's argument is data), and the find branch
+// denied `find -name <base> -exec echo \;` (-name's argument is data). The missed-run holes of the same round --
+// `bash ./<base>` after `cd`, `env X=1 timeout 5 ./<base>` -- run at positions the broad scan never modelled.
+// 47eeb016 R4: the wrapper branch no longer applies env's conservative any-word reading -- the wrapped command gets
+// the same executable-position analysis as a bare one, so its plain operands are data (upstream #2891's wrapped
+// reader/upload pins).
+const targetBase = (t) => t.slice(t.lastIndexOf('/') + 1)
+const targetDir = (t) => (t.lastIndexOf('/') > 0 ? t.slice(0, t.lastIndexOf('/')) : '')
+const FIND_RUN_ACTIONS = new Set(['-exec', '-execdir', '-ok', '-okdir'])
+// 47eeb016 R2 B1: per command wrapper, the SHORT and LONG options that consume a SEPARATE value word. An option not
+// listed takes no argument; an unknown option consumes nothing extra. Some wrappers also take ONE leading operand
+// between their options and the executable (timeout's duration, chrt's priority, taskset's mask) -- see below.
+const WRAPPER_VALUE_OPTIONS = new Map([
+  ['timeout', new Set(['-s', '-k', '--signal', '--kill-after'])],
+  ['gtimeout', new Set(['-s', '-k', '--signal', '--kill-after'])],
+  ['nice', new Set(['-n', '--adjustment'])],
+  ['nohup', new Set()],
+  ['builtin', new Set()],
+  ['command', new Set()], // -p / -v / -V take no argument
+  ['stdbuf', new Set(['-o', '-e', '-i'])], // the value may also be attached: -o0
+  ['setsid', new Set()], // -c / -f / -w take no argument
+  ['time', new Set(['-f', '-o', '--format', '--output'])], // -p / -a / -v take no argument
+  ['sudo', new Set(['-u', '-g', '-p', '-r', '-t', '-C', '-D', '-a', '-R', '--user', '--group', '--prompt', '--role', '--type', '--chdir'])],
+  ['chrt', new Set()], // the policy flags -b -f -i -o -r -R -m -a take no argument
+  ['taskset', new Set(['-c', '--cpulist'])], // -a takes no argument
+  ['ionice', new Set(['-c', '-n', '--class', '--classdata'])], // -t takes no argument
+  ['doas', new Set(['-C', '-a', '-u'])], // -n / -s / -S take no argument
+  ['parallel', new Set(['-j', '--jobs', '-a', '--arg-file', '--results', '-S', '--sshlogin', '--ssh', '--tmpdir', '--workdir', '--tagstring', '--timeout', '--retries'])],
+])
+// The one leading operand a wrapper skips, only when the word matches its required shape.
+const TIMEOUT_OPERAND_RX = /^[0-9][0-9.]*[smhdSMHD]?$|^[0-9]+m[0-9]+s$/ // 5, 0.5, 5m, 90m30s
+const NUMERIC_OPERAND_RX = /^[0-9]+$/ // chrt's priority
+const MASK_OPERAND_RX = /^0x[0-9a-fA-F]+$|^[0-9]+$/ // taskset's affinity mask
+// 47eeb016 R2 B1: walk a wrapper's option zone and its one leading operand; the index of the word it EXECUTES,
+// or -1 when the words ran out -- or in a -p pid mode (chrt/taskset/ionice then have no executable at all).
+function wrapperExecIndex(name, ws) {
+  const valueOpts = WRAPPER_VALUE_OPTIONS.get(name) ?? new Set()
+  let i = 1
+  let ended = false // after a bare `--` no word is an option
+  while (i < ws.length) {
+    const v = ws[i].value
+    if (v === '--' && !ended) { ended = true; i++; continue }
+    if (!ended && v.startsWith('-') && v.length > 1) {
+      if (v.includes('=')) { i++; continue } // --signal=KILL: the value is attached
+      if (!v.startsWith('--') && v.length > 2 && valueOpts.has('-' + v[1])) { i++; continue } // -sKILL, -n5, -o0
+      if (valueOpts.has(v)) { i += 2; continue } // -s KILL, --signal KILL: the next word is the value
+      i++; continue // a no-arg or unknown option consumes nothing extra
+    }
+    break // the first word that is not an option ends the option zone
+  }
+  // chrt/taskset/ionice -p act on a running pid: nothing is executed
+  if ((name === 'chrt' || name === 'taskset' || name === 'ionice') && ws.slice(1, i).some((w) => w.value === '-p')) return -1
+  if (i < ws.length) {
+    const v = ws[i].value
+    if ((name === 'timeout' || name === 'gtimeout') && TIMEOUT_OPERAND_RX.test(v)) i++
+    else if (name === 'chrt' && NUMERIC_OPERAND_RX.test(v)) i++
+    else if (name === 'taskset' && MASK_OPERAND_RX.test(v)) i++
+  }
+  return i < ws.length ? i : -1
+}
+// 47eeb016 R2 B1o: env's executable word. env's options (envOption) and then its NAME=value assignments are
+// VALUES, not runs -- only the word they precede is the command env starts.
+function envExecIndex(ws) {
+  let i = 1
+  let ended = false
+  while (i < ws.length) {
+    const v = ws[i].value
+    if (v === '--' && !ended) { ended = true; i++; continue }
+    if (!ended && v.startsWith('-') && v.length > 1) { i += envOption(ws, i).n; continue }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(v)) { i++; continue }
+    break
+  }
+  return i < ws.length ? i : -1
+}
+// 47eeb016 R3: an interpreter's VALUE options, in three kinds. Which options exist per interpreter follows the
+// knowledge the code already has (FILE_INTERPRETERS / SHELL_INTERPRETERS / the python regex of isInterpreter);
+// an interpreter with no table here (deno, perl, php, osascript, tsx) keeps the old reading: every unknown
+// option consumes nothing, so its value word lands on the script position and is checked there.
+// CODE: the value IS the program (`node -e/-p/--eval/--print`, `python -c`, `ruby -e`, `bun -e`, `fish -c`;
+// the attached form `-c./x` too): the value word is a run, but the option no longer ENDS the walk -- node keeps
+// reading options after a code value (`node -e 0 -r ./x.js` loads and runs x.js too), so the walk goes on and
+// only the script POSITION is consumed: the first word after a CODE value that is no option is that program's
+// argv, data, and never a run.
+// DATA: the value only configures the interpreter (python's -W): exactly ONE word is skipped while searching
+// for the script operand and is NOT a run. Attached (`-Werror`): the remainder of the option word is the value,
+// no extra word is consumed.
+// LOAD: the value is loaded AND run (`node -r/--require`, `ruby -r`, python's `-m`: the module runs, attached
+// too): one word (or the attached remainder) is skipped and checked as a run.
+// python -m MOD: db-write-gate's writtenFileSpellings adds MOD as a spelling of a written MOD.py, so the LOAD value
+// is checked against it (develop #2934 (d)).
+// sh: the table of the SHELL family (bash, sh, zsh, dash, ksh, ash), which the real bash reads its own way:
+// -c is a FLAG that never takes a value (a `c` anywhere in a cluster is the flag: `-ce`, `-co`), and a short
+// cluster is read CHARACTER BY CHARACTER -- every o/O in it takes the NEXT word as its option name, and an
+// attached remainder is never one (`bash -oerrexit` names the option of the word AFTER it, so only later words
+// can be the script). The family has no CODE kind: the first word that is no option (and no o/O value) is the
+// run position -- the command string with -c, the script operand without -- and the walk stops right there.
+const SH_VALUE_OPTIONS = { sh: true, short: { c: 'flag', o: 'data', O: 'data' } }
+const NODE_VALUE_OPTIONS = { short: { e: 'code', p: 'code', r: 'load' }, long: { eval: 'code', print: 'code', require: 'load' } }
+const PY_VALUE_OPTIONS = { short: { c: 'code', m: 'load', W: 'data' } }
+const INTERPRETER_VALUE_OPTIONS = new Map([
+  ['bash', SH_VALUE_OPTIONS], ['sh', SH_VALUE_OPTIONS], ['zsh', SH_VALUE_OPTIONS], ['dash', SH_VALUE_OPTIONS],
+  ['ksh', SH_VALUE_OPTIONS], ['ash', SH_VALUE_OPTIONS],
+  ['fish', { short: { c: 'code' } }],
+  ['node', NODE_VALUE_OPTIONS], ['nodejs', NODE_VALUE_OPTIONS],
+  ['ruby', { short: { e: 'code', r: 'load' } }],
+  ['bun', { short: { e: 'code' } }],
+])
+const interpreterValueOptions = (name) =>
+  INTERPRETER_VALUE_OPTIONS.get(name) ?? (/^python[0-9.]*$/.test(name) ? PY_VALUE_OPTIONS : undefined)
+// 47eeb016 R3b: the run positions among an interpreter's words (ws[0] is the interpreter command word): the
+// script operand -- the first word that is no option, found with the option walk above -- plus every CODE and
+// LOAD value met before it. The shell family (a table with sh) walks its clusters character by character and
+// stops at the first operand, be it the -c command string or the script; every other table ends the run
+// positions at a CODE value even though the walk itself goes on -- the CODE value took the script position, so
+// the next word that is no option is that program's argv, and so are all words after the script operand.
+// Attached CODE/LOAD values are returned as the path part of the remainder (`-c./a.sh` -> `./a.sh`); DATA
+// values are consumed and returned nowhere.
+function interpreterRunWords(name, ws) {
+  const opts = interpreterValueOptions(name)
+  const runs = []
+  let codeSeen = false // a CODE value consumed the script position: the next operand is argv, not a run
+  let i = 1
+  while (i < ws.length) {
+    const v = ws[i].value
+    if (!v.startsWith('-')) {
+      if (codeSeen) return runs // argv of the code program: data
+      runs.push(ws[i]); return runs // the script operand
+    }
+    if (v.startsWith('--')) {
+      const eq = v.indexOf('=')
+      const kind = opts?.long?.[eq < 0 ? v.slice(2) : v.slice(2, eq)]
+      if (!kind) { i++; continue } // an unknown long option takes no value: the next word can still be the script
+      if (eq >= 0) { // --require=./x: the value is attached
+        if (kind !== 'data') runs.push({ value: v.slice(eq + 1) })
+        i++
+      } else {
+        if (i + 1 >= ws.length) return runs // the value word is missing: no script operand either
+        if (kind !== 'data') runs.push(ws[i + 1])
+        i += 2
+      }
+      if (kind === 'code') codeSeen = true // the walk goes on (node reads options past a code value)
+      continue
+    }
+    if (opts?.sh) { // the shell family: -c is a flag, and every o/O of the cluster takes the NEXT word
+      let next = i + 1 // the words after the cluster, one consumed per o/O, in order; c and unknown chars none
+      for (let c = 1; c < v.length; c++) if (opts.short[v[c]] === 'data' && next < ws.length) next++
+      i = next
+      continue
+    }
+    let kind // the first option char of the cluster the interpreter knows: the chars before it are no-argument
+    let rest = ''
+    for (let c = 1; c < v.length; c++) {
+      if (!opts?.short?.[v[c]]) continue
+      kind = opts.short[v[c]]
+      rest = v.slice(c + 1)
+      break
+    }
+    if (!kind) { i++; continue } // an unknown short option takes no value
+    if (kind === 'data') { i += rest ? 1 : 2; continue } // -Werror: the remainder is the value; -W error: one word
+    if (rest) { runs.push({ value: rest }); i++ } // -c./a.sh, -r./dep.js: the attached value
+    else {
+      if (i + 1 >= ws.length) return runs
+      runs.push(ws[i + 1])
+      i += 2
+    }
+    if (kind === 'code') codeSeen = true // the walk goes on: a later option is still read, not argv
+  }
+  return runs
+}
+// 47eeb016 R2 B2: find's -exec family, by POSITION. The run positions are the found file itself (the command word
+// `{}`), an interpreter command word that receives the found file as an operand (`-exec sh {} \;`), or a command
+// word that IS the written file; `-name <base>` and an action's data operands stayed denied in round 13 because
+// every word was matched. namesTarget is the SAME word-match the round-13 branch used.
+// 47eeb016 R3: an interpreter's words inside the action are read with the same option walk as everywhere else
+// (its script operand is the run position, every other clause word is data: `-exec sh /dev/null {} +` only
+// passes the found file as $1), and a command word that is env or a wrapper gets the full recursive analysis
+// with `{}` standing for the found file (`-exec timeout 5 {} \;`, `-exec env X=1 timeout 5 {} +`).
+function findRunsTarget(ws, targets, relRun) {
+  const namesTarget = (w) => targets.some((t) => w.value.includes(t)
+    || (targetBase(t) !== '' && w.value === targetBase(t))
+    || (targetDir(t) !== '' && w.value === targetDir(t)))
+  for (let j = 1; j < ws.length; j++) {
+    if (!FIND_RUN_ACTIONS.has(ws[j].value)) continue
+    const cw = ws[j + 1]
+    if (cw === undefined) { if (ws.some(namesTarget)) return true; continue } // action word last: malformed, fail closed
+    if (cw.value === '{}') { if (ws.some(namesTarget)) return true; continue } // find executes the found file itself
+    let end = ws.length // this -exec clause ends at the next `;` / `+` word after j
+    for (let k = j + 2; k < ws.length; k++) if (ws[k].value === ';' || ws[k].value === '+') { end = k; break }
+    // the wrapper's / env's operand that replaces `{}` is the found file: it IS a run position
+    const relRunFound = (v) => (v === '{}' ? ws.some(namesTarget) : relRun(v))
+    const head = baseName(cw.value)
+    if (head === 'env' || ENV_COMMAND_WRAPPERS.has(head)) {
+      if (execWordsRun(ws.slice(j + 1, end), targets, undefined, relRunFound, 1)) return true
+    }
+    if (isInterpreter(head) && interpreterRunWords(head, ws.slice(j + 1, end)).some((w) => relRunFound(w.value))) return true
+    if (relRun(cw.value)) return true // the -exec command word itself is the written file
+  }
+  return false
+}
+// 47eeb016 R2 B1: the executable-position analysis, shared by runsByName and its env / wrapper recursion. ws[0]
+// is a command word; the run positions are the command word itself, the command env or a wrapper STARTS, an
+// interpreter's / a file runner's operand. Everything else -- a plain command's arguments, an option's or an
+// assignment's value, a find action's data operand -- is DATA. Without a parseable executable the round-13 broad
+// relRun scan stays (fail closed), as it does past the depth bound.
+const RUN_ANALYSIS_MAX_DEPTH = 6
+function execWordsRun(ws, targets, own, relRun, depth) {
+  const broad = () => ws.slice(1).some((w) => relRun(w.value))
+  if (depth > RUN_ANALYSIS_MAX_DEPTH) return broad()
+  const name = commandName(ws) || baseName(ws[0].value)
+  if (name === 'env') {
+    if (envRunsTarget(ws, targets, own)) return true
+    const ei = envExecIndex(ws)
+    if (ei < 0) return broad()
+    if (relRun(ws[ei].value)) return true
+    return execWordsRun(ws.slice(ei), targets, own, relRun, depth + 1)
+  }
+  if (ENV_COMMAND_WRAPPERS.has(name)) {
+    const ei = wrapperExecIndex(name, ws)
+    if (ei < 0) return broad()
+    if (relRun(ws[ei].value)) return true
+    if (name === 'parallel') {
+      // ::: / :::: end the command template: from the first one on, every word is data, never a run position
+      const sep = ws.slice(ei).findIndex((w) => w.value === ':::' || w.value === '::::')
+      const template = ws.slice(ei, sep < 0 ? ws.length : ei + sep)
+      if (!template.length) return broad()
+      if (relRun(template[0].value)) return true
+      return execWordsRun(template, targets, own, relRun, depth + 1)
+    }
+    return execWordsRun(ws.slice(ei), targets, own, relRun, depth + 1)
+  }
+  // An interpreter's SCRIPT operand (the first word that is no option, found with the R3 option walk: an option
+  // with a value consumes it, a CODE option consumes the script position itself) is a run position -- `cd <dir>
+  // && bash ./<base>` (round 13's missed run), `bash -O extglob ./<base>` (R3: the -O value was taken for the
+  // script) deny --, but a DATA option's value or a later argument is DATA: the kanban tool's --comment-file, a
+  // prefixed script's argument (R2 gate-suite regression: db-write-gate.test.ts 3 red on 58ebb9ad, green on
+  // 9311a515; the named branch's script rule, mirrored here). A file runner's ANY operand stays a run position:
+  // source/xargs/eval read a file and do what it says.
+  if (isInterpreter(name)) return interpreterRunWords(name, ws).some((w) => relRun(w.value))
+  if (FILE_RUNNERS.has(name)) return ws.slice(1).some((w) => relRun(w.value))
+  if (name === 'find' && ws.some((w) => FIND_RUN_ACTIONS.has(w.value))) return findRunsTarget(ws, targets, relRun)
+  return false // a plain command: its arguments are data
+}
+function runsByName(words, targets, own, exact = false) {
+  let i = 0
+  while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i].value)) i++
+  if (i >= words.length) return false
+  const ws = words.slice(i)
+  // exact: the caller passed every spelling of the file already resolved per directory (db-write-gate's
+  // writtenFileSpellings), so only those words are the file; otherwise a path with the file's last part is
+  // taken for it (fail closed: the directory it runs in is not followed here)
+  const relRun = exact
+    ? (v) => targets.includes(v)
+    : (v) => v.includes('/') && targets.some((t) => targetBase(t) !== '' && baseName(v) === targetBase(t))
+  if (relRun(ws[0].value)) return true
+  return execWordsRun(ws, targets, own, relRun, 0)
+}
+
+// 47eeb016 R2 (G6/G7): the two shapes shellWords refuses inside a find -exec clause are find's own syntax, not
+// shell structure -- the bare `{}` operand, and the `\` left at the end when the segment splitter consumed the `;`
+// of a `\;`. Re-split those for the near-branch fallback in laterRuns: `{}` becomes a plain token mapped back
+// after the split, the trailing `\` goes only when the separator really was the `;` it escaped. The re-split is
+// REFUSED (the caller keeps its deny) when anything else unsplittable or unresolved remains, and when a word from
+// an -exec action word on carries a `$`, a glob or a redirection character: an unresolved variable or an expanded
+// word could be the very command find executes, so only provably inert clauses reach the positional analysis.
+function findClauseWords(own, sep) {
+  let t = own
+  if (sep === ';' && /\\\s*$/.test(t)) t = t.replace(/\\\s*$/, '')
+  t = t.replace(/(^|\s)\{\}(?=\s|$)/g, '$147eeb016FOUND')
+  if (t.includes('\\') || /[{}]/.test(t)) return null
+  const ws = shellWords(t)
+  if (!ws || !ws.length) return null
+  let inClause = false
+  for (const w of ws) {
+    if (FIND_RUN_ACTIONS.has(w.value)) inClause = true
+    if (inClause && /[$*?<>()'"`]/.test(w.value)) return null
+  }
+  return ws.map((w) => (w.value.includes('47eeb016FOUND')
+    ? { ...w, value: w.value.replaceAll('47eeb016FOUND', '{}') }
+    : w))
+}
+
+export function laterRuns(segs, k, targets, opts = {}) {
   if (!targets.length) return false
+  const exact = opts.exactNames === true
   for (let j = k + 1; j < segs.length; j++) {
     const s = segs[j]
-    if (!targets.some((t) => [s.own, ...s.bodies].join('\n').includes(t))) continue
+    const text = [s.own, ...s.bodies].join('\n')
+    if (!targets.some((t) => text.includes(t) || dropEmptyQuotes(text).includes(t))) {
+      // Not named as spelled: it can still run through a relative path or find's -exec family (runsByName).
+      const near = targets.some((t) => (targetBase(t) !== '' && text.includes(targetBase(t)))
+        || (targetDir(t) !== '' && text.includes(targetDir(t))))
+      const w = near ? shellWords(s.own) : null
+      // A segment shellWords cannot split (find's `-exec {} \;` leaves a bare `{}`, a brace group) that names the
+      // file's base or directory is denied, as the named branch below denies an unsplittable one (fail closed) --
+      // EXCEPT the find-clause shapes findClauseWords can re-split cleanly (47eeb016 R2: `find <dir> -name <base>
+      // -exec echo \;` and `-exec cat {} +` only read the file); those get the same positional analysis as a
+      // splittable segment, and every shape the re-split refuses keeps the deny.
+      if (near && !w) {
+        const fw = findClauseWords(s.own, s.sep)
+        if (!fw || runsByName(fw, targets, s.own, exact)) return true
+        continue
+      }
+      if (w && w.length && runsByName(w, targets, s.own, exact)) return true
+      continue
+    }
     const words = shellWords(s.own)
     if (!words || !words.length) return true
     const first = words[0].value
     if (targets.includes(first)) return true
     const name = commandName(words) || first.slice(first.lastIndexOf('/') + 1)
+    if (runsByName(words, targets, s.own, exact)) return true
     if (isInterpreter(name)) {
-      const stdin = targets.some((t) => new RegExp(`(?:^|[^<])<\\s*['"]?${escapeRx(t)}`).test(s.own))
+      const stdin = stdinFromTarget(s.own, targets)
       const code = words.some((w, i) => /^-[A-Za-z]*[ceE]$/.test(w.value) && targets.some((t) => (words[i + 1]?.value ?? '').includes(t)))
       const script = words.slice(1).find((w) => !w.value.startsWith('-'))
-      if (stdin || code || (script && targets.includes(script.value))) return true
+      // GATEPATHNORM1118 F5: a shell option that takes an argument (-o NAME, +o NAME, -O NAME, +O NAME) is not the script
+      // word. Read in addition to the word above, never instead of it, so no run read before is lost.
+      const optScript = shellScriptWord(name, words.slice(1).map((w) => w.value))
+      // F6: an rc file the shell is told to read runs too (an interactive shell runs it; judged fail-closed)
+      const rc = shellRcFiles(name, words.slice(1).map((w) => w.value)).some((v) => targets.includes(v))
+      // R3 (rebased onto GATEPATHNORM1118 F5/F6: read in addition, never instead): the same option walk as the executable-position analysis -- `bash -O extglob <f>` names <f> as its
+      // script operand, an option's DATA value (`bash -o <f>`) does not name a run at all.
+      const runWords = interpreterRunWords(name, words)
+      if (stdin || code || rc || (script && targets.includes(script.value)) || (optScript !== null && targets.includes(optScript)) || runWords.some((w) => targets.includes(w.value))) return true
       continue
     }
-    if (FILE_RUNNERS.has(name)) return true
+    if (name === 'env') { if (envRunsTarget(words, targets, s.own)) return true }
+    else if (FILE_RUNNERS.has(name)) return true
     if ((s.sep === '|' || s.sep === '|&') && segs[j + 1]) {
       const nw = shellWords(segs[j + 1].own)
       if (!nw || isFileRunner(commandName(nw))) return true
@@ -2951,17 +3920,21 @@ function optionValueCount(v) {
 // as code strings (-c; for fish also -C, --command, --init-command), and
 // { stdin } when no code string is given, so the word may read its code from
 // stdin (whatever its operand is).
-function shellWordRuns(words, i) {
+// strictStdin (Refs #2974, #2975, the db-write-gate's shell-code reading): a non-fish shell reads its code from stdin
+// only with no script operand, or with -s; `bash script.sh <<'E' ... E` hands the body to the script as data. The
+// default (false) keeps the wider reading for the other callers.
+function shellWordRuns(words, i, strictStdin = false) {
   const fish = baseName(words[i].value) === 'fish'
   const codes = []
   let cGiven = false
+  let sGiven = false
   let mainGiven = false
   let operand = false
   for (let j = i + 1; j < words.length; j++) {
     const v = words[j].value
     if (!/^[-+]/.test(v) || v === '--') {
       // fish: a -c/-C/--command/--init-command anywhere still runs code
-      if (!fish) break
+      if (!fish) { operand = v !== '--' || j + 1 < words.length; break }
       operand = true
       continue
     }
@@ -2989,6 +3962,7 @@ function shellWordRuns(words, i) {
       continue
     }
     if (/^-[A-Za-z]+$/.test(v) && v.includes('c')) cGiven = true
+    if (/^-[A-Za-z]+$/.test(v) && v.includes('s')) sGiven = true
     j += optionValueCount(v)
   }
   if (!fish && cGiven) {
@@ -3002,7 +3976,7 @@ function shellWordRuns(words, i) {
     }
     if (words[j]) codes.push(words[j])
   }
-  return { codes, stdin: fish ? !mainGiven : !cGiven }
+  return { codes, stdin: fish ? !mainGiven : !cGiven && (!strictStdin || !operand || sGiven) }
 }
 
 // shellSegments cuts at an escaped `\;` (tmux's own command separator); glue
@@ -3562,7 +4536,7 @@ export function substitutionInCommandPosition(command, { heredoc: asHeredocBody 
   return found
 }
 
-function scanShellCode(command) {
+function scanShellCode(command, strictStdin = false) {
   const segs = codeSegments(command)
   const codes = []
   const seen = new Set()
@@ -3619,7 +4593,7 @@ function scanShellCode(command) {
       const base = baseName(v)
       if (base === 'tmux') for (const c of tmuxGlobalOptions(args, i + 1).codes) push(c)
       if (!SHELL_NAMES.has(base)) continue
-      const runs = shellWordRuns(args, i)
+      const runs = shellWordRuns(args, i, strictStdin)
       for (const c of runs.codes) push(c)
       if (!runs.stdin) continue
       for (const c of stdinCodes()) push(c)
@@ -3628,8 +4602,8 @@ function scanShellCode(command) {
   return { codes, bad }
 }
 
-export function shellCodeStrings(command) {
-  return scanShellCode(command).codes.map((c) => c.value)
+export function shellCodeStrings(command, opts = {}) {
+  return scanShellCode(command, opts.strictStdin === true).codes.map((c) => c.value)
 }
 
 // tmux takes an exact command name or alias first, otherwise a prefix that only
@@ -3832,6 +4806,8 @@ function decide(toolName, toolInput, opts = {}) {
     protectedCtx.homeTouched = HOME_TOUCH_RX.test(safeCommand.replace(/\$(?=['"])|["'\\]/g, ''))
     for (const [idx, seg] of protSegs.entries()) {
       protectedCtx.definite = definite[idx]
+      // The inbound signature key (HMACINBOUND1125): a secret, so not even a read.
+      if (!inboundSigKeyBashSegmentAllowed(seg, definite[idx])) return { deny: true, reason: 'inbound-sig-key' }
       // The other store files that gate the sub-agent (c556a35a) first: they are matched by
       // name only, so a segment that names one of them gets that file's message even when
       // the allowlist check below would also deny it on an unresolved word (`> $TARGET`).
@@ -3926,10 +4902,16 @@ const MCP_GATE_MSG =
   'alapertelmezett helyere irna. Adj meg kifejezett, a munkakonyvtaradon beluli celutat es egyszeru fajlnevet; ha vedett ' +
   'fajl kell, kerd a fo agenst.'
 
+const INBOUND_SIG_KEY_GATE_MSG =
+  'Titok TILTOTT (governance hard-gate, HMACINBOUND1125). A store/.inbound-sig-key a dashboard kulcsa, amellyel az ' +
+  'uzenetsor sorait alairja: aki ismeri, a gazda hangjan tud uzenetet alairni. Sub-agentkent se olvasni, se irni, se ' +
+  'masolni nem szabad, egyetlen paranccsal sem. Csak a dashboard-szerver es a csatorna-koordinator olvassa. Ha az ' +
+  'alairassal gond van (sig_ok false, untrusted gazda-sor), szolj a fo agensnek (inter-agent uzenet), ne a fajlt nezd meg.'
+
 const PROTECTED_STORE_GATE_MSG =
   'Vedett store-fajl TILTOTT (governance hard-gate). Sub-agentkent NEM irhatod a ' +
   'store/egress-vendor-hosts.json, store/egress-vendor-hosts-<agent>.json, store/config-overrides.json, store/bash-sandbox-write-paths.json, ' +
-  'store/email-standing-recipients.json, store/.approval-bot-token es store/.approval-bot-key ' +
+  'store/email-standing-recipients.json, store/agent-send-exceptions.json, store/.approval-bot-token es store/.approval-bot-key ' +
   'fajlt: mindegyik RAD vonatkozo kapu beallitasa. ' +
   'Ha valtoztatas kell, kerd a fo agenst (inter-agent uzenet: mit es miert); o a gazda ' +
   'jovahagyasaval irja. Olvasni szabad: cat / grep / jq a fajlra (ertelmezo -- python, node -- nem).'
@@ -3972,7 +4954,7 @@ function isInvokedDirectly() {
 // Stated exception: stdin that is not JSON still ALLOWS (unchanged). It comes
 // from the harness, not from the agent, and a gate that blocks every tool on a
 // harness glitch takes the whole fleet down (hook-exit-code-invariant pins it).
-const DECISION_DEADLINE_MS = Math.min(5000, Math.max(100, Number(process.env.SELF_PACE_GATE_DEADLINE_MS) || 5000))
+const DECISION_DEADLINE_MS = Math.min(30000, Math.max(100, Number(process.env.SELF_PACE_GATE_DEADLINE_MS) || 5000))
 
 const FAIL_CLOSED_MSG = (why) => 'Self-pace kapu: belso hiba vagy idotullepes a vizsgalat kozben ' +
   `(${String(why).slice(0, 200)}). Fail-closed: a hivas nem vizsgalhato, ezert TILTVA. ` + GATE_MSG
@@ -4024,6 +5006,7 @@ if (!isMainThread && workerData?.selfPaceGateWorker) {
       deny(verdict.reason === 'egress-allowlist' ? ALLOWLIST_GATE_MSG
         : verdict.reason === 'dynamic-command' ? DYNAMIC_COMMAND_GATE_MSG
         : verdict.reason === 'protected-store-file' ? PROTECTED_STORE_GATE_MSG
+        : verdict.reason === 'inbound-sig-key' ? INBOUND_SIG_KEY_GATE_MSG
         : String(verdict.reason ?? '').startsWith('mcp-') ? MCP_GATE_MSG : GATE_MSG)
     }
     allow()

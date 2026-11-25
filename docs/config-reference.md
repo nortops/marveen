@@ -165,7 +165,7 @@ Minden dashboard-szerkeszthető beállítás egy bejegyzésként szerepel a regi
 | Kulcs | Típus | Alapérték | Leírás | Újraindítás |
 |-------|-------|-----------|--------|-------------|
 | `AGENT_TOKENS` | boolean | `0` (ki) | Saját dashboard-token minden al-ügynöknek (`agents/<név>/.dashboard-token`), szerveroldali hatókörrel és azonosság-kötéssel; lásd `agens-azonositas-api.md` 8. fejezet | nem (az al-ügynök következő indításakor lép életbe) |
-| `SKILL_QUARANTINE` | boolean | `0` (ki) | Skill-karantén. Ki: az új vagy javított skill (javaslat, generálás, import) azonnal élesedik, a scan, a hash-kötés és egy auditsor (`store/skills-audit.jsonl`) mellett; ami a scan számára nem mutatható teljesen, jóváhagyásra vár. Be: minden új skill a gazda jóváhagyásáig vár. Kikapcsolni az API-n csak a dashboard-belépéssel lehet | nem |
+| `SKILL_QUARANTINE` | boolean | `0` (ki) | Skill-karantén. Be: minden új vagy javított skill (javaslat, generálás, import) a gazda jóváhagyásáig vár. Ki (alapértelmezés): azonnal élesedik, a scan, a hash-kötés és egy auditsor (`store/skills-audit.jsonl`) mellett; ami a scan számára nem mutatható teljesen (például mert a találati lista elérte a felső korlátját), vagy amiben a scan erős mintát talál (hamisított címke vagy fejléc, utasítás-felülírás, láthatatlan Unicode, letöltött kód futtatása, hosszú kódolt blob), az jóváhagyásra vár. Kikapcsolni az API-n csak a dashboard-belépéssel lehet | nem |
 
 **Registry -- Heartbeat modul:**
 
@@ -174,6 +174,9 @@ Minden dashboard-szerkeszthető beállítás egy bejegyzésként szerepel a regi
 | `HEARTBEAT_START_HOUR` | int | 9 | min 0, max 22 | nem |
 | `HEARTBEAT_END_HOUR` | int | 23 | min 1, max 24 | nem |
 | `HEARTBEAT_AGENT_ENABLED` | string | `1` | `0` vagy `1` | igen |
+| `QUOTA_GATE_HARD_AT_PERCENT` | int | 0 (ki) | min 0, max 100 | nem |
+
+`QUOTA_GATE_HARD_AT_PERCENT` a kvóta-kapu (`src/quota-gate.ts`) szintjeit kapcsolja be kis előfizetéshez. 0: a mai viselkedés (85%-tól minden háttér-heartbeat áll). Ha be van állítva (pl. 95): 85% és e határ között csak az `essential: true` jelölésű heartbeatek futnak (`scheduled-tasks.md`), a határon és fölötte egy háttérfeladat sem. 85 vagy annál kisebb érték mindenkire lejjebb hozza a vonalat (az essential sem fut). A 20 perc és 2 óra közötti régi pillanatképnél a kapu már nem tart vissza, de még nem riaszt; 2 óra után egyszer szól. A `task` és `command` típusú feladatokat nem érinti.
 **Registry -- Ötletláda modul:**
 
 | Kulcs | Típus | Alapérték | Korlát | Újraindítás |
@@ -187,7 +190,13 @@ Minden dashboard-szerkeszthető beállítás egy bejegyzésként szerepel a regi
 |-------|-------|-----------|----------|-------------|
 | `MAIN_AGENT_ISOLATED_CONFIG` | boolean | `0` (ki) | csak macOS | igen |
 | `TELEGRAM_TOPICS_ENABLED` | boolean | `0` (ki) | mind | igen (csatorna-indítás) |
+| `TELEGRAM_REACTIONS_ENABLED` | boolean | `0` (ki) | mind | igen (csatorna-indítás) |
 | `TELEGRAM_REPLY_BUTTONS` | boolean | `1` (be) | mind | igen (csatorna-indítás) |
+| `TELEGRAM_REPLY_BUTTONS_MAX_AGE_HOURS` | int (min 0, max 8760) | `0` (nem jár le) | mind | igen (csatorna-indítás) |
+| `DISCORD_PLUGIN_EXT` | boolean | `1` (be) | mind | igen (csatorna-indítás) |
+| `DISCORD_OWNER_USER_ID` | string | üres | mind | igen (csatorna-indítás) |
+| `DISCORD_BACKFILL` | boolean | `1` (be) | mind | igen (csatorna-indítás) |
+| `DISCORD_CHANNEL_POLICY` | string (JSON) | üres | mind | igen (csatorna-indítás) |
 
 #### `MAIN_AGENT_ISOLATED_CONFIG` -- a fő agent config-izolációja (macOS)
 
@@ -323,6 +332,98 @@ kapcsolás előtt kiküldött gombra koppintás egyszer még válaszol.
 plugin forrását. Az ügynökök viszont addig a régi kóddal futnak, amíg a saját plugin-folyamatuk
 újra nem indul: a session újraindítása hozza el náluk.
 
+#### `TELEGRAM_REPLY_BUTTONS_MAX_AGE_HOURS`: a válasz-gombok lejárata
+
+**Mire szolgál.** Egy régi kérdés gombjára akkor is rá lehet koppintani, amikor a beszélgetés
+már rég továbblépett. Beállítva (például `24`) egy ennél régebbi kérdés gombjára koppintás nem
+jut el az ügynökhöz: a felugró üzenet azt kéri, hogy a választ írd be, és a kérdés gombjai helyére
+egyetlen „⏱ Lejárt, írd be a választ” gomb kerül (mint a megválaszolt kérdésnél a „✓ <felirat>”). A kor a kérdés elküldési idejétől számít (a Telegram-üzenet saját időbélyege),
+így a plugin újraindítása után is érvényes. Egy már megválaszolt kérdésnél továbbra is az „Erre
+már válaszoltál.” üzenet jön. A gombokat csak koppintáskor cseréli, magától nem. A felugró
+üzenetek és ez a felirat a gombág többi felugró üzenetével együtt az `AGENT_TEXT_LANG` nyelvén
+szólnak (`en`: angolul, „⏱ Expired, type your answer”; bármi más, vagy ha nincs beállítva:
+magyarul, ahogy itt).
+
+**Beállítás.** Dashboard: *Beállítások → Csatornák → `TELEGRAM_REPLY_BUTTONS_MAX_AGE_HOURS`*, vagy
+`.env`-ben például `TELEGRAM_REPLY_BUTTONS_MAX_AGE_HOURS=24`. Egész óra 0 és 8760 között; a `0`
+(alapértelmezés) kikapcsolja, és ilyenkor a plugin forrása pontosan a mai. Érvénytelen értéknél
+a gombok nem járnak le, és a `store/channels-failures.log` egy sorban jelzi. A csatorna következő
+indításakor lép életbe, a futó ügynököknél a session újraindításával.
+
+#### `TELEGRAM_REACTIONS_ENABLED`: a Telegram-reakciók továbbítása
+
+**Mire szolgál.** Ha a tulajdonos egy üzenetre emoji-reakciót tesz, az eddig nem jutott el az
+ügynökhöz: a plugin a Telegram alapértelmezett frissítés-típusait kéri, és abban a reakció nincs
+benne. Bekapcsolva a plugin a grammY saját alapértelmezett listáját kéri, és mellé a
+`message_reaction`-t. A reakció csak a párosított tulajdonostól, a privát chatjéből megy tovább,
+a plugin saját kapuján át. Az ügynök `(reaction 👍)` alakban kapja meg (mint a matricát:
+`(sticker 😀)`), a `reply_to_message_id` mezőben a reagált üzenet azonosítójával. Ha az üzenetet
+az ügynök küldte a plugin indulása óta, a `reply_to_text` mezőben egy egysoros kivonatot is kap
+belőle (legfeljebb 300 karakter, az utolsó 500 elküldött üzenetből; újraindítás után csak az
+azonosító marad). Csak a hozzáadott reakció megy tovább, a levétel nem; egyedi emoji
+`(custom emoji)`-ként jelenik meg.
+
+A reakciónak nincs saját üzenet-azonosítója, ezért nem kerül a bejövő bizonyíték-naplóba: írási
+parancs (például `/model`) bizonyítéka nem lehet, a bejövő-újraküldés nem látja, és a
+beszélgetés-napló (ledger) sem rögzíti. Választ sem vár rá semmi: a „Dolgozom rajta…” helyőrző
+nem jelenik meg, a Stop hook nem követel rá Telegram-választ, és a kötelező-válasz direktíva
+helyett az ügynök egy rövid jelzést kap, hogy ez reakció, nem kérdés.
+
+A reakció jóváhagyás sem. A jelzés ezt is kimondja, akkor is, ha a reakció egy üzenettel együtt
+érkezik: ha a lépéshez a tulajdonos kifejezett engedélye kell (jóváhagyás, kifelé ható vagy
+visszafordíthatatlan lépés), az ügynök írásban kéri, és szöveges választ vár. Egy „Mehet?”-re
+adott hüvelykujj egyetlen koppintás bizonyíték-sor nélkül, és nem mondja meg, mit hagy jóvá. A
+hivatalos jóváhagyások az approvals API-n mennek, oda reakció nem jut el.
+
+**Beállítás.** Dashboard: *Beállítások → Csatornák → `TELEGRAM_REACTIONS_ENABLED`*, vagy
+`.env`-ben `TELEGRAM_REACTIONS_ENABLED=1`. Minden reakció egy újabb kör az ügynöknek, ezért
+alapból ki van kapcsolva; kikapcsolva a plugin forrása pontosan a mai, és a Telegram a következő
+indításkor visszaáll az alapértelmezett frissítés-típusokra. A csatorna következő indításakor lép
+életbe, a futó ügynököknél a session újraindításával.
+
+#### `DISCORD_PLUGIN_EXT`, `DISCORD_OWNER_USER_ID`, `DISCORD_BACKFILL`: a Marveen Discord-pluginja
+
+**Mire szolgál.** A csatorna-indítás (`scripts/patch-discord-plugin.py`) a hivatalos Discord plugin
+forrását a Marveen-változatra cseréli (`vendor/discord-plugin/<verzió>/overlay`, a különbség a
+`VENDOR.md`-ben). Csak akkor, ha a telepített plugin pontosan az ismert verzió; plugin-frissítés
+után a hivatalos plugin fut változatlanul, és a `store/channels-failures.log` egy `LOUD:` sorban jelzi.
+
+**Kikapcsolás.** `DISCORD_PLUGIN_EXT=0` (csak a gazda: felülírás-kulcs, `.env`-sor nem kapcsolja ki).
+A csatorna következő indításakor a hivatalos plugin áll vissza byte-azonosan.
+
+**A gazda.** `DISCORD_OWNER_USER_ID`: csak ő kapja Discordon az eszköz-jóváhagyás kérését, és
+csak az ő döntése érvényes. Üresen a fő bot egyetlen párosított DM-je; több DM mellett senki (a
+kérés a terminálban marad). Felülírás-kulcs: `.env`-ből nem olvasódik.
+
+**Pótlás.** `DISCORD_BACKFILL=0` kikapcsolja a kiesett üzenetek induláskori pótlását.
+
+**Szerepek csatornánként.** `DISCORD_CHANNEL_POLICY` (csak a gazda, felülírás-kulcs), például
+`{"<csatorna-ID>": {"allowRoles": ["<szerep-ID>"]}}`. Ahol szerep van megadva, ott a csatorna engedélyezett
+felhasználói MELLETT a szerep birtokosai is írhatnak a botnak (üres felhasználói lista mellett csak ők).
+A szerep **ID-ja** kell, nem a neve: a mentés a nem-ID tételt elutasítja, a csatorna-indítás pedig minden
+eldobott tételt egy `LOUD` sorral jelez. Vigyázat: az `@everyone` szerep ID-ja a szerver (guild) ID-ja, érvényes
+ID, tehát átmegy, és a csatornát a szerver MINDEN tagjának megnyitja.
+Nem az `access.json`-ban él, mert a `/discord:access group add` a csatorna bejegyzését felülírja.
+Ugyanitt kapcsolható be csatornánként a **csatorna-előzmény**: `{"<csatorna-ID>": {"history": true}}` (a
+szerepekkel együtt is). Ilyenkor a botnak szóló üzenet elé bekerül, amit a csatornában a bot utolsó üzenete óta
+írtak (legfeljebb 20 üzenet, csak azoktól, akik a botnak is írhatnának). Alapból ki van kapcsolva. Az értéke
+idézőjel nélküli `true` vagy `false`; mást (`"true"`, `1`) és ismeretlen kulcsot (elírást) a mentés visszautasít.
+Szintén itt kapcsolható be az **automatikus szál**: `{"<csatorna-ID>": {"autoThread": true}}`. Ilyenkor a botnak
+szóló üzenet szálat nyit magán, és a válasz abba megy (csak olyan csatornán, ahol a botot meg kell szólítani).
+Ha a szál nem nyitható meg, egy sor megy a csatornába, és az üzenet nem jut el a sessionig. Alapból ki van kapcsolva.
+A `history`-hoz hasonlóan csak idézőjel nélküli `true` vagy `false` lehet.
+
+**Slash-parancsok.** Ha a `DISCORD_OWNER_USER_ID` be van állítva, a dashboard parancslistája (ugyanaz, amiből a
+Telegram-menü készül) Discord slash-parancsként is megjelenik, de csak a bottal folytatott DM-ben, és csak a
+gazdának fut. A válasz ugyanaz, mint Telegramon (a parancs-hook adja, modell-kör nélkül). Discordról csak az
+olvasó parancsok futnak (`/status`, `/usage`, `/board`...); egy állító parancs (`/model`, `/context clear`, a saját
+parancsok) egy sorban jelzi, hogy Telegramon adható ki. A lista a csatorna indításakor frissül, és a Discordnál
+csak akkor regisztrálódik újra, ha változott.
+
+**Kapcsolat-figyelés.** A plugin 15 mp-enként nézi, él-e a Discord-kapcsolat; elakadásnál újra bejelentkezik,
+de legfeljebb 5 percenként, egyre ritkábban (5-60 perc), és 24 óra alatt legfeljebb 20-szor
+(`$DISCORD_STATE_DIR/reconnects.json`). A hosszú csend önmagában nem hiba, csak rossz heartbeattel együtt.
+
 **API végpontok:**
 
 `GET /api/settings` -- összes nem-titkos beállítás lekérése:
@@ -400,7 +501,7 @@ dashboard indulásakor is (ilyenkor a meglévő ágensekre is, újraindítás n�
 | `script` | igen | Relatív út a projekt gyökeréhez képest, a `local-hooks/` mappán belül (gitignore-olt), `.py`, `.mjs` vagy `.js`; csak betű, szám és `_ . / @ + -`, `..` nélkül |
 | `timeout` | nem | Másodperc, 1..600, alapból 10 |
 | `failClosed` | igen | `true`: a beépített kapukkal azonos burok (hiányzó interpreter vagy a 0-tól és 2-től eltérő kilépés = tiltás, a határidő 2 mp-cel a timeout előtt). Csak `PreToolUse`-on engedett, mert `UserPromptSubmit`-en egy összeomlás minden promptot blokkolna. `false`: sima hívás, egy összeomlás nem blokkol |
-| `scope` | nem | Csak `"subagents"` (az alapértelmezés); más érték esetén a bejegyzés kimarad |
+| `scope` | nem | `"subagents"` (az alapértelmezés): minden sub-ügynök generált beállítása. `"main"`: a fő ügynök projekt-helyi `.claude/settings.local.json`-ja, amit a fő session betölt (a `--main-scope` egress-parser is ezt használja), minden parancs előtt `[ "$CLAUDE_PROJECT_DIR" = '<gyökér>' ] \|\| exit 0;`: egy sub-ügynök sessionje is betölti ezt a fájlt, és ott a hook nem csinál semmit. Csak a megjelölt extra bejegyzések cserélődnek, a fájl többi kulcsa marad. Más érték esetén a bejegyzés kimarad |
 | `description` | nem | Szabad szöveg, a scaffold nem használja |
 
 Amit egy bejegyzés NEM tud: beépített hookot cserélni, törölni vagy átrendezni (a plusz hook az
@@ -647,9 +748,11 @@ A főbb konfigurációs változók a launchd plist-ben (`~/Library/LaunchAgents/
 | `OWNER_NAME` | A tulajdonos neve (pl. "Jónás Gergő") |
 | `BOT_NAME` | A főágens neve (pl. "Jarvis") |
 | `VOICE_TRANSCRIBE_INBOUND` | `1` = a text módú ügynököknél is átirat készül a bejövő hangüzenetről (alapból ki; az ügynökönkénti `voice.transcribeInbound` felülírja). Lásd `voice.md` |
+| `USAGE_LIMIT_NOTICE_ROUTE` | Hová menjen az ütemező usage-limit jelzése: `both` (alapból) = a gazda privát chatje (a képernyő-sorral) ÉS a fő ágens üzenetsora (képernyő-szöveg nélkül), `owner` = csak a gazda chatje, `main` = csak a fő ágens (ha az üzenet nem írható be, a gazda chatje). Ha maga a fő ágens fogyott ki, a gazda chatjébe megy. Azonnal hat. A `main` értéket csak a gazda állíthatja be (felülírás-kulcs); a `.env`-ben álló `main` nem hat, az `owner` igen. |
 | `PERMISSION_ALERT_MARKS` | Mikor szóljon a figyelő egy megválaszolatlan engedélykérő dialógusról: vesszővel elválasztott időpontok a dialógus megjelenésétől (alapból `15m,30m,1h,2h,8h,24h`; egy al-ügynök kérdéséről a fő ügynök azonnal üzenetet kap, a gazda az első időponttól; `s`/`m`/`h`/`d`, a puszta szám perc). Az utolsó érték egyben az ismétlési idő; a `0` első értékként azonnali jelzés. Értelmezhetetlen értéknél az alapértelmezés marad, naplózva |
 | `WEB_ONLY` | `true` = minden háttér-szolgáltatás ki (ütemező, router, monitorok, worker-előindítás). **Csak a folyamat környezetéből hat** (`WEB_ONLY=true node dist/index.js`); a `.env`-be írva hatástalan, mert nincs dotenv |
 | `MARVEEN_ALLOW_SECOND_INSTANCE_SERVICES` | Egy második példány (git worktree, ideiglenes mappában álló klón) WEB_ONLY nélkül sem futtat háttér-szolgáltatást, mert az ütemezője a globális ütemezett feladatokat az élő sessionökbe lőné. `1` = mégis fusson (szándékos teszt-példány), és ezt indításkor figyelmeztetésként naplózza. **Csak a folyamat környezetéből hat**, mint a `WEB_ONLY`. Második példánynak a git worktree és az ideiglenes mappában (`/tmp`, `/private/tmp`, `/var/folders`, az OS tmpdir) álló klón számít: egy ezeken KÍVÜLI sima `git clone` telepítésnek számít, ott a szolgáltatások futnak, tehát ott a `WEB_ONLY=true` a védelem |
+| `MARVEEN_SPAWN_BROKER` | A dashboard a négy központi tmux-segédhívását egy kis spawn broker folyamaton keresztül végzi, így nem a dashboard főfolyamata indítja el az egyes tmux-gyerekfolyamatokat. `off` = a broker nem indul el, minden ilyen hívás közvetlenül a dashboard folyamatából fut, ahogy a broker bevezetése előtt (hibaelhárításhoz vagy visszalépéshez hasznos). Bármely más értéknél vagy beállítás nélkül a brokert használja. **Csak a folyamat környezetéből hat**, mint a `WEB_ONLY`; a `.env`-be írva hatástalan, mert nincs dotenv. A broker indulásakor olvasódik be, ezért a módosításához újra kell indítani a dashboardot |
 | `MXD_DASH_SOCK` | A marveen-mxd dash.sock útja. **Fordítva: csak a `.env` fájlból olvasódik** (hívásonként), a folyamat környezetéből nem; nélküle a platform-alapértelmezett, éles socket. Teszt-példánynál a saját `.env`-jébe írd |
 
 ---

@@ -67,8 +67,9 @@ describe('resumePrompt carries the prod-tree constraint on every variant', () =>
 // fresh session never looked back, and completed_at is unused (0/37 measured)
 // so the loss was invisible. The resume prompt is the fresh session's ONLY
 // context, so the re-read instruction must be present on EVERY variant, and
-// it must demand an OBSERVABLE trace (ack to the sender) -- an instruction
-// whose success cannot be observed would run into the same blindness.
+// it must demand an OBSERVABLE trace -- an instruction whose success cannot be
+// observed would run into the same blindness. The trace is the closed row
+// (notify:false), not an ack message: each ack woke its sender for a full turn.
 describe('resumePrompt carries the restart-window re-read on every variant', () => {
   const variants = [
     ['without a handoff', () => resumePrompt('samu', '/x/HANDOFF.md', false)],
@@ -83,10 +84,12 @@ describe('resumePrompt carries the restart-window re-read on every variant', () 
       expect(p).toContain('RESTART-ABLAK')
       // The queue re-read names the concrete endpoint, not a vague "check".
       expect(p).toContain('api/messages?agent=')
-      // The observable trace: an ack to the SENDER, required even when the
-      // item needs no work -- this is what makes the v1 measurable at all.
-      expect(p).toContain('nyugtát a feladónak')
-      expect(p).toContain('akkor is, ha nincs belőle teendő')
+      // The observable trace: the row closed without a notification, and no
+      // separate ack to the sender (the ack woke the sender for a whole turn).
+      expect(p).toContain('KÖTELEZŐ MEGFIGYELHETŐ NYOM: a lezárt sor')
+      expect(p).toContain('PUT /api/messages/<id> {"status":"done","notify":false}')
+      expect(p).toContain('nyugtát NE küldj')
+      expect(p).not.toContain('felvéve a friss sessionben')
     })
   }
 })
@@ -133,4 +136,37 @@ describe('resumePrompt never tells any agent to notify the channel', () => {
       })
     }
   }
+})
+
+// HANDOFFKARTYA1118: at a customer, the fresh session continued from the kanban
+// alone and dropped an agreed HANDOFF item that had no card. Every branch that
+// points at a handoff now says its Next Steps items are tasks even without a
+// card; the no-handoff branch has no Next Steps to point at, so it says nothing.
+describe('resumePrompt: the handoff Next Steps items are tasks even without a card', () => {
+  const ITEMS = 'A HANDOFF Next Steps MINDEN tétele teendő akkor is, ha nincs kártyája'
+  const FIRST_ROUND = 'ebben az első körben minden kártya nélküli tételre hozz létre kártyát (vagy írd a tétel mellé, miért nem kell)'
+  const NOT_FULL = 'A kanban NEM a teljes teendőlista.'
+  const withHandoff: Array<[string, () => string]> = [
+    ['fresh', () => resumePrompt('samu', '/x/HANDOFF.md', true)],
+    ['stale', () => resumePrompt('samu', '/x/HANDOFF.md', true, 42)],
+    ['unknown freshness', () => resumePrompt('samu', '/x/HANDOFF.md', true, 'unknown')],
+    ['main agent, fresh', () => resumePrompt('marveen', '/x/HANDOFF.md', true)],
+  ]
+  for (const [label, make] of withHandoff) {
+    it(`${label}: present, after the kanban/FOLYTASD sentence`, () => {
+      const p = make()
+      expect(p).toContain(ITEMS)
+      expect(p).toContain(FIRST_ROUND)
+      expect(p).toContain(NOT_FULL)
+      expect(p.indexOf(ITEMS)).toBeGreaterThan(p.indexOf('FOLYTASD a megkezdett munkát'))
+    })
+  }
+  it('no handoff written: absent', () => {
+    for (const name of ['samu', 'marveen']) {
+      const p = resumePrompt(name, '/x/HANDOFF.md', false)
+      expect(p).not.toContain(ITEMS)
+      expect(p).not.toContain('kártya nélküli tételre')
+      expect(p).not.toContain(NOT_FULL)
+    }
+  })
 })

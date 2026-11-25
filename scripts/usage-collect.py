@@ -12,7 +12,11 @@ Reads current usage/quota status for two providers:
     does not exist). On a transient
     failure (429/5xx/timeout) it reuses the last authoritative snapshot
     from store/usage-latest.json if it's fresh enough (source becomes
-    "authoritative_cached") instead of losing real numbers. Only falls
+    "authoritative_cached") instead of losing real numbers. When neither
+    the endpoint, the statusLine side file nor that cache gave anything, the
+    same windows are read from the rate-limit headers of one minimal
+    Messages call (dist/claude-ratelimit-reading.js, source
+    "ratelimit_headers"). Only falls
     back to a token-total ESTIMATE built from local
     ~/.claude/projects/*/*.jsonl transcripts when there's no usable
     cache: missing/expired token, a 403 (real scope problem), or a
@@ -78,6 +82,7 @@ CONFIG = {
     "claude_statusline_max_age_min": 10,
 }
 
+
 # Window length in seconds, keyed by the Claude window's dict key. Codex
 # windows carry their own "window_minutes" field so no static table is
 # needed for them.
@@ -106,6 +111,7 @@ LATEST_PATH = os.path.join(STORE_DIR, "usage-latest.json")
 STATE_PATH = os.path.join(STORE_DIR, "usage-alert-state.json")
 STATUSLINE_PATH = os.path.join(STORE_DIR, ".claude-rate-limits.json")
 ENV_PATH = os.path.join(REPO_ROOT, ".env")
+SETUP_TOKEN_PATH = os.path.join(STORE_DIR, ".claude-oauth-token")
 
 # Display timezone for reset stamps: MARVEEN_TZ when set, else the install zone
 # (SCHEDULER_TZ, config-overrides.json over .env, the same rule as APP_TZ in
@@ -434,15 +440,19 @@ def _read_keychain_token():
     return oauth.get("accessToken") or data.get("accessToken") or None
 
 
-def _read_claude_token():
+def _read_claude_token(skip=()):
     """Return (token, token_source) or (None, None). Never logs the value.
+
+    `skip` names sources already tried and refused (a 401): the next one is
+    returned, so a stale ~/.claude/.credentials.json left next to a valid
+    Keychain login no longer hides the Keychain (USAGE401FALLBACK1123).
 
     Source order matters: the long-lived `claude setup-token` value that
     typically lands in the .env file is NOT accepted by the oauth/usage
     endpoint (it answers 403), while the session token from the Keychain /
     credentials file is. Cheapest authoritative source first, .env last."""
     cred_path = os.path.expanduser("~/.claude/.credentials.json")
-    if os.path.exists(cred_path):
+    if "credentials_file" not in skip and os.path.exists(cred_path):
         try:
             with open(cred_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -453,11 +463,11 @@ def _read_claude_token():
         except Exception:
             pass
 
-    keychain_token = _read_keychain_token()
+    keychain_token = _read_keychain_token() if "keychain" not in skip else None
     if keychain_token:
         return keychain_token, "keychain"
 
-    if os.path.exists(ENV_PATH):
+    if "env_file" not in skip and os.path.exists(ENV_PATH):
         try:
             with open(ENV_PATH, "r", encoding="utf-8") as f:
                 for line in f:
@@ -472,6 +482,19 @@ def _read_claude_token():
     return None, None
 
 
+def _read_setup_token(path=None):
+    """The fleet's `claude setup-token` value (store/.claude-oauth-token), or None.
+    The oauth/usage endpoint refuses this token, so only the rate-limit header
+    probe uses it: it keeps the quota gate seeing when the main agent runs on an
+    isolated config dir (no credentials file) and its statusLine has gone quiet."""
+    try:
+        with open(path or SETUP_TOKEN_PATH, "r", encoding="utf-8") as f:
+            token = f.read().strip()
+    except OSError:
+        return None
+    return token or None
+
+
 def _claude_cli_version():
     try:
         out = subprocess.run(
@@ -480,6 +503,18 @@ def _claude_cli_version():
         return out.split()[0] if out else "unknown"
     except Exception:
         return "unknown"
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an error here, never followed: urllib would re-send the Authorization header to the new host
+    (Dani, #3073 review, measured with a 302). The usage endpoint has no reason to redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# urlopen goes through the installed opener: this script's only network call never follows a redirect.
+urllib.request.install_opener(urllib.request.build_opener(_NoRedirect))
 
 
 def _collect_claude_authoritative():
@@ -496,29 +531,51 @@ def _collect_claude_authoritative():
       'transient' -- 429 / 5xx / timeout / network error / unparseable
                      response -- safe to serve from cache if fresh enough
     """
-    token, token_source = _read_claude_token()
-    if not token:
-        return None, "no oauth token available (no credentials.json, no keychain entry, no .env token)", "no_token"
-
-    version = _claude_cli_version()
-    req = urllib.request.Request(
-        "https://api.anthropic.com/api/oauth/usage",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "User-Agent": f"claude-code/{version}",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        # 401 (expired/invalid token) and 403 (scope) are both no-retry: serving
-        # the stale authoritative cache would mask the auth problem. 401 needs a
-        # token refresh, 403 a scope fix -- the HTTP code below tells them apart.
-        kind = "permanent" if e.code in (401, 403) else "transient"
-        return None, f"HTTP {e.code} ({token_source} token)", kind
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}", "transient"
+    # USAGE401FALLBACK1123: a 401 refuses that SOURCE, not the account. A stale
+    # ~/.claude/.credentials.json left next to a valid Keychain login (macOS,
+    # MAIN_AGENT_ISOLATED_CONFIG=1) used to end the run here without the
+    # Keychain ever being tried. The next source gets one try; only the last
+    # 401 is final. Any other answer (403, 5xx, a timeout) ends the run as before.
+    tried = []
+    last_401 = None
+    data = None
+    version = None
+    while data is None:
+        token, token_source = _read_claude_token(skip=tuple(tried))
+        if not token or token_source in tried:
+            if last_401 is not None:
+                return None, last_401, "permanent"
+            return None, "no oauth token available (no credentials.json, no keychain entry, no .env token)", "no_token"
+        tried.append(token_source)
+        if version is None:
+            version = _claude_cli_version()
+        req = urllib.request.Request(
+            "https://api.anthropic.com/api/oauth/usage",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": f"claude-code/{version}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                last_401 = f"HTTP 401 ({', '.join(tried)} token{'s' if len(tried) > 1 else ''})"
+                continue
+            # 403 (scope) is no-retry: serving the stale authoritative cache
+            # would mask the auth problem. 401 (above) needs a token refresh,
+            # 403 a scope fix -- the HTTP code below tells them apart.
+            kind = "permanent" if e.code == 403 else "transient"
+            err = f"HTTP {e.code} ({token_source} token)"
+            # A 401 earlier in this run is the actionable one (Geri #3073): the .env setup-token answers this endpoint
+            # 403 by design, so "403" alone after a stale file's 401 would send the owner to fix a scope, not to
+            # refresh the token. Report both, the 401 first, and keep it a permanent (token) failure.
+            if last_401 is not None:
+                return None, f"{last_401}; then {err}", "permanent"
+            return None, err, kind
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}", "transient"
 
     # Windows are TOP-LEVEL keys of the response (not nested under
     # "rate_limits"), e.g. {"five_hour": {...}, "seven_day": {...}, ...,
@@ -650,6 +707,42 @@ def _read_claude_statusline(max_age_minutes, now_utc=None, path=None):
     return windows, age_minutes
 
 
+# Last-resort Claude source: the unified rate-limit headers of one minimal
+# Messages call, read by the compiled TypeScript entry (the same parser and 429
+# rules as the plan rotation). Costs a few tokens of the quota per run.
+# Under plan rotation (MAIN_AGENT_ISOLATED_CONFIG=1, 2+ plans, no
+# MAIN_AGENT_CONFIG_DIR) the entry makes no call: the token read below is the
+# host's default login, not necessarily the active plan, so it answers ok:false
+# and this collector falls through to the estimate (QUOTAHDRROT1118).
+RATELIMIT_ENTRY = os.path.join(REPO_ROOT, "dist", "claude-ratelimit-reading.js")
+
+
+def _collect_claude_ratelimit_headers():
+    """Return (windows_dict, None) or (None, reason). The token travels to the
+    entry in its environment only, never in argv; no reason string contains it."""
+    token, token_source = _read_claude_token()
+    if not token:
+        token, token_source = _read_setup_token(), "setup_token_file"
+    if not token:
+        return None, "no oauth token available"
+    if not os.path.isfile(RATELIMIT_ENTRY):
+        return None, "dist/claude-ratelimit-reading.js not built"
+    try:
+        # 10 s: the entry's own probe timeout is 8 s; with the 10 s usage call and the
+        # 5 s `claude --version` this stays inside the seed task's 30 s timeoutMs.
+        proc = subprocess.run(
+            ["node", RATELIMIT_ENTRY], capture_output=True, text=True, timeout=10,
+            env={**os.environ, "CLAUDE_RATELIMIT_TOKEN": token},
+        )
+        out = json.loads(proc.stdout.strip().splitlines()[-1])
+    except Exception as e:
+        # The exception text is dropped: only its type is safe to record.
+        return None, type(e).__name__
+    if out.get("ok") is True and isinstance(out.get("windows"), dict):
+        return out["windows"], None
+    return None, f"{out.get('reason', 'no reading')} ({token_source} token)"
+
+
 def _claude_transcript_globs():
     """Every place Claude Code transcripts live on this install. A glob over
     ~/.claude/projects alone finds nothing when the main agent and the
@@ -772,6 +865,16 @@ def collect_claude():
             result["cache_age_minutes"] = round(age_minutes, 1)
             return result
 
+    # Last resort before the estimate: the rate-limit headers. Never ahead of a
+    # fresh authoritative cache above, which is what the plan rotation sees (#2839 B1).
+    rl_windows, rl_err = _collect_claude_ratelimit_headers()
+    if rl_windows is not None:
+        result["source"] = "ratelimit_headers"
+        result["windows"] = rl_windows
+        result["measured_at"] = datetime.now(timezone.utc).isoformat()
+        return result
+    result["ratelimit_headers_error"] = rl_err
+
     try:
         result.update(_collect_claude_estimate())
     except Exception as e:
@@ -857,7 +960,9 @@ def render_summary(snapshot):
     lines.append(f"Claude (source: {claude.get('source')}):")
     if not claude.get("ok"):
         lines.append(f"  error: {claude.get('error')}")
-    elif claude.get("source") in ("authoritative", "authoritative_cached", "statusline"):
+    elif claude.get("source") in ("authoritative", "authoritative_cached", "statusline", "ratelimit_headers"):
+        if claude.get("source") == "ratelimit_headers":
+            lines.append(f"  (from the rate-limit headers of a minimal Messages call -- usage endpoint error: {claude.get('auth_error')})")
         if claude.get("source") == "statusline":
             age = claude.get("statusline_age_minutes")
             age_str = f"{age:.0f}" if isinstance(age, (int, float)) else "?"
@@ -885,6 +990,8 @@ def render_summary(snapshot):
     else:
         if claude.get("auth_error"):
             lines.append(f"  (authoritative endpoint unavailable: {claude['auth_error']})")
+        if claude.get("ratelimit_headers_error"):
+            lines.append(f"  (rate-limit header probe unavailable: {claude['ratelimit_headers_error']})")
         lines.append(f"  5-hour estimated token volume: {claude.get('five_hour_est_tokens', '?')}")
         lines.append(f"  weekly estimated token volume: {claude.get('seven_day_est_tokens', '?')}")
         lines.append(f"  weekly Opus estimated token volume: {claude.get('seven_day_opus_est_tokens', '?')}")

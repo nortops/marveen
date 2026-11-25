@@ -42,6 +42,9 @@ CARD_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 # the status set belongs to the server; this only keeps the value one plain token
 STATUS_RE = re.compile(r'^[a-z][a-z_]{1,31}$')
 PRIORITIES = ('low', 'normal', 'high', 'urgent')
+# memory-save --supersedes: the server's MAX_SUPERSEDES (src/web/routes/memories.ts); one replacing save names a
+# handful of older rows, not a sweep.
+MAX_SUPERSEDES = 50
 DATE_RE = re.compile(r'^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
 # a card's assignee: an agent name, or the owner's name as the board holds it ("Szabolcs"); letters (any script),
 # digits, space, '.', '-', '_'; a JSON value in the body, never a path or a shell word
@@ -52,7 +55,10 @@ USAGE = """usage: bash scripts/marveen-api.sh <verb> [args]
   message-close <id> [--result-file <file>] [--no-notify] [--failed]
   directive-verify <msg-id>
   memory-search <agent> <query> [--category hot|warm|cold|shared] [--strict] [--date <expr>] [--since <day>] [--until <day>] [--limit <n>]
-  memory-save <agent> <hot|warm|cold|shared> <keywords> <content-file>
+  memory-save <agent> <hot|warm|cold|shared> <keywords> <content-file> [--supersedes <id>[,<id>...]]
+                (--supersedes: your own older memories this one replaces; the server retracts them)
+  memory-retract <memory-id> <agent>
+                (takes back your own memory: it leaves the lists and the search, it is not deleted)
   memory-list <agent> <hot|warm|cold|shared> [--limit <n>]
   memory-move <memory-id> <hot|warm|cold|shared> <updated-by>
   memory-update <memory-id> <updated-by> <content-file>
@@ -70,6 +76,9 @@ USAGE = """usage: bash scripts/marveen-api.sh <verb> [args]
   kanban-claim <card-id> <agent> [--ttl <seconds>]
   kanban-release <card-id> <agent>
   kanban-comment <card-id> <author> <content-file>
+  kanban-archive <card-id>
+  vault-login <agent> <web-login-id>   (logs in, in the agent's own browser; prints the outcome only)
+  vault-logins                         (the web logins: id, origin, username, allowed agents; never a password)
   kanban-assign <card-id> <assignee> [--actor <name>]
   agents-list
   agent-restart <agent> [--fresh]
@@ -240,6 +249,22 @@ def check(value, rx, what):
     return value
 
 
+def parse_id_list(value, what):
+    """'12,34' -> [12, 34]: positive memory ids, comma-separated, no repeats, at most MAX_SUPERSEDES (the server's
+    own limit, src/web/routes/memories.ts)."""
+    parts = value.split(',')
+    if any(not ID_RE.fullmatch(p) for p in parts):
+        fail_usage(f'{what}: expected memory ids separated by commas, got {value!r}')
+    ids = [int(p) for p in parts]
+    if any(i < 1 for i in ids):
+        fail_usage(f'{what}: a memory id is a positive number, got {value!r}')
+    if len(set(ids)) != len(ids):
+        fail_usage(f'{what}: an id is given twice in {value!r}')
+    if len(ids) > MAX_SUPERSEDES:
+        fail_usage(f'{what}: at most {MAX_SUPERSEDES} ids in one save, got {len(ids)}')
+    return ids
+
+
 def check_category(value):
     if value not in CATEGORIES:
         fail_usage(f'invalid category: {value!r} (one of {", ".join(CATEGORIES)})')
@@ -291,7 +316,8 @@ def build_request(verb, args):
     if verb == 'directive-verify':
         (msg_id,) = positional(args, 1, verb)
         check(msg_id, ID_RE, 'message id')
-        return 'GET', f'/api/messages/{msg_id}', None, headers, {}
+        # HMACINBOUND1125: a directive row counts only when the server signed it (sig_ok), see main().
+        return 'GET', f'/api/messages/{msg_id}', None, headers, {'require_sig_ok': True}
     if verb == 'memory-search':
         category = take_opt(args, '--category')
         strict = take_flag(args, '--strict')
@@ -316,13 +342,28 @@ def build_request(verb, args):
             q['limit'] = check(limit, ID_RE, 'limit')
         return 'GET', '/api/memories?' + urllib.parse.urlencode(q), None, headers, {'search_header': True}
     if verb == 'memory-save':
+        supersedes = take_opt(args, '--supersedes')
         agent, category, keywords, content_file = positional(args, 4, verb)
         check(agent, NAME_RE, 'agent name')
+        replaced = parse_id_list(supersedes, '--supersedes') if supersedes is not None else None
         body = {'agent_id': agent, 'content': read_text(content_file), 'category': check_category(category), 'keywords': keywords}
         if not body['content'].strip():
             fail_usage('memory-save: the content is empty')
+        if replaced is not None:
+            # The server retracts these rows in the same transaction as the insert, and only the author's own.
+            body['supersedes'] = replaced
         headers['X-Agent-Id'] = agent
         return 'POST', '/api/memories', body, headers, {}
+    if verb == 'memory-retract':
+        mem_id, agent = positional(args, 2, verb)
+        check(mem_id, ID_RE, 'memory id')
+        check(agent, NAME_RE, 'agent name')
+        if int(mem_id) < 1:
+            fail_usage(f'invalid memory id: {mem_id!r}')
+        # A retraction, not a delete: the row stays readable (GET /api/memories/<id>), it only leaves the lists
+        # and the search. Only the author can retract (the server answers 403 otherwise).
+        headers['X-Agent-Id'] = agent
+        return 'POST', f'/api/memories/{mem_id}/retract', {'agent_id': agent}, headers, {}
     if verb == 'memory-list':
         limit = take_opt(args, '--limit')
         agent, category = positional(args, 2, verb)
@@ -523,6 +564,22 @@ def build_request(verb, args):
         if not content.strip():
             fail_usage('kanban-comment: the content is empty')
         return 'POST', f'/api/kanban/{card}/comments', {'author': author, 'content': content}, headers, {}
+    if verb == 'kanban-archive':
+        # KANBANARCHIVEVERB1122: the audit's archive step (POST /api/kanban/<id>/archive, empty body).
+        # Without a verb the level-3 archive could only go through a raw token curl, so it did not run.
+        (card,) = positional(args, 1, verb)
+        check(card, CARD_ID_RE, 'card id')
+        return 'POST', f'/api/kanban/{card}/archive', {}, headers, {}
+    if verb == 'vault-login':
+        # VAULTLOGIN1112: the dashboard types the vault password into the agent's own browser; only the entry id goes
+        # out and only the outcome comes back (success, 2fa, wrong, unknown, origin-mismatch, no-form, ...).
+        agent, entry = positional(args, 2, verb)
+        check(agent, NAME_RE, 'agent name')
+        check(entry, NAME_RE, 'web login id')
+        return 'POST', f'/api/vault/web-logins/{entry}/login', {}, {'X-Agent-Id': agent}, {}
+    if verb == 'vault-logins':
+        positional(args, 0, verb)
+        return 'GET', '/api/vault/web-logins', None, headers, {}
     fail_usage(f'unknown verb: {verb!r}')
 
 
@@ -550,6 +607,19 @@ def completion_close_refused(path, token):
     return None
 
 
+def verb_usage(verb):
+    # A failed call prints this verb's usage lines only (its line and its indented notes), not the whole list:
+    # measured on one fleet, 132 failed calls in 3 days printed the ~2.7k-character USAGE each.
+    lines = USAGE.split('\n')
+    for i, line in enumerate(lines):
+        if line == f'  {verb}' or line.startswith(f'  {verb} '):
+            j = i + 1
+            while j < len(lines) and lines[j].startswith('                ('):
+                j += 1
+            return '\n'.join(lines[i:j])
+    return 'verbs: ' + ', '.join(re.findall(r'^ {2}([a-z-]+)(?= |$)', USAGE, re.M))
+
+
 def main(argv):
     if not argv or argv[0] in ('-h', '--help'):
         print(USAGE)
@@ -572,7 +642,7 @@ def main(argv):
     try:
         method, path, body, headers, flags = build_request(verb, rest)
     except UsageError as e:
-        print(f'FAIL: {e}\n{USAGE}', file=sys.stderr)
+        print(f'FAIL: {e}\n{verb_usage(verb)}\n(every verb: bash scripts/marveen-api.sh --help)', file=sys.stderr)
         return 2
     refused = schedule_write_refused(method, path)
     if refused:
@@ -618,6 +688,16 @@ def main(argv):
     if 200 <= status < 300:
         empty_sent_payloads()
         print(text)
+        if flags.get('require_sig_ok'):
+            # HMACINBOUND1125 (Dani 85038, 3): from_agent='system' alone can be written by a raw INSERT; only a row the
+            # server signed is a directive. An older dashboard sends no sig_ok: that is a refusal too, not a pass.
+            try:
+                sig_ok = json.loads(text).get('sig_ok') is True
+            except (ValueError, AttributeError):
+                sig_ok = False
+            if not sig_ok:
+                print('FAIL: sig_ok is not true: the dashboard did not sign this row, so it is not a verified directive.', file=sys.stderr)
+                return 1
         return 0
     print(f'FAIL: HTTP {status}: {text[:500]}', file=sys.stderr)
     return 1

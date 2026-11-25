@@ -35,6 +35,8 @@ _owner_chat_normalize() {
   if [ -z "$v" ] || [ "$v" = "0" ]; then
     return 1
   fi
+  # BOTTOKEN1124: the installer's .env.example placeholders ("your_telegram_chat_id") are not a chat either.
+  case "$v" in [Yy][Oo][Uu][Rr]_*) return 1 ;; esac
   printf '%s' "$v"
 }
 
@@ -103,6 +105,7 @@ _owner_chat_from_access() {
     function norm(v) {
       const s = String(v).trim().replace(/^["\x27]|["\x27]$/g, "")
       if (!s || s === "0") return null
+      if (/^your_/i.test(s)) return null  // BOTTOKEN1124: same rule as _owner_chat_normalize / normalizeChatId
       return s
     }
     const ids = new Set()
@@ -123,6 +126,42 @@ _owner_chat_from_access() {
   ' "$path"
 }
 
+# _owner_chat_from_teams_allowlist ALLOWLIST_JSON_PATH -- TEAMSAPPROVECARD1118:
+# the Teams plugin writes no access.json; its paired users are in
+# allowlist.json, {"version":1,"entries":[{"aad_object_id":...}]}. stdout: the
+# one paired user (lowercased); exit 1 with a reason on stderr otherwise.
+# Port of owner-chat.ts soleTeamsOwner/teamsAllowlistIds.
+_owner_chat_from_teams_allowlist() {
+  local path="$1"
+  if [ ! -f "$path" ]; then
+    echo "no owner chat: .env placeholder/empty and no readable Teams allowlist.json" >&2
+    return 1
+  fi
+  node -e '
+    const fs = require("fs")
+    let raw
+    try { raw = JSON.parse(fs.readFileSync(process.argv[1], "utf-8")) } catch {
+      process.stderr.write("no owner chat: .env placeholder/empty and no readable Teams allowlist.json\n"); process.exit(1)
+    }
+    const ids = []
+    if (raw && typeof raw === "object" && raw.version === 1 && Array.isArray(raw.entries)) {
+      for (const e of raw.entries) {
+        const id = e && typeof e === "object" ? e.aad_object_id : undefined
+        if (typeof id !== "string") continue
+        const n = id.trim().toLowerCase()
+        if (n && !ids.includes(n)) ids.push(n)
+      }
+    }
+    if (ids.length === 1) { process.stdout.write(ids[0]); process.exit(0) }
+    if (ids.length === 0) {
+      process.stderr.write("no owner chat: .env placeholder/empty and the Teams allowlist.json has no paired user\n")
+    } else {
+      process.stderr.write("no owner chat: .env placeholder/empty and the Teams allowlist.json has " + ids.length + " paired users, refusing to guess\n")
+    }
+    process.exit(1)
+  ' "$path"
+}
+
 # resolve_owner_chat_id ENV_FILE [PROVIDER] -- see file header.
 resolve_owner_chat_id() {
   local env_file="$1" provider="${2:-telegram}" key raw normalized state_dir access_id
@@ -137,6 +176,13 @@ resolve_owner_chat_id() {
     return 0
   fi
   state_dir="$(_owner_chat_state_dir "$env_file" "$provider")"
+  if [ "$provider" = "teams" ]; then
+    if access_id="$(_owner_chat_from_teams_allowlist "$state_dir/allowlist.json")"; then
+      printf '%s\n' "$access_id"
+      return 0
+    fi
+    return 1
+  fi
   if access_id="$(_owner_chat_from_access "$state_dir/access.json")"; then
     printf '%s\n' "$access_id"
     return 0

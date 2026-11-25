@@ -80,6 +80,16 @@ native_module_loads() {
   node -e "new (require('better-sqlite3'))(':memory:').close()" >/dev/null 2>&1
 }
 
+# ISSUE3103 (#3103): every `npm ci` here runs with --ignore-scripts. better-sqlite3 has a binding.gyp, so npm
+# (10.9.8, measured) runs a default `node-gyp rebuild` for it even though its package.json says gypfile:false and
+# it ships the Node-API prebuild it loads (prebuilds/<platform>-<arch>.node). On a host without make/g++ that build
+# failed every npm ci, the update and its rollback alike, and left node_modules empty. The one install script the
+# tree needs is esbuild's postinstall, so it runs on its own; native_module_loads stays the gate for better-sqlite3.
+npm_ci_deps() {
+  npm ci --ignore-scripts --silent --include=dev || return $?
+  npm rebuild esbuild --silent
+}
+
 health_ok() {
   local port="${WEB_PORT:-3420}" i=0
   while [ "$i" -lt 20 ]; do
@@ -416,7 +426,15 @@ DIRTY=$(git status --porcelain --untracked-files=no | grep -vE ' HEARTBEAT\.md$'
 if [ -n "$DIRTY" ]; then
   if [ "${AUTO_STASH:-0}" = "1" ]; then
     echo -e "  Lokalis valtozasok stash-elve (auto-stash)..."
-    if ! git stash push -u -m "marveen-update-auto-stash $(date +%Y%m%d-%H%M%S)"; then
+    # Tracked changes only, no -u (#2835). With -u every untracked file went
+    # into the stash as a blob, and after the pop those blobs stayed behind as
+    # unreachable objects: an install with a large untracked folder (e.g. a
+    # local model or a dataset) grew .git/objects by its full size on every
+    # stash update. The guard above never looks at untracked files, and a
+    # fast-forward leaves them where they are. The one case they matter, an
+    # upstream commit adding a tracked file at the same path, stops the pull
+    # loudly below, with the local file untouched.
+    if ! git stash push -m "marveen-update-auto-stash $(date +%Y%m%d-%H%M%S)"; then
       if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
         echo -e "${RED}ERROR:${NC} Auto-stash failed. Check: git status"
       else
@@ -457,7 +475,9 @@ fi
 # 2.50.1): the TRACKED edits come back, the untracked ones do not, and the
 # stash is kept. So the outcome never says "nothing came back"; it lists, per
 # path, what is in the working tree now and what is only in the stash
-# (stash_restore_report).
+# (stash_restore_report). Since #2835 the auto-stash holds tracked files only,
+# so this refusal no longer comes from our own stash; the untracked branch of
+# the report stays as a guard.
 STASH_POP_FAILED=0
 STASH_CONFLICT_PATHS=""
 UPDATE_WARN=""
@@ -616,7 +636,7 @@ npm_ci_failed() {
   local deps_ok=0
   if [ -n "$OLD_VERSION_FULL" ]; then
     git reset --hard "$OLD_VERSION_FULL" >/dev/null 2>&1 || true
-    if npm ci --silent --include=dev 2>/dev/null; then deps_ok=1; fi
+    if npm_ci_deps 2>/dev/null; then deps_ok=1; fi
     # #950: rebuild only when the installed prebuild does not load -- a failing source build
     # deletes the working binary, which is what this rollback is trying to restore.
     native_module_loads || npm rebuild better-sqlite3 --silent 2>/dev/null || true
@@ -639,8 +659,8 @@ npm_ci_failed() {
     RESULT_MSG="A frissítés közben ${cause}; a rendszer visszaállt a korábbi verzióra (${OLD_VERSION}). A visszaállítás függőség-telepítése is elbukott, de a meglévő függőségek épek (npm ls rendben, a natív modul betölt), a korábbi verzió fut. A frissítés nem ment ki."
   else
     RESULT_STATUS="failed"
-    RESULT_MSG="A frissítés közben ${cause}, és a visszaállítás függőség-telepítése sem sikerült: a kód a korábbi verzión (${OLD_VERSION}) áll, de a node_modules hiányos lehet. Kézi beavatkozás kell: npm ci --include=dev, majd npm run build."
-    echo -e "${RED}HIBA:${NC} a visszaallitas npm ci-je is elbukott; a node_modules hianyos lehet. Kezi beavatkozas kell: npm ci --include=dev && npm run build"
+    RESULT_MSG="A frissítés közben ${cause}, és a visszaállítás függőség-telepítése sem sikerült: a kód a korábbi verzión (${OLD_VERSION}) áll, de a node_modules hiányos lehet. Kézi beavatkozás kell: npm ci --ignore-scripts --include=dev, npm rebuild esbuild, majd npm run build."
+    echo -e "${RED}HIBA:${NC} a visszaallitas npm ci-je is elbukott; a node_modules hianyos lehet. Kezi beavatkozas kell: npm ci --ignore-scripts --include=dev && npm rebuild esbuild && npm run build"
   fi
   restore_stash_before_exit
   exit 6
@@ -800,8 +820,28 @@ fi
 # Pull latest, NON-fatal under set -e so a diverged/network failure is reported.
 echo -e "  Letoltes (origin/${CURRENT_BRANCH})..."
 if ! retry 3 3 git pull --ff-only origin "$CURRENT_BRANCH"; then
-  RESULT_MSG="git pull --ff-only sikertelen (divergencia vagy halozati hiba). Nezd: git status; git log @{u}..HEAD"
+  # #2835: an untracked local file at a path the upstream now tracks blocks the
+  # fast-forward. git leaves the file alone; name it, so the message does not
+  # send the operator after a divergence or a network error that is not there.
+  # FETCH_HEAD is what the failed pull fetched; without it the list is empty.
+  PULL_BLOCKERS=""
+  if git rev-parse -q --verify 'FETCH_HEAD^{commit}' >/dev/null 2>&1; then
+    PULL_BLOCKERS="$(comm -12 \
+      <(git ls-files --others --exclude-standard 2>/dev/null | LC_ALL=C sort) \
+      <(git diff --name-only --diff-filter=A HEAD FETCH_HEAD 2>/dev/null | LC_ALL=C sort) \
+      | head -n 20 | paste -sd, - | sed 's/,/, /g')"
+  fi
+  if [ -n "$PULL_BLOCKERS" ]; then
+    if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+      RESULT_MSG="git pull --ff-only failed: the update adds tracked files where local untracked files already are (${PULL_BLOCKERS}). Nothing was overwritten. Move or rename those files, then run the update again."
+    else
+      RESULT_MSG="git pull --ff-only sikertelen: a frissites kovetett fajlt hoz oda, ahol helyben egy nem kovetett fajl all (${PULL_BLOCKERS}). Semmi nem irodott felul. Mozgasd el vagy nevezd at ezeket, majd inditsd ujra a frissitest."
+    fi
+  else
+    RESULT_MSG="git pull --ff-only sikertelen (divergencia vagy halozati hiba). Nezd: git status; git log @{u}..HEAD"
+  fi
   echo -e "${RED}HIBA:${NC} git pull --ff-only sikertelen origin/${CURRENT_BRANCH}."
+  [ -n "$PULL_BLOCKERS" ] && echo -e "       Nem kovetett fajl all az uj, kovetett fajl helyen: ${PULL_BLOCKERS}"
   restore_stash_before_exit
   exit 5
 fi
@@ -1627,7 +1667,7 @@ if git diff "$OLD_VERSION" "$NEW_VERSION" --name-only | grep -qE "^package(-lock
   # failure next run, forever (the rollback also reverts the freshly pulled
   # update.sh, so a fix can never arrive through this path on its own).
   NPM_CI_RC=0
-  retry 3 3 npm ci --silent --include=dev || NPM_CI_RC=$?
+  retry 3 3 npm_ci_deps || NPM_CI_RC=$?
   if [ "$NPM_CI_RC" -ne 0 ]; then
     npm_ci_failed "$NPM_CI_RC"
   fi
@@ -1676,7 +1716,7 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
       # failed `npm ci` above may have pruned dev deps (NODE_ENV=production),
       # and without the compiler this rollback build would also fail silently,
       # leaving git=OLD + node_modules=pruned (AUTOUPDNODEENV905 finding A).
-      npm ci --silent --include=dev 2>/dev/null || true
+      npm_ci_deps 2>/dev/null || true
       native_module_loads || npm rebuild better-sqlite3 --silent 2>/dev/null || true
       npm run build --silent 2>/dev/null || true
       [ -d "$INSTALL_DIR/dist" ] && echo "$OLD_VERSION_FULL" > "$BUILT_COMMIT_FILE"
@@ -1699,7 +1739,7 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
     echo -e "  ${DIM}Futo Node: $(node -v 2>/dev/null || echo '?'). A better-sqlite3 13.x Node 22 vagy ujabbat igenyel; ha ez alatt futsz, frissitsd a Node-ot es futtasd ujra a frissitest.${NC}"
     if [ -n "$OLD_VERSION_FULL" ]; then
       git reset --hard "$OLD_VERSION_FULL" >/dev/null 2>&1 || true
-      npm ci --silent --include=dev 2>/dev/null || true
+      npm_ci_deps 2>/dev/null || true
       native_module_loads || npm rebuild better-sqlite3 --silent 2>/dev/null || true
       npm run build --silent 2>/dev/null || true
       [ -d "$INSTALL_DIR/dist" ] && echo "$OLD_VERSION_FULL" > "$BUILT_COMMIT_FILE"
@@ -2092,6 +2132,8 @@ STAGE="boot"
 _stage() { STAGE="$1"; echo "[finalize] stage=$1 $(date '+%H:%M:%S')" >&2; }
 # Same check as update.sh's native_module_loads (#950): this script runs on its own.
 native_module_loads() { node -e "new (require('better-sqlite3'))(':memory:').close()" >/dev/null 2>&1; }
+# Same as update.sh's npm_ci_deps (ISSUE3103): no install scripts but esbuild's, so no source build of better-sqlite3.
+npm_ci_deps() { npm ci --ignore-scripts --silent --include=dev || return $?; npm rebuild esbuild --silent; }
 trap 'echo "[finalize] SIGNAL caught in stage=${STAGE} $(date +%H:%M:%S)" >&2' TERM HUP INT
 
 _esc() { printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || printf '"%s"' "$1"; }
@@ -2119,7 +2161,12 @@ _notify() { # status [message]
   bash "$INSTALL_DIR/scripts/notify.sh" "$msg" >/dev/null 2>&1 || true
 }
 _finish() { _write "$1" "$2" "$3" "$4"; _notify "$1" "$4"; exit "$3"; }
-_health() { local i=0; while [ "$i" -lt 20 ]; do
+# FINHEALTHWIN1120: the old window was 20 attempts. A measured v1.51.0 start
+# listened only after 20 s, then blocked its event loop for 22.3 s, so the window
+# ran out and a good build was rolled back. The attempt bound keeps the loop
+# finite when sleep returns at once; the time bound does so when every curl
+# hangs for its full 3 s.
+_health() { local i=0 deadline=$(( SECONDS + 120 )); while [ "$i" -lt 120 ] && [ "$SECONDS" -lt "$deadline" ]; do
   curl -fsS -m 3 -o /dev/null "http://127.0.0.1:${PORT}/" 2>/dev/null && return 0
   sleep 1; i=$(( i + 1 )); done; return 1; }
 _restart() { "$INSTALL_DIR/scripts/stop.sh"; "$INSTALL_DIR/scripts/start.sh"; }
@@ -2194,7 +2241,7 @@ if [ -n "$OLD_FULL" ]; then
   # --include=dev: same reason as the main npm ci (AUTOUPDNODEENV905) -- under
   # NODE_ENV=production a plain ci prunes the compiler and the rebuild below
   # dies silently, re-creating the pruned tree this rollback tries to escape.
-  npm ci --silent --include=dev 2>/dev/null || true
+  npm_ci_deps 2>/dev/null || true
   native_module_loads || npm rebuild better-sqlite3 --silent 2>/dev/null || true
   npm run build --silent 2>/dev/null || true
   [ -d "$INSTALL_DIR/dist" ] && echo "$OLD_FULL" > "$BUILT"
@@ -2245,10 +2292,46 @@ if command -v systemd-run >/dev/null 2>&1 && [ -d "$XDG_RUN" ]; then
   #
   # setsid is NOT hoisted out of this branch on purpose: macOS has no setsid at
   # all (measured), and this branch only runs where systemd-run exists.
+  FINALIZE_STARTED="${FINALIZE_SCRIPT%.sh}.started"; rm -f "$FINALIZE_STARTED" 2>/dev/null
+  # FINMARKERCLEAR1120: an old marker that rm -f cannot clear (a folder, or a
+  # file in a folder that is not writable) made the fallback below believe the
+  # finalizer had started, so no finalizer ran at all. This run then uses a
+  # marker name of its own; plain shell only, the PATH here may be minimal.
+  # The replacement name is cleared first, because a recycled pid can find an
+  # earlier run's file there.
+  if [ -e "$FINALIZE_STARTED" ] || [ -L "$FINALIZE_STARTED" ]; then
+    FINALIZE_OWN="${FINALIZE_SCRIPT%.sh}.started.$$"; rm -f "$FINALIZE_OWN" 2>/dev/null
+    if [ ! -e "$FINALIZE_OWN" ] && [ ! -L "$FINALIZE_OWN" ]; then
+      echo "[update] the old finalizer start marker $FINALIZE_STARTED could not be removed; this run uses $FINALIZE_OWN" >> "$FINALIZE_LOG" 2>/dev/null
+      FINALIZE_STARTED="$FINALIZE_OWN"
+    elif [ -f "$FINALIZE_OWN" ] && [ ! -L "$FINALIZE_OWN" ] && { : > "$FINALIZE_OWN"; } 2>/dev/null; then
+      # The leftover replacement is a regular file this shell could truncate (a
+      # plain ': >', so noclobber and the append-only attribute make it fail, as
+      # they would in the wrapper), so the wrapper can write it and the run
+      # stays inside the scope. Known limit: if
+      # systemd-run then cannot start, the fallback sees the leftover file and
+      # does not run the finalizer (0 runs), as this case behaved before
+      # FINMARKERCLEAR1120 too.
+      FINALIZE_OLD="$FINALIZE_STARTED"
+      echo "[update] the old finalizer start marker $FINALIZE_OLD and $FINALIZE_OWN could not be removed; $FINALIZE_OWN could be truncated, so this run reuses it" >> "$FINALIZE_LOG" 2>/dev/null
+      FINALIZE_STARTED="$FINALIZE_OWN"
+    else
+      echo "[update] the old finalizer start marker $FINALIZE_STARTED and $FINALIZE_OWN could not be removed; the finalizer starts through the fallback only" >> "$FINALIZE_LOG" 2>/dev/null
+      # With an empty marker path the wrapper's `: > "$1"` fails, so the wrapper
+      # exits 1 before running the finalizer, and the fallback's `[ -e "" ]` is
+      # false, so the finalizer runs exactly once, through the fallback.
+      FINALIZE_STARTED=""
+    fi
+  fi
+  # FINONCE1120: systemd-run --scope returns the command's exit code. A
+  # rolled-back/failed finalizer used to run twice, and the second run wrote
+  # a false success. The marker limits the fallback to the case where
+  # systemd-run did not start the finalizer. If writing the marker fails, the
+  # wrapper exits before running the finalizer so the fallback runs it once.
   XDG_RUNTIME_DIR="$XDG_RUN" setsid systemd-run --user --scope --collect --quiet \
-    bash "$FINALIZE_SCRIPT" "${FINALIZE_ARGS[@]}" \
+    bash -c ': > "$1" || exit 1; shift; exec "$@"' finalize-start "$FINALIZE_STARTED" bash "$FINALIZE_SCRIPT" "${FINALIZE_ARGS[@]}" \
     < /dev/null >> "$FINALIZE_LOG" 2>&1 \
-    || setsid bash "$FINALIZE_SCRIPT" "${FINALIZE_ARGS[@]}" < /dev/null >> "$FINALIZE_LOG" 2>&1 &
+    || { [ -e "$FINALIZE_STARTED" ] || setsid bash "$FINALIZE_SCRIPT" "${FINALIZE_ARGS[@]}" < /dev/null >> "$FINALIZE_LOG" 2>&1; } &
 elif command -v setsid >/dev/null 2>&1; then
   # macOS/launchd or no user-systemd: no cgroup self-kill. Detach in the
   # background so a parent signal during restart cannot abort the health/

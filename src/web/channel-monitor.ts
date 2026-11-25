@@ -40,6 +40,7 @@ import {
   fleetVenvPathPrefix,
   buildCustomProviderLaunchEnv,
   type CustomProviderLaunchEnv,
+  disallowedToolsFlag,
 } from './agent-process.js'
 import { sendSystemDirective } from './system-directive.js'
 import { isRestartInFlight, beginRestart, endRestart } from './restart-lock.js'
@@ -48,6 +49,7 @@ import { paneRunsClaude, scheduleHardRestartVerify } from './hard-restart-verify
 import { freshSupervisor, launchdReloadVerdict, reloadWindowSec, runningChannelsSupervisors, supervisorWaitDecision, type SupervisorWait } from './channels-supervisor.js'
 import { resolveMainConfigDecision, type MainConfigDecision } from './main-config-decision.js'
 import { cfgKindFromDecision, mainAuthConflictText, prepareMainAuth } from './main-auth.js'
+import { mainCustomProviderLaunchEnv } from './main-custom-provider-env.js'
 import { runMainContinueRestart, type ContinueRestartResult } from './main-rotation-continue.js'
 import { withSessionSendLock } from './session-send-lock.js'
 import { reapChannelOrphans, reapDetachedChannelClaudes, collectPollerEvidence, reapForeignMainPollers, reapGromzoOrphans, scheduleGromzoOrphanReap } from './channel-poller-reap.js'
@@ -59,7 +61,7 @@ import {
   stuckInputSignature, decideStuckInputRecovery, parkedChannelInput,
   parkedInputText, shouldClearTruncatedPreamble,
   parkedInputRowCount, submitLanded, decideStuckInputAction,
-  parkedScheduledTaskInput, parkedMachineOriginInput, parkedMainInputHasRemedy,
+  parkedScheduledTaskInput, parkedMachineOriginInput, parkedMainInputHasRemedy, paneTurnInFlight,
   type StuckInputState, type StuckInputThresholds, type StuckInputAction,
   type StuckInputActionFacts,
 } from '../pane-state.js'
@@ -675,7 +677,11 @@ export async function recoverStuckInputForSession(
   // nothing parked, stays off the event loop.
   const pane = pre != null && stuckInputSignature(pre) != null ? captureParkedInputView(session) : pre
   const sig = pane != null ? stuckInputSignature(pane) : null
-  const decision = decideStuckInputRecovery(sig, prev, Date.now(), thresholds)
+  // A parked box tall enough to push the live spinner out of detectPaneState's
+  // window reads 'typing' on a WORKING pane. Hold instead of typing into a live
+  // turn, and spend no attempt -- see paneTurnInFlight.
+  const turnInFlight = sig != null && pane != null && paneTurnInFlight(pane)
+  const decision = decideStuckInputRecovery(sig, prev, Date.now(), thresholds, { turnInFlight })
   if (decision.recover && pane != null) {
     const attempt = decision.next.attempts
     const block = parkedChannelInput(pane)
@@ -1216,9 +1222,13 @@ export function buildMainSessionRespawnCmd(opts: {
    * which itself throws when a customProvider is configured but broken (missing
    * definition/vault key), matching main-agent-custom-provider.mjs's abort
    * contract: a broken provider must stop the launch, not silently fall back to
-   * the wrong backend.
+   * the wrong backend. Named distinctly from `customProviderEnv` below (HOSTINGERRETEST1125):
+   * that one is the main session's OWN channels.sh-style provider (Hostinger AI Router etc,
+   * a shell-prefix string from mainCustomProviderLaunchEnv); this one is the per-agent
+   * LiteLLM/OpenCode provider (an object with envPrefix/model/approval key). Both can be set
+   * at once on different installs and must not collide under one name.
    */
-  customProviderEnv: CustomProviderLaunchEnv | null
+  customProviderLaunchEnv: CustomProviderLaunchEnv | null
   /**
    * SLACKDMVESZT1006: the --settings file that ENABLES the extras for this
    * session only (writeMainExtraPluginsSettings). Without it a recovery
@@ -1238,12 +1248,20 @@ export function buildMainSessionRespawnCmd(opts: {
   gromzoTokenFile?: string | null
   /** GROMZONOPROVIDER1108: test seam for mainGromzoPrimaryReady when the primary is the Gromzo plugin. */
   gromzoPrimaryReady?: boolean
+  /** AGENT_DISALLOWED_TOOLS as the launch flag (disallowedToolsFlag); absent: read from the settings. Test seam. */
+  disallowedTools?: string
   /**
    * CHANNELUNCONF1110: false when the primary is a token provider with no token (mainPrimaryConfigured): the respawn
    * then comes back WITHOUT the primary channel, exactly as channels.sh, channel-watchdog.sh and stuck-modal-guard.sh
    * launch it. Absent: configured (the launch as before).
    */
   channelConfigured?: boolean
+  /**
+   * HOSTINGERRETEST1125: the main agent's custom provider env (mainCustomProviderLaunchEnv), '' or absent when it has
+   * none. Set: it goes after the auth files, as channels.sh's CUSTOM_PROVIDER_ENV does, and the --model flag is dropped
+   * (the provider's model rides ANTHROPIC_MODEL; a flag would override it).
+   */
+  customProviderEnv?: string
 }): string {
   // GROMZONOPROVIDER1108: on a gromzo install the Gromzo plugin is the PRIMARY (never also an extra). It comes back only
   // when the main agent can take it (mainGromzoPrimaryReady); otherwise this respawn is a gromzo-pending session with
@@ -1318,13 +1336,15 @@ export function buildMainSessionRespawnCmd(opts: {
         : []),
     // MAINAUTH1107: the post-file right AFTER the config branch (a static piece: no mode logic in this builder).
     `&& { [ ! -f ${shSingleQuote(PANE_AUTH_POST_PATH)} ] || . ${shSingleQuote(PANE_AUTH_POST_PATH)}; }`,
+    // HOSTINGERRETEST1125: the custom provider after the auth files, as channels.sh's CUSTOM_PROVIDER_ENV.
+    ...(opts.customProviderEnv ? [`&& ${opts.customProviderEnv}`] : []),
     // GROMZOMAINAGENT1106: the plugin names itself with MXD_AGENT (main-gromzo-launch.ts).
     // MXDAGENTSOCKID1106: and its token file, so a protected main agent's hello is not refused.
     ...(gromzoSlug ? [`&& export MXD_AGENT="${gromzoSlug}" MXD_SCOPE="both"`] : []),
     ...(gromzoToken ? [`&& ${gromzoToken.replace(/ && $/, '')}`] : []),
     // GROMZONEEDSAUTH1109: in the pane, after the kill and the exports, right before claude (gromzoNeedsAuthPaneStep).
     ...(channelsList.includes(`plugin:${MAIN_GROMZO_PLUGIN_ID}`) ? [`&& ${gromzoNeedsAuthPaneStep()}`] : []),
-    // RESPAWNCUSTOMPROVIDER1012: customProviderEnv, when set, is injected AFTER
+    // RESPAWNCUSTOMPROVIDER1012: customProviderLaunchEnv, when set, is injected AFTER
     // the config-dir/token block above -- same ordering as scripts/channels.sh's
     // CFG_ENV followed by CUSTOM_PROVIDER_ENV -- and OVERRIDES it. It starts by
     // unsetting CLAUDE_CODE_OAUTH_TOKEN because the Claude CLI prefers that var
@@ -1334,8 +1354,8 @@ export function buildMainSessionRespawnCmd(opts: {
     // provider endpoint. CLAUDE_CONFIG_DIR, if any, is left untouched -- the
     // provider auth is env-based (no .credentials.json), so the dir is still
     // where the TUI's own state (onboarding flags, approval stamps) lives.
-    ...(opts.customProviderEnv
-      ? [`&& unset CLAUDE_CODE_OAUTH_TOKEN && ${opts.customProviderEnv.envPrefix}${opts.claudePath}`]
+    ...(opts.customProviderLaunchEnv
+      ? [`&& unset CLAUDE_CODE_OAUTH_TOKEN && ${opts.customProviderLaunchEnv.envPrefix}${opts.claudePath}`]
       : ['&&', opts.claudePath]),
     ...(opts.continueSession ? ['--continue'] : []),
     '--dangerously-skip-permissions',
@@ -1346,7 +1366,14 @@ export function buildMainSessionRespawnCmd(opts: {
     // the 5th launch sink; it must use the same escaper as the other four (the
     // allowlist is the belt, this is the braces). shSingleQuote makes the value
     // one inert shell word. See model-id-injection.test.ts.
-    ...(opts.model ? ['--model', shSingleQuote(opts.model)] : []),
+    // customProviderLaunchEnv (ours) is NOT part of this gate: its ANTHROPIC_MODEL is authoritative
+    // but --model still rides opts.model too (same two-layer contract main-agent-custom-provider.mjs
+    // documents; see channel-deafness-recovery.test.ts "still passes --model ... independent of the
+    // provider env model" -- a locked contract, not an oversight). Only customProviderEnv (upstream's
+    // Hostinger-style string, HOSTINGERRETEST1125) drops --model.
+    ...(opts.model && !opts.customProviderEnv ? ['--model', shSingleQuote(opts.model)] : []),
+    // Parity with channels.sh/channel-watchdog.sh: without it every recovery respawn drops AGENT_DISALLOWED_TOOLS.
+    ...[(opts.disallowedTools ?? disallowedToolsFlag()).trim()].filter(Boolean),
     ...(channelsList.length > 0 ? [['--channels', ...channelsList].join(' ')] : []),
   ].join(' ')
 }
@@ -1412,6 +1439,11 @@ export function respawnMainSessionFresh(): void {
   // end (see main-respawn-hold.ts); the finally clears it on every exit.
   const endRespawn = beginMainRespawn()
   try {
+    // HOSTINGERRETEST1125 (Samu's review): the config and the custom provider env are decided FIRST, before the reaps
+    // below can kill the pane's claude. A provider that cannot be served throws here, and the running main agent is
+    // left as it is, instead of being stopped with nothing started in its place.
+    const respawnConfig = mainRespawnConfigWithAuth()
+    const customProviderEnv = mainCustomProviderLaunchEnv(respawnConfig.isolatedConfigDir)
     // Same rationale as the resume path: respawn-pane -k kills the parent claude
     // but leaves grandchild pollers alive, and two pollers on one bot token race
     // for getUpdates (409). Reap BEFORE respawning, never after.
@@ -1440,8 +1472,9 @@ export function respawnMainSessionFresh(): void {
       // The main session always starts a new conversation -- this is the whole
       // point of the nightly restart (drop the accumulated context).
       continueSession: false,
-      config: mainRespawnConfigWithAuth(),
-      customProviderEnv: buildCustomProviderLaunchEnv(MAIN_AGENT_ID),
+      config: respawnConfig,
+      customProviderLaunchEnv: buildCustomProviderLaunchEnv(MAIN_AGENT_ID),
+      customProviderEnv,
     })
     // c5296a52: the two reaps above kill the pane's claude, and channels.sh starts the session
     // WITHOUT remain-on-exit -- so the pane and the session can already be gone by the time we get
@@ -1508,6 +1541,11 @@ export async function resumeMarveenSession(opts: { byMonitor?: boolean } = {}): 
   // end (see main-respawn-hold.ts); the finally clears it on every exit.
   const endRespawn = beginMainRespawn()
   try {
+    // HOSTINGERRETEST1125 (Samu's review): the config and the custom provider env are decided FIRST, before the reaps
+    // below can kill the pane's claude. A provider that cannot be served throws here, and the running main agent is
+    // left as it is, instead of being stopped with nothing started in its place.
+    const respawnConfig = mainRespawnConfigWithAuth()
+    const customProviderEnv = mainCustomProviderLaunchEnv(respawnConfig.isolatedConfigDir)
     // Reap any orphan bun/node poller BEFORE we respawn. tmux respawn-pane -k
     // kills the parent claude process but leaves grandchild pollers running -
     // see channel-poller-reap.ts. Without this, the freshly-respawned
@@ -1553,8 +1591,9 @@ export async function resumeMarveenSession(opts: { byMonitor?: boolean } = {}): 
       // isolated CLAUDE_CONFIG_DIR (macOS), else it re-authenticates from the
       // rotating Keychain and 401s. Returns null when isolation is off/no token,
       // preserving the prior shared-root behaviour.
-      config: mainRespawnConfigWithAuth(),
-      customProviderEnv: buildCustomProviderLaunchEnv(MAIN_AGENT_ID),
+      config: respawnConfig,
+      customProviderLaunchEnv: buildCustomProviderLaunchEnv(MAIN_AGENT_ID),
+      customProviderEnv,
     })
     if (opts.byMonitor) monitorMainRespawnAt = Date.now()
     execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), claudeCmd], { timeout: 15000 })
@@ -1849,6 +1888,11 @@ function respawnMarveenSessionFresh(): boolean {
   // end (see main-respawn-hold.ts); the finally clears it on every exit.
   const endRespawn = beginMainRespawn()
   try {
+    // HOSTINGERRETEST1125 (Samu's review): the config and the custom provider env are decided FIRST, before the reaps
+    // below can kill the pane's claude. A provider that cannot be served throws here, and the running main agent is
+    // left as it is, instead of being stopped with nothing started in its place.
+    const respawnConfig = mainRespawnConfigWithAuth()
+    const customProviderEnv = mainCustomProviderLaunchEnv(respawnConfig.isolatedConfigDir)
     // Same first-run-picker guard as resumeMarveenSession.
     ensureSharedClaudeOnboarded()
     const claudeCmd = buildMainSessionRespawnCmd({
@@ -1865,8 +1909,9 @@ function respawnMarveenSessionFresh(): boolean {
       // Same channels.sh-bypass concern as resumeMarveenSession: this fresh
       // respawn also skips channels.sh, so it must carry the isolated config
       // itself or it 401s on the rotating macOS Keychain. null when off/no token.
-      config: mainRespawnConfigWithAuth(),
-      customProviderEnv: buildCustomProviderLaunchEnv(MAIN_AGENT_ID),
+      config: respawnConfig,
+      customProviderLaunchEnv: buildCustomProviderLaunchEnv(MAIN_AGENT_ID),
+      customProviderEnv,
     })
     execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), claudeCmd], { timeout: 15000 })
     // MXDAGENTSOCKID1106 (b): the old claude's gromzo plugin outlives it (it ignores a closed stdin); sweep it once the respawn landed.
@@ -2098,12 +2143,12 @@ export function hardRestartMarveenChannels(): { ok: boolean; error?: string } {
     logger.warn({ plist: MAIN_CHANNELS_PLIST }, 'Hard restart: launchd channels plist absent -- falling back to respawn-pane')
   }
 
-  // Linux: respawn-pane ONLY -- NEVER `systemctl --user restart`. The channels
-  // unit (e.g. marveen-channels.service) runs with KillMode=control-group and
-  // the shared tmux SERVER lives in its cgroup, so restarting the unit kills the
-  // tmux server and with it EVERY agent session, not just the main one.
-  // respawn-pane replaces only the claude process in the main channels pane,
-  // leaving the server and all other sessions intact.
+  // Linux: respawn-pane, not `systemctl --user restart`. The shared tmux SERVER
+  // lives in the channels unit's cgroup; the shipped unit
+  // (scripts/systemd/marveen-channels.service) runs KillMode=process, so a unit
+  // restart no longer takes the fleet down (it did under the old
+  // control-group mode, 2026-06-26), but it reruns all of channels.sh.
+  // respawn-pane replaces only the claude process in the main channels pane.
   if (respawnMarveenSessionFresh()) {
     marveenLastHardRestart = Date.now()
     noteOwnHardRestartStamp(marveenLastHardRestart) // respawnMarveenSessionFresh wrote the stamp
@@ -2232,6 +2277,10 @@ function maybeRestartWedgedMainChannel(state: StuckInputState): void {
 // discarding real work. The alert gives a human (or a future, explicitly
 // approved level-2 change) the chance to decide per incident.
 export const SUBAGENT_OVERDUE_ALERT_MIN_INTERVAL_MS = 15 * 60 * 1000
+// Parked text waiting behind a live turn is not alerted -- until the wait
+// passes this cap. The same 30 minutes the message router gives a busy target
+// before it escalates (BUSY_STUCK_ESCALATE_MS).
+export const SUBAGENT_OVERDUE_BUSY_CAP_MS = 30 * 60 * 1000
 const subAgentOverdueAlertedAt: Map<string, number> = new Map()
 
 /**
@@ -2245,23 +2294,67 @@ const subAgentOverdueAlertedAt: Map<string, number> = new Map()
  * @param lastAlertedAt Epoch ms of the last alert for this session, or 0 if never.
  * @param nowMs       Current time (injected so tests don't depend on the clock).
  * @param minIntervalMs Minimum gap between alerts for the same session.
+ * @param turnInFlight  The pane is working (paneTurnInFlight): suppress unless the wait passed busyCapMs.
+ * @param busyCapMs     How long parked text may wait behind a live turn before it is alerted anyway.
  */
 export function shouldAlertStuckSubAgent(
   state: StuckInputState, maxAttempts: number, lastAlertedAt: number, nowMs: number, minIntervalMs: number,
+  turnInFlight = false, busyCapMs = SUBAGENT_OVERDUE_BUSY_CAP_MS,
 ): boolean {
   if (state.parkedSig === null) return false
-  if (state.attempts < maxAttempts) return false
-  return nowMs - lastAlertedAt >= minIntervalMs
+  if (nowMs - lastAlertedAt < minIntervalMs) return false
+  // Parked behind a live turn: waiting, not wedged -- the budget is not even
+  // being spent (decideStuckInputRecovery holds). Only a wait past the cap is
+  // worth a human's attention: a turn that long, or a frozen tool call, which
+  // no sub-agent watchdog covers.
+  if (turnInFlight) return state.firstSeenAt !== null && nowMs - state.firstSeenAt >= busyCapMs
+  return state.attempts >= maxAttempts
+}
+
+/**
+ * The overdue-guard alert text. Pure, exported for unit testing.
+ *
+ * It states what is known -- how long the text has been parked, and whether
+ * the agent is working -- not a count of "automatic attempts": a spell whose
+ * every tick was a 'hold' spends its budget without a single keystroke
+ * (measured 2026-09-10/11 on agent-cortex-router: 59 of 63 alerts followed
+ * four holds). It sends the reader to LOOK first, and names the managed
+ * restart rather than `tmux respawn-pane -k`, which discards the delegated
+ * task in progress.
+ */
+export function subAgentOverdueAlertText(o: {
+  label: string; session: string; agentName: string | null; parkedMs: number; turnInFlight: boolean
+}): string {
+  const minutes = Math.max(1, Math.round(o.parkedMs / 60_000))
+  const look = `\`tmux attach -t ${o.session}\` (kilépés: Ctrl-b d)`
+  const restart = o.agentName != null
+    ? `a dashboardos újraindítás (\`POST /api/agents/${o.agentName}/restart\`)`
+    : 'a dashboardos újraindítás'
+  if (o.turnInFlight) {
+    return `⚠️ A(z) ${o.label} bemenetén kb. ${minutes} perce vár egy üzenet, miközben az ügynök egyfolytában dolgozik: lehet egy nagyon hosszú feladat, vagy egy megakadt eszközhívás. Nézd meg: ${look}. Ha a spinner ideje nő, dolgozik, hagyd; ha áll, ${restart} a kíméletes út.`
+  }
+  return `⚠️ A(z) ${o.label} bemenetén kb. ${minutes} perce parkol egy be nem küldött üzenet, és az automatikus helyreállítás nem tudta beküldeni. Előbb nézd meg, dolgozik-e az ügynök: ${look}. Ha dolgozik, várj; ha tényleg áll, ${restart} a kíméletes út. A \`tmux respawn-pane -k\` kerülendő: eldobja a folyamatban lévő delegált feladatot.`
 }
 
 function maybeAlertStuckSubAgent(session: string, agentName: string | null, state: StuckInputState): void {
   const last = subAgentOverdueAlertedAt.get(session) ?? 0
   const now = Date.now()
-  if (!shouldAlertStuckSubAgent(state, MAIN_STUCK_THRESHOLDS.maxAttempts, last, now, SUBAGENT_OVERDUE_ALERT_MIN_INTERVAL_MS)) return
+  // Cheap checks first: an unparked or rate-limited session costs no capture.
+  if (state.parkedSig === null || now - last < SUBAGENT_OVERDUE_ALERT_MIN_INTERVAL_MS) return
+  // Read fresh at alert time, with the box-height-proof busy check (a tall
+  // parked box hides the spinner from detectPaneState -- see paneTurnInFlight).
+  const pane = capturePane(session)
+  const turnInFlight = pane != null && paneTurnInFlight(pane)
+  if (!shouldAlertStuckSubAgent(state, MAIN_STUCK_THRESHOLDS.maxAttempts, last, now, SUBAGENT_OVERDUE_ALERT_MIN_INTERVAL_MS, turnInFlight)) return
   subAgentOverdueAlertedAt.set(session, now)
-  const label = agentName ?? session
-  logger.error({ session, agentName, attempts: state.attempts }, 'Sub-agent stuck input survived soft recovery -- overdue-guard alert (no auto-restart)')
-  sendAlert(`⚠️ A(z) ${label} session bemenete beragadt, ${state.attempts} automatikus próbálkozás sem szabadította ki (kb. 4-4.5 perce). Kézi ellenőrzés javasolt: \`tmux attach -t ${session}\`, szükség esetén \`tmux respawn-pane -k -t ${session}\`.`)
+  const parkedMs = state.firstSeenAt !== null ? now - state.firstSeenAt : 0
+  logger.error(
+    { session, agentName, attempts: state.attempts, turnInFlight, parkedMs },
+    turnInFlight
+      ? 'Sub-agent input parked behind a live turn past the busy cap -- overdue-guard alert (no auto-restart)'
+      : 'Sub-agent stuck input survived soft recovery -- overdue-guard alert (no auto-restart)',
+  )
+  sendAlert(subAgentOverdueAlertText({ label: agentName ?? session, session, agentName, parkedMs, turnInFlight }))
 }
 
 // --- Keep-alive staleness watchdog (deafness safety net, decision #3) ---

@@ -23,6 +23,8 @@ import {
   mcpTrustAcceptKeys,
   detectsFirstRunGate,
   detectsModelConsentDialog,
+  paneTurnInFlight,
+  type StuckInputState,
 } from '../pane-state.js'
 
 // Realistic pane fixtures modelled on actual `tmux capture-pane -p`
@@ -66,6 +68,12 @@ const IDLE_MANUAL_MODE = modeFooter('  ⏵ manual mode on (shift+tab to cycle)')
 const IDLE_BYPASS_FLEETVIEW = modeFooter('  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents')
 // No shift+tab hint at all: the tail alone has to carry it.
 const IDLE_ACCEPT_EDITS_TAIL_ONLY = modeFooter('  ⏵⏵ accept edits on · 1 monitor · ← for agents')
+
+// A STRICT-PROFILE AGENT RENDERS THE MODE WITH NO TAIL AT ALL (measured
+// 2026-10-24 on agent-helga, live pane). No shift+tab hint, no `·` action:
+// just the glyph and the mode. Before the glyph anchor this read 'unknown' and
+// the router silently refused every message to her for nine days.
+const IDLE_MANUAL_NO_TAIL = modeFooter('  ⏸ manual mode on')
 
 // The tail is what keeps prose out. Scrollback quoting a footer phrase without
 // the UI chrome must NOT read as idle -- otherwise a pasted log line parks the
@@ -420,6 +428,7 @@ describe('detectPermissionMode', () => {
     ['auto mode', IDLE_AUTO_MODE],
     ['manual mode', IDLE_MANUAL_MODE],
     ['accept edits', IDLE_ACCEPT_EDITS_TAIL_ONLY],
+    ['manual mode', IDLE_MANUAL_NO_TAIL],
   ])('reads %s off the footer', (expected, pane) => {
     expect(detectPermissionMode(pane)).toBe(expected)
   })
@@ -461,6 +470,7 @@ describe('detectPaneState', () => {
     ['manual mode', IDLE_MANUAL_MODE],
     ['bypass with the FleetView tail', IDLE_BYPASS_FLEETVIEW],
     ['accept edits with no shift+tab hint', IDLE_ACCEPT_EDITS_TAIL_ONLY],
+    ['manual mode with no tail at all (strict profile)', IDLE_MANUAL_NO_TAIL],
   ])('detects idle on the %s footer', (_label, pane) => {
     expect(detectPaneState(pane)).toBe('idle')
     expect(isReadyForPrompt(pane)).toBe(true)
@@ -2871,5 +2881,98 @@ describe('idle footer whose background-task tail is a monitor alone or first (MO
   it('does not count the monitor tail when it is not the last line (a log line in the scrollback)', () => {
     const above = ['  ⏵⏵ bypass permissions on · 1 monitor', '', SEP, '❯ ', SEP, '  some status line'].join('\n')
     expect(detectPaneState(above)).toBe('unknown')
+  })
+})
+
+// --- paneTurnInFlight: a tall parked box must not hide a live turn ---
+// Measured 2026-09-11 on agent-cortex-router: a working pane whose turn
+// counter sat 13 lines above the bottom -- pushed there by a multi-row parked
+// message -- classified 'typing', so the stuck-input watchers treated a
+// working agent as a wedged one.
+
+const TURN_COUNTER = '✢ Combobulating… (1m 16s · ↓ 4.0k tokens · thinking some more)'
+const IDLE_FOOTER_LINE = '  ⏵⏵ bypass permissions on (shift+tab to cycle)'
+
+function parkedBox(rows: number): string[] {
+  return [
+    SEP,
+    '❯ <inter-agent notice> első sor',
+    ...Array.from({ length: rows - 1 }, (_, i) => `  folytatás, ${i + 2}. sor`),
+    SEP,
+    IDLE_FOOTER_LINE,
+  ]
+}
+
+const WORKING_BEHIND_TALL_BOX = ['korábbi kimenet', TURN_COUNTER, '', ...parkedBox(10)].join('\n')
+const IDLE_TALL_BOX = ['korábbi kimenet', '⏺ Kész, elküldtem.', '', ...parkedBox(10)].join('\n')
+const STALE_COUNTER_ABOVE_OUTPUT = [
+  '✻ Accomplishing… (3m 8s · ↓ 9.3k tokens)',
+  ...Array.from({ length: 14 }, (_, i) => `kimenet ${i + 1}`),
+  '',
+  ...parkedBox(10),
+].join('\n')
+
+describe('paneTurnInFlight', () => {
+  it('the blind spot it exists for: detectPaneState reads a working pane behind a tall box as typing', () => {
+    expect(detectPaneState(WORKING_BEHIND_TALL_BOX)).toBe('typing')
+    expect(paneTurnInFlight(WORKING_BEHIND_TALL_BOX)).toBe(true)
+  })
+
+  it('the same geometry with a one-row box is already busy for detectPaneState', () => {
+    const oneRow = ['korábbi kimenet', TURN_COUNTER, '', ...parkedBox(1)].join('\n')
+    expect(detectPaneState(oneRow)).toBe('busy')
+    expect(paneTurnInFlight(oneRow)).toBe(true)
+  })
+
+  it('a busy pane is in flight', () => {
+    expect(paneTurnInFlight(BUSY_FULL_FOOTER)).toBe(true)
+  })
+
+  it('a tall parked box at an idle pane is not in flight (the genuine wedge stays visible)', () => {
+    expect(detectPaneState(IDLE_TALL_BOX)).toBe('typing')
+    expect(paneTurnInFlight(IDLE_TALL_BOX)).toBe(false)
+  })
+
+  it('a stale counter scrolled above real output stays outside the window', () => {
+    expect(paneTurnInFlight(STALE_COUNTER_ABOVE_OUTPUT)).toBe(false)
+  })
+
+  it('idle, single-row parked and empty panes are not in flight', () => {
+    expect(paneTurnInFlight(IDLE_BYPASS)).toBe(false)
+    expect(paneTurnInFlight(TYPING_PARKED)).toBe(false)
+    expect(paneTurnInFlight('')).toBe(false)
+  })
+})
+
+describe('decideStuckInputRecovery: parked behind a live turn', () => {
+  const TH = { confirmMs: 10_000, dedupMs: 12_000, maxAttempts: 3 }
+  const NONE = { parkedSig: null, firstSeenAt: null, lastRecoverAt: null, attempts: 0 }
+  const held = { parkedSig: 'msg-A', firstSeenAt: 0, lastRecoverAt: null, attempts: 0 }
+
+  it('holds without acting and without spending an attempt', () => {
+    const d = decideStuckInputRecovery('msg-A', held, 600_000, TH, { turnInFlight: true })
+    expect(d.recover).toBe(false)
+    expect(d.next).toEqual(held)
+  })
+
+  it('keeps the spell start, so the wait stays measurable', () => {
+    let state: StuckInputState = held
+    for (let now = 60_000; now <= 1_800_000; now += 60_000) {
+      state = decideStuckInputRecovery('msg-A', state, now, TH, { turnInFlight: true }).next
+    }
+    expect(state.firstSeenAt).toBe(0)
+    expect(state.attempts).toBe(0)
+  })
+
+  it('a new parked text still opens a spell (record only)', () => {
+    const d = decideStuckInputRecovery('msg-A', NONE, 5_000, TH, { turnInFlight: true })
+    expect(d.recover).toBe(false)
+    expect(d.next).toEqual({ parkedSig: 'msg-A', firstSeenAt: 5_000, lastRecoverAt: null, attempts: 0 })
+  })
+
+  it('recovery resumes on the first tick after the turn ends', () => {
+    const d = decideStuckInputRecovery('msg-A', held, 600_000, TH, { turnInFlight: false })
+    expect(d.recover).toBe(true)
+    expect(d.next.attempts).toBe(1)
   })
 })

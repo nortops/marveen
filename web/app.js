@@ -10,7 +10,7 @@ function avatarBust() { return _avatarEpoch ? `?t=${_avatarEpoch}` : '' }
 
 // === i18n runtime ===
 // Priority: localStorage['marveen.lang'] > DASHBOARD_LANG (server default, read
-// from /api/settings on init) > 'hu' (hardcoded fallback).
+// from the public /api/auth/status on init, so the sign-in page has it too) > 'hu' (hardcoded fallback).
 // Rick's spec (kanban card 209696a9): t(key,params), window._i18n={hu,en},
 // window._lang; {name} interpolation; EN-fallback then key; dev-mode warning.
 ;(() => {
@@ -38,6 +38,8 @@ function avatarBust() { return _avatarEpoch ? `?t=${_avatarEpoch}` : '' }
 
   function applyLang(lang) {
     window._lang = VALID.has(lang) ? lang : 'hu'
+    // DOCKERUX1118 (Geri 33345): the page's own language follows the shown one (it stayed "hu" on an English page).
+    document.documentElement.lang = window._lang
   }
 
   // Initialise from localStorage; server default fetched async below.
@@ -50,17 +52,18 @@ function avatarBust() { return _avatarEpoch ? `?t=${_avatarEpoch}` : '' }
   // server default was silently dead code. Microtasks run after the whole
   // classic script has evaluated, when window.fetch is the wrapped version.
   queueMicrotask(() => {
-    fetch('/api/settings')
+    // HOSTINGERI18N1122: /api/auth/status is public, /api/settings is not, so before a login the server default used to
+    // be out of reach and the sign-in page stayed in the 'hu' fallback even on an install set to en.
+    fetch('/api/auth/status')
       .then(r => r.ok ? r.json() : null)
       .then(data => {
         if (!data || localStorage.getItem(LS_KEY)) return
-        const entry = (data.settings || []).find(s => s.key === 'DASHBOARD_LANG')
-        if (!entry || !VALID.has(entry.value) || entry.value === window._lang) return
+        if (!VALID.has(data.lang) || data.lang === window._lang) return
         // Apply WITHOUT persisting (localStorage must keep overriding the
         // server default), and re-run the render dance: the initial
         // DOMContentLoaded render almost always beats this response, so a
         // plain applyLang would leave the page painted in the old language.
-        applyLang(entry.value)
+        applyLang(data.lang)
         if (typeof renderNav === 'function') renderNav()
         if (typeof renderStaticI18n === 'function') renderStaticI18n()
         const activeLink = document.querySelector('.sb-link.active[data-page]')
@@ -72,6 +75,7 @@ function avatarBust() { return _avatarEpoch ? `?t=${_avatarEpoch}` : '' }
   window.setLang = function setLang(lang) {
     if (!VALID.has(lang)) return
     window._lang = lang
+    document.documentElement.lang = lang
     localStorage.setItem(LS_KEY, lang)
     renderNav()
     // Static elements (kanban column titles, hints, empty states) are otherwise
@@ -169,6 +173,10 @@ function mainAgentId() {
       showLoginOverlay()
       return
     }
+    if (status && status.setup_code) {
+      showSetupCodeOverlay()
+      return
+    }
     // An installed (home-screen) PWA has its own localStorage, separate from
     // Safari's, and the manifest start_url has no ?token=, so the very first
     // standalone launch is token-less and 401s. There is no address bar to paste
@@ -210,6 +218,62 @@ function mainAgentId() {
     overlay.appendChild(box)
     document.body.appendChild(overlay)
     setTimeout(() => close.focus(), 50)
+  }
+
+  // DOCKERHTTPS1119: the public (HTTPS) address before the first login: no token reaches it, so the page asks for the
+  // one-time setup code from the container log. Redeemed in the body (never the URL); the server answers with a short
+  // setup-session cookie that lets the wizard create the dashboard password, then the page reloads into the wizard.
+  function showSetupCodeOverlay() {
+    if (document.getElementById('mv-setup-code-overlay')) return
+    const tr = (k, fallback) => (typeof window.t === 'function' ? window.t(k) : fallback) || fallback
+    const overlay = document.createElement('div')
+    overlay.id = 'mv-setup-code-overlay'
+    overlay.setAttribute('role', 'dialog')
+    overlay.setAttribute('aria-modal', 'true')
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:#1a1917;color:#faf9f5;' +
+      'display:flex;align-items:center;justify-content:center;padding:24px;' +
+      'font-family:system-ui,-apple-system,sans-serif'
+    const form = document.createElement('form')
+    form.style.cssText = 'max-width:420px;width:100%;display:flex;flex-direction:column;gap:14px'
+    const title = document.createElement('h2')
+    title.style.cssText = 'margin:0;font-size:18px;text-align:center'
+    title.textContent = tr('auth.setup_code.title', 'Enter the setup code')
+    const desc = document.createElement('p')
+    desc.style.cssText = 'margin:0;font-size:14px;opacity:0.8;line-height:1.5;text-align:center'
+    desc.textContent = tr('auth.setup_code.desc', 'Find the "Marveen setup code" line in the server log (on Hostinger: Docker Manager, View logs) and type the code here. It works once; a restart of the container gives a new one.')
+    const input = document.createElement('input')
+    input.type = 'text'
+    input.autocomplete = 'one-time-code'
+    input.spellcheck = false
+    input.setAttribute('aria-label', tr('auth.setup_code.title', 'Enter the setup code'))
+    input.style.cssText = 'padding:12px;border-radius:8px;border:1px solid #3a3936;background:#262522;color:#faf9f5;font-size:15px;font-family:ui-monospace,monospace'
+    const msg = document.createElement('div')
+    msg.setAttribute('role', 'alert')
+    msg.style.cssText = 'min-height:18px;font-size:13px;color:#f0a58f;text-align:center'
+    const submit = document.createElement('button')
+    submit.type = 'submit'
+    submit.style.cssText = 'padding:12px;border:0;border-radius:8px;background:#d97757;color:#1a1917;font-size:15px;font-weight:600'
+    submit.textContent = tr('auth.setup_code.submit', 'Continue')
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault()
+      const code = (input.value || '').trim()
+      if (!code) return
+      submit.disabled = true
+      msg.textContent = ''
+      try {
+        const r = await originalFetch('/api/auth/setup-code', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }) })
+        if (r.ok) { location.reload(); return }
+        if (r.status === 409) { location.reload(); return }
+        msg.textContent = r.status === 429 ? tr('auth.setup_code.throttled', 'Too many attempts. Wait a minute and try again.') : tr('auth.setup_code.wrong', 'This code is wrong, used or expired. Check the log, or restart the container for a new one.')
+      } catch {
+        msg.textContent = tr('auth.login.err_network', 'Network error')
+      }
+      submit.disabled = false
+    })
+    form.append(title, desc, input, msg, submit)
+    overlay.appendChild(form)
+    document.body.appendChild(overlay)
+    setTimeout(() => input.focus(), 50)
   }
 
   // Full-screen username+password login overlay. Posts to /api/auth/login; on
@@ -256,6 +320,28 @@ function mainAgentId() {
     const passEl = overlay.querySelector('#mv-login-pass')
     const errEl = overlay.querySelector('#mv-login-err')
     const submitEl = overlay.querySelector('#mv-login-submit')
+    // DOCKERHTTPS1119: the password was right and the second factor is on: the code step replaces the form; the
+    // pending token lives only in that step's closure. Expired: back to the password form with the reason.
+    const showCodeStep = (pending) => {
+      form.hidden = true
+      const cancelEl = overlay.querySelector('#mv-login-cancel')
+      const step = buildTotpCodeStep({
+        pending,
+        idPrefix: 'mv-totp',
+        title: tr('auth.login.title', 'Sign in'),
+        formClass: 'mv-auth-card',
+        descClass: 'mv-auth-desc',
+        errClass: 'mv-auth-err',
+        cancel: cancelEl ? { label: cancelEl.textContent, onClick: () => cancelEl.click() } : null,
+        onExpired: (msg) => {
+          step.remove()
+          form.hidden = false
+          errEl.textContent = msg
+          setTimeout(() => passEl.focus(), 50)
+        },
+      })
+      overlay.appendChild(step)
+    }
     form.addEventListener('submit', async (e) => {
       e.preventDefault()
       errEl.textContent = ''
@@ -270,10 +356,17 @@ function mainAgentId() {
           body: JSON.stringify({ username, password }),
         })
         if (r.ok) { window.location.reload(); return }
+        let data = null
+        try { data = await r.json() } catch { /* not JSON */ }
+        // DOCKERHTTPS1119: keyed on the contract's code, never on the English error text.
+        const o = totpOutcome(r.status, data)
+        if (o.kind === 'totp_required') { passEl.value = ''; showCodeStep(o.pending); return }
         if (r.status === 429) {
-          let retry = 0
-          try { retry = (await r.json()).retry_after_s || 0 } catch { /* ignore */ }
+          const retry = (data && data.retry_after_s) || 0
           errEl.textContent = tr('auth.login.err_throttled', 'Too many attempts. Try again later.') + (retry ? ' (' + retry + 's)' : '')
+        } else if (o.kind === 'unavailable') {
+          // No password-only fallback: the server refuses it, the text says what must be repaired.
+          errEl.textContent = totpOutcomeText(o)
         } else {
           errEl.textContent = tr('auth.login.err_invalid', 'Invalid credentials.')
         }
@@ -298,11 +391,34 @@ function mainAgentId() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password }),
       })
-      let retryAfter = 0
-      if (r.status === 429) { try { retryAfter = (await r.json()).retry_after_s || 0 } catch { /* ignore */ } }
-      return { ok: r.ok, status: r.status, retryAfter }
+      let data = null
+      if (!r.ok) { try { data = await r.json() } catch { /* not JSON */ } }
+      const retryAfter = (r.status === 429 && data && data.retry_after_s) || 0
+      // DOCKERHTTPS1119: a right password with the second factor on comes back as totp_required and its pending token.
+      const o = totpOutcome(r.status, data)
+      return {
+        ok: r.ok, status: r.status, retryAfter,
+        totpRequired: o.kind === 'totp_required', pending: o.kind === 'totp_required' ? o.pending : '',
+        code: data && typeof data.code === 'string' ? data.code : '',
+      }
     } catch {
-      return { ok: false, status: 0, retryAfter: 0 }
+      return { ok: false, status: 0, retryAfter: 0, totpRequired: false, pending: '', code: '' }
+    }
+  }
+
+  // DOCKERHTTPS1119: the two-step sign-in endpoints, on the unwrapped fetch like the login above: their 401s (a wrong
+  // code or password) must not wipe the stored token or open the full-screen login. The owner session rides on the
+  // mv_session cookie. Returns { status, body }; status 0 on a network error.
+  window.mvTotpCall = async (method, path, body) => {
+    try {
+      const init = { method, cache: 'no-store', credentials: 'same-origin' }
+      if (body !== undefined) { init.headers = { 'Content-Type': 'application/json' }; init.body = JSON.stringify(body) }
+      const r = await originalFetch(path, init)
+      let data = null
+      try { data = await r.json() } catch { /* not JSON */ }
+      return { status: r.status, body: data }
+    } catch {
+      return { status: 0, body: null }
     }
   }
 
@@ -483,6 +599,7 @@ function switchPage(pageId) {
   if (pageId === 'status') loadStatus()
   if (pageId === 'recall') loadRecallPage()
   if (pageId === 'bgTasks') loadBgTasksPage()
+  if (pageId === 'agentCatalog') loadAgentCatalogPage()
   if (pageId === 'vault') loadVaultPage()
   if (pageId === 'approvals') loadApprovalsPage()
   if (pageId === 'settings') loadSettings()
@@ -536,7 +653,7 @@ const SIDEBAR_GROUPS_LS_KEY = 'marveen.sidebarGroups'
 const SIDEBAR_GROUPS = [
   // 'activity' is gone: the live per-agent status is now the Agents page's
   // "Aktivitás" card mode, so it has no page, no nav entry and no URL.
-  { key: 'team',        labelKey: 'nav.group.team',        pages: ['agents', 'messages', 'tasks', 'bgTasks'] },
+  { key: 'team',        labelKey: 'nav.group.team',        pages: ['agents', 'agentCatalog', 'messages', 'tasks', 'bgTasks'] },
   { key: 'knowledge',   labelKey: 'nav.group.knowledge',   pages: ['memories', 'skills', 'research', 'ideas'] },
   { key: 'stats',       labelKey: 'nav.group.stats',       pages: ['costs', 'tokenUsage'] },
   { key: 'system',      labelKey: 'nav.group.system',      pages: ['status', 'naplo', 'updates', 'settings', 'vault'] },
@@ -612,7 +729,7 @@ const NAV_I18N = {
   overview: 'nav.overview', kanban: 'nav.kanban', archived: 'nav.archived',
   agents: 'nav.agents', activity: 'nav.activity', team: 'nav.team',
   messages: 'nav.messages', tasks: 'nav.tasks', memories: 'nav.memories',
-  recall: 'nav.recall', naplo: 'nav.recall', bgTasks: 'nav.bgTasks',
+  recall: 'nav.recall', naplo: 'nav.recall', bgTasks: 'nav.bgTasks', agentCatalog: 'nav.agentCatalog',
   skills: 'nav.skills', connectors: 'nav.connectors', clitools: 'nav.clitools', migrate: 'nav.migrate',
   approvals: 'nav.approvals',
   docs: 'nav.docs', research: 'nav.research', status: 'nav.status',
@@ -646,6 +763,7 @@ const PAGE_HEADER_I18N = {
   memoriesPage:   { title: 'memories.page_title',    sub: 'memories.page_subtitle' },
   recallPage:     { title: 'recall.page_title',      sub: 'recall.page_subtitle' },
   bgTasksPage:    { title: 'bgTasks.page_title',     sub: 'bgTasks.page_subtitle' },
+  agentCatalogPage: { title: 'agentCatalog.page_title', sub: 'agentCatalog.page_subtitle' },
   connectorsPage: { title: 'connectors.page_title',  sub: 'connectors.page_subtitle' },
   migratePage:    { title: 'migrate.page_title',     sub: 'migrate.page_subtitle' },
   docsPage:       { title: 'docs.page_title',        sub: 'docs.page_subtitle' },
@@ -774,6 +892,9 @@ function renderStaticI18n() {
   // if loadUpdates' refetch is slow or fails.
   if (typeof renderUpdatesVersion === 'function') renderUpdatesVersion(window._updatesStatus)
   if (typeof applyOnboardingProviderTab === 'function') applyOnboardingProviderTab()
+  // DOCKERI18N1119: the "no channel configured" banner's text is drawn from /api/marveen with the language of that
+  // moment; on a fresh install that answer can come before DASHBOARD_LANG (Geri, v1.50.1: Hungarian on an en install).
+  if (typeof updateMainChannelUnconfBanner === 'function' && mainChannelUnconfLast) updateMainChannelUnconfBanner(mainChannelUnconfLast)
 }
 
 // Initial render on page load.
@@ -795,9 +916,9 @@ if (document.readyState !== 'loading') {
 // "Aktivitás" card mode (see renderAgentCardActivity). This table is the shared
 // vocabulary: the same states, labels, colours and tooltips as before.
 const ACTIVITY_STATE_META = {
-  working: { label: () => t('activity.state.working'), cls: 'act-working', tip: 'Élő állapot (a tmux pane tartalmából, 3 másodpercenként): éppen dolgozik / gondolkodik.' },
-  idle: { label: () => t('activity.state.idle'), cls: 'act-idle', tip: 'Élő állapot (3 másodpercenként): fut, de épp nem csinál semmit.' },
-  dead: { label: () => t('activity.state.dead'), cls: 'act-dead', tip: 'A tmux session él, de nincs benne Claude CLI: a pane egy shell promptra esett vissza. Ez nem várakozás, ez halott ágens -- indítsd újra.' },
+  working: { label: () => t('activity.state.working'), cls: 'act-working', tip: () => t('activity.tip.working') },
+  idle: { label: () => t('activity.state.idle'), cls: 'act-idle', tip: () => t('activity.tip.idle') },
+  dead: { label: () => t('activity.state.dead'), cls: 'act-dead', tip: () => t('activity.tip.dead') },
   // Main thread idle, background (sub-)agents running. Display-only: the API's
   // `state` stays 'idle' and this is picked by activityDisplayState.
   subagents: {
@@ -805,11 +926,11 @@ const ACTIVITY_STATE_META = {
       ? t('activity.state.subagents_queued', { n: entry.bgAgents.running, q: entry.bgAgents.queued })
       : t('activity.state.subagents', { n: entry.bgAgents.running }),
     cls: 'act-subagents',
-    tip: 'Élő állapot (3 másodpercenként): a fő szál tétlen, de a háttér-alügynökei dolgoznak. A "vár" az alügynököknek küldött, még fel nem vett üzenetek száma.',
+    tip: () => t('activity.tip.subagents'),
   },
-  unknown: { label: () => t('activity.state.unknown'), cls: 'act-unknown', tip: 'Élő állapot: nem sikerült megállapítani a session pane tartalmából.' },
-  error: { label: () => t('activity.state.error'), cls: 'act-error', tip: 'Élő állapot: hiba látszik az ágens session paneljén.' },
-  stopped: { label: () => t('activity.state.stopped'), cls: 'act-stopped', tip: 'Élő állapot: az ágens session nem fut.' },
+  unknown: { label: () => t('activity.state.unknown'), cls: 'act-unknown', tip: () => t('activity.tip.unknown') },
+  error: { label: () => t('activity.state.error'), cls: 'act-error', tip: () => t('activity.tip.error') },
+  stopped: { label: () => t('activity.state.stopped'), cls: 'act-stopped', tip: () => t('activity.tip.stopped') },
 }
 
 // The state an entry is SHOWN in. The main thread working always wins; only an
@@ -868,7 +989,7 @@ function agentActivityBodyHtml(entry) {
     : ''
   return (
     '<div class="agent-act-head">' +
-      '<span class="activity-badge ' + metaRaw.cls + '" title="' + escapeHtml(metaRaw.tip || '') + '">' + (entry.state === 'working' ? '<span class="act-orb" aria-hidden="true"></span>' : '') + escapeHtml(label) + '</span>' +
+      '<span class="activity-badge ' + metaRaw.cls + '" title="' + escapeHtml(typeof metaRaw.tip === 'function' ? metaRaw.tip() : (metaRaw.tip || '')) + '">' + (entry.state === 'working' ? '<span class="act-orb" aria-hidden="true"></span>' : '') + escapeHtml(label) + '</span>' +
       '<span class="agent-act-head-right">' + modeChip + termIcon + '</span>' +
     '</div>' +
     (tail
@@ -1048,7 +1169,7 @@ async function renderKanbanSummary() {
     chip.addEventListener('click', () => {
       const target = kanbanCards.find((c) => c.id === ref.id)
       if (target) showCardDetail(target)
-      else showToast(t('kanban.toast.blocker_not_on_board'))
+      else showToast(t('kanban.toast.blocker_not_on_board'), 'warn')
     })
     return chip
   }
@@ -2285,7 +2406,7 @@ function wireKanbanColumnDnD(col) {
       })
       loadKanban()
     } catch {
-      showToast(t('kanban.toast.move_error'))
+      showToast(t('kanban.toast.move_error'), 'error')
     }
   })
 }
@@ -2452,7 +2573,7 @@ async function kanbanTouchEnd(e) {
     if (!r.ok) throw new Error('move failed')
     loadKanban()
   } catch {
-    showToast(t('kanban.toast.move_error'))
+    showToast(t('kanban.toast.move_error'), 'error')
   }
 }
 
@@ -2573,12 +2694,12 @@ document.getElementById('saveCardBtn').addEventListener('click', async () => {
         if (res.status === 409 && e.conflict === 'stale_version') {
           // The modal STAYS OPEN: the typed text is the only copy of it, and closing
           // would destroy it to report that something else was nearly destroyed.
-          showToast(t('kanban.toast.stale_version_form'), 8000)
+          showToast(t('kanban.toast.stale_version_form'), { kind: 'warn', duration: 8000 })
           return
         }
         throw new Error(e.error || res.status)
       }
-      showToast(t('kanban.toast.card_updated'))
+      showToast(t('kanban.toast.card_updated'), 'success')
     } else {
       data.status = document.getElementById('cardEditStatus').value
       const res = await fetch('/api/kanban', {
@@ -2587,12 +2708,12 @@ document.getElementById('saveCardBtn').addEventListener('click', async () => {
         body: JSON.stringify(data),
       })
       if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || res.status) }
-      showToast(t('kanban.toast.card_created'))
+      showToast(t('kanban.toast.card_created'), 'success')
     }
     closeModal(cardModalOverlay)
     loadKanban()
   } catch (err) {
-    showToast(t('kanban.toast.save_error_msg', { msg: err.message }))
+    showToast(t('kanban.toast.save_error_msg', { msg: err.message }), 'error')
   }
 })
 
@@ -2626,7 +2747,7 @@ async function renderCardLabelsSection(card) {
         await fetch(`/api/kanban/${encodeURIComponent(card.id)}/labels/${encodeURIComponent(label.id)}`, { method: 'DELETE' })
         renderCardLabelsSection(card)
         loadKanban()
-      } catch { showToast(t('kanban.toast.label_remove_error')) }
+      } catch { showToast(t('kanban.toast.label_remove_error'), 'error') }
     })
     listEl.appendChild(pill)
   }
@@ -2651,7 +2772,7 @@ async function renderCardLabelsSection(card) {
       })
       renderCardLabelsSection(card)
       loadKanban()
-    } catch { showToast(t('kanban.toast.label_add_error')) }
+    } catch { showToast(t('kanban.toast.label_add_error'), 'error') }
   }
 
   newForm.style.display = 'none'
@@ -2683,7 +2804,7 @@ async function renderCardLabelsSection(card) {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, color: selectedColor }),
       })
-      if (!r.ok) { showToast(t('kanban.toast.label_create_error')); return }
+      if (!r.ok) { showToast(t('kanban.toast.label_create_error'), 'error'); return }
       const newLabel = await r.json()
       kanbanAllLabels.push(newLabel)
       await fetch(`/api/kanban/${encodeURIComponent(card.id)}/labels`, {
@@ -2693,7 +2814,7 @@ async function renderCardLabelsSection(card) {
       newForm.style.display = 'none'
       renderCardLabelsSection(card)
       loadKanban()
-    } catch { showToast(t('kanban.toast.label_create_error')) }
+    } catch { showToast(t('kanban.toast.label_create_error'), 'error') }
   }
 }
 
@@ -2785,7 +2906,7 @@ async function renderCardBlockersSection(card) {
     link.addEventListener('click', () => {
       const target = kanbanCards.find((c) => c.id === ref.id)
       if (target) showCardDetail(target)
-      else showToast(t('kanban.toast.blocker_not_on_board'))
+      else showToast(t('kanban.toast.blocker_not_on_board'), 'warn')
     })
     row.appendChild(link)
     const state = document.createElement('span')
@@ -2804,7 +2925,7 @@ async function renderCardBlockersSection(card) {
           await fetch(`/api/kanban/${encodeURIComponent(card.id)}/blockers/${encodeURIComponent(ref.id)}`, { method: 'DELETE' })
           renderCardBlockersSection(card)
           loadKanban()
-        } catch { showToast(t('kanban.toast.blocker_remove_error')) }
+        } catch { showToast(t('kanban.toast.blocker_remove_error'), 'error') }
       })
       row.appendChild(rm)
     }
@@ -2851,13 +2972,13 @@ async function renderCardBlockersSection(card) {
         // The server's message names the actual reason (cycle, missing card);
         // surfacing it beats a generic failure the operator has to guess at.
         const err = await r.json().catch(() => ({}))
-        showToast(err.error || t('kanban.toast.blocker_add_error'))
+        showToast(err.error || t('kanban.toast.blocker_add_error'), 'error')
         addSelect.value = ''
         return
       }
       renderCardBlockersSection(card)
       loadKanban()
-    } catch { showToast(t('kanban.toast.blocker_add_error')) }
+    } catch { showToast(t('kanban.toast.blocker_add_error'), 'error') }
   }
 }
 
@@ -2968,11 +3089,11 @@ async function showCardDetail(card) {
         if (!r.ok) throw new Error('move failed')
         card.status = newVal
         restore(newVal)
-        showToast(t('kanban.toast.status_updated'))
+        showToast(t('kanban.toast.status_updated'), 'success')
         loadKanban && loadKanban()
       } catch {
         restore(current)
-        showToast(t('kanban.toast.move_error'))
+        showToast(t('kanban.toast.move_error'), 'error')
       }
     }
     sel.addEventListener('change', save)
@@ -3017,7 +3138,7 @@ async function showCardDetail(card) {
           const e = await r.json().catch(() => ({}))
           if (e.conflict === 'stale_version') {
             assigneeValueEl.textContent = current ? current : t('kanban.meta.none')
-            showToast(t('kanban.toast.stale_version'), 6000)
+            showToast(t('kanban.toast.stale_version'), { kind: 'warn', duration: 6000 })
             loadKanban && loadKanban()
             return
           }
@@ -3029,11 +3150,11 @@ async function showCardDetail(card) {
         if (Number.isInteger(saved.version)) card.version = saved.version
         card.assignee = newVal
         assigneeValueEl.textContent = newVal ? newVal : t('kanban.meta.none')
-        showToast(t('kanban.toast.assignee_updated'))
+        showToast(t('kanban.toast.assignee_updated'), 'success')
         loadKanban && loadKanban()
       } catch {
         assigneeValueEl.textContent = current ? current : t('kanban.meta.none')
-        showToast(t('kanban.toast.save_error'))
+        showToast(t('kanban.toast.save_error'), 'error')
       }
     }
     sel.addEventListener('change', save)
@@ -3097,11 +3218,11 @@ async function showCardDetail(card) {
       if (r.ok) {
         const saved = await r.json().catch(() => ({}))
         if (Number.isInteger(saved.version)) card.version = saved.version
-        card.parent_id = newParentId; showToast(label); loadKanban(); showCardDetail(card)
+        card.parent_id = newParentId; showToast(label, 'success'); loadKanban(); showCardDetail(card)
       } else if (r.status === 409 && (await r.json().catch(() => ({}))).conflict === 'stale_version') {
-        showToast(t('kanban.toast.stale_version'), 6000)
+        showToast(t('kanban.toast.stale_version'), { kind: 'warn', duration: 6000 })
         loadKanban()
-      } else showToast(t('kanban.toast.save_error'))
+      } else showToast(t('kanban.toast.save_error'), 'error')
     }
     parentMetaItem.style.display = ''
   } else {
@@ -3142,7 +3263,7 @@ async function showCardDetail(card) {
     const content = document.getElementById('commentContent').value.trim()
     const author = document.getElementById('commentAuthor').value
     if (!content) { document.getElementById('commentContent').focus(); return }
-    if (!author) { showToast(t('kanban.toast.comment_no_author')); return }
+    if (!author) { showToast(t('kanban.toast.comment_no_author'), 'warn'); return }
     try {
       const res = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/comments`, {
         method: 'POST',
@@ -3154,13 +3275,13 @@ async function showCardDetail(card) {
       if (!res.ok) {
         let msg = `HTTP ${res.status}`
         try { msg = (await res.json()).error || msg } catch {}
-        showToast(t('kanban.toast.comment_failed', { msg }))
+        showToast(t('kanban.toast.comment_failed', { msg }), 'error')
         return
       }
       document.getElementById('commentContent').value = ''
       showCardDetail(card) // refresh
     } catch {
-      showToast(t('kanban.toast.comment_error'))
+      showToast(t('kanban.toast.comment_error'), 'error')
     }
   }
 
@@ -3194,10 +3315,10 @@ async function showCardDetail(card) {
     try {
       await fetch(`/api/kanban/${encodeURIComponent(card.id)}/archive`, { method: 'POST' })
       closeModal(cardDetailOverlay)
-      showToast(t('kanban.toast.card_archived'))
+      showToast(t('kanban.toast.card_archived'), 'success')
       loadKanban()
     } catch {
-      showToast(t('kanban.toast.archive_error'))
+      showToast(t('kanban.toast.archive_error'), 'error')
     }
   }
 
@@ -3213,10 +3334,10 @@ async function showCardDetail(card) {
     try {
       await fetch(`/api/kanban/${encodeURIComponent(card.id)}`, { method: 'DELETE' })
       closeModal(cardDetailOverlay)
-      showToast(t('kanban.toast.card_deleted'))
+      showToast(t('kanban.toast.card_deleted'), 'success')
       loadKanban()
     } catch {
-      showToast(t('common.error_delete'))
+      showToast(t('common.error_delete'), 'error')
     }
   }
 
@@ -3242,11 +3363,11 @@ async function showCardDetail(card) {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ title, parent_id: card.id, status: card.status, priority: card.priority, project: card.project || null, assignee: null }),
           })
-          if (!r.ok) { showToast(t('kanban.toast.subtask_error')); return }
-          showToast(t('kanban.toast.subtask_created'))
+          if (!r.ok) { showToast(t('kanban.toast.subtask_error'), 'error'); return }
+          showToast(t('kanban.toast.subtask_created'), 'success')
           loadKanban()
           showCardDetail(card)
-        } catch { showToast(t('kanban.toast.subtask_error')) }
+        } catch { showToast(t('kanban.toast.subtask_error'), 'error') }
       }
     } else {
       addSubtaskSection.style.display = 'none'
@@ -3284,11 +3405,11 @@ async function showCardDetail(card) {
             if (!confirmed) return
             try {
               const r = await fetch(`/api/kanban/${encodeURIComponent(ch.id)}`, { method: 'DELETE' })
-              if (!r.ok) { showToast(t('common.error_delete')); return }
-              showToast(t('kanban.toast.subtask_deleted'))
+              if (!r.ok) { showToast(t('common.error_delete'), 'error'); return }
+              showToast(t('kanban.toast.subtask_deleted'), 'success')
               loadKanban()
               showCardDetail(card)
-            } catch { showToast(t('common.error_delete')) }
+            } catch { showToast(t('common.error_delete'), 'error') }
           }
           div.appendChild(delBtn)
         }
@@ -3313,7 +3434,7 @@ async function showCardDetail(card) {
     try {
       const res = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/breakdown`, { method: 'POST' })
       const data = await res.json()
-      if (!res.ok) { showToast(data.error || t('kanban.breakdown.failed')); return }
+      if (!res.ok) { showToast(data.error || t('kanban.breakdown.failed'), 'error'); return }
       breakdownMode = 'kanban'
       breakdownCardId = card.id
       breakdownSubtasks = data.subtasks
@@ -3321,7 +3442,7 @@ async function showCardDetail(card) {
       const dodSec = document.getElementById('breakdownDoDSection')
       if (dodSec) dodSec.style.display = 'none'
     } catch (err) {
-      showToast(t('kanban.breakdown.failed'))
+      showToast(t('kanban.breakdown.failed'), 'error')
     } finally {
       btn.disabled = false
       btn.replaceChildren(...label)
@@ -3337,13 +3458,13 @@ async function triggerBreakdown(card) {
   try {
     const res = await fetch(`/api/kanban/${encodeURIComponent(card.id)}/breakdown`, { method: 'POST' })
     const data = await res.json()
-    if (!res.ok) { showToast(data.error || t('kanban.breakdown.failed')); return }
+    if (!res.ok) { showToast(data.error || t('kanban.breakdown.failed'), 'error'); return }
     breakdownMode = 'kanban'
     breakdownCardId = card.id
     breakdownSubtasks = data.subtasks
     showBreakdownModal(data.subtasks, card)
   } catch {
-    showToast(t('kanban.breakdown.failed'))
+    showToast(t('kanban.breakdown.failed'), 'error')
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '⚡' }
   }
@@ -3402,7 +3523,7 @@ document.getElementById('breakdownAcceptBtn').addEventListener('click', async ()
     const description = breakdownSubtasks[idx]?.description || ''
     accepted.push({ title, assignee, priority, description })
   })
-  if (accepted.length === 0) { showToast(t('kanban.breakdown.select_one')); return }
+  if (accepted.length === 0) { showToast(t('kanban.breakdown.select_one'), 'warn'); return }
   try {
     if (breakdownMode === 'idea') {
       const successCriteria = document.getElementById('breakdownSuccessCriteria')?.value.trim() || undefined
@@ -3412,9 +3533,9 @@ document.getElementById('breakdownAcceptBtn').addEventListener('click', async ()
         body: JSON.stringify({ subtasks: accepted, success_criteria: successCriteria }),
       })
       const data = await res.json()
-      if (!res.ok) { showToast(data.error || t('common.error_save')); return }
+      if (!res.ok) { showToast(data.error || t('common.error_save'), 'error'); return }
       closeModal(breakdownOverlay)
-      showToast(t('kanban.breakdown.promoted', { count: data.child_count }))
+      showToast(t('kanban.breakdown.promoted', { count: data.child_count }), 'success')
       loadIdeasPage()
       return
     }
@@ -3424,13 +3545,13 @@ document.getElementById('breakdownAcceptBtn').addEventListener('click', async ()
       body: JSON.stringify({ subtasks: accepted }),
     })
     const data = await res.json()
-    if (!res.ok) { showToast(data.error || t('common.error_save')); return }
+    if (!res.ok) { showToast(data.error || t('common.error_save'), 'error'); return }
     closeModal(breakdownOverlay)
     closeModal(cardDetailOverlay)
-    showToast(t('kanban.breakdown.created_count', { count: data.created.length }))
+    showToast(t('kanban.breakdown.created_count', { count: data.created.length }), 'success')
     loadKanban()
   } catch {
-    showToast(t('common.error_save'))
+    showToast(t('common.error_save'), 'error')
   }
 })
 
@@ -3468,6 +3589,8 @@ let agents = []
 // the underlying measurement reads each agent's transcript from disk, so it is
 // only worth paying for when the Agents page is actually being (re)drawn.
 let contextGuardPct = {}
+// CTXUNKNOWNMODEL1122: agents whose pct is measured against an ASSUMED window (unknown model, no limitTokens pinned).
+let contextGuardAssumed = {}
 let currentAgent = null
 // API-safe agent id for the currently open detail modal. Sub-agents key off
 // their name; the main agent's detail object carries name:'marveen' for legacy
@@ -3480,6 +3603,9 @@ let wizardStep = 1
 let generatedClaudeMd = ''
 let generatedSoulMd = ''
 let wizardCreatedName = ''
+// True once step 3's texts came from the created agent's detail. When that GET failed, the boxes start empty and an
+// empty claudeMd/soulMd in the Create PUT would overwrite the generated files (#2845).
+let wizardTextsLoaded = false
 // Set from the POST /api/agents response when the backend fell back to a template
 // because personality generation failed. It answers 200 in that case (the agent
 // EXISTS and works), so `res.ok` alone cannot tell the operator anything -- without
@@ -3584,7 +3710,7 @@ async function canActAsOwnerNow() {
 // Wizard open: without the owner, the login comes first, so no create starts that the server would refuse halfway.
 addBtn.addEventListener('click', async () => {
   if (!(await canActAsOwnerNow())) {
-    showToast(t('common.owner_session_required'))
+    showToast(t('common.owner_session_required'), 'warn')
     if (typeof window.mvShowLogin === 'function') window.mvShowLogin({ cancellable: true })
     return
   }
@@ -3767,6 +3893,7 @@ function resetWizard() {
   generatedClaudeMd = ''
   generatedSoulMd = ''
   wizardCreatedName = ''
+  wizardTextsLoaded = false
   wizardPersonalityPending = null
   renderWizardPendingBanner()
   document.getElementById('wizardClaudeMd').value = ''
@@ -3797,6 +3924,15 @@ agentModel.addEventListener('change', () => updateCustomModelIdRow(agentModel))
 
 // Step 1 -> Step 2 (generate)
 document.getElementById('wizardNextBtn').addEventListener('click', async () => {
+  // The agent already exists (Back from step 3): Next returns to its review and never POSTs again, so a second Next
+  // cannot answer 409 or, after a rename, create a second agent (#2845). The step 1 fields are not applied again,
+  // and the toast says so.
+  if (wizardCreatedName) {
+    showToast(t('agents.wizard.already_created', { name: wizardCreatedName }))
+    wizardStep = 3
+    updateWizardUI()
+    return
+  }
   const name = agentName.value.trim()
   const desc = agentDesc.value.trim()
   // A custom provider goes in its own field with the model id typed beside it, as the agent editor saves it.
@@ -3806,7 +3942,7 @@ document.getElementById('wizardNextBtn').addEventListener('click', async () => {
   const customModelId = customProvider ? customModelInput.value.trim() : ''
   if (!name) { agentName.focus(); return }
   if (!desc) { agentDesc.focus(); return }
-  if (customProvider && !customModelId) { customModelInput.focus(); showToast(t('agents.model.custom_model_required')); return }
+  if (customProvider && !customModelId) { customModelInput.focus(); showToast(t('agents.model.custom_model_required'), 'warn'); return }
 
   wizardStep = 2
   updateWizardUI()
@@ -3853,6 +3989,7 @@ document.getElementById('wizardNextBtn').addEventListener('click', async () => {
       const detail = await detailRes.json()
       generatedClaudeMd = detail.claudeMd || detail.content || ''
       generatedSoulMd = detail.soulMd || ''
+      wizardTextsLoaded = true
     }
 
     statusEl.textContent = t('kanban.breakdown.running')
@@ -3883,8 +4020,17 @@ document.getElementById('wizardNextBtn').addEventListener('click', async () => {
       updateWizardUI()
     }, 600)
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
-    wizardStep = 1
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
+    // Back to step 1 only when the create POST itself failed. Once the agent exists, a later error (detail fetch,
+    // avatar) goes on to its review: step 1 would only offer to create it again (#2845).
+    if (wizardCreatedName) {
+      wizardStep = 3
+      document.getElementById('wizardClaudeMd').value = generatedClaudeMd
+      document.getElementById('wizardSoulMd').value = generatedSoulMd
+      renderWizardPendingBanner()
+    } else {
+      wizardStep = 1
+    }
     updateWizardUI()
   }
 })
@@ -3909,11 +4055,15 @@ document.getElementById('wizardCreateBtn').addEventListener('click', async () =>
   createBtn.querySelector('.btn-loading').hidden = false
 
   try {
-    // Update with edited content
+    // Update with edited content. A text that never loaded and is still empty is left out: the server keeps the
+    // generated file for an omitted field, while an empty string would overwrite it (#2845).
+    const edits = {}
+    if (wizardTextsLoaded || claudeMd) edits.claudeMd = claudeMd
+    if (wizardTextsLoaded || soulMd) edits.soulMd = soulMd
     const res = await fetch(`/api/agents/${encodeURIComponent(name)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ claudeMd, soulMd }),
+      body: JSON.stringify(edits),
     })
 
     if (!res.ok) {
@@ -3922,7 +4072,7 @@ document.getElementById('wizardCreateBtn').addEventListener('click', async () =>
     }
 
     closeModal(agentWizardOverlay)
-    showToast(t('agents.wizard.created'))
+    showToast(t('agents.wizard.created'), 'success')
     await loadAgents()
     // Drop the operator straight into the Telegram tab of the new agent so
     // the pairing step is in front of them -- easy to miss otherwise.
@@ -3931,7 +4081,7 @@ document.getElementById('wizardCreateBtn').addEventListener('click', async () =>
       switchAgentTab('channel')
     } catch { /* detail open failed, list refresh already happened */ }
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   } finally {
     createBtn.disabled = false
     createBtn.querySelector('.btn-text').hidden = false
@@ -3940,11 +4090,19 @@ document.getElementById('wizardCreateBtn').addEventListener('click', async () =>
 })
 
 // === Toast ===
+// The second argument is the duration in ms, a kind, or both: showToast(msg, 8000), showToast(msg, 'error'),
+// showToast(msg, { kind: 'error', duration: 8000 }). The kind colours the toast (.toast-error / .toast-success /
+// .toast-warn in style.css); without one, or with an unknown one, it stays the neutral toast. Anything but a
+// finite duration means the default (a type word where the duration went once made the delay NaN, and the toast was
+// gone at once).
 function showToast(msg, duration = 3000) {
-  // Some callers pass a type word ('error') where the duration goes. The delay was then NaN, which setTimeout runs
-  // at once: the toast was gone before it could be seen. Anything but a finite number means the default.
+  const TOAST_KINDS = ['error', 'success', 'warn']
+  let kind = ''
+  if (typeof duration === 'string') { kind = duration; duration = 3000 }
+  else if (duration && typeof duration === 'object') { kind = duration.kind; duration = duration.duration }
   if (typeof duration !== 'number' || !Number.isFinite(duration)) duration = 3000
   toast.textContent = msg
+  for (const k of TOAST_KINDS) toast.classList.toggle('toast-' + k, k === kind)
   toast.classList.add('visible')
   setTimeout(() => toast.classList.remove('visible'), toastDuration(msg, duration))
 }
@@ -4023,9 +4181,11 @@ async function loadAgents() {
     agents = await agentsRes.json()
     if (fedStatus && Array.isArray(fedStatus.peers)) federatedPeerStatus = fedStatus.peers
     contextGuardPct = {}
+    contextGuardAssumed = {}
     if (ctxGuard && Array.isArray(ctxGuard.agents)) {
       for (const g of ctxGuard.agents) {
         if (typeof g.pct === 'number' && isFinite(g.pct)) contextGuardPct[g.agent] = g.pct
+        if (g.assumedWindow === true) contextGuardAssumed[g.agent] = true
       }
     }
     if (marveenRes.ok) {
@@ -4069,7 +4229,10 @@ function contextPctBadgeHtml(agentName) {
   // Mirrors context-guard's own default tiers (actPct 0.90, hardPct 0.97):
   // green under act, amber from act to hard, red at/over hard.
   const tier = pct >= 0.97 ? 'danger' : pct >= 0.90 ? 'warning' : 'ok'
-  return `<span class="agent-ctx-badge ${tier}" title="${escapeHtml(t('agents.context_tip', { pct: pctRound }))}">${pctRound}%</span>`
+  // An assumed window (unknown model) is marked with ~ and says so in the tooltip.
+  const assumed = contextGuardAssumed[agentName] === true
+  const tip = t('agents.context_tip', { pct: pctRound }) + (assumed ? ' ' + t('agents.context_assumed_tip') : '')
+  return `<span class="agent-ctx-badge ${tier}" title="${escapeHtml(tip)}">${assumed ? '~' : ''}${pctRound}%</span>`
 }
 
 // Populate the auto-restart controls + context display from an agent payload.
@@ -4260,7 +4423,7 @@ document.getElementById('saveContextGuardBtn').addEventListener('click', async (
   const actPct = Number(cgActPct.value) / 100
   const hardPct = Number(cgHardPct.value) / 100
   if (hardPct < actPct) {
-    showToast(t('agents.settings.ctx_guard_pct_hint'))
+    showToast(t('agents.settings.ctx_guard_pct_hint'), 'warn')
     return
   }
 
@@ -4286,8 +4449,8 @@ document.getElementById('saveContextGuardBtn').addEventListener('click', async (
       body: JSON.stringify(cfg),
     })
     if (!res.ok) throw new Error()
-    showToast(t('agents.toast.ctx_guard_saved'))
-  } catch { showToast(t('common.error_save')) }
+    showToast(t('agents.toast.ctx_guard_saved'), 'success')
+  } catch { showToast(t('common.error_save'), 'error') }
 })
 
 // Populate the idle-flush controls from an agent payload. Same source as
@@ -4419,6 +4582,8 @@ async function openMarveenDetail() {
     }
   } catch {}
   applyMarveenReadonlyMode(true)
+  // The main agent's voice reply section stayed blank: only the sub-agent detail loaded it (#2848).
+  loadVoiceConfig(mainAgentId())
 
   // Telegram tab -- without this the tab stays in the default "not connected"
   // view even though the bot is running and receiving messages.
@@ -4480,18 +4645,31 @@ function applyMarveenReadonlyMode(readOnly) {
     const btn = document.getElementById(id)
     if (btn) { btn.hidden = false; btn.disabled = readOnly }
   }
+  // HOSTINGERRETEST1125: a sub-agent on a custom provider (the Hostinger AI Router on a router install) runs on that
+  // provider's key, so the Claude login choices (auth mode, Claude subscription) do not apply and are not offered:
+  // a router-only install is never pushed toward a Claude login. A note says why.
+  const agent = typeof currentAgent === 'undefined' ? null : currentAgent
+  const onProvider = !readOnly && !!(agent && agent.role !== 'main' && agent.customProvider)
+  const providerNote = document.getElementById('agentProviderAuthNote')
+  if (providerNote) providerNote.hidden = !onProvider
+  const providerNoteText = document.getElementById('agentProviderAuthNoteText')
+  if (onProvider && providerNoteText) providerNoteText.textContent = t('agents.plan_login.provider_note', { provider: agent.customProvider })
   const authModeGroup = document.getElementById('authModeGroup')
-  if (authModeGroup) authModeGroup.hidden = readOnly
+  if (authModeGroup) authModeGroup.hidden = readOnly || onProvider
   const memoryIsolationGroup = document.getElementById('memoryIsolationGroup')
   if (memoryIsolationGroup) memoryIsolationGroup.hidden = readOnly
+  // CODEMODEFLAG1119: sub-agents only (the main agent does not start through the launcher that reads it)
+  const codeModeGroup = document.getElementById('codeModeGroup')
+  if (codeModeGroup) codeModeGroup.hidden = readOnly
   // #2727: the security profile and the Claude plan are per SUB-agent settings. openMarveenDetail never fills
   // their selects, so for the main agent they showed whatever the last opened sub-agent left there (or an empty
   // select on a fresh load), above a Save button that returns early for role 'main'. Hidden here, the one hook
   // both open paths run; openAgentDetail used to hide the plan group itself, which the main agent never reached.
   for (const id of ['securityProfileGroup', 'claudePlanGroup']) {
     const group = document.getElementById(id)
-    if (group) group.hidden = readOnly
+    if (group) group.hidden = readOnly || (id === 'claudePlanGroup' && onProvider)
   }
+
   // MAINAUTHSWITCH1107: the main agent's own authentication switch, on the main agent card only
   const mainAuthGroup = document.getElementById('mainAuthGroup')
   if (mainAuthGroup) {
@@ -4552,7 +4730,7 @@ function attachTmuxCopyButtons(card, agent) {
       btn.classList.add('copied')
       btn.innerHTML = '<span class="tmux-copy-ico">✓</span>' + t('agents.tmux_copied')
       setTimeout(() => { btn.innerHTML = orig; btn.classList.remove('copied') }, 1400)
-    }).catch(() => showToast(t('agents.tmux_copy_failed')))
+    }).catch(() => showToast(t('agents.tmux_copy_failed'), 'error'))
   })
   row.appendChild(btn)
   card.appendChild(row)
@@ -4855,7 +5033,7 @@ async function openAgentDetail(agentName) {
     if (!res.ok) throw new Error('Not found')
     currentAgent = await res.json()
   } catch (err) {
-    showToast(t('agents.toast.load_failed'))
+    showToast(t('agents.toast.load_failed'), 'error')
     return
   }
 
@@ -4939,6 +5117,8 @@ async function openAgentDetail(agentName) {
   updateAuthModeUI(currentAgent.authMode || 'shared', currentAgent.hasApiKey || false)
   const memIsoToggle = document.getElementById('memoryIsolationToggle')
   if (memIsoToggle) memIsoToggle.checked = currentAgent.memoryIsolation === true
+  const codeModeToggle = document.getElementById('codeModeToggle')
+  if (codeModeToggle) codeModeToggle.checked = currentAgent.codeMode === true
   loadVoiceConfig(currentAgent.name)
   document.getElementById('editClaudeMd').value = currentAgent.claudeMd || currentAgent.content || ''
   document.getElementById('editSoulMd').value = currentAgent.soulMd || ''
@@ -4963,6 +5143,8 @@ async function openAgentDetail(agentName) {
 
   // Restore editable Settings (Marveen detail flips this to read-only).
   applyMarveenReadonlyMode(false)
+  // HOSTINGERRETEST1125: a subscription login started on another agent's page is not shown on this one.
+  setAgentPlanLoginState({})
 
   // Delete button (restore visibility for normal agents)
   document.getElementById('deleteAgentBtn').style.display = ''
@@ -4977,10 +5159,10 @@ async function openAgentDetail(agentName) {
     try {
       await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`, { method: 'DELETE' })
       closeModal(agentDetailOverlay)
-      showToast(t('agents.toast.deleted'))
+      showToast(t('agents.toast.deleted'), 'success')
       loadAgents()
     } catch (err) {
-      showToast(t('common.error_delete'))
+      showToast(t('common.error_delete'), 'error')
     }
   }
 
@@ -5006,7 +5188,7 @@ async function openAgentDetail(agentName) {
       const res = await fetch(url)
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
-        showToast(data.error || t('agents.export.error'))
+        showToast(data.error || t('agents.export.error'), 'error')
         return
       }
       const blob = await res.blob()
@@ -5018,9 +5200,9 @@ async function openAgentDetail(agentName) {
       a.click()
       a.remove()
       URL.revokeObjectURL(objectUrl)
-      showToast(t(withSecrets ? 'agents.export.done_secrets' : 'agents.export.done'))
+      showToast(t(withSecrets ? 'agents.export.done_secrets' : 'agents.export.done'), 'success')
     } catch {
-      showToast(t('agents.export.error'))
+      showToast(t('agents.export.error'), 'error')
     }
   }
 
@@ -5050,14 +5232,14 @@ function populateDetailAvatarGrid() {
           body: JSON.stringify({ galleryAvatar: avatar }),
         })
         if (!res.ok) throw new Error()
-        showToast(t('agents.toast.avatar_updated'))
+        showToast(t('agents.toast.avatar_updated'), 'success')
         bumpAvatarEpoch()
         // Update the detail avatar display
         document.getElementById('agentDetailAvatar').innerHTML = `<img src="/api/agents/${encodeURIComponent(currentAgent.name)}/avatar${avatarBust()}" alt="">`
         document.getElementById('detailAvatarGallery').hidden = true
         loadAgents()
       } catch {
-        showToast(t('agents.toast.avatar_error'))
+        showToast(t('agents.toast.avatar_error'), 'error')
       }
     })
     grid.appendChild(item)
@@ -5085,14 +5267,14 @@ document.getElementById('avatarChangeBtn').addEventListener('click', () => {
             body: JSON.stringify({ galleryAvatar: avatar }),
           })
           if (!res.ok) throw new Error()
-          showToast(t('agents.toast.avatar_updated'))
+          showToast(t('agents.toast.avatar_updated'), 'success')
           bumpAvatarEpoch()
           const imgUrl = isMarveen ? `/api/marveen/avatar${avatarBust()}` : `/api/agents/${encodeURIComponent(currentAgent.name)}/avatar${avatarBust()}`
           document.getElementById('agentDetailAvatar').innerHTML = `<img src="${imgUrl}" alt="">`
           gallery.hidden = true
           loadAgents()
         } catch {
-          showToast(t('agents.toast.avatar_error'))
+          showToast(t('agents.toast.avatar_error'), 'error')
         }
       })
       grid.appendChild(item)
@@ -5138,11 +5320,11 @@ document.getElementById('avatarChangeBtn').addEventListener('click', () => {
 
   async function handleAvatarFile(file) {
     if (!file.type.match(/^image\/(png|jpe?g|webp)$/)) {
-      showToast(t('agents.toast.avatar_format'))
+      showToast(t('agents.toast.avatar_format'), 'warn')
       return
     }
     if (file.size > MAX_SIZE) {
-      showToast(t('agents.toast.avatar_size'))
+      showToast(t('agents.toast.avatar_size'), 'warn')
       return
     }
     previewImg.src = URL.createObjectURL(file)
@@ -5160,7 +5342,7 @@ document.getElementById('avatarChangeBtn').addEventListener('click', () => {
     try {
       const res = await fetch(endpoint, { method: 'POST', body: form })
       if (!res.ok) throw new Error()
-      showToast(t('agents.toast.avatar_uploaded'))
+      showToast(t('agents.toast.avatar_uploaded'), 'success')
       bumpAvatarEpoch()
       const imgUrl = isMarveen ? `/api/marveen/avatar${avatarBust()}` : `/api/agents/${encodeURIComponent(currentAgent.name)}/avatar${avatarBust()}`
       document.getElementById('agentDetailAvatar').innerHTML = `<img src="${imgUrl}" alt="">`
@@ -5168,7 +5350,7 @@ document.getElementById('avatarChangeBtn').addEventListener('click', () => {
       resetAvatarUpload()
       loadAgents()
     } catch {
-      showToast(t('common.error_save'))
+      showToast(t('common.error_save'), 'error')
       resetAvatarUpload()
     }
   }
@@ -5220,11 +5402,11 @@ function resetCreateAvatarUpload() {
 
   function handleCreateAvatarFile(file) {
     if (!file.type.match(/^image\/(png|jpe?g|webp)$/)) {
-      showToast(t('agents.toast.avatar_format'))
+      showToast(t('agents.toast.avatar_format'), 'warn')
       return
     }
     if (file.size > MAX_SIZE) {
-      showToast(t('agents.toast.avatar_size'))
+      showToast(t('agents.toast.avatar_size'), 'warn')
       return
     }
     // Custom upload and gallery pick are mutually exclusive.
@@ -5270,6 +5452,9 @@ function mainAuthSelected() {
 function renderMainAuthSections() {
   const api = mainAuthSelected() === 'api'
   document.getElementById('mainAuthApiSection').hidden = !api
+  // HOSTINGERROUTER1122: the router section, only with its radio (itself shown only on a Hostinger install)
+  const rs = document.getElementById('mainAuthRouterSection')
+  if (rs) rs.hidden = mainAuthSelected() !== 'router'
 }
 function mainAuthRunningText(d) {
   const l = d && d.mainAuthLaunched
@@ -5281,6 +5466,33 @@ function mainAuthRunningText(d) {
   }
   return base
 }
+// HOSTINGERROUTER1122: the router model select. Experimental (non-Claude) models carry their context cap; a model
+// the main agent already runs on stays selectable even when the list no longer has it.
+function fillMainRouterModels(models, selected, note) {
+  const sel = document.getElementById('mainAuthRouterModel')
+  sel.innerHTML = ''
+  const list = models.slice()
+  if (selected && !list.some((m) => m.id === selected)) list.unshift({ id: selected, experimental: false })
+  for (const m of list) {
+    const o = document.createElement('option')
+    o.value = m.id
+    o.textContent = m.experimental && m.contextTokens
+      ? `${m.id} (${t('agents.main_auth.router_experimental', { cap: Math.round(m.contextTokens / 1000) })})`
+      : m.id
+    o.selected = m.id === selected
+    sel.appendChild(o)
+  }
+  const n = document.getElementById('mainAuthRouterListNote')
+  if (n) n.textContent = note || ''
+}
+async function loadMainRouterModels(selected) {
+  try {
+    const res = await fetch('/api/hostinger-router/models')
+    if (!res.ok) return
+    const d = await res.json()
+    fillMainRouterModels(d.models || [], selected, d.source === 'fallback' ? t('agents.main_auth.router_fallback') : t('agents.main_auth.router_more_claude'))
+  } catch { /* keeps the measured three */ }
+}
 async function loadMainAuthPanel() {
   const group = document.getElementById('mainAuthGroup')
   if (!group) return
@@ -5291,8 +5503,18 @@ async function loadMainAuthPanel() {
     const res = await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}`)
     if (res.ok) d = await res.json()
   } catch { /* shown as unknown */ }
-  const mode = d && d.authMode === 'api' ? 'api' : 'shared'
+  const router = (d && d.router) || { available: false }
+  const mode = router.active ? 'router' : d && d.authMode === 'api' ? 'api' : 'shared'
   for (const r of document.querySelectorAll('input[name="mainAuthMode"]')) r.checked = r.value === mode
+  // HOSTINGERROUTER1122: the router option only on a Hostinger install (or when the main agent already runs on it)
+  document.getElementById('mainAuthRouterOption').hidden = !(router.available || router.active)
+  document.getElementById('mainAuthRouterKey').value = ''
+  const rStatus = document.getElementById('mainAuthRouterKeyStatus')
+  rStatus.textContent = router.keyStored ? t('agents.main_auth.router_key_stored') : t('agents.main_auth.router_key_missing')
+  rStatus.style.color = router.keyStored ? 'var(--success)' : 'var(--warning)'
+  fillMainRouterModels((router.models || []).map((id) => ({ id, experimental: false })), router.model || router.defaultModel, null)
+  // HOSTINGERROUTER1122 (Marveen 83042): the router's own list, fetched by the server with the stored key
+  if (router.available || router.active) loadMainRouterModels(router.model || router.defaultModel)
   const status = document.getElementById('mainAuthKeyStatus')
   status.textContent = d && d.hasApiKey ? t('agents.main_auth.key_stored') : t('agents.main_auth.key_missing')
   status.style.color = d && d.hasApiKey ? 'var(--success)' : 'var(--warning)'
@@ -5309,6 +5531,11 @@ document.getElementById('mainAuthApplyBtn').addEventListener('click', async () =
   const payload = { authMode: mode }
   const key = document.getElementById('mainAuthApiKey').value.trim()
   if (mode === 'api' && key) payload.apiKey = key
+  if (mode === 'router') {
+    const rKey = document.getElementById('mainAuthRouterKey').value.trim()
+    if (rKey) payload.apiKey = rKey
+    payload.model = document.getElementById('mainAuthRouterModel').value
+  }
   btn.disabled = true
   try {
     const res = await fetch(`/api/agents/${encodeURIComponent(mainAgentId())}`, {
@@ -5323,9 +5550,10 @@ document.getElementById('mainAuthApplyBtn').addEventListener('click', async () =
       return
     }
     document.getElementById('mainAuthApiKey').value = ''
-    if (reply.body.verified === false) showToast(t('agents.main_auth.unverified'))
+    document.getElementById('mainAuthRouterKey').value = ''
+    if (reply.body.verified === false) showToast(t('agents.main_auth.unverified'), 'warn')
     const restarted = await restartMainAgentGated()
-    showToast(t(restarted ? 'agents.main_auth.saved_restarting' : 'agents.main_auth.saved_not_restarted'))
+    showToast(t(restarted ? 'agents.main_auth.saved_restarting' : 'agents.main_auth.saved_not_restarted'), restarted ? 'success' : 'warn')
     setTimeout(() => { loadMainAuthPanel() }, 20000)
     loadMainAuthPanel()
   } catch (err) {
@@ -5381,9 +5609,9 @@ document.getElementById('marveenRestartBtn').addEventListener('click', async () 
   const btn = document.getElementById('marveenRestartBtn')
   btn.disabled = true
   try {
-    if (await restartMainAgentGated()) showToast(t('agents.toast.marveen_restarted'))
+    if (await restartMainAgentGated()) showToast(t('agents.toast.marveen_restarted'), 'success')
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   } finally {
     btn.disabled = false
   }
@@ -5402,7 +5630,7 @@ document.getElementById('agentStartBtn').addEventListener('click', async () => {
       const err = await res.json()
       throw new Error(err.error || t('agents.toast.start_failed'))
     }
-    showToast(t('agents.toast.started'))
+    showToast(t('agents.toast.started'), 'success')
     // Refresh
     const detailRes = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`)
     if (detailRes.ok) {
@@ -5411,7 +5639,7 @@ document.getElementById('agentStartBtn').addEventListener('click', async () => {
     }
     loadAgents()
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -5435,7 +5663,7 @@ document.getElementById('agentStopBtn').addEventListener('click', async () => {
       const err = await res.json()
       throw new Error(err.error || t('agents.toast.stop_failed'))
     }
-    showToast(t('agents.toast.stopped'))
+    showToast(t('agents.toast.stopped'), 'success')
     const detailRes = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`)
     if (detailRes.ok) {
       currentAgent = await detailRes.json()
@@ -5443,7 +5671,7 @@ document.getElementById('agentStopBtn').addEventListener('click', async () => {
     }
     loadAgents()
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   }
 })
 
@@ -5703,6 +5931,7 @@ async function loadAvailableModels() {
       }
     }
     updateCustomModelIdRow(document.getElementById('editAgentModel'))
+    applySubAgentAuthAdvice(data.subAgentAuth)
     updateCustomModelIdRow(document.getElementById('agentModel'))
   } catch { /* dashboard not available */ }
 }
@@ -5734,6 +5963,463 @@ async function markMissingCustomProvider(sel, providerId, brokenModel = null) {
   warn.hidden = sel.selectedOptions[0]?.dataset.deleted !== '1'
 }
 
+// HOSTINGERSUBAGENTAUTH1122: on a router install without a Claude login, the create form says so, and when the main
+// agent runs on the router it preselects the router. Only while the form is still on its default ('inherit'), so a
+// choice the user made is never overwritten. Off a router install the advice is all false and nothing changes.
+function applySubAgentAuthAdvice(advice) {
+  const warn = document.getElementById('agentModelAuthWarn')
+  const sel = document.getElementById('agentModel')
+  if (!warn || !sel) return
+  if (!advice || !advice.claudeAuthMissing) { warn.style.display = 'none'; warn.textContent = ''; return }
+  const routerValue = `custom:${advice.routerProviderId}`
+  const routerOption = [...sel.options].some((o) => o.value === routerValue)
+  if (advice.routerSuggested && routerOption && sel.value === 'inherit') {
+    sel.value = routerValue
+    const idInput = document.getElementById('agentModelCustomModelId')
+    if (idInput && !idInput.value.trim()) idInput.value = advice.routerModel
+    updateCustomModelIdRow(sel)
+  }
+  warn.textContent = t(advice.routerSuggested && routerOption ? 'agents.model.no_claude_auth_router' : 'agents.model.no_claude_auth')
+  warn.style.display = ''
+}
+
+// ===================== MIOAGENTB4-1122: Agent catalog (agent packages from marveen.io) =====================
+// The page over the agent-package routes (src/web/routes/agent-packages.ts): link this machine with a one-time
+// code, list the catalog, install, start. Every catalog field is the publishing side's data, so it reaches the DOM
+// as text only (textContent), never as HTML or markdown (plan 6.5, T4; Samu, extra 2).
+
+// Error code -> lang key (agentCatalog.err.<key>), from the route and remote.ts tables. An unknown code keeps the
+// server's own text (the CLI gate answers with a sentence of its own).
+const AGENT_PKG_ERR_KEYS = {
+  bad_request: 'bad_request', invalid_code: 'invalid_code', token_limit: 'token_limit', redeem_failed: 'redeem_failed',
+  credential_store_failed: 'credential_store_failed', credential_delete_failed: 'credential_delete_failed',
+  not_connected: 'not_connected', credential_rejected: 'credential_rejected', not_entitled: 'not_entitled',
+  package_not_found: 'package_not_found', rate_limited: 'rate_limited', temporarily_unavailable: 'temporarily_unavailable',
+  download_failed: 'download_failed', unknown_kid: 'unknown_kid', incompatible: 'incompatible',
+  package_rejected: 'package_rejected', invalid_slug: 'invalid_slug', name_reserved: 'name_reserved',
+  name_taken: 'name_taken', stale_install: 'stale_install', already_installed: 'already_installed',
+  unsupported_layout: 'unsupported_layout', own_version_unknown: 'own_version_unknown', install_failed: 'install_failed',
+  invalid_display_name: 'invalid_display_name',
+  // PR-I4: the update's check and apply (plan 6.2, 6.3).
+  agent_not_found: 'agent_not_found',
+  not_a_package: 'not_a_package',
+  manifest_unreadable: 'manifest_unreadable',
+  version_conflict: 'version_conflict',
+  downgrade_refused: 'downgrade_refused',
+  plan_changed: 'plan_changed',
+  decision_required: 'decision_required',
+  path_blocked: 'path_blocked',
+  update_in_progress: 'update_in_progress',
+  update_failed: 'update_failed',
+}
+function agentPkgErrorText(d) {
+  const owner = ownerSessionText(d)
+  if (owner) return owner
+  const key = d && AGENT_PKG_ERR_KEYS[d.error]
+  return key ? t(`agentCatalog.err.${key}`) : ((d && typeof d.error === 'string' && d.error) || t('agentCatalog.err.generic'))
+}
+
+// The install step an install error belongs to: 1 download, 2 signature and files, 3 security scan, 4 creating the
+// agent. A package_rejected names its verifier step (verify.ts: 5 is the content scan, the others are the document,
+// the signature and the file set).
+const AGENT_PKG_ERR_STEP = {
+  not_connected: 1, credential_rejected: 1, not_entitled: 1, package_not_found: 1, rate_limited: 1,
+  temporarily_unavailable: 1, download_failed: 1, unknown_kid: 2, incompatible: 2,
+  // A refused name is a local refusal before any download: the first step carries it, nothing is marked done.
+  invalid_display_name: 1,
+}
+function agentPkgErrorStep(d) {
+  if (d && d.error === 'package_rejected') return d.step === 5 ? 3 : 2
+  return (d && AGENT_PKG_ERR_STEP[d.error]) || 4
+}
+
+// The package picture: https only, and only from the publishing side's origin (Samu, extra 1); anything else gets the
+// initial placeholder.
+function agentPkgAvatarUrl(raw, origin) {
+  if (typeof raw !== 'string' || typeof origin !== 'string' || origin === '') return null
+  let u
+  try { u = new URL(raw) } catch { return null }
+  if (u.protocol !== 'https:' || u.origin !== origin) return null
+  return u.href
+}
+
+function agentPkgVersionParts(v) {
+  const m = typeof v === 'string' ? /^(\d+)\.(\d+)\.(\d+)$/.exec(v) : null
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null
+}
+/** -1, 0, 1, or null when either is not x.y.z. */
+function agentPkgVersionCmp(a, b) {
+  const x = agentPkgVersionParts(a)
+  const y = agentPkgVersionParts(b)
+  if (!x || !y) return null
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1
+  return 0
+}
+
+/**
+ * The card state (plan 3.3). `view` is {catalog, knownKids, marveenVersion}; `installed` maps slug -> {name,
+ * version, running}. Order: installed first (the agent is here whatever the account says now), then the account,
+ * then what this build can take.
+ */
+function agentPkgCardState(pkg, view, installed) {
+  const cat = view.catalog || {}
+  const have = installed[pkg.slug]
+  if (have) {
+    const newer = agentPkgVersionCmp(pkg.version, have.version) === 1
+    return { kind: newer ? 'update' : 'installed', installed: have }
+  }
+  if (cat.access === 'none') return { kind: 'locked_free' }
+  if (cat.access === 'trial' && typeof cat.trial_pick === 'string' && cat.trial_pick !== pkg.slug) {
+    return { kind: 'locked_trial', pick: cat.trial_pick }
+  }
+  if (cat.access !== 'full' && cat.access !== 'trial') return { kind: 'locked_free' }
+  if (agentPkgVersionCmp(view.marveenVersion, pkg.min_marveen_version) === -1) return { kind: 'locked_old' }
+  if (typeof pkg.kid !== 'string' || !(view.knownKids || []).includes(pkg.kid)) return { kind: 'locked_old' }
+  return { kind: 'install', trialPick: cat.access === 'trial' && cat.trial_pick == null }
+}
+
+/** The files a package puts on the machine, from the catalog's files[] when given (D3/A), else from skills[] (D3/B). */
+function agentPkgFileRows(pkg) {
+  const rows = [['PACKAGE.md', t('agentCatalog.file.package')], ['SOUL.md', t('agentCatalog.file.soul')]]
+  if (Array.isArray(pkg.files) && pkg.files.every((f) => typeof f === 'string')) {
+    const perSkill = new Map()
+    for (const f of pkg.files) {
+      const m = /^skills\/([^/]+)\//.exec(f)
+      if (m) perSkill.set(m[1], (perSkill.get(m[1]) || 0) + 1)
+    }
+    for (const [name, n] of perSkill) rows.push([`skills/${name}/`, t('agentCatalog.file.count', { n })])
+    if (typeof pkg.avatar_url === 'string') rows.push(['avatar', t('agentCatalog.file.avatar')])
+    return rows
+  }
+  for (const name of (Array.isArray(pkg.skills) ? pkg.skills : [])) {
+    if (typeof name === 'string') rows.push([`skills/${name}/`, t('agentCatalog.file.skill')])
+  }
+  return rows
+}
+
+// ---- DOM helpers: text only ----
+function acEl(tag, cls, text) {
+  const e = document.createElement(tag)
+  if (cls) e.className = cls
+  if (text !== undefined && text !== null) e.textContent = String(text)
+  return e
+}
+function acBtn(cls, text, onClick) {
+  const b = acEl('button', cls, text)
+  b.type = 'button'
+  b.addEventListener('click', onClick)
+  return b
+}
+
+const agentCatalogState = { busy: false }
+
+// MIOAGENTB4-1122 (Marveen 84855): the menu item stays hidden until the server says the publishing origin is set.
+// Failure-proof like VIDEOREVIEW1002: an error, a refusal or an older backend leaves it hidden.
+async function revealAgentCatalogNav(fetchImpl, link) {
+  if (!link) return
+  try {
+    const r = await fetchImpl('/api/agent-packages/credential')
+    const cred = r.ok ? await r.json() : null
+    link.hidden = !(cred && cred.configured === true)
+  } catch {
+    link.hidden = true
+  }
+}
+
+async function loadAgentCatalogPage() {
+  const root = document.getElementById('agentCatalogRoot')
+  if (!root) return
+  root.replaceChildren(acEl('p', 'ac-muted', t('agentCatalog.loading')))
+  let cred
+  try {
+    const r = await readActionReply(await fetch('/api/agent-packages/credential'))
+    if (!r.ok) { root.replaceChildren(acEl('p', 'ac-error', agentPkgErrorText(r.body))); return }
+    cred = r.body
+  } catch {
+    root.replaceChildren(acEl('p', 'ac-error', t('agentCatalog.err.generic')))
+    return
+  }
+  // MIOAGENTB4-1122 (Marveen 84855): no publishing origin yet, so no connect box (a deep link lands here).
+  if (cred.configured !== true) { root.replaceChildren(acEl('p', 'ac-muted', t('agentCatalog.not_available'))); return }
+  if (!cred.connected) { root.replaceChildren(agentCatalogConnectForm()); return }
+  const head = acEl('div', 'ac-connected')
+  head.append(acEl('span', null, t('agentCatalog.connected_as', { label: cred.label })))
+  head.append(acBtn('btn-secondary btn-compact', t('agentCatalog.disconnect'), agentCatalogDisconnect))
+  const list = acEl('div', 'ac-list')
+  root.replaceChildren(head, list)
+  list.append(acEl('p', 'ac-muted', t('agentCatalog.loading')))
+  let view
+  let agents
+  try {
+    const [c, a] = await Promise.all([fetch('/api/agent-packages/catalog').then(readActionReply), fetch('/api/agents').then(readActionReply)])
+    if (!c.ok) { list.replaceChildren(acEl('p', 'ac-error', agentPkgErrorText(c.body))); return }
+    view = c.body
+    agents = Array.isArray(a.body) ? a.body : (Array.isArray(a.body.agents) ? a.body.agents : [])
+  } catch {
+    list.replaceChildren(acEl('p', 'ac-error', t('agentCatalog.err.generic')))
+    return
+  }
+  const installed = {}
+  for (const ag of agents) {
+    if (ag && ag.package && typeof ag.package.slug === 'string') {
+      installed[ag.package.slug] = { name: ag.name, version: ag.package.version, running: !!ag.running }
+    }
+  }
+  const pkgs = Array.isArray(view.catalog && view.catalog.packages) ? view.catalog.packages : []
+  list.replaceChildren()
+  if (pkgs.length === 0) { list.append(acEl('p', 'ac-muted', t('agentCatalog.empty'))); return }
+  for (const pkg of pkgs) {
+    if (pkg && typeof pkg.slug === 'string') list.append(agentCatalogCard(pkg, view, installed))
+  }
+}
+
+function agentCatalogConnectForm() {
+  const box = acEl('div', 'ac-panel')
+  box.append(acEl('h3', null, t('agentCatalog.connect.title')))
+  box.append(acEl('p', 'ac-muted', t('agentCatalog.connect.desc')))
+  const label = acEl('label', 'form-label-sm', t('agentCatalog.connect.code_label'))
+  const input = acEl('input', 'input ac-code')
+  input.id = 'agentCatalogCode'
+  input.autocomplete = 'off'
+  input.spellcheck = false
+  input.placeholder = 'XXXX-XXXXXXXX'
+  label.htmlFor = input.id
+  const msg = acEl('p', 'ac-msg')
+  const go = acBtn('btn-primary', t('agentCatalog.connect.btn'), async () => {
+    const code = input.value.trim()
+    if (!code) { msg.className = 'ac-msg ac-error'; msg.textContent = t('agentCatalog.connect.empty'); return }
+    go.disabled = true
+    try {
+      const r = await readActionReply(await fetch('/api/agent-packages/credential', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }),
+      }))
+      if (!r.ok) { msg.className = 'ac-msg ac-error'; msg.textContent = agentPkgErrorText(r.body); return }
+      showToast(t('agentCatalog.connect.done'), 'success')
+      loadAgentCatalogPage()
+    } catch {
+      msg.className = 'ac-msg ac-error'
+      msg.textContent = t('agentCatalog.err.generic')
+    } finally {
+      go.disabled = false
+    }
+  })
+  box.append(label, input, go, msg, acEl('p', 'ac-muted', t('agentCatalog.connect.expiry')))
+  return box
+}
+
+async function agentCatalogDisconnect() {
+  if (!confirm(t('agentCatalog.disconnect_confirm'))) return
+  try {
+    const r = await readActionReply(await fetch('/api/agent-packages/credential', { method: 'DELETE' }))
+    if (!r.ok) { showToast(agentPkgErrorText(r.body), 'error'); return }
+  } catch {
+    showToast(t('agentCatalog.err.generic'), 'error')
+    return
+  }
+  loadAgentCatalogPage()
+}
+
+function agentCatalogInitial(pkg) {
+  return acEl('div', 'ac-avatar ac-avatar-initial', (String(pkg.title || pkg.slug).trim()[0] || '?').toUpperCase())
+}
+
+function agentCatalogCard(pkg, view, installed) {
+  const state = agentPkgCardState(pkg, view, installed)
+  const card = acEl('div', 'ac-card')
+  card.dataset.slug = pkg.slug
+  card.dataset.state = state.kind
+  const top = acEl('div', 'ac-card-top')
+  const src = agentPkgAvatarUrl(pkg.avatar_url, view.origin)
+  if (src) {
+    const img = acEl('img', 'ac-avatar')
+    img.alt = ''
+    img.referrerPolicy = 'no-referrer'
+    // A signed picture URL expires (Samu 83364): a picture that does not load falls back to the initial.
+    img.addEventListener('error', () => img.replaceWith(agentCatalogInitial(pkg)), { once: true })
+    img.src = src
+    top.append(img)
+  } else {
+    top.append(agentCatalogInitial(pkg))
+  }
+  const head = acEl('div', 'ac-card-head')
+  head.append(acEl('div', 'ac-title', pkg.title || pkg.slug))
+  const skillCount = Array.isArray(pkg.skills) ? pkg.skills.length : 0
+  head.append(acEl('div', 'ac-meta', t('agentCatalog.meta', { version: pkg.version || '?', n: skillCount })))
+  top.append(head)
+  card.append(top)
+  if (pkg.description) card.append(acEl('p', 'ac-desc', pkg.description))
+  if (Array.isArray(pkg.connectors) && pkg.connectors.length) {
+    const ul = acEl('ul', 'ac-connectors')
+    for (const c of pkg.connectors) {
+      if (!c || typeof c.name !== 'string') continue
+      const lvl = c.level === 'required' ? t('agentCatalog.connector.required') : t('agentCatalog.connector.recommended')
+      ul.append(acEl('li', null, `${c.name}: ${lvl}`))
+    }
+    card.append(ul)
+  }
+  if (typeof pkg.changelog === 'string' && pkg.changelog) {
+    const det = acEl('details', 'ac-changelog')
+    det.append(acEl('summary', null, t('agentCatalog.changelog')), acEl('pre', null, pkg.changelog))
+    card.append(det)
+  }
+  const foot = acEl('div', 'ac-foot')
+  card.append(foot)
+  const panel = acEl('div', 'ac-panel-slot')
+  card.append(panel)
+  if (state.kind === 'installed' || state.kind === 'update') {
+    const run = state.installed.running ? t('agentCatalog.running') : t('agentCatalog.stopped')
+    foot.append(acEl('span', 'ac-state', t('agentCatalog.installed', { version: state.installed.version, run })))
+    if (state.kind === 'update') foot.append(acEl('span', 'ac-state ac-update', t('agentCatalog.update_available', { version: pkg.version })))
+  } else if (state.kind === 'locked_free') {
+    foot.append(acEl('span', 'ac-state ac-locked', t('agentCatalog.locked_free')))
+  } else if (state.kind === 'locked_trial') {
+    foot.append(acEl('span', 'ac-state ac-locked', t('agentCatalog.locked_trial', { pick: state.pick })))
+  } else if (state.kind === 'locked_old') {
+    foot.append(acEl('span', 'ac-state ac-locked', t('agentCatalog.locked_old')))
+  } else {
+    foot.append(acBtn('btn-primary', t('agentCatalog.install'), () => agentCatalogConfirm(pkg, state, panel)))
+  }
+  return card
+}
+
+function agentCatalogConfirm(pkg, state, panel) {
+  const box = acEl('div', 'ac-panel')
+  box.append(acEl('p', null, t('agentCatalog.confirm.files')))
+  const ul = acEl('ul', 'ac-files')
+  for (const [path, what] of agentPkgFileRows(pkg)) ul.append(acEl('li', null, `${path} · ${what}`))
+  box.append(ul)
+  // MIOAGENTB4-1122 (Samu 83718): the name the dashboard shows for the agent. Empty keeps the package's own name;
+  // the agent's id and folder stay the package's slug whatever is typed here.
+  const nameLab = acEl('label', 'ac-name')
+  nameLab.append(acEl('span', null, t('agentCatalog.confirm.name')))
+  const nameInput = acEl('input')
+  nameInput.type = 'text'
+  nameInput.maxLength = 60
+  nameInput.autocomplete = 'off'
+  nameInput.className = 'input ac-name-input'
+  nameLab.append(nameInput)
+  box.append(nameLab, acEl('p', 'ac-muted', t('agentCatalog.confirm.name_hint')))
+  const go = acBtn('btn-primary', t('agentCatalog.install'), () => agentCatalogInstall(pkg, panel, go, nameInput.value))
+  if (state.trialPick) {
+    box.append(acEl('p', 'ac-warn', t('agentCatalog.confirm.trial')))
+    const lab = acEl('label', 'ac-check')
+    const cb = acEl('input')
+    cb.type = 'checkbox'
+    cb.className = 'ac-trial-ack'
+    go.disabled = true
+    cb.addEventListener('change', () => { go.disabled = !cb.checked || agentCatalogState.busy })
+    lab.append(cb, acEl('span', null, t('agentCatalog.confirm.trial_ack')))
+    box.append(lab)
+  }
+  const row = acEl('div', 'ac-actions')
+  row.append(acBtn('btn-secondary', t('agentCatalog.cancel'), () => panel.replaceChildren()), go)
+  box.append(row)
+  panel.replaceChildren(box)
+}
+
+const AGENT_PKG_STEPS = ['download', 'verify', 'scan', 'create', 'start']
+
+/** Is `slug` installed now? The re-measure after a request whose answer was lost (Samu, extra 3). */
+async function agentCatalogInstalledName(slug) {
+  try {
+    const a = await readActionReply(await fetch('/api/agents'))
+    const list = Array.isArray(a.body) ? a.body : (Array.isArray(a.body.agents) ? a.body.agents : [])
+    const hit = list.find((ag) => ag && ag.package && ag.package.slug === slug)
+    return hit ? hit.name : null
+  } catch {
+    return null
+  }
+}
+
+async function agentCatalogInstall(pkg, panel, btn, displayName = '') {
+  if (agentCatalogState.busy) return
+  agentCatalogState.busy = true
+  btn.disabled = true
+  const box = acEl('div', 'ac-panel')
+  const ol = acEl('ol', 'ac-steps')
+  const items = AGENT_PKG_STEPS.map((s) => {
+    const li = acEl('li', 'ac-step', t(`agentCatalog.step.${s}`))
+    li.dataset.step = s
+    ol.append(li)
+    return li
+  })
+  const status = acEl('p', 'ac-muted', t('agentCatalog.step.running'))
+  box.append(ol, status, acEl('p', 'ac-muted', t('agentCatalog.step.all_or_nothing')))
+  panel.replaceChildren(box)
+  const mark = (i, cls) => { items[i].classList.add(cls) }
+  let name = null
+  try {
+    let r = null
+    try {
+      r = await readActionReply(await fetch('/api/agents/install-package', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(displayName.trim() ? { slug: pkg.slug, display_name: displayName } : { slug: pkg.slug }),
+      }))
+    } catch {
+      // The answer was lost (a proxy or the network cut it): the install may have finished. Measure, do not guess.
+      name = await agentCatalogInstalledName(pkg.slug)
+      if (name === null) { status.className = 'ac-error'; status.textContent = t('agentCatalog.err.lost'); return }
+    }
+    if (r && !r.ok) {
+      const step = agentPkgErrorStep(r.body) - 1
+      for (let i = 0; i < step; i++) mark(i, 'ac-done')
+      mark(step, 'ac-failed')
+      status.className = 'ac-error'
+      status.textContent = agentPkgErrorText(r.body)
+      return
+    }
+    if (r) name = r.body.name
+    for (let i = 0; i < 4; i++) mark(i, 'ac-done')
+    // Installed: the card's Install button goes (a failed install keeps it, to try again).
+    panel.closest('.ac-card')?.querySelector('.ac-foot')?.replaceChildren(acEl('span', 'ac-state', t('agentCatalog.installed_now')))
+    if (r && r.body.skillReport && r.body.skillReport.findings && Object.keys(r.body.skillReport.findings).length) {
+      box.append(acEl('p', 'ac-warn', t('agentCatalog.skill_findings')))
+    }
+    await agentCatalogStart(name, items[4], status, box)
+  } finally {
+    agentCatalogState.busy = false
+  }
+}
+
+/** Step 5 (Samu D4): start the new agent. A failed start is not a failed install: the agent exists. */
+async function agentCatalogStart(name, item, status, box) {
+  item.classList.remove('ac-failed')
+  status.className = 'ac-muted'
+  status.textContent = t('agentCatalog.step.starting')
+  let r
+  try {
+    r = await readActionReply(await fetch(`/api/agents/${encodeURIComponent(name)}/start`, { method: 'POST' }))
+  } catch {
+    r = { ok: false, body: {} }
+  }
+  if (r.ok) {
+    item.classList.add('ac-done')
+    status.className = 'ac-ok'
+    status.textContent = t('agentCatalog.done', { name })
+    return
+  }
+  item.classList.add('ac-failed')
+  status.className = 'ac-error'
+  status.textContent = t('agentCatalog.start_failed', { reason: ownerSessionText(r.body) || r.body.error || r.body.message || t('agentCatalog.err.generic') })
+  const again = acBtn('btn-secondary btn-compact', t('agentCatalog.start_btn'), async () => {
+    again.remove()
+    await agentCatalogStart(name, item, status, box)
+  })
+  box.append(again)
+}
+
+// HOSTINGERWIZERRI18N1122: the Claude step's errors come from the server in one fixed language (the Claude branch
+// Hungarian, the router branch English). The wizard shows them in the UI language, by the response's reason, per
+// branch (bad-key and write-failed occur in both). An unknown reason keeps the server's own text.
+const ONB_AUTH_ERR_KEYS = {
+  claude: { missing: 'missing', 'bad-token': 'bad_token', 'bad-key': 'bad_key', 'verify-failed': 'verify_failed', 'write-failed': 'write_failed' },
+  router: { mixed: 'router_mixed', 'router-unavailable': 'router_unavailable', 'bad-key': 'router_bad_key', 'bad-model': 'router_bad_model', 'write-failed': 'router_write_failed' },
+}
+function onbAuthErrorText(d, router) {
+  const key = ONB_AUTH_ERR_KEYS[router ? 'router' : 'claude'][d && d.reason]
+  return key ? t(`onboarding.auth_err.${key}`) : ((d && d.error) || t('onboarding.error'))
+}
+
 function updateCustomModelIdRow(selectEl) {
   if (!selectEl) return
   const isEdit = selectEl.id === 'editAgentModel'
@@ -5757,13 +6443,13 @@ async function openOpenrouterModal() {
   // The modal markup lives inside the (hidden) connectors page; reparent it to
   // <body> so it renders full-viewport regardless of which tab is active.
   if (modal.parentElement !== document.body) document.body.appendChild(modal)
-  if (agentEl) agentEl.textContent = (currentAgent && (currentAgent.displayName || currentAgent.name)) || 'ágens'
+  if (agentEl) agentEl.textContent = (currentAgent && (currentAgent.displayName || currentAgent.name)) || t('openrouter.modal.agent_fallback')
   // Two competing .modal-overlay CSS rules: one hides via [hidden], the other
   // via opacity/visibility (toggled by .active). Set both so the modal shows
   // regardless of which rule wins the cascade.
   modal.hidden = false
   modal.classList.add('active')
-  listEl.innerHTML = '<div style="padding:14px;color:var(--text-muted);font-size:13px">Modellek betöltése…</div>'
+  listEl.innerHTML = '<div style="padding:14px;color:var(--text-muted);font-size:13px">' + escapeHtml(t('openrouter.modal.loading')) + '</div>'
   if (searchEl) searchEl.value = ''
   if (freeEl) freeEl.checked = false
   try {
@@ -5784,7 +6470,7 @@ async function openOpenrouterModal() {
     }
     renderOpenrouterList()
   } catch {
-    listEl.innerHTML = '<div style="padding:14px;color:var(--danger,#dc2626);font-size:13px">Nem sikerült betölteni az OpenRouter modelleket.</div>'
+    listEl.innerHTML = '<div style="padding:14px;color:var(--danger,#dc2626);font-size:13px">' + escapeHtml(t('openrouter.modal.load_error')) + '</div>'
   }
 }
 
@@ -5805,7 +6491,7 @@ function renderOpenrouterList() {
     if (ca !== cb) return ca ? -1 : 1
     return a.id.localeCompare(b.id)
   })
-  if (countEl) countEl.textContent = `${rows.length} modell · ${openrouterCurated.size} kézi listán`
+  if (countEl) countEl.textContent = t('openrouter.modal.count', { n: rows.length, m: openrouterCurated.size })
   listEl.innerHTML = ''
   for (const m of rows.slice(0, 400)) {
     const checked = openrouterCurated.has(m.id)
@@ -5830,7 +6516,7 @@ function renderOpenrouterList() {
     row.addEventListener('mouseleave', () => { row.style.background = '' })
     listEl.appendChild(row)
   }
-  if (rows.length === 0) listEl.innerHTML = '<div style="padding:14px;color:var(--text-muted);font-size:13px">Nincs találat.</div>'
+  if (rows.length === 0) listEl.innerHTML = '<div style="padding:14px;color:var(--text-muted);font-size:13px">' + escapeHtml(t('common.no_results')) + '</div>'
 }
 
 // Tick/untick a model into the curated manual list. Persists server-side, then
@@ -5841,7 +6527,7 @@ async function toggleCuratedModel(id, name, checked) {
   const countEl = document.getElementById('openrouterModalCount')
   if (countEl) {
     const total = countEl.textContent.split('·')[0].trim()
-    countEl.textContent = `${total} · ${openrouterCurated.size} kézi listán`
+    countEl.textContent = t('openrouter.modal.count_short', { total, m: openrouterCurated.size })
   }
   try {
     const res = await fetch('/api/openrouter/manual', {
@@ -5852,7 +6538,7 @@ async function toggleCuratedModel(id, name, checked) {
     // OWNERGATE3-1104: the server may refuse (403 owner_session_required); say why before the rollback below.
     const reply = await readActionReply(res)
     if (!reply.ok) {
-      showToast(t('common.not_done', { msg: refusalReason(res, reply.body) }))
+      showToast(t('common.not_done', { msg: refusalReason(res, reply.body) }), 'error')
       throw new Error('save failed')
     }
     const data = reply.body
@@ -5901,7 +6587,7 @@ function startModelRestartPolling(name, expectedModel, triggeredAt) {
       stopModelRestartPolling()
       badge.hidden = true
       if (currentAgent) updateProcessControl(currentAgent)
-      showToast(t('agents.toast.restart_state_error'))
+      showToast(t('agents.toast.restart_state_error'), 'error')
       return
     }
     try {
@@ -5932,7 +6618,7 @@ function startModelRestartPolling(name, expectedModel, triggeredAt) {
         const liveMatched = data.activeModel === expectedModel
         showToast(liveMatched
           ? t('agents.model.toast_active', { model: displayModel })
-          : t('agents.model.toast_restarted', { model: displayModel }))
+          : t('agents.model.toast_restarted', { model: displayModel }), 'success')
       }
     } catch { /* network blip, keep polling */ }
   }, 2000)
@@ -5952,7 +6638,7 @@ document.getElementById('saveModelBtn').addEventListener('click', async () => {
   // The model id is required with a custom provider: the picker value ("custom:<id>") used to be saved as the model.
   const customModelInput = document.getElementById('editAgentModelCustomModelId')
   const customModelId = isCustom ? customModelInput.value.trim() : ''
-  if (isCustom && !customModelId) { customModelInput.focus(); showToast(t('agents.model.custom_model_required')); return }
+  if (isCustom && !customModelId) { customModelInput.focus(); showToast(t('agents.model.custom_model_required'), 'warn'); return }
   const newModel = isCustom ? customModelId : selectVal
   const name = currentAgent.name
   try {
@@ -5976,11 +6662,12 @@ document.getElementById('saveModelBtn').addEventListener('click', async () => {
       if (currentAgent) updateProcessControl(currentAgent)
       // RESTARTSTOPPED1005: a deliberately stopped agent is not restarted; the
       // model is saved and applies at its next start -- not a failure.
-      showToast(t(restartRes.status === 409 ? 'agents.toast.model_saved_stopped' : 'agents.restart_failed'))
+      if (restartRes.status === 409) showToast(t('agents.toast.model_saved_stopped'))
+      else showToast(t('agents.restart_failed'), 'error')
       return
     }
     startModelRestartPolling(name, newModel, triggeredAt)
-  } catch { showToast(t('common.error_save')) }
+  } catch { showToast(t('common.error_save'), 'error') }
 })
 
 document.getElementById('modelSuggestBtn').addEventListener('click', async () => {
@@ -6064,7 +6751,7 @@ document.getElementById('analyzeAllModelsBtn').addEventListener('click', async (
             created++
           } catch { /* skip failed card */ }
         }
-        showToast(t('agents.model.cards_created', { n: created }))
+        showToast(t('agents.model.cards_created', { n: created }), 'success')
         createBtn.textContent = t('agents.model.cards_created', { n: created })
       })
     }
@@ -6102,7 +6789,7 @@ if (exportAllAgentsBtn) {
       const res = await fetch(url)
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
-        showToast(data.error || t('agents.export.error'))
+        showToast(data.error || t('agents.export.error'), 'error')
         return
       }
       const blob = await res.blob()
@@ -6114,9 +6801,9 @@ if (exportAllAgentsBtn) {
       a.click()
       a.remove()
       URL.revokeObjectURL(objectUrl)
-      showToast(t(withSecrets ? 'agents.export_all.done_secrets' : 'agents.export_all.done'))
+      showToast(t(withSecrets ? 'agents.export_all.done_secrets' : 'agents.export_all.done'), 'success')
     } catch {
-      showToast(t('agents.export.error'))
+      showToast(t('agents.export.error'), 'error')
     }
   })
 }
@@ -6173,7 +6860,7 @@ if (importAgentBtn && importAgentFile) {
         }
         ;({ res, data } = await upload(true))
       }
-      if (!res.ok) { showToast(data.error || t('agents.import.error')); return }
+      if (!res.ok) { showToast(data.error || t('agents.import.error'), 'error'); return }
       const parts = []
       if (data.kind === 'fleet') {
         const skipped = (data.skipped || []).length
@@ -6185,10 +6872,11 @@ if (importAgentBtn && importAgentFile) {
         if (data.includedSecrets) parts.push(t('agents.import.note_secrets'))
         if (data.overwritten) parts.push(t('agents.import.note_overwritten'))
       }
-      showToast(parts.join(' '))
+      // a fleet import that skipped some agents is only partly done
+      showToast(parts.join(' '), data.kind === 'fleet' && (data.skipped || []).length ? 'warn' : 'success')
       loadAgents()
     } catch {
-      showToast(t('agents.import.error'))
+      showToast(t('agents.import.error'), 'error')
     } finally {
       importAgentFile.value = ''
     }
@@ -6216,10 +6904,10 @@ document.getElementById('saveAutoRestartBtn').addEventListener('click', async ()
     })
     // OWNERGATE3-1104: the server may refuse (403 owner_session_required); show why instead of a generic error.
     const reply = await readActionReply(res)
-    if (!reply.ok) { showToast(t('common.not_done', { msg: refusalReason(res, reply.body) })); return }
+    if (!reply.ok) { showToast(t('common.not_done', { msg: refusalReason(res, reply.body) }), 'error'); return }
     if (currentAgent) currentAgent.autoRestart = reply.body.autoRestart
-    showToast(t('agents.toast.auto_restart_saved'))
-  } catch { showToast(t('common.error_save')) }
+    showToast(t('agents.toast.auto_restart_saved'), 'success')
+  } catch { showToast(t('common.error_save'), 'error') }
 })
 
 document.getElementById('saveIdleFlushBtn').addEventListener('click', async () => {
@@ -6241,7 +6929,7 @@ document.getElementById('saveIdleFlushBtn').addEventListener('click', async () =
     const cur = await fetch(`/api/agents/${encodeURIComponent(id)}/context-guard`)
     if (!cur.ok) throw new Error()
     current = (await cur.json()).contextGuard || {}
-  } catch { showToast(t('common.error_save')); return }
+  } catch { showToast(t('common.error_save'), 'error'); return }
   const cfg = Object.assign({}, current, {
     idleFlushEnabled: document.getElementById('ifEnabled').checked,
     idleFlushTokens: Math.round(Number(document.getElementById('ifTokens').value) * 1000),
@@ -6256,15 +6944,20 @@ document.getElementById('saveIdleFlushBtn').addEventListener('click', async () =
     if (!res.ok) throw new Error()
     const body = await res.json()
     if (currentAgent) currentAgent.contextGuard = body.contextGuard
-    showToast(t('agents.toast.idle_flush_saved'))
-  } catch { showToast(t('common.error_save')) }
+    showToast(t('agents.toast.idle_flush_saved'), 'success')
+  } catch { showToast(t('common.error_save'), 'error') }
 })
 
 // ---- voice config UI -------------------------------------------------------
 
+// Only the latest call may write the voice fields: opening one agent and then
+// another quickly must not let the first agent's late answer fill the second's form.
+let _voiceConfigSeq = 0
+
 async function loadVoiceConfig(agentName) {
   const voiceModelSel = document.getElementById('editAgentVoiceModel')
   if (!voiceModelSel) return
+  const seq = ++_voiceConfigSeq
   const banner = document.getElementById('voiceNotInstalledBanner')
   const controls = document.getElementById('voiceInstalledControls')
   try {
@@ -6272,6 +6965,7 @@ async function loadVoiceConfig(agentName) {
     const statusR = await fetch('/api/voice/status')
     if (!statusR.ok) return
     const status = await statusR.json()
+    if (seq !== _voiceConfigSeq) return
 
     if (!status.installed) {
       if (banner) banner.hidden = false
@@ -6284,6 +6978,7 @@ async function loadVoiceConfig(agentName) {
     const r = await fetch(`/api/agents/${encodeURIComponent(agentName)}/voice-config`)
     if (!r.ok) return
     const cfg = await r.json()
+    if (seq !== _voiceConfigSeq) return
     voiceModelSel.innerHTML = (cfg.availableVoices || []).map(v =>
       `<option value="${escapeHtml(v)}"${v === cfg.voiceModel ? ' selected' : ''}>${escapeHtml(v)}</option>`
     ).join('')
@@ -6301,7 +6996,7 @@ document.getElementById('voiceInstallBtn').addEventListener('click', async () =>
 
   if (sudoHint) sudoHint.hidden = true
   btn.disabled = true
-  btn.textContent = 'Indítás...'
+  btn.textContent = t('agents.auth.btn_starting')
 
   try {
     const r = await fetch('/api/voice/install', { method: 'POST' })
@@ -6312,10 +7007,10 @@ document.getElementById('voiceInstallBtn').addEventListener('click', async () =>
       // Show sudo command -- user must run it then click again
       if (sudoHint) {
         sudoHint.hidden = false
-        sudoHint.innerHTML = 'A rendszercsomagok telepítéséhez futtasd terminálon:<br><code style="display:block;margin-top:4px;word-break:break-all">' + escapeHtml(data.sudoCommand) + '</code><br>Ezután kattints újra a Telepítés gombra.'
+        sudoHint.innerHTML = escapeHtml(t('agents.voice.sudo_hint_before')) + '<br><code style="display:block;margin-top:4px;word-break:break-all">' + escapeHtml(data.sudoCommand) + '</code><br>' + escapeHtml(t('agents.voice.sudo_hint_after'))
       }
       btn.disabled = false
-      btn.textContent = 'Telepítés'
+      btn.textContent = t('connectors.catalog.install_btn')
       return
     }
 
@@ -6328,7 +7023,7 @@ document.getElementById('voiceInstallBtn').addEventListener('click', async () =>
     // Max 4 minutes (80 × 3s); on timeout show a hint and re-enable the button
     // so the user can retry (the only failure signal from a fire-and-forget spawn).
     if (progress) progress.hidden = false
-    btn.textContent = 'Telepítés...'
+    btn.textContent = t('common.installing')
     clearInterval(_voiceInstallPollTimer)
     let _voiceInstallPollCount = 0
     const VOICE_INSTALL_MAX_POLLS = 80 // 80 × 3s = 4 min
@@ -6351,16 +7046,16 @@ document.getElementById('voiceInstallBtn').addEventListener('click', async () =>
         if (progress) progress.hidden = true
         if (sudoHint) {
           sudoHint.hidden = false
-          sudoHint.textContent = 'A telepítés tovább tart vagy elakadt. Ellenőrizd a dashboard logjait, majd próbáld újra.'
+          sudoHint.textContent = t('agents.voice.install_stuck')
         }
         btn.disabled = false
-        btn.textContent = 'Újrapróbálás'
+        btn.textContent = t('agents.voice.retry')
       }
     }, 3000)
   } catch {
     btn.disabled = false
-    btn.textContent = 'Telepítés'
-    showToast(t('agents.voice.install_error'))
+    btn.textContent = t('connectors.catalog.install_btn')
+    showToast(t('agents.voice.install_error'), 'error')
   }
 })
 
@@ -6377,9 +7072,9 @@ document.getElementById('saveVoiceConfigBtn').addEventListener('click', async ()
     })
     // OWNERGATE3-1104: the server may refuse (403 owner_session_required); show why instead of a generic error.
     const reply = await readActionReply(r)
-    if (!reply.ok) { showToast(t('common.not_done', { msg: refusalReason(r, reply.body) })); return }
-    showToast(t('agents.voice.saved'))
-  } catch { showToast(t('common.error_save')) }
+    if (!reply.ok) { showToast(t('common.not_done', { msg: refusalReason(r, reply.body) }), 'error'); return }
+    showToast(t('agents.voice.saved'), 'success')
+  } catch { showToast(t('common.error_save'), 'error') }
 })
 
 document.getElementById('saveProfileBtn').addEventListener('click', async () => {
@@ -6393,9 +7088,9 @@ document.getElementById('saveProfileBtn').addEventListener('click', async () => 
     })
     if (!res.ok) throw new Error()
     const body = await res.json()
-    showToast(body.requiresRestart ? t('agents.toast.profile_saved_restart') : t('agents.toast.profile_saved'))
+    showToast(body.requiresRestart ? t('agents.toast.profile_saved_restart') : t('agents.toast.profile_saved'), 'success')
     loadAgents()
-  } catch { showToast(t('agents.toast.profile_error')) }
+  } catch { showToast(t('agents.toast.profile_error'), 'error') }
 })
 
 document.getElementById('savePlanBtn').addEventListener('click', async () => {
@@ -6411,9 +7106,137 @@ document.getElementById('savePlanBtn').addEventListener('click', async () => {
     })
     if (!res.ok) throw new Error()
     currentAgent.claudePlan = claudePlan || null
-    showToast(t('agents.toast.plan_saved'))
+    showToast(t('agents.toast.plan_saved'), 'success')
     loadAgents()
-  } catch { showToast(t('agents.toast.plan_error')) }
+  } catch { showToast(t('agents.toast.plan_error'), 'error') }
+})
+
+// === Log in to a Claude subscription for this agent (HOSTINGERRETEST1125) ===
+// The same setup-token relay as Settings > Claude subscriptions (/api/claude-plans/login/*): a link to open, the code
+// from the login page back here, the token checked with a test call. The new plan is then assigned to this agent, with
+// authMode 'shared' (a plan token runs only there: plan-token-launch.ts). The agent's own /login in its terminal
+// (own_team) is a different, advanced path that the dashboard cannot finish.
+
+/** A plan id for this agent's login: the agent name plus a time stamp, within the plan id charset. */
+function agentPlanLoginId(agentName, now = Date.now()) {
+  const base = String(agentName || 'agent').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 40) || 'agent'
+  return `${base}-${now.toString(36)}`
+}
+
+let agentPlanLoginFor = null // the agent the running login belongs to
+
+function setAgentPlanLoginState({ step = false, status = null, error = null } = {}) {
+  document.getElementById('agentPlanLoginStep').hidden = !step
+  const st = document.getElementById('agentPlanLoginStatus')
+  st.textContent = status || ''
+  st.hidden = !status
+  const er = document.getElementById('agentPlanLoginError')
+  er.textContent = error || ''
+  er.hidden = !error
+}
+
+document.getElementById('agentPlanLoginBtn').addEventListener('click', async () => {
+  if (!currentAgent || currentAgent.role === 'main') return
+  const agent = currentAgent
+  const btn = document.getElementById('agentPlanLoginBtn')
+  btn.disabled = true
+  setAgentPlanLoginState({ status: t('settings.claude_plans.login.starting') })
+  try {
+    const res = await fetch('/api/claude-plans/login/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: agentPlanLoginId(agent.name),
+        label: `${agent.displayName || agent.name} (${agent.name})`,
+        planType: 'personal',
+        channelsAllowed: false,
+      }),
+    })
+    let data = null
+    try { data = await res.json() } catch { /* non-JSON error body */ }
+    if (!res.ok || !data || typeof data.url !== 'string') {
+      setAgentPlanLoginState({ error: claudePlanLoginErrorText(data) })
+      return
+    }
+    agentPlanLoginFor = agent.name
+    const link = document.getElementById('agentPlanLoginLink')
+    link.href = safeHref(data.url) || '#'
+    document.getElementById('agentPlanLoginUrl').value = data.url
+    document.getElementById('agentPlanLoginCode').value = ''
+    setAgentPlanLoginState({ step: true, status: t('settings.claude_plans.login.waiting_code') })
+    link.focus()
+  } catch {
+    setAgentPlanLoginState({ error: t('settings.claude_plans.form.error_generic') })
+  } finally {
+    btn.disabled = false
+  }
+})
+
+document.getElementById('agentPlanLoginCopyBtn').addEventListener('click', async () => {
+  const field = document.getElementById('agentPlanLoginUrl')
+  if (!field.value) return
+  try {
+    await navigator.clipboard.writeText(field.value)
+    showToast(t('settings.claude_plans.login.copied'), 'success')
+  } catch {
+    field.focus()
+    field.select()
+  }
+})
+
+document.getElementById('agentPlanLoginCodeBtn').addEventListener('click', async () => {
+  const code = document.getElementById('agentPlanLoginCode').value.trim()
+  const agentName = agentPlanLoginFor
+  if (!code || !agentName) return
+  const btn = document.getElementById('agentPlanLoginCodeBtn')
+  btn.disabled = true
+  setAgentPlanLoginState({ step: true, status: t('settings.claude_plans.login.checking') })
+  try {
+    const res = await fetch('/api/claude-plans/login/code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+    })
+    let data = null
+    try { data = await res.json() } catch { /* non-JSON error body */ }
+    if (res.status !== 201 || !data || !data.id) {
+      // A mistyped code leaves the login waiting; anything else has ended it.
+      const waiting = data && data.code === 'bad-code'
+      setAgentPlanLoginState({ step: waiting, status: waiting ? t('settings.claude_plans.login.waiting_code') : null, error: claudePlanLoginErrorText(data) })
+      if (!waiting) agentPlanLoginFor = null
+      return
+    }
+    agentPlanLoginFor = null
+    // The plan exists now; assign it to the agent (a plan token runs with authMode 'shared' only).
+    const put = await fetch(`/api/agents/${encodeURIComponent(agentName)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ authMode: 'shared', claudePlan: data.id }),
+    })
+    if (!put.ok) {
+      setAgentPlanLoginState({ error: t('agents.plan_login.assign_failed', { label: data.label || data.id }) })
+      return
+    }
+    setAgentPlanLoginState({})
+    showToast(t('agents.plan_login.done', { label: data.label || data.id }), data.verified ? 'success' : 'warn')
+    if (currentAgent && currentAgent.name === agentName) {
+      currentAgent.claudePlan = data.id
+      currentAgent.authMode = 'shared'
+      populatePlanSelect(document.getElementById('editAgentPlan'), document.getElementById('editAgentPlanDesc'), data.id)
+      updateAuthModeUI('shared', currentAgent.hasApiKey || false)
+    }
+    loadAgents()
+  } catch {
+    setAgentPlanLoginState({ error: t('settings.claude_plans.form.error_generic') })
+  } finally {
+    btn.disabled = false
+  }
+})
+
+document.getElementById('agentPlanLoginCancelBtn').addEventListener('click', async () => {
+  agentPlanLoginFor = null
+  setAgentPlanLoginState({})
+  try { await fetch('/api/claude-plans/login/cancel', { method: 'POST' }) } catch { /* the server ends it on its own timeout */ }
 })
 
 // === Auth Mode ===
@@ -6477,7 +7300,7 @@ document.getElementById('authSharedApplyBtn').addEventListener('click', async ()
         return
       }
     }
-    showToast(t('agents.toast.host_oauth_restart'))
+    showToast(t('agents.toast.host_oauth_restart'), 'success')
     loadAgents()
     const detailRes = await fetch(base)
     if (detailRes.ok) {
@@ -6539,7 +7362,7 @@ document.getElementById('authFlowInitBtn').addEventListener('click', async () =>
 
 document.getElementById('authFlowCopyBtn').addEventListener('click', () => {
   const url = document.getElementById('authFlowUrl').textContent
-  navigator.clipboard.writeText(url).then(() => showToast(t('common.toast.copied')))
+  navigator.clipboard.writeText(url).then(() => showToast(t('common.toast.copied'), 'success'))
 })
 
 document.getElementById('memoryIsolationToggle').addEventListener('change', async (e) => {
@@ -6553,10 +7376,28 @@ document.getElementById('memoryIsolationToggle').addEventListener('change', asyn
     })
     if (!res.ok) throw new Error()
     currentAgent.memoryIsolation = enabled
-    showToast(t(enabled ? 'agents.toast.memory_isolation_on' : 'agents.toast.memory_isolation_off'))
+    showToast(t(enabled ? 'agents.toast.memory_isolation_on' : 'agents.toast.memory_isolation_off'), 'success')
   } catch {
     e.target.checked = !enabled
-    showToast(t('common.error_save'))
+    showToast(t('common.error_save'), 'error')
+  }
+})
+
+document.getElementById('codeModeToggle').addEventListener('change', async (e) => {
+  if (!currentAgent || currentAgent.role === 'main') return
+  const enabled = e.target.checked
+  try {
+    const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ codeMode: enabled }),
+    })
+    if (!res.ok) throw new Error()
+    currentAgent.codeMode = enabled
+    showToast(t(enabled ? 'agents.toast.code_mode_on' : 'agents.toast.code_mode_off'), 'success')
+  } catch {
+    e.target.checked = !enabled
+    showToast(t('common.error_save'), 'error')
   }
 })
 
@@ -6575,7 +7416,7 @@ document.getElementById('saveAuthModeBtn').addEventListener('click', async () =>
       body: JSON.stringify(payload),
     })
     if (!res.ok) throw new Error()
-    showToast(t('agents.toast.auth_mode_saved'))
+    showToast(t('agents.toast.auth_mode_saved'), 'success')
     loadAgents()
     const detailRes = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}`)
     if (detailRes.ok) {
@@ -6583,7 +7424,7 @@ document.getElementById('saveAuthModeBtn').addEventListener('click', async () =>
       currentAgent = updated
       updateAuthModeUI(updated.authMode || 'shared', updated.hasApiKey || false)
     }
-  } catch { showToast(t('common.error_save')) }
+  } catch { showToast(t('common.error_save'), 'error') }
 })
 
 document.getElementById('saveClaudeMdBtn').addEventListener('click', async () => {
@@ -6596,8 +7437,8 @@ document.getElementById('saveClaudeMdBtn').addEventListener('click', async () =>
     })
     if (!res.ok) throw new Error()
     markFieldSaved(document.getElementById('editClaudeMd'))
-    showToast(t('agents.claude_md_saved'))
-  } catch { showToast(t('common.error_save')) }
+    showToast(t('agents.claude_md_saved'), 'success')
+  } catch { showToast(t('common.error_save'), 'error') }
 })
 
 document.getElementById('saveSoulMdBtn').addEventListener('click', async () => {
@@ -6610,8 +7451,8 @@ document.getElementById('saveSoulMdBtn').addEventListener('click', async () => {
     })
     if (!res.ok) throw new Error()
     markFieldSaved(document.getElementById('editSoulMd'))
-    showToast(t('agents.soul_md_saved'))
-  } catch { showToast(t('common.error_save')) }
+    showToast(t('agents.soul_md_saved'), 'success')
+  } catch { showToast(t('common.error_save'), 'error') }
 })
 
 document.getElementById('saveMcpJsonBtn').addEventListener('click', async () => {
@@ -6624,8 +7465,8 @@ document.getElementById('saveMcpJsonBtn').addEventListener('click', async () => 
     })
     if (!res.ok) throw new Error()
     markFieldSaved(document.getElementById('editMcpJson'))
-    showToast(t('agents.mcp_json_saved'))
-  } catch { showToast(t('common.error_save')) }
+    showToast(t('agents.mcp_json_saved'), 'success')
+  } catch { showToast(t('common.error_save'), 'error') }
 })
 
 // === Channel tab ===
@@ -6740,6 +7581,12 @@ function updateProviderUI() {
     if (pairingInfo) pairingInfo.textContent = t('channel.setup.slack_pairing')
   }
   if (howto) howto.innerHTML = buildHowtoHtml()
+  // SLACKINVCOPY1121: a Slack invite approves nobody by itself (SLACKINVBIND1120), the owner approves the pairing code.
+  const inviteDesc = document.getElementById('chInviteDesc')
+  if (inviteDesc) {
+    inviteDesc.dataset.i18n = currentChannelProvider === 'slack' ? 'agents.channel.slack_invite_desc' : 'agents.channel.tg_invite_desc'
+    inviteDesc.textContent = t(inviteDesc.dataset.i18n)
+  }
   if (reconnectBtn) {
     reconnectBtn.hidden = !(currentAgent && currentAgent.running && agentIsConnected(currentAgent))
   }
@@ -6843,15 +7690,16 @@ document.getElementById('chConnectBtn').addEventListener('click', async () => {
     const result = await res.json()
     // #1878 (6): on the main agent the save restarts the channels session; a failed
     // restart must not read as "connected".
-    if (result.restartError) showToast(t('agents.channel.saved_restart_failed', { provider: getProviderLabel(), cmd: result.restartCommand || '' }), 12000)
-    else showToast(t('channel.toast.connected', { provider: getProviderLabel() }))
+    if (result.restartError) showToast(t('agents.channel.saved_restart_failed', { provider: getProviderLabel(), cmd: result.restartCommand || '' }), { kind: 'warn', duration: 12000 })
+    // INSTTGPOLLWARN1119: another install polling the same bot cannot be checked; said with "connected", not blocked.
+    else showToast(t('channel.toast.connected', { provider: getProviderLabel() }) + (result.pollerNote ? ' ' + t('channel.telegram.poller_unverifiable') : ''), result.pollerNote ? { kind: 'warn', duration: 10000 } : 'success')
     // Refresh detail
     // CHANNELUNCONF1110: the main agent's detail draws from /api/marveen; fetch it first so the status and the banner follow.
     if (currentAgent.name === mainAgentId()) await refreshMainChannelUnconfBanner()
     await openAgentDetail(currentAgent.name)
     loadAgents()
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -6870,11 +7718,11 @@ document.getElementById('chTestBtn').addEventListener('click', async () => {
     // after a restart). Say so instead of "all right".
     const missing = Array.isArray(data.missingScopes) ? data.missingScopes : []
     if (missing.length > 0) {
-      // showToast's 2nd argument is the DURATION (ms). Long enough to read
-      // a sentence that names scopes and what to do.
+      // A warning, with a DURATION (ms) long enough to read a sentence that
+      // names scopes and what to do.
       const msg = t('channel.toast.missing_scopes', { scopes: missing.join(', ') })
         + (missing.includes('im:read') ? ' ' + t('channel.toast.missing_scopes_imread') : '')
-      showToast(msg, 12000)
+      showToast(msg, { kind: 'warn', duration: 12000 })
     } else {
       const exp = data.secretExpiry
       const suffix = !exp ? ''
@@ -6884,10 +7732,12 @@ document.getElementById('chTestBtn').addEventListener('click', async () => {
         : exp.state === 'soon' ? ' ' + t('channel.toast.teams_secret_expiry_soon', { date: exp.date, days: exp.daysLeft })
         : exp.state === 'expired' ? ' ' + t('channel.toast.teams_secret_expiry_expired', { date: exp.date })
         : ''
-      showToast(t('channel.toast.test_ok') + suffix, suffix ? 8000 : undefined)
+      // the connection works; a secret that is missing, unreadable or near its end still needs the owner
+      const secretNeedsCare = ['missing', 'invalid', 'soon', 'expired'].includes(exp?.state)
+      showToast(t('channel.toast.test_ok') + suffix, secretNeedsCare ? { kind: 'warn', duration: 8000 } : { kind: 'success', duration: suffix ? 8000 : 3000 })
     }
   } catch {
-    showToast(t('channel.toast.smoke_failed'))
+    showToast(t('channel.toast.smoke_failed'), 'error')
   }
 })
 
@@ -6901,13 +7751,13 @@ document.getElementById('chReconnectBtn').addEventListener('click', async () => 
     const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/channel/reconnect`, { method: 'POST' })
     const data = await res.json()
     if (data.ok) {
-      showToast(t('channel.toast.reconnect_ok'))
+      showToast(t('channel.toast.reconnect_ok'), 'success')
       document.getElementById('chDisconnectedNotice').hidden = true
     } else {
-      showToast(data.message || t('channel.toast.reconnect_failed'), 8000)
+      showToast(data.message || t('channel.toast.reconnect_failed'), { kind: 'error', duration: 8000 })
     }
   } catch {
-    showToast(t('channel.toast.reconnect_error'), 8000)
+    showToast(t('channel.toast.reconnect_error'), { kind: 'error', duration: 8000 })
   } finally {
     btn.disabled = false
     btn.textContent = origText
@@ -6924,12 +7774,12 @@ document.getElementById('chSmokeTestBtn').addEventListener('click', async () => 
     const res = await fetch(`/api/agents/${encodeURIComponent(currentAgent.name)}/channels/slack/smoke-test`, { method: 'POST' })
     const data = await res.json()
     if (!res.ok) {
-      showToast(data.error || t('channel.smoke_test.failed'), 8000)
+      showToast(data.error || t('channel.smoke_test.failed'), { kind: 'error', duration: 8000 })
       return
     }
     showSmokeTestResult(data.output || 'OK')
   } catch {
-    showToast(t('channel.smoke_test.error'), 8000)
+    showToast(t('channel.smoke_test.error'), { kind: 'error', duration: 8000 })
   } finally {
     btn.disabled = false
     btn.textContent = origText
@@ -6996,11 +7846,11 @@ async function approvePairing(code) {
       const err = await res.json()
       throw new Error(err.error || t('channel.toast.approve_error'))
     }
-    showToast(t('channel.toast.pairing_approved'))
+    showToast(t('channel.toast.pairing_approved'), 'success')
     refreshPendingPairings()
     refreshAllowedList()
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   }
 }
 
@@ -7065,10 +7915,10 @@ async function removeAllowed(kind, id) {
       const err = await res.json().catch(() => ({}))
       throw new Error(err.error || t('channel.toast.remove_error'))
     }
-    showToast(t('common.toast.removed'))
+    showToast(t('common.toast.removed'), 'success')
     refreshAllowedList()
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   }
 }
 
@@ -7110,8 +7960,8 @@ async function refreshInvites() {
       if (copyBtn) {
         copyBtn.addEventListener('click', async (e) => {
           const link = e.currentTarget.getAttribute('data-link')
-          try { await navigator.clipboard.writeText(link); showToast(t('common.toast.copied')) }
-          catch { showToast(t('common.toast.copy_failed')) }
+          try { await navigator.clipboard.writeText(link); showToast(t('common.toast.copied'), 'success') }
+          catch { showToast(t('common.toast.copy_failed'), 'error') }
         })
       }
       const revokeBtn = item.querySelector('button[data-token]')
@@ -7136,14 +7986,14 @@ async function generateInvite() {
     }
     const data = await res.json()
     if (data.deepLink) {
-      try { await navigator.clipboard.writeText(data.deepLink); showToast(t('channel.toast.invite_copied')) }
+      try { await navigator.clipboard.writeText(data.deepLink); showToast(t('channel.toast.invite_copied'), 'success') }
       catch { showToast(t('channel.toast.invite_created')) }
     } else {
       showToast(t('channel.toast.invite_pending'))
     }
     refreshInvites()
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   } finally {
     btn.disabled = false
     btn.textContent = t('channel.btn.invite_new')
@@ -7165,10 +8015,10 @@ async function revokeInviteToken(token) {
       const err = await res.json().catch(() => ({}))
       throw new Error(err.error || t('common.failed'))
     }
-    showToast(t('channel.toast.invite_revoked'))
+    showToast(t('channel.toast.invite_revoked'), 'success')
     refreshInvites()
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   }
 }
 
@@ -7254,10 +8104,10 @@ async function submitApproveModal() {
     document.getElementById('chApproveModalOverlay').hidden = true
     const item = document.querySelector(`[data-req-id="${CSS.escape(String(id))}"]`)
     if (item) item.remove()
-    showToast(t('channel.toast.approved'))
+    showToast(t('channel.toast.approved'), 'success')
     refreshChannelRequests()
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   } finally {
     confirmBtn.querySelector('.btn-text').hidden = false
     confirmBtn.querySelector('.btn-loading').hidden = true
@@ -7275,7 +8125,7 @@ async function denyChannelRequest(id, itemEl) {
     showToast(t('channel.toast.denied'))
     refreshChannelRequests()
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
     refreshChannelRequests()
   }
 }
@@ -7315,14 +8165,14 @@ document.getElementById('chDisconnectBtn').addEventListener('click', async () =>
     // OWNERGATE2-1104: the server may refuse (403 owner_session_required); a refusal is never shown as done.
     const res = await fetch(`${channelApiBase()}`, { method: 'DELETE' })
     const reply = await readActionReply(res)
-    if (!reply.ok) { showToast(t('common.not_done', { msg: refusalReason(res, reply.body) })); return }
-    showToast(t('channel.toast.disconnected', { provider: provLabel }))
+    if (!reply.ok) { showToast(t('common.not_done', { msg: refusalReason(res, reply.body) }), 'error'); return }
+    showToast(t('channel.toast.disconnected', { provider: provLabel }), 'success')
     // CHANNELUNCONF1110: the main agent's detail draws from /api/marveen; fetch it first so the status and the banner follow.
     if (currentAgent.name === mainAgentId()) await refreshMainChannelUnconfBanner()
     await openAgentDetail(currentAgent.name)
     loadAgents()
   } catch {
-    showToast(t('channel.toast.disconnect_error'))
+    showToast(t('channel.toast.disconnect_error'), 'error')
   }
 })
 
@@ -7372,10 +8222,10 @@ async function loadSkills(agentName) {
           if (!confirmed) return
           try {
             await fetch(`/api/agents/${encodeURIComponent(agentName)}/skills/${encodeURIComponent(skill.name)}`, { method: 'DELETE' })
-            showToast(t('skills.toast.deleted'))
+            showToast(t('skills.toast.deleted'), 'success')
             loadSkills(agentName)
           } catch {
-            showToast(t('common.error_delete'))
+            showToast(t('common.error_delete'), 'error')
           }
         })
       }
@@ -7437,13 +8287,13 @@ document.getElementById('saveSkillBtn').addEventListener('click', async () => {
   const name = document.getElementById('skillName').value.trim()
   if (!name) {
     document.getElementById('skillName').focus()
-    showToast(t('skills.toast.name_required'))
+    showToast(t('skills.toast.name_required'), 'warn')
     return
   }
   const description = document.getElementById('skillDescription').value.trim()
   if (!description) {
     document.getElementById('skillDescription').focus()
-    showToast(t('skills.toast.desc_required'))
+    showToast(t('skills.toast.desc_required'), 'warn')
     return
   }
 
@@ -7470,14 +8320,14 @@ document.getElementById('saveSkillBtn').addEventListener('click', async () => {
     }
     const created = await res.json().catch(() => ({}))
     closeModal(skillModalOverlay)
-    showToast(created.pending ? t('skills.toast.queued') : t('skills.toast.added'))
+    showToast(created.pending ? t('skills.toast.queued') : t('skills.toast.added'), created.pending ? undefined : 'success')
     if (isGlobal) {
       loadGlobalSkills()
     } else {
       loadSkills(agentApiName())
     }
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -7488,8 +8338,8 @@ document.getElementById('saveSkillBtn').addEventListener('click', async () => {
 // Import skill
 document.getElementById('importSkillBtn').addEventListener('click', async () => {
   const isGlobal = skillModalScope === 'global'
-  if (!skillFile) { showToast(t('skills.toast.select_file')); return }
-  if (!isGlobal && !currentAgent) { showToast(t('skills.toast.select_file')); return }
+  if (!skillFile) { showToast(t('skills.toast.select_file'), 'warn'); return }
+  if (!isGlobal && !currentAgent) { showToast(t('skills.toast.select_file'), 'warn'); return }
 
   const btn = document.getElementById('importSkillBtn')
   btn.disabled = true
@@ -7513,7 +8363,7 @@ document.getElementById('importSkillBtn').addEventListener('click', async () => 
     const result = await res.json()
     closeModal(skillModalOverlay)
     const importedList = Array.isArray(result.imported) ? result.imported : []
-    showToast(t(result.pending ? 'skills.toast.imported_queued' : 'skills.toast.imported', { list: importedList.join(', ') }))
+    showToast(t(result.pending ? 'skills.toast.imported_queued' : 'skills.toast.imported', { list: importedList.join(', ') }), result.pending ? undefined : 'success')
     skillFile = null
     document.getElementById('skillFileName').textContent = ''
     if (isGlobal) {
@@ -7522,7 +8372,7 @@ document.getElementById('importSkillBtn').addEventListener('click', async () => 
       loadSkills(agentApiName())
     }
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -7646,6 +8496,11 @@ function resetScheduleForm() {
   document.getElementById('scheduleSkipIfBusy').checked = false
   document.getElementById('scheduleForceSend').checked = false
   document.getElementById('scheduleTargetSession').value = ''
+  for (const id of ['schedulePreCheck', 'schedulePreCheckTimeout']) {
+    const el = document.getElementById(id)
+    el.value = el.defaultValue = ''
+  }
+  document.getElementById('schedulePreCheckGroup').hidden = true
   scheduleFrequency.value = 'daily'
   document.getElementById('scheduleTime').value = '09:00'
   document.getElementById('scheduleCustomCron').value = ''
@@ -7883,10 +8738,10 @@ function renderPendingRetries(container, rows) {
         const res = await fetch(`/api/schedules/pending/${encodeURIComponent(id)}`, { method: 'DELETE' })
         // The server's reasons are English API texts ("Pending retry not found"): a translated toast instead,
         // and the list is reloaded, since a 404 means the retry is already gone.
-        if (!res.ok) showToast(t('tasks.toast.cancel_pending_error'))
+        if (!res.ok) showToast(t('tasks.toast.cancel_pending_error'), 'error')
         loadPendingRetries()
       } catch {
-        showToast(t('tasks.toast.cancel_pending_error'))
+        showToast(t('tasks.toast.cancel_pending_error'), 'error')
       }
     })
   })
@@ -7979,10 +8834,10 @@ function makeScheduleRow(task) {
       try {
         const r = await fetch(`/api/schedules/${encodeURIComponent(task.name)}/run`, { method: 'POST' })
         const data = await r.json().catch(() => ({}))
-        if (r.ok) showToast(t('tasks.toast.run_started') + (data.result ? ': ' + data.result : ''))
-        else showToast(t('common.not_done', { msg: refusalReason(r, data) }))
+        if (r.ok) showToast(t('tasks.toast.run_started') + (data.result ? ': ' + data.result : ''), 'success')
+        else showToast(t('common.not_done', { msg: refusalReason(r, data) }), 'error')
         loadSchedules()
-      } catch { showToast(t('tasks.toast.run_error')) }
+      } catch { showToast(t('tasks.toast.run_error'), 'error') }
     })
 
     row.querySelector('[data-action="toggle"]').addEventListener('click', async (e) => {
@@ -7990,10 +8845,10 @@ function makeScheduleRow(task) {
       try {
         const res = await fetch(`/api/schedules/${encodeURIComponent(task.name)}/toggle`, { method: 'POST' })
         const reply = await readActionReply(res)
-        if (reply.ok) showToast(task.enabled ? t('tasks.toast.toggled_paused') : t('tasks.toast.toggled_resumed'))
-        else showToast(t('common.not_done', { msg: refusalReason(res, reply.body) }))
+        if (reply.ok) showToast(task.enabled ? t('tasks.toast.toggled_paused') : t('tasks.toast.toggled_resumed'), 'success')
+        else showToast(t('common.not_done', { msg: refusalReason(res, reply.body) }), 'error')
         loadSchedules()
-      } catch { showToast(t('common.error')) }
+      } catch { showToast(t('common.error'), 'error') }
     })
 
     row.querySelector('[data-action="delete"]').addEventListener('click', async (e) => {
@@ -8008,10 +8863,10 @@ function makeScheduleRow(task) {
       try {
         const res = await fetch(`/api/schedules/${encodeURIComponent(task.name)}`, { method: 'DELETE' })
         const reply = await readActionReply(res)
-        if (reply.ok) showToast(t('tasks.toast.deleted'))
-        else showToast(t('common.not_done', { msg: refusalReason(res, reply.body) }))
+        if (reply.ok) showToast(t('tasks.toast.deleted'), 'success')
+        else showToast(t('common.not_done', { msg: refusalReason(res, reply.body) }), 'error')
         loadSchedules()
-      } catch { showToast(t('common.error_delete')) }
+      } catch { showToast(t('common.error_delete'), 'error') }
     })
 
     row.querySelector('[data-action="history"]').addEventListener('click', async (e) => {
@@ -8329,6 +9184,12 @@ function openEditSchedule(task) {
     document.getElementById('scheduleSkipIfBusy').checked = !!task.skipIfBusy
     document.getElementById('scheduleForceSend').checked = !!task.forceSend
     document.getElementById('scheduleTargetSession').value = task.targetSession || ''
+    // edit only: the loaded list carries both fields; defaultValue is what the save compares against
+    const preCheckEl = document.getElementById('schedulePreCheck')
+    preCheckEl.value = preCheckEl.defaultValue = typeof task.preCheck === 'string' ? task.preCheck : ''
+    const preCheckTimeoutEl = document.getElementById('schedulePreCheckTimeout')
+    preCheckTimeoutEl.value = preCheckTimeoutEl.defaultValue = task.preCheckTimeoutSeconds ?? ''
+    document.getElementById('schedulePreCheckGroup').hidden = false
 
     // Set type (heartbeat or task; custom types fall back to task)
     const typeEl = document.getElementById('scheduleType')
@@ -8416,7 +9277,7 @@ document.getElementById('expandPromptBtn').addEventListener('click', async () =>
     applyBtn.className = 'btn-primary btn-compact'
     applyBtn.innerHTML = `<span class="btn-text">${t('tasks.expand.apply_btn')}</span><span class="btn-loading" hidden><span class="spinner"></span></span>`
     applyBtn.addEventListener('click', async () => {
-      if (expandAnswers.length === 0) { showToast(t('tasks.expand.need_answer')); return }
+      if (expandAnswers.length === 0) { showToast(t('tasks.expand.need_answer'), 'warn'); return }
       applyBtn.disabled = true
       applyBtn.querySelector('.btn-text').hidden = true
       applyBtn.querySelector('.btn-loading').hidden = false
@@ -8430,9 +9291,9 @@ document.getElementById('expandPromptBtn').addEventListener('click', async () =>
         const { prompt: expanded } = await res2.json()
         document.getElementById('schedulePrompt').value = expanded
         questionsEl.hidden = true
-        showToast(t('tasks.expand.done'))
+        showToast(t('tasks.expand.done'), 'success')
       } catch {
-        showToast(t('tasks.expand.error'))
+        showToast(t('tasks.expand.error'), 'error')
       } finally {
         applyBtn.disabled = false
         applyBtn.querySelector('.btn-text').hidden = false
@@ -8462,10 +9323,18 @@ saveScheduleBtn.addEventListener('click', async () => {
   const targetSession = document.getElementById('scheduleTargetSession').value.trim()
   const advanced = { skipIfBusy, forceSend }
   if (targetSession) advanced.targetSession = targetSession
+  // preCheck / preCheckTimeoutSeconds are owner fields (OWNEREXEC1109): sent only when changed, so a plain edit
+  // needs no owner session; an emptied field sends null, which clears it. The server makes the owner check.
+  const preCheckEl = document.getElementById('schedulePreCheck')
+  if (preCheckEl.value.trim() !== preCheckEl.defaultValue) advanced.preCheck = preCheckEl.value.trim() || null
+  const preCheckTimeoutEl = document.getElementById('schedulePreCheckTimeout')
+  if (preCheckTimeoutEl.value.trim() !== preCheckTimeoutEl.defaultValue) {
+    advanced.preCheckTimeoutSeconds = preCheckTimeoutEl.value.trim() ? Number(preCheckTimeoutEl.value) : null
+  }
 
   if (!name) { document.getElementById('scheduleName').focus(); return }
   if (!prompt) { document.getElementById('schedulePrompt').focus(); return }
-  if (!schedule) { showToast(t('tasks.toast.select_schedule')); return }
+  if (!schedule) { showToast(t('tasks.toast.select_schedule'), 'warn'); return }
 
   saveScheduleBtn.disabled = true
   saveScheduleBtn.querySelector('.btn-text').hidden = true
@@ -8483,7 +9352,7 @@ saveScheduleBtn.addEventListener('click', async () => {
         const err = await res.json()
         throw new Error(err.error || t('common.failed'))
       }
-      showToast(t('tasks.toast.updated'))
+      showToast(t('tasks.toast.updated'), 'success')
     } else {
       // Create
       const res = await fetch('/api/schedules', {
@@ -8495,12 +9364,12 @@ saveScheduleBtn.addEventListener('click', async () => {
         const err = await res.json()
         throw new Error(err.error || t('common.failed'))
       }
-      showToast(t('tasks.toast.created'))
+      showToast(t('tasks.toast.created'), 'success')
     }
     closeModal(scheduleModalOverlay)
     loadSchedules()
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   } finally {
     saveScheduleBtn.disabled = false
     saveScheduleBtn.querySelector('.btn-text').hidden = false
@@ -8634,15 +9503,15 @@ async function saveMemoryFromModal() {
       const b = reply.body
       showToast(b.error === 'destructive_memory_write' && Number.isFinite(b.old_len) && Number.isFinite(b.new_len)
         ? t('memories.toast.destructive_refused', { old_len: b.old_len, new_len: b.new_len })
-        : t('memories.toast.save_refused', { msg: refusalReason(res, b) }), 6000)
+        : t('memories.toast.save_refused', { msg: refusalReason(res, b) }), { kind: 'error', duration: 6000 })
       return
     }
-    showToast(t(editId ? 'memories.toast.updated' : 'memories.toast.created'))
+    showToast(t(editId ? 'memories.toast.updated' : 'memories.toast.created'), 'success')
     closeModal(memModalOverlay)
     loadMemories()
     loadMemStats()
   } catch {
-    showToast(t('common.error_save'))
+    showToast(t('common.error_save'), 'error')
   }
 }
 document.getElementById('saveMemBtn').addEventListener('click', saveMemoryFromModal)
@@ -8732,11 +9601,11 @@ async function moveMemTier(mem, tier) {
       body: JSON.stringify({ tier, updated_by: 'dashboard' }),
     })
     if (!res.ok) throw new Error(String(res.status))
-    showToast(t('memories.stale.moved', { tier: tierLabels[tier] || tier }))
+    showToast(t('memories.stale.moved', { tier: tierLabels[tier] || tier }), 'success')
     loadMemories()
     loadMemStats()
   } catch {
-    showToast(t('common.error_save'))
+    showToast(t('common.error_save'), 'error')
   }
 }
 
@@ -8763,10 +9632,10 @@ async function loadMemStats() {
         const r = await fetch('/api/memories/backfill', { method: 'POST' })
         const data = await r.json()
         // ok:false = pending memories but the embedding backend answered none
-        if (data.ok === false) showToast(t('memories.toast.vector_error'))
-        else showToast(t('memories.toast.vector_count', { count: data.embedded ?? data.count }))
+        if (data.ok === false) showToast(t('memories.toast.vector_error'), 'error')
+        else showToast(t('memories.toast.vector_count', { count: data.embedded ?? data.count }), 'success')
         loadMemStats()
-      } catch { showToast(t('memories.toast.vector_error')) }
+      } catch { showToast(t('memories.toast.vector_error'), 'error') }
     })
   } catch (err) {
     console.error('Stats hiba:', err)
@@ -9000,16 +9869,16 @@ function renderMemories(memories) {
           body = await res.json().catch(() => ({}))
         }
         if (res.ok) {
-          showToast(t('memories.toast.deleted'))
+          showToast(t('memories.toast.deleted'), 'success')
           loadMemories()
           loadMemStats()
         } else if (body.error === 'approval_required') {
           showToast(t('memories.toast.delete_pending'))
         } else {
-          showToast(`${t('common.error_delete')}: ${body.error || res.status}`)
+          showToast(`${t('common.error_delete')}: ${body.error || res.status}`, 'error')
         }
       } catch {
-        showToast(t('common.error_delete'))
+        showToast(t('common.error_delete'), 'error')
       }
     })
 
@@ -9888,9 +10757,9 @@ document.getElementById('connectorRefreshBtn').addEventListener('click', async (
     const res = await fetch('/api/connectors/refresh', { method: 'POST' })
     const data = await res.json().catch(() => ({}))
     if (!res.ok || !data.ok) {
-      showToast(t('updates.error', {msg: data.error || 'HTTP ' + res.status}))
+      showToast(t('updates.error', {msg: data.error || 'HTTP ' + res.status}), 'error')
     } else {
-      showToast(t('connectors.toast.mcp_refreshed', { n: data.count || 0 }))
+      showToast(t('connectors.toast.mcp_refreshed', { n: data.count || 0 }), 'success')
     }
     await loadConnectors()
     // Reload catalog only if the Gallery tab is currently active so we
@@ -9899,7 +10768,7 @@ document.getElementById('connectorRefreshBtn').addEventListener('click', async (
       await loadCatalog()
     }
   } catch (err) {
-    showToast(t('updates.toast.error', {msg: err.message || err}))
+    showToast(t('updates.toast.error', {msg: err.message || err}), 'error')
   } finally {
     btn.disabled = false
   }
@@ -9958,7 +10827,7 @@ function renderCatalog() {
       </div>
       <div class="catalog-card-footer">
         ${item.installed
-          ? `<span class="catalog-install-btn installed" title="${item.configMatch ? t('connectors.tooltip.installed_mcp') : t('connectors.tooltip.installed_src', { src: escapeHtml(item.installedSource || '') })}">Telepítve &#10003;${item.configMatch ? ' (.mcp.json)' : item.installedSource === 'claude.ai' ? ' (claude.ai)' : item.installedSource === 'plugin' ? ' (plugin)' : ''}</span>${(item.installedSource === 'claude.ai' || item.configMatch) ? '' : `<a class="catalog-uninstall-link" data-id="${escapeHtml(item.id)}">Eltávolítás</a>`}`
+          ? `<span class="catalog-install-btn installed" title="${item.configMatch ? t('connectors.tooltip.installed_mcp') : t('connectors.tooltip.installed_src', { src: escapeHtml(item.installedSource || '') })}">${escapeHtml(t('connectors.catalog.installed'))} &#10003;${item.configMatch ? ' (.mcp.json)' : item.installedSource === 'claude.ai' ? ' (claude.ai)' : item.installedSource === 'plugin' ? ' (plugin)' : ''}</span>${(item.installedSource === 'claude.ai' || item.configMatch) ? '' : `<a class="catalog-uninstall-link" data-id="${escapeHtml(item.id)}">Eltávolítás</a>`}`
           : `<button class="catalog-install-btn install" data-id="${escapeHtml(item.id)}">${t('connectors.catalog.install_btn')}</button>${authHint}`
         }
       </div>
@@ -10033,7 +10902,7 @@ document.getElementById('catalogInstallBtn').addEventListener('click', async () 
     const val = input.value.trim()
     if (!val) {
       input.focus()
-      showToast(t('connectors.toast.required_field', { key }))
+      showToast(t('connectors.toast.required_field', { key }), 'warn')
       return
     }
     envData[key] = val
@@ -10054,12 +10923,12 @@ document.getElementById('catalogInstallBtn').addEventListener('click', async () 
     const data = reply.body
     if (!reply.ok) throw new Error(refusalReason(res, data))
     closeModal(catalogInstallOverlay)
-    showToast(data.message || t('connectors.toast.installed'))
+    showToast(data.message || t('connectors.toast.installed'), 'success')
     // Reload both views
     loadCatalog()
     loadConnectors()
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -10081,11 +10950,11 @@ async function catalogUninstall(item) {
     const reply = await readActionReply(res)
     const data = reply.body || {}
     if (!reply.ok) throw new Error(refusalReason(res, reply.body))
-    showToast(data.message || t('connectors.toast.removed'))
+    showToast(data.message || t('connectors.toast.removed'), 'success')
     loadCatalog()
     loadConnectors()
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   }
 }
 
@@ -10438,7 +11307,7 @@ async function offerGitHubRepoScriptsOptIn(name, skipped) {
     body: JSON.stringify({ runScripts: true }),
   })
   const data = await res.json()
-  if (data.error) showToast(data.error)
+  if (data.error) showToast(data.error, 'error')
 }
 
 async function loadGitHubRepos() {
@@ -10461,7 +11330,7 @@ async function loadGitHubRepos() {
         try {
           const res = await fetch(`/api/connectors/github-repos/${encodeURIComponent(r.name)}`, { method: 'PATCH' })
           const data = await res.json()
-          if (data.error) { showToast(data.error); return }
+          if (data.error) { showToast(data.error, 'error'); return }
           await offerGitHubRepoScriptsOptIn(r.name, data.scriptsSkipped)
           loadConnectors()
         } finally { btn.disabled = false; btn.innerHTML = '&#x21bb;' }
@@ -10691,7 +11560,7 @@ function renderOssRow(e) {
             status.textContent = 'Telepitve, kulcsok mentve a Vault-ba!'
           } else {
             status.className = 'github-repo-status error'
-            status.textContent = 'Telepitve, de néhány kulcs mentése sikertelen. Add meg újra a Vault-ban.'
+            status.textContent = t('connectors.env_modal.partial_save')
           }
           loadVault()
         } else {
@@ -10747,7 +11616,7 @@ async function loadVault() {
         })
         if (!confirmed) return
         const res = await fetch(`/api/vault/${encodeURIComponent(s.id)}`, { method: 'DELETE' })
-        if (!res.ok) { showToast(t('vault.toast.delete_error')); return }
+        if (!res.ok) { showToast(t('vault.toast.delete_error'), 'error'); return }
         loadVault()
       })
       list.appendChild(item)
@@ -10778,7 +11647,7 @@ async function loadVault() {
     })
     if (!res.ok) {
       const e = await res.json().catch(() => ({}))
-      showToast(t('vault.toast.save_failed', { msg: e.error || res.status }))
+      showToast(t('vault.toast.save_failed', { msg: e.error || res.status }), 'error')
       return
     }
     idInput.value = ''
@@ -10917,7 +11786,7 @@ function renderSshKeys() {
       })
       if (!confirmed) return
       const res = await fetch(`/api/vault/ssh-keys/${encodeURIComponent(btn.dataset.id)}`, { method: 'DELETE' })
-      if (!res.ok) showToast(t('vault.toast.delete_error'))
+      if (!res.ok) showToast(t('vault.toast.delete_error'), 'error')
       await loadSshKeys()
       await loadSshServers()
     })
@@ -11056,7 +11925,7 @@ function renderSshServers() {
       try {
         await fetch(`/api/vault/ssh-servers/${encodeURIComponent(id)}`, { method: 'DELETE' })
         await loadSshServers()
-      } catch { showToast(t('vault.toast.delete_error')) }
+      } catch { showToast(t('vault.toast.delete_error'), 'error') }
     })
   })
 
@@ -11137,7 +12006,7 @@ function openSshKeygenModal(callback) {
   submitBtn.addEventListener('click', async () => {
     const label = document.getElementById('sshKeygenLabelInput').value.trim()
     const username = document.getElementById('sshKeygenUserInput').value.trim()
-    if (!label || !username) { showToast(t('vault.ssh.toast.label_user_required')); return }
+    if (!label || !username) { showToast(t('vault.ssh.toast.label_user_required'), 'warn'); return }
 
     document.getElementById('sshKeygenForm').hidden = true
     document.getElementById('sshKeygenSpinner').hidden = false
@@ -11152,7 +12021,7 @@ function openSshKeygenModal(callback) {
       })
       const data = await res.json()
       if (!res.ok) {
-        showToast(data.code === 'label_taken' ? t('vault.ssh.toast.label_taken', { name: label }) : (data.error || t('vault.ssh.keygen.failed')))
+        showToast(data.code === 'label_taken' ? t('vault.ssh.toast.label_taken', { name: label }) : (data.error || t('vault.ssh.keygen.failed')), 'error')
         resetKeygenForm()
         if (data.code === 'label_taken') document.getElementById('sshKeygenLabelInput').focus()
         return
@@ -11170,7 +12039,7 @@ function openSshKeygenModal(callback) {
 
       await loadSshKeys()
       if (_sshKeygenCallback) _sshKeygenCallback(data.key || data)
-    } catch { showToast(t('vault.toast.network_error')); resetKeygenForm() }
+    } catch { showToast(t('vault.toast.network_error'), 'error'); resetKeygenForm() }
   })
 
   copyBtn?.addEventListener('click', () => {
@@ -11398,7 +12267,7 @@ function openSshInfoModal(preselectedServerId, { keyOnly = false } = {}) {
       : !host ? ['sshHostInput', 'vault.ssh.form.host_required']
       : !user ? ['sshUserInput', 'vault.ssh.form.user_required']
       : null
-    if (missing) { document.getElementById(missing[0]).focus(); showToast(t(missing[1])); return }
+    if (missing) { document.getElementById(missing[0]).focus(); showToast(t(missing[1]), 'warn'); return }
     const isEdit = !!_sshEditingId
     try {
       const res = await fetch(
@@ -11411,13 +12280,13 @@ function openSshInfoModal(preselectedServerId, { keyOnly = false } = {}) {
       )
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
-        showToast(err.error || t('common.error_save')); return
+        showToast(err.error || t('common.error_save'), 'error'); return
       }
       resetSshAddForm()
       panel.hidden = true
       await loadSshServers()
-      showToast(t(isEdit ? 'vault.ssh.toast.server_updated' : 'vault.ssh.toast.server_added'))
-    } catch { showToast(t('vault.toast.network_error')) }
+      showToast(t(isEdit ? 'vault.ssh.toast.server_updated' : 'vault.ssh.toast.server_added'), 'success')
+    } catch { showToast(t('vault.toast.network_error'), 'error') }
   })
 
   cardViewBtn?.addEventListener('click', () => {
@@ -11447,6 +12316,194 @@ function openSshInfoModal(preselectedServerId, { keyOnly = false } = {}) {
   })
 })()
 
+// --- Web logins (VAULTLOGIN1112) ---
+// The vault's web logins: an exact origin, a username and a password the dashboard types into an agent's own
+// browser. The password is write-only here: it is sent once on save and never rendered or read back.
+let _webLogins = []
+let _webLoginAgents = []
+let _webLoginEditingId = null
+
+async function loadWebLogins() {
+  try {
+    const [res, agentsRes] = await Promise.all([fetch('/api/vault/web-logins'), fetch('/api/agents')])
+    if (res.ok) _webLogins = (await res.json()).logins || []
+    if (agentsRes.ok) {
+      const list = await agentsRes.json()
+      _webLoginAgents = (Array.isArray(list) ? list : []).map(a => a && a.name).filter(n => n && n !== mainAgentId())
+    }
+    renderWebLogins()
+  } catch { /* ignore */ }
+}
+
+function _webLoginResultText(result) {
+  const key = 'vault.weblogin.result.' + result
+  const text = t(key)
+  return text === key ? result : text
+}
+
+function renderWebLogins() {
+  const cards = document.getElementById('webLoginCards')
+  const empty = document.getElementById('webLoginEmpty')
+  if (!cards || !empty) return
+  if (_webLogins.length === 0) { cards.innerHTML = ''; empty.hidden = false; return }
+  empty.hidden = true
+  cards.innerHTML = _webLogins.map(e => {
+    const agents = (e.allowedAgents || []).length ? e.allowedAgents.join(', ') : t('vault.weblogin.card.no_agents')
+    const last = e.lastResult
+      ? t('vault.weblogin.card.last', {
+          result: _webLoginResultText(e.lastResult),
+          agent: e.lastAgent || '',
+          time: e.lastAttemptAt ? new Date(e.lastAttemptAt).toLocaleString(window._lang === 'en' ? 'en-GB' : 'hu-HU') : '',
+        })
+      : t('vault.weblogin.card.never')
+    return `
+    <div class="ssh-card web-login-card" data-id="${escapeHtml(e.id)}">
+      <div class="ssh-card-head">
+        <div class="ssh-card-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+        </div>
+        <div class="ssh-card-title">
+          <div class="ssh-card-name" title="${escapeHtml(e.origin)}">${escapeHtml(e.origin)}</div>
+          <div class="ssh-card-desc">${escapeHtml(e.username)}</div>
+        </div>
+        ${e.locked ? `<span class="ssh-key-badge expired web-login-locked" title="${escapeHtml(t('vault.weblogin.card.locked_title'))}">${escapeHtml(t('vault.weblogin.card.locked'))}</span>` : ''}
+      </div>
+      <div class="ssh-card-meta">
+        <div class="ssh-card-row web-login-agents-row">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          <span>${escapeHtml(t('vault.weblogin.card.agents', { agents }))}</span>
+        </div>
+        <div class="ssh-card-row web-login-last"><span>${escapeHtml(last)}</span></div>
+      </div>
+      <div class="ssh-card-footer">
+        <div class="ssh-card-actions web-login-actions">
+          ${e.locked ? `<button class="btn-secondary btn-compact web-login-unlock-btn" data-id="${escapeHtml(e.id)}">${escapeHtml(t('vault.weblogin.card.unlock'))}</button>` : ''}
+          <button class="btn-secondary btn-compact web-login-edit-btn" data-id="${escapeHtml(e.id)}" title="${escapeHtml(t('common.btn.edit'))}">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+          </button>
+          <button class="btn-secondary btn-compact web-login-delete-btn" data-id="${escapeHtml(e.id)}" title="${escapeHtml(t('common.btn.delete'))}">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>`
+  }).join('')
+
+  cards.querySelectorAll('.web-login-edit-btn').forEach(btn => btn.addEventListener('click', () => openWebLoginForm(btn.dataset.id)))
+  cards.querySelectorAll('.web-login-unlock-btn').forEach(btn => btn.addEventListener('click', async () => {
+    try {
+      const res = await fetch(`/api/vault/web-logins/${encodeURIComponent(btn.dataset.id)}/unlock`, { method: 'POST' })
+      if (!res.ok) { const err = await res.json().catch(() => ({})); showToast(err.error || t('common.error_save'), 'error'); return }
+      showToast(t('vault.weblogin.toast.unlocked'), 'success')
+      await loadWebLogins()
+    } catch { showToast(t('vault.toast.network_error'), 'error') }
+  }))
+  cards.querySelectorAll('.web-login-delete-btn').forEach(btn => btn.addEventListener('click', async () => {
+    const entry = _webLogins.find(e => e.id === btn.dataset.id)
+    const confirmed = await confirmDialog({
+      title: t('vault.weblogin.confirm.delete_title'),
+      message: t('vault.weblogin.confirm.delete', { name: entry ? `${entry.origin} (${entry.username})` : btn.dataset.id }),
+      okLabel: t('vault.weblogin.confirm.delete_ok'),
+      danger: true,
+    })
+    if (!confirmed) return
+    try {
+      const res = await fetch(`/api/vault/web-logins/${encodeURIComponent(btn.dataset.id)}`, { method: 'DELETE' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) { showToast(data.error || t('vault.toast.delete_error'), 'error'); return }
+      showToast(t('vault.weblogin.toast.deleted'), 'success')
+      _showWebLoginRestartNote(data.restartAgents)
+      await loadWebLogins()
+    } catch { showToast(t('vault.toast.network_error'), 'error') }
+  }))
+}
+
+function _showWebLoginRestartNote(agents) {
+  const note = document.getElementById('webLoginRestartNote')
+  if (!note) return
+  if (!Array.isArray(agents) || agents.length === 0) { note.hidden = true; note.textContent = ''; return }
+  note.textContent = t('vault.weblogin.restart_note', { agents: agents.join(', ') })
+  note.hidden = false
+}
+
+function _renderWebLoginAgentChecks(checked) {
+  const box = document.getElementById('webLoginAgents')
+  if (!box) return
+  if (_webLoginAgents.length === 0) { box.innerHTML = `<span class="web-login-hint">${escapeHtml(t('vault.weblogin.form.no_agents'))}</span>`; return }
+  box.innerHTML = _webLoginAgents.map(a => `
+    <label class="web-login-agent"><input type="checkbox" value="${escapeHtml(a)}"${checked.includes(a) ? ' checked' : ''}> <span>${escapeHtml(a)}</span></label>`).join('')
+}
+
+function openWebLoginForm(id) {
+  const entry = id ? _webLogins.find(e => e.id === id) : null
+  _webLoginEditingId = entry ? entry.id : null
+  const origin = document.getElementById('webLoginOriginInput')
+  origin.value = entry ? entry.origin : ''
+  // The origin is the entry's identity: it is not changed in place (delete and add instead).
+  origin.disabled = !!entry
+  document.getElementById('webLoginUserInput').value = entry ? entry.username : ''
+  const pass = document.getElementById('webLoginPassInput')
+  pass.value = ''
+  pass.placeholder = entry ? t('vault.weblogin.form.password_keep_ph') : ''
+  document.getElementById('webLoginUrlInput').value = entry && entry.loginUrl ? entry.loginUrl : ''
+  document.getElementById('webLoginUserSelInput').value = entry && entry.userSelector ? entry.userSelector : ''
+  document.getElementById('webLoginPassSelInput').value = entry && entry.passSelector ? entry.passSelector : ''
+  _renderWebLoginAgentChecks(entry ? entry.allowedAgents || [] : [])
+  document.getElementById('webLoginPanelTitle').textContent = entry
+    ? t('vault.weblogin.form.edit_title', { name: entry.origin })
+    : t('vault.weblogin.form.add_title')
+  document.getElementById('webLoginPanel').hidden = false
+  ;(entry ? document.getElementById('webLoginUserInput') : origin).focus()
+}
+
+function closeWebLoginForm() {
+  // The password never stays in the DOM once the form is closed or saved.
+  document.getElementById('webLoginPassInput').value = ''
+  document.getElementById('webLoginPanel').hidden = true
+  _webLoginEditingId = null
+}
+
+;(function wireWebLogins() {
+  const newBtn = document.getElementById('webLoginNewBtn')
+  if (!newBtn) return
+  newBtn.addEventListener('click', () => openWebLoginForm(null))
+  document.getElementById('webLoginPanelClose')?.addEventListener('click', closeWebLoginForm)
+  document.getElementById('webLoginSaveBtn')?.addEventListener('click', async () => {
+    const isEdit = !!_webLoginEditingId
+    const origin = document.getElementById('webLoginOriginInput').value.trim()
+    const username = document.getElementById('webLoginUserInput').value.trim()
+    const passEl = document.getElementById('webLoginPassInput')
+    const password = passEl.value
+    const loginUrl = document.getElementById('webLoginUrlInput').value.trim()
+    const userSelector = document.getElementById('webLoginUserSelInput').value.trim()
+    const passSelector = document.getElementById('webLoginPassSelInput').value.trim()
+    const allowedAgents = [...document.querySelectorAll('#webLoginAgents input[type="checkbox"]:checked')].map(c => c.value)
+    const missing = !isEdit && !origin ? ['webLoginOriginInput', 'vault.weblogin.form.origin_required']
+      : !username ? ['webLoginUserInput', 'vault.weblogin.form.user_required']
+      : !isEdit && !password ? ['webLoginPassInput', 'vault.weblogin.form.pass_required']
+      : null
+    if (missing) { document.getElementById(missing[0]).focus(); showToast(t(missing[1]), 'warn'); return }
+    const body = { username, loginUrl: loginUrl || null, userSelector: userSelector || null, passSelector: passSelector || null, allowedAgents }
+    if (!isEdit) body.origin = origin
+    // On edit an empty password field keeps the stored one: the key is only sent when the owner typed a new one.
+    if (password) body.password = password
+    try {
+      const res = await fetch(isEdit ? `/api/vault/web-logins/${encodeURIComponent(_webLoginEditingId)}` : '/api/vault/web-logins', {
+        method: isEdit ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) { showToast(data.error || t('common.error_save'), 'error'); return }
+      passEl.value = ''
+      closeWebLoginForm()
+      showToast(t(isEdit ? 'vault.weblogin.toast.updated' : 'vault.weblogin.toast.added'), 'success')
+      _showWebLoginRestartNote(data.restartAgents)
+      await loadWebLogins()
+    } catch { showToast(t('vault.toast.network_error'), 'error') }
+  })
+})()
+
 // --- Vault Page ---
 let _vaultSecrets = []
 
@@ -11465,7 +12522,7 @@ async function loadVaultPage() {
     document.getElementById('vaultStatTotal').textContent = String(_vaultSecrets.length)
     document.getElementById('vaultStatBindings').textContent = String(_vaultBindings.length)
     renderVaultGrid(_vaultSecrets)
-    await Promise.all([loadSshKeys(), loadSshServers()])
+    await Promise.all([loadSshKeys(), loadSshServers(), loadWebLogins()])
   } catch { /* ignore */ }
 }
 
@@ -11545,13 +12602,13 @@ function renderVaultGrid(secrets) {
           failure = err && err.message ? err.message : String(err)
         }
         if (failure !== null) {
-          showToast(t('vault.toast.update_error') + ': ' + failure)
+          showToast(t('vault.toast.update_error') + ': ' + failure, 'error')
           saveBtn.disabled = false
           saveBtn.textContent = t('vault.btn.save')
           return
         }
         form.remove()
-        showToast(t(newVal ? 'vault.toast.updated_synced' : 'vault.toast.label_updated'))
+        showToast(t(newVal ? 'vault.toast.updated_synced' : 'vault.toast.label_updated'), 'success')
         loadVaultPage()
         loadVault()
       })
@@ -11574,7 +12631,7 @@ function renderVaultGrid(secrets) {
       })
       if (!confirmed) return
       const res = await fetch(`/api/vault/${encodeURIComponent(id)}`, { method: 'DELETE' })
-      if (!res.ok) { showToast(t('vault.toast.delete_error')); return }
+      if (!res.ok) { showToast(t('vault.toast.delete_error'), 'error'); return }
       loadVaultPage()
       loadVault()
     })
@@ -11616,7 +12673,7 @@ function renderVaultGrid(secrets) {
     }
     if (failure !== null) {
       // keep the inputs so the pasted value is not lost
-      showToast(t('vault.toast.save_error') + ': ' + failure)
+      showToast(t('vault.toast.save_error') + ': ' + failure, 'error')
       addBtn.disabled = false
       return
     }
@@ -11696,7 +12753,7 @@ function renderVaultGrid(secrets) {
       openModal(overlay)
     } catch (err) {
       console.error('Vault bind modal error:', err)
-      showToast(t('vault.bind.load_error', { msg: err.message }))
+      showToast(t('vault.bind.load_error', { msg: err.message }), 'error')
     }
   })
 
@@ -11777,12 +12834,12 @@ function renderVaultGrid(secrets) {
       const res = await fetch('/api/vault/sync', { method: 'POST' })
       const data = await res.json()
       if (data.updated > 0) {
-        showToast(t('vault.sync.updated', { n: data.updated }))
+        showToast(t('vault.sync.updated', { n: data.updated }), 'success')
       } else {
         showToast(t('vault.sync.nothing'))
       }
       if (data.errors?.length) {
-        showToast(t('vault.toast.errors', { list: data.errors.join(', ') }))
+        showToast(t('vault.toast.errors', { list: data.errors.join(', ') }), 'error')
       }
     } finally {
       syncBtn.disabled = false
@@ -11868,7 +12925,7 @@ function renderVaultGrid(secrets) {
       })
     }
 
-    if (imports.length === 0) { showToast(t('vault.scan.none_selected')); return }
+    if (imports.length === 0) { showToast(t('vault.scan.none_selected'), 'warn'); return }
 
     importBtn.disabled = true
     importBtn.textContent = t('common.importing')
@@ -11881,10 +12938,10 @@ function renderVaultGrid(secrets) {
       })
       const data = await res.json()
       if (data.imported > 0) {
-        showToast(t('vault.scan.imported', { imported: data.imported, bound: data.bound }))
+        showToast(t('vault.scan.imported', { imported: data.imported, bound: data.bound }), 'success')
       }
       if (data.errors?.length) {
-        showToast(t('vault.toast.errors', { list: data.errors.join(', ') }))
+        showToast(t('vault.toast.errors', { list: data.errors.join(', ') }), 'error')
       }
     } finally {
       importBtn.disabled = false
@@ -11943,7 +13000,7 @@ async function loadExternalPaths() {
       body: JSON.stringify({ path: val }),
     })
     const data = await res.json()
-    if (data.error) { showToast(data.error); return }
+    if (data.error) { showToast(data.error, 'error'); return }
     input.value = ''
     loadExternalPaths()
     loadConnectors()
@@ -12218,10 +13275,10 @@ async function openConnectorDetail(connector) {
     try {
       await fetch(`/api/connectors/${encodeURIComponent(connector.name)}`, { method: 'DELETE' })
       closeModal(connectorDetailOverlay)
-      showToast(t('connectors.toast.deleted'))
+      showToast(t('connectors.toast.deleted'), 'success')
       loadConnectors()
     } catch {
-      showToast(t('common.error_delete'))
+      showToast(t('common.error_delete'), 'error')
     }
   }
 
@@ -12235,11 +13292,11 @@ async function openConnectorDetail(connector) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agents: checked, allAgents: allVisible }),
       })
-      showToast(t('connectors.toast.assignment_updated'))
+      showToast(t('connectors.toast.assignment_updated'), 'success')
       closeModal(connectorDetailOverlay)
       loadConnectors()
     } catch {
-      showToast(t('connectors.toast.assignment_error'))
+      showToast(t('connectors.toast.assignment_error'), 'error')
     }
   }
 
@@ -12337,13 +13394,13 @@ document.getElementById('saveConnectorBtn').addEventListener('click', async () =
 
     closeModal(connectorModalOverlay)
     if (result.nameChanged) {
-      showToast(t('connectors.toast.added', { name: savedName }))
+      showToast(t('connectors.toast.added', { name: savedName }), 'success')
     } else {
-      showToast(t('connectors.toast.created'))
+      showToast(t('connectors.toast.created'), 'success')
     }
     loadConnectors()
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -12854,7 +13911,7 @@ async function parseFileToChunks(file) {
 // Import button click
 memImportSaveBtn.addEventListener('click', async () => {
   if (!memImportFiles.length) {
-    showToast(t('memories.toast.select_files'))
+    showToast(t('memories.toast.select_files'), 'warn')
     return
   }
 
@@ -12878,7 +13935,7 @@ memImportSaveBtn.addEventListener('click', async () => {
       memImportSaveBtn.querySelector('.btn-text').hidden = false
       memImportSaveBtn.querySelector('.btn-loading').hidden = true
       memImportSaveBtn.disabled = false
-      showToast(t('memories.toast.no_content'))
+      showToast(t('memories.toast.no_content'), 'warn')
       return
     }
 
@@ -12904,15 +13961,15 @@ memImportSaveBtn.addEventListener('click', async () => {
           Hot: ${s.hot || 0} | Warm: ${s.warm || 0} | Cold: ${s.cold || 0} | Shared: ${s.shared || 0}
         </div>
       `
-      showToast(t('memories.toast.imported', { n: data.imported }))
+      showToast(t('memories.toast.imported', { n: data.imported }), 'success')
       loadMemories()
       loadMemStats()
     } else {
-      showToast(`${t('common.error')}: ${data.error || t('common.unknown')}`)
+      showToast(`${t('common.error')}: ${data.error || t('common.unknown')}`, 'error')
     }
   } catch (err) {
     memImportProgress.hidden = true
-    showToast(t('memories.toast.import_error'))
+    showToast(t('memories.toast.import_error'), 'error')
   }
 
   memImportSaveBtn.querySelector('.btn-text').hidden = false
@@ -12966,7 +14023,7 @@ document.getElementById('migrateScanBtn').addEventListener('click', async () => 
     document.getElementById('migrateStep1').hidden = true
     document.getElementById('migrateStep2').hidden = false
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -13072,7 +14129,7 @@ document.getElementById('migrateRunBtn').addEventListener('click', async () => {
       ${data.details ? '<div class="migrate-result-details">' + data.details.map(d => escapeHtml(d)).join('<br>') + '</div>' : ''}
     `
   } catch (err) {
-    showToast(`${t('common.error')}: ${err.message}`)
+    showToast(`${t('common.error')}: ${err.message}`, 'error')
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -13109,7 +14166,7 @@ document.getElementById('fleetExportBtn').addEventListener('click', async () => 
     const res = await fetch('/api/fleet/export', { headers })
     if (!res.ok) {
       const data = await res.json().catch(() => ({}))
-      showToast(data.error || t('fleet.export.error'))
+      showToast(data.error || t('fleet.export.error'), 'error')
       return
     }
 
@@ -13127,9 +14184,9 @@ document.getElementById('fleetExportBtn').addEventListener('click', async () => 
     a.remove()
     URL.revokeObjectURL(url)
 
-    showToast(t('fleet.export.success'))
+    showToast(t('fleet.export.success'), 'success')
   } catch (err) {
-    showToast(`${t('fleet.export.error')}: ${err.message}`)
+    showToast(`${t('fleet.export.error')}: ${err.message}`, 'error')
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -13140,7 +14197,7 @@ document.getElementById('fleetExportBtn').addEventListener('click', async () => 
 document.getElementById('fleetDryRunBtn').addEventListener('click', async () => {
   const fileInput = document.getElementById('fleetImportFile')
   if (!fileInput.files.length) {
-    showToast(t('fleet.import.no_file'))
+    showToast(t('fleet.import.no_file'), 'warn')
     return
   }
 
@@ -13160,7 +14217,7 @@ document.getElementById('fleetDryRunBtn').addEventListener('click', async () => 
   try {
     const text = await fileInput.files[0].text()
     // Validate JSON client-side first
-    try { JSON.parse(text) } catch { showToast(t('fleet.import.invalid_json')); return }
+    try { JSON.parse(text) } catch { showToast(t('fleet.import.invalid_json'), 'error'); return }
 
     const password = document.getElementById('fleetImportPassword').value.trim()
     const headers = { 'Content-Type': 'application/json' }
@@ -13221,7 +14278,7 @@ document.getElementById('fleetDryRunBtn').addEventListener('click', async () => 
       applyBtn.disabled = false
     }
   } catch (err) {
-    showToast(`${t('fleet.import.error')}: ${err.message}`)
+    showToast(`${t('fleet.import.error')}: ${err.message}`, 'error')
   } finally {
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
@@ -13277,7 +14334,7 @@ document.getElementById('fleetApplyBtn').addEventListener('click', async () => {
     fleetLastBody = null
     btn.disabled = true
   } catch (err) {
-    showToast(`${t('fleet.import.error')}: ${err.message}`)
+    showToast(`${t('fleet.import.error')}: ${err.message}`, 'error')
     btn.disabled = false
     btn.querySelector('.btn-text').hidden = false
     btn.querySelector('.btn-loading').hidden = true
@@ -13519,10 +14576,10 @@ function renderPendingSkills(box, list) {
         })
         const body = await res.json().catch(() => ({}))
         if (!res.ok) throw new Error(refusalReason(res, body))
-        showToast(t('skills.pending.approved', { name: p.name }))
+        showToast(t('skills.pending.approved', { name: p.name }), 'success')
         loadGlobalSkills()
       } catch (err) {
-        showToast(`${t('skills.pending.error')}: ${err.message}`)
+        showToast(`${t('skills.pending.error')}: ${err.message}`, 'error')
         loadPendingSkills()
       } finally { approve.disabled = !p.approvable }
     })
@@ -13540,7 +14597,7 @@ function renderPendingSkills(box, list) {
         if (!res.ok) throw new Error(refusalReason(res, await res.json().catch(() => ({}))))
         showToast(t('skills.pending.rejected', { name: p.name }))
       } catch (err) {
-        showToast(`${t('skills.pending.error')}: ${err.message}`)
+        showToast(`${t('skills.pending.error')}: ${err.message}`, 'error')
       } finally { reject.disabled = false; loadPendingSkills() }
     })
     actions.append(approve, reject)
@@ -13944,12 +15001,12 @@ async function openSkillDetail(skillName, displayLabel, agentId = null) {
         contentEl.innerHTML = renderMarkdown(newContent)
         _skillDetailSavedContent = newContent
         _skillDetailExitEdit()
-        showToast(t('skills.toast.saved'))
+        showToast(t('skills.toast.saved'), 'success')
         // Refresh list to pick up new description/keywords
         loadGlobalSkills()
       } catch (err) {
         console.error('Skill mentés hiba:', err)
-        showToast(t('skills.toast.save_error'))
+        showToast(t('skills.toast.save_error'), 'error')
       } finally {
         saveBtn.disabled = false
       }
@@ -13982,7 +15039,7 @@ async function saveTeamReportsTo(childId, parentId, ctx) {
   const { byId, parentOf, descendantsOf, mainAgentId } = ctx
   if (!childId || childId === parentId || childId === mainAgentId) return
   if (parentOf.get(childId) === parentId) return  // already the parent
-  if (descendantsOf(childId).has(parentId)) { showToast(t('team.drop.cycle')); return }
+  if (descendantsOf(childId).has(parentId)) { showToast(t('team.drop.cycle'), 'warn'); return }
   try {
     const r = await fetch(`/api/agents/${encodeURIComponent(childId)}/team`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -13990,13 +15047,13 @@ async function saveTeamReportsTo(childId, parentId, ctx) {
     })
     if (!r.ok) throw new Error('HTTP ' + r.status)
     const result = await r.json().catch(() => ({}))
-    if (result.cycleRejected) { showToast(t('team.drop.cycle')); return }
+    if (result.cycleRejected) { showToast(t('team.drop.cycle'), 'warn'); return }
     const childLabel = (byId.get(childId) || {}).label || childId
     const parentLabel = (byId.get(parentId) || {}).label || parentId
-    showToast(t('team.drop.saved', { child: childLabel, parent: parentLabel }))
+    showToast(t('team.drop.saved', { child: childLabel, parent: parentLabel }), 'success')
     loadTeamGraph()
   } catch {
-    showToast(t('team.drop.error'))
+    showToast(t('team.drop.error'), 'error')
   }
 }
 
@@ -14730,11 +15787,11 @@ async function sendChatMessage(toAgent) {
     if (textarea) textarea.value = ''
     // A stopped target (#2426): the server stores the message as pending and says
     // queued; it is delivered when the agent starts, so "sent" would be wrong.
-    showToast(reply.body.queued === true ? t('messages.queued', { agent: toAgent }) : t('messages.sent'), reply.body.queued === true ? 6000 : 3000)
+    showToast(reply.body.queued === true ? t('messages.queued', { agent: toAgent }) : t('messages.sent'), reply.body.queued === true ? 6000 : { kind: 'success', duration: 3000 })
     await loadChatThread(toAgent)
     await loadChatAgentList()
   } catch (e) {
-    showToast(t('messages.error_send', { msg: e.message || e }))
+    showToast(t('messages.error_send', { msg: e.message || e }), 'error')
   } finally {
     if (btn) btn.disabled = false
   }
@@ -14840,12 +15897,12 @@ document.getElementById('saveTeamBtn').addEventListener('click', async () => {
         if (parts.length) warningMsg = parts.join(' · ')
       }
     } catch { /* body already consumed or not JSON -- OK, no warnings to show */ }
-    showToast(warningMsg ? t('team.save_warning', { detail: warningMsg }) : t('team.save_ok'))
+    showToast(warningMsg ? t('team.save_warning', { detail: warningMsg }) : t('team.save_ok'), warningMsg ? 'warn' : 'success')
     btn.textContent = t('team.save_done')
     setTimeout(() => { btn.textContent = originalText; btn.disabled = false }, 1800)
     loadAgents()
   } catch {
-    showToast(t('team.save_error'))
+    showToast(t('team.save_error'), 'error')
     btn.textContent = originalText
     btn.disabled = false
   }
@@ -15038,10 +16095,10 @@ document.getElementById('projectsGrid')?.addEventListener('click', async (e) => 
       view.dataset.raw = text.trim()
       view.hidden = false; editArea.hidden = true
       editBtn.hidden = false; saveBtn.hidden = true; cancelBtn.hidden = true
-      showToast(t('common.saved'))
+      showToast(t('common.saved'), 'success')
     } catch (err) {
       console.error('save project description failed:', err)
-      showToast(t('projects.save_error'))
+      showToast(t('projects.save_error'), 'error')
     }
     return
   }
@@ -15524,7 +16581,11 @@ function wireBranchDriftBanner() {
 // runs WITHOUT its channel (channels.sh), so nobody can message the main agent; the dashboard, the scheduled tasks and
 // the other agents keep working. One sentence plus the way to the main agent's Channel tab. Not dismissible.
 const MAIN_CHANNEL_PROVIDER_LABELS = { telegram: 'Telegram', discord: 'Discord', slack: 'Slack', teams: 'Microsoft Teams' }
+// DOCKERI18N1119: the last /api/marveen payload the banner was drawn from, so a language change redraws it
+// (renderStaticI18n). `var`: renderStaticI18n is defined earlier in the file.
+var mainChannelUnconfLast = null
 function updateMainChannelUnconfBanner(m) {
+  mainChannelUnconfLast = m || null
   const banner = document.getElementById('mainChannelUnconfBanner')
   if (!banner) return
   const provider = m && typeof m.mainChannelUnconfigured === 'string' ? m.mainChannelUnconfigured : null
@@ -15791,14 +16852,14 @@ async function applyCliUpdate(target) {
     const data = await res.json().catch(() => ({}))
     if (!res.ok) {
       if (btn) btn.disabled = false
-      showToast(t('updates.cli.failed', { msg: data.error || ('HTTP ' + res.status) }))
+      showToast(t('updates.cli.failed', { msg: data.error || ('HTTP ' + res.status) }), 'error')
       return
     }
     showToast(t('updates.cli.started', { v: target }))
     renderCliUpdateOffer(true)
   } catch (err) {
     if (btn) btn.disabled = false
-    showToast(t('updates.cli.failed', { msg: err.message || err }))
+    showToast(t('updates.cli.failed', { msg: err.message || err }), 'error')
   }
 }
 
@@ -15841,14 +16902,14 @@ async function runDiagnose() {
     const data = await res.json().catch(() => ({}))
     if (!res.ok) {
       if (btn) btn.disabled = false
-      showToast(t('updates.diagnose.failed', { msg: data.error || ('HTTP ' + res.status) }))
+      showToast(t('updates.diagnose.failed', { msg: data.error || ('HTTP ' + res.status) }), 'error')
       return
     }
     showToast(data.already ? t('updates.diagnose.already') : t('updates.diagnose.started'))
     if (btn) { btn.hidden = true }
   } catch (err) {
     if (btn) btn.disabled = false
-    showToast(t('updates.diagnose.failed', { msg: err.message || err }))
+    showToast(t('updates.diagnose.failed', { msg: err.message || err }), 'error')
   }
 }
 
@@ -15871,17 +16932,17 @@ async function offerRebaseUpdate() {
     const r = await fetch('/api/updates/rebase-plan')
     plan = await r.json().catch(() => ({}))
     if (!r.ok || !plan || typeof plan.hash !== 'string') {
-      showToast(t('updates.rebase.plan_error', { msg: (plan && plan.error) || ('HTTP ' + r.status) }), 12000)
+      showToast(t('updates.rebase.plan_error', { msg: (plan && plan.error) || ('HTTP ' + r.status) }), { kind: 'error', duration: 12000 })
       return
     }
   } catch (err) {
-    showToast(t('updates.rebase.plan_error', { msg: err.message || String(err) }), 12000)
+    showToast(t('updates.rebase.plan_error', { msg: err.message || String(err) }), { kind: 'error', duration: 12000 })
     return
   }
   if (plan.willFail) {
     showToast(plan.willFail === 'local-dependency-without-lock'
       ? t('updates.rebase.will_fail_lock')
-      : t('updates.rebase.will_fail', { reason: plan.willFail }), 20000)
+      : t('updates.rebase.will_fail', { reason: plan.willFail }), { kind: 'warn', duration: 20000 })
     return
   }
   const content = document.createElement('div')
@@ -15927,7 +16988,7 @@ async function offerRebaseUpdate() {
   })
   const approval = await a.json().catch(() => ({}))
   if (!a.ok || typeof approval.id !== 'string') {
-    showToast(t('updates.rebase.approve_failed', { msg: approval.error || ('HTTP ' + a.status) }), 12000)
+    showToast(t('updates.rebase.approve_failed', { msg: approval.error || ('HTTP ' + a.status) }), { kind: 'error', duration: 12000 })
     return
   }
   await runUpdate(false, approval.id)
@@ -15975,7 +17036,7 @@ async function runUpdate(autoStash, rebaseApproval) {
         await offerRebaseUpdate()
         return
       }
-      showToast(t('updates.toast.not_started', { msg: data.error || ('HTTP ' + res.status) }))
+      showToast(t('updates.toast.not_started', { msg: data.error || ('HTTP ' + res.status) }), 'error')
       return
     }
     showToast(t('updates.toast.applying'))
@@ -15986,15 +17047,27 @@ async function runUpdate(autoStash, rebaseApproval) {
     await pollUpdateOutcome(resetBtn)
   } catch (err) {
     resetBtn()
-    showToast(t('updates.toast.error', {msg: err.message || err}))
+    showToast(t('updates.toast.error', {msg: err.message || err}), 'error')
   }
 }
+
+// How long the UI waits for the update verdict (UPDATEUIPLAFON1120, #2991). The
+// finalizer in update.sh runs _health up to twice (after the restart, and again
+// after a rollback), each bounded by its 120 s deadline plus one last
+// `curl -m 3` and `sleep 1` started just before it. The headroom covers
+// git pull + npm ci + build and the rollback's own npm ci + build. A dead new
+// build then still ends in "rolled back" / "failed" on a slow box, not in
+// "did not arrive in time". update-poll-cap.test.ts derives the health figure
+// from update.sh, so raising that window fails the test until this follows.
+const FINALIZER_HEALTH_WORST_S = 124
+const UPDATE_BUILD_HEADROOM_S = 300
+const UPDATE_POLL_CAP_MS = (2 * FINALIZER_HEALTH_WORST_S + UPDATE_BUILD_HEADROOM_S) * 1000
 
 // Poll /api/updates/status until the run finishes (pidfile gone AND a fresh
 // result is present), then show the true outcome. Reload only on success.
 async function pollUpdateOutcome(resetBtn) {
   const startedAt = Date.now()
-  const deadline = startedAt + 5 * 60_000   // hard cap: 5 min
+  const deadline = startedAt + UPDATE_POLL_CAP_MS
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 3000))
     let data
@@ -16010,7 +17083,7 @@ async function pollUpdateOutcome(resetBtn) {
     if (data && !data.running && fresh) {
       const st = result.status
       if (st === 'success') {
-        showToast(t('updates.toast.success', { old: result.old || '', new: result.new || '' }))
+        showToast(t('updates.toast.success', { old: result.old || '', new: result.new || '' }), 'success')
         setTimeout(() => window.location.reload(), 2000)
         return
       }
@@ -16019,24 +17092,24 @@ async function pollUpdateOutcome(resetBtn) {
         // human (stash conflict, settings.json gate). No auto-reload: it
         // would wipe this message before anyone reads it.
         if (resetBtn) resetBtn()
-        showToast(t('updates.toast.warning', { old: result.old || '', new: result.new || '', msg: result.message || '' }), 30000)
+        showToast(t('updates.toast.warning', { old: result.old || '', new: result.new || '', msg: result.message || '' }), { kind: 'warn', duration: 30000 })
         return
       }
       if (st === 'rolled-back') {
         if (resetBtn) resetBtn()
-        showToast(t('updates.toast.rolled_back', { old: result.old || '', msg: result.message || '' }))
+        showToast(t('updates.toast.rolled_back', { old: result.old || '', msg: result.message || '' }), 'error')
         renderDiagnoseOffer()
         return
       }
       // failed
       if (resetBtn) resetBtn()
-      showToast(t('updates.toast.failed', { phase: result.phase || '?', msg: result.message || ('code ' + result.code) }))
+      showToast(t('updates.toast.failed', { phase: result.phase || '?', msg: result.message || ('code ' + result.code) }), 'error')
       renderDiagnoseOffer()
       return
     }
   }
   if (resetBtn) resetBtn()
-  showToast(t('updates.toast.status_timeout'))
+  showToast(t('updates.toast.status_timeout'), 'warn')
 }
 
 // update.sh stops and starts the dashboard and the channels unit (scripts/stop.sh, start.sh), and channels.sh
@@ -16182,6 +17255,69 @@ async function refreshOnboarding() {
   const s = await fetchOnboardingStatus()
   if (s) renderOnboarding(s, await fetchOnboardingAuth())
 }
+// DOCKERUX1118 (owner 33327/33329, Samu 80886): the install's language on the wizard's first screen, in the container
+// only. Before the owner is signed in a click switches the wizard's text in this browser and is remembered; the
+// install's own language (its persona files and seeded texts, where untouched) changes once the owner is signed in,
+// through POST /api/onboarding/language, which also says which edited files it kept.
+const ONB_LANG_PENDING = 'marveen.onbLangPending'
+let onbLangState = { docker: false, installLang: null, loginStep: true, busy: false }
+function onbLangPending() { try { return localStorage.getItem(ONB_LANG_PENDING) } catch { return null } }
+function setOnbLangPending(lang) { try { if (lang) localStorage.setItem(ONB_LANG_PENDING, lang); else localStorage.removeItem(ONB_LANG_PENDING) } catch { /* ignore */ } }
+function syncOnboardingLang(s, loginStep) {
+  onbLangState = { ...onbLangState, docker: s.deployment === 'docker', installLang: s.installLang || null, loginStep }
+  const box = document.getElementById('onbLang')
+  if (!box) return
+  box.hidden = !onbLangState.docker
+  box.querySelectorAll('.onb-lang-btn').forEach((b) => {
+    b.setAttribute('aria-pressed', String(b.dataset.lang === window._lang))
+    b.disabled = onbLangState.busy
+  })
+}
+// The server's answer as one line: how many files follow the new language, and which edited ones were kept.
+function onbLangSummary(d) {
+  const files = Array.isArray(d.files) ? d.files : []
+  const done = files.filter((f) => f.result === 're-rendered' || f.result === 'added').length
+  const kept = files.filter((f) => f.result === 'kept_customized').map((f) => f.file)
+  return t('onboarding.lang.done', { done }) + (kept.length ? ' ' + t('onboarding.lang.kept', { files: kept.join(', ') }) : '')
+}
+async function switchInstallLang(lang) {
+  onbLangState.busy = true
+  const before = window._lang
+  try {
+    const r = await fetch('/api/onboarding/language', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lang }) })
+    const d = await r.json().catch(() => ({}))
+    setOnbLangPending(null)
+    onbLangState.busy = false
+    if (r.ok && d.ok) {
+      window.setLang(lang)
+      await refreshOnboarding()
+      onbMsg(onbLangSummary(d))
+      return
+    }
+    // Not switched: the wizard stays in the install's language, so what it shows is what the agent will use.
+    window.setLang(onbLangState.installLang || before)
+    await refreshOnboarding()
+    onbMsg(t('onboarding.lang.failed', { error: d.error || r.status }), true)
+  } catch {
+    onbLangState.busy = false
+    window.setLang(before)
+    onbMsg(t('auth.login.err_network'), true)
+  }
+}
+document.querySelectorAll('#onbLang .onb-lang-btn').forEach((b) => b.addEventListener('click', async () => {
+  const lang = b.dataset.lang
+  if (onbLangState.busy || !onbLangState.docker) return
+  if (onbLangState.loginStep) {
+    // Not signed in yet: this browser only; the install follows right after the login.
+    setOnbLangPending(lang === onbLangState.installLang ? null : lang)
+    if (lang !== window._lang) window.setLang(lang)
+    applyOnboardingProviderTab()
+    await refreshOnboarding()
+    return
+  }
+  if (lang === onbLangState.installLang && lang === window._lang) return
+  await switchInstallLang(lang)
+}))
 // ONBOARDOWNERPW1107 (owner decision, 11-07): the wizard's FIRST step is the dashboard login, so every later step runs
 // in the owner's session (the Bridge key or the token plus the owner cookie) and never stops on a "go to Settings"
 // text. owner_session is in the status only for a caller that could hold it (the shared token, a FULL device key, a
@@ -16221,7 +17357,16 @@ function renderOnboarding(s, auth) {
   const base = onboardingCurrentStep(s)
   if (base === 0) { overlay.classList.remove('active'); overlay.hidden = true; document.body.style.overflow = ''; return }
   const loginStep = onboardingNeedsLogin(auth)
-  const step = onboardingDisplayStep(base, auth)
+  syncOnboardingLang(s, loginStep)
+  // DOCKERUX1118: a language chosen before the login is the install's now that the owner is signed in.
+  const pendingLang = onbLangPending()
+  if (!loginStep && onbLangState.docker && !onbLangState.busy && (pendingLang === 'en' || pendingLang === 'hu')) {
+    if (pendingLang === s.installLang) setOnbLangPending(null)
+    else { switchInstallLang(pendingLang); return }
+  }
+  // DOCKERHTTPS1119: the optional two-step sign-in step belongs to the login step (1) in the bar.
+  const totpOffer = !loginStep && onbTotpOfferPending()
+  const step = totpOffer ? 1 : onboardingDisplayStep(base, auth)
   overlay.hidden = false
   overlay.classList.add('active')
   document.body.style.overflow = 'hidden'
@@ -16241,6 +17386,7 @@ function renderOnboarding(s, auth) {
     wireOnboardingLogin(auth)
     return
   }
+  if (totpOffer) { renderOnbTotpOffer(body); return }
   if (base === 1) body.innerHTML = onbIdentityHtml(s)
   else if (base === 2) body.innerHTML = onbStep1Html(s)
   else if (base === 3) body.innerHTML = onbStep2Html(s)
@@ -16285,10 +17431,56 @@ function onbLoginHtml(auth) {
 async function onbSignIn(username, password) {
   const r = await window.mvPasswordLogin(username, password)
   if (r.ok) { window.location.reload(); return true }
+  // DOCKERHTTPS1119: the second factor is on: the code step, as in the login overlay.
+  if (r.totpRequired) { renderOnbTotpLogin(r.pending); return true }
   if (r.status === 429) onbMsg(t('auth.login.err_throttled') + (r.retryAfter ? ` (${r.retryAfter}s)` : ''), true)
+  else if (r.code === 'totp_store_unavailable') onbMsg(t('auth.totp.err_unavailable'), true)
   else if (r.status === 401) onbMsg(t('auth.login.err_invalid'), true)
   else onbMsg(t('auth.login.err_network'), true)
   return false
+}
+// DOCKERHTTPS1119: the optional two-step sign-in step, right after the owner login is created in the wizard. A flag for
+// this browser tab (no secret in it) carries "just created" across the sign-in's reload; Skip is the default action.
+const ONB_TOTP_OFFER_KEY = 'mvOnbTotpOffer'
+function onbTotpOfferPending() {
+  try { return sessionStorage.getItem(ONB_TOTP_OFFER_KEY) === '1' } catch { return false }
+}
+function setOnbTotpOffer(on) {
+  try { if (on) sessionStorage.setItem(ONB_TOTP_OFFER_KEY, '1'); else sessionStorage.removeItem(ONB_TOTP_OFFER_KEY) } catch { /* storage blocked */ }
+}
+function renderOnbTotpOffer(body) {
+  body.innerHTML = `<p><strong>${escapeHtml(t('onboarding.totp.title'))}</strong></p>`
+    + `<p>${escapeHtml(t('onboarding.totp.desc'))}</p>`
+    + `<div class="totp-actions" id="onbTotpActions">`
+    + `<button class="btn-primary btn-compact" id="onbTotpSkip">${escapeHtml(t('onboarding.totp.skip'))}</button>`
+    + `<button class="btn-secondary btn-compact" id="onbTotpStart">${escapeHtml(t('onboarding.totp.start'))}</button>`
+    + `</div>`
+    + `<div id="onbTotpFlow"></div>`
+    + `<div id="onbMsg" class="onb-msg"></div>`
+  const finish = () => { setOnbTotpOffer(false); refreshOnboarding() }
+  const skip = document.getElementById('onbTotpSkip')
+  skip.addEventListener('click', finish)
+  document.getElementById('onbTotpStart').addEventListener('click', () => {
+    document.getElementById('onbTotpActions').hidden = true
+    mountTotpSetup(document.getElementById('onbTotpFlow'), { idPrefix: 'onbTotpSetup', cancelLabel: t('onboarding.totp.skip'), onDone: finish })
+  })
+  setTimeout(() => skip.focus(), 50)
+}
+// The wizard's sign-in, second step: the shared code step in the wizard's body.
+function renderOnbTotpLogin(pending) {
+  const body = document.getElementById('onboardingBody')
+  if (!body) return
+  body.innerHTML = ''
+  body.appendChild(buildTotpCodeStep({
+    pending,
+    idPrefix: 'onbTotpLogin',
+    formClass: 'auth-form onb-totp-login',
+    descClass: '',
+    errClass: 'onb-msg err',
+    inputClass: 'onb-input',
+    submitClass: 'btn-primary btn-compact',
+    onExpired: async (msg) => { await refreshOnboarding(); onbMsg(msg, true) },
+  }))
 }
 function wireOnboardingLogin(auth) {
   const field = (id) => document.getElementById(id)
@@ -16305,6 +17497,8 @@ function wireOnboardingLogin(auth) {
       const r = await fetch('/api/auth/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password: p1 }) })
       const d = await r.json().catch(() => ({}))
       if (r.ok) {
+        // DOCKERHTTPS1119: the optional two-step step comes right after this new login, past the sign-in's reload.
+        setOnbTotpOffer(true)
         const signedIn = await onbSignIn(username, p1)
         clearPasswords()
         if (!signedIn) {
@@ -16360,13 +17554,35 @@ function onbIdentityHtml(s) {
     + `<button class="btn-primary btn-compact" id="onbIdentityBtn">${escapeHtml(t('onboarding.identity.save_btn'))}</button>`
     + `<div id="onbMsg" class="onb-msg"></div>`
 }
+// HOSTINGERROUTER1122 (Samu 83036): on a Hostinger install the Claude step offers the Hostinger AI Router as its SECOND
+// choice; the Claude subscription stays the first, preselected one. Elsewhere the step is exactly as before.
+function onbRouterChoiceHtml(s) {
+  const r = s && s.router
+  if (!r || !r.available) return ''
+  const opts = (r.models || []).map((m) => `<option value="${escapeHtml(m)}"${m === r.defaultModel ? ' selected' : ''}>${escapeHtml(m)}</option>`).join('')
+  return `<div role="radiogroup" style="display:flex;flex-direction:column;gap:6px;margin:6px 0 10px">`
+    + `<label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="radio" name="onbAuthKind" value="claude" checked>${escapeHtml(t('onboarding.router.choice_claude'))}</label>`
+    + `<label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="radio" name="onbAuthKind" value="router">${escapeHtml(t('onboarding.router.choice_router'))}</label>`
+    + `</div>`
+    + `<div id="onbRouterSection" hidden>`
+    + `<label class="form-label-sm">${escapeHtml(t('onboarding.router.key_label'))}</label>`
+    + `<input id="onbRouterKey" type="password" class="onb-input" placeholder="sk-hstgr-..." autocomplete="off">`
+    + `<label class="form-label-sm">${escapeHtml(t('onboarding.router.model_label'))}</label>`
+    + `<select id="onbRouterModel" class="onb-input">${opts}</select>`
+    + `<div class="onb-hint">${escapeHtml(t('onboarding.router.notice'))}</div>`
+    + `<div class="onb-hint">${escapeHtml(t('onboarding.router.more_models'))}</div>`
+    + `</div>`
+}
 function onbStep1Html(s) {
   return `<p>${escapeHtml(t('onboarding.step1.desc'))}</p>`
     + (s.claudeAuthPresent
       ? `<p class="onb-ok-line">${escapeHtml(t('onboarding.step1.auth_done'))}</p>`
-      : `<label class="form-label-sm">${escapeHtml(t('onboarding.step1.token_label'))}</label>`
+      : onbRouterChoiceHtml(s)
+        + `<div id="onbClaudeSection">`
+        + `<label class="form-label-sm">${escapeHtml(t('onboarding.step1.token_label'))}</label>`
         + `<input id="onbToken" type="password" class="onb-input" placeholder="sk-ant-oat01-..." autocomplete="off">`
         + `<div class="onb-hint">${escapeHtml(t('onboarding.step1.token_hint'))}</div>`
+        + `</div>`
         + `<button class="btn-primary btn-compact" id="onbAuthBtn">${escapeHtml(t('onboarding.step1.save_btn'))}</button>`)
     + (s.claudeAuthPresent && !s.agentsRunning
       ? `<button class="btn-primary btn-compact" id="onbLaunchBtn">${escapeHtml(t('onboarding.step1.launch_btn'))}</button>`
@@ -16441,20 +17657,35 @@ function wireOnboarding(step) {
   }
   if (step === 2) {
     const authBtn = document.getElementById('onbAuthBtn')
+    // HOSTINGERROUTER1122: the router choice (present only on a Hostinger install) swaps the token field for its own.
+    const onbRouterSelected = () => (document.querySelector('input[name="onbAuthKind"]:checked') || {}).value === 'router'
+    document.querySelectorAll('input[name="onbAuthKind"]').forEach((el) => el.addEventListener('change', () => {
+      const router = onbRouterSelected()
+      const rs = document.getElementById('onbRouterSection')
+      const cs = document.getElementById('onbClaudeSection')
+      if (rs) rs.hidden = !router
+      if (cs) cs.hidden = router
+    }))
     if (authBtn) authBtn.addEventListener('click', async () => {
-      const token = (document.getElementById('onbToken').value || '').trim()
-      if (!token) { onbMsg(t('onboarding.step1.token_empty'), true); return }
+      const router = onbRouterSelected()
+      const token = router ? '' : (document.getElementById('onbToken').value || '').trim()
+      const routerKey = router ? (document.getElementById('onbRouterKey').value || '').trim() : ''
+      const routerModel = router ? (document.getElementById('onbRouterModel').value || '') : ''
+      if (router && !routerKey) { onbMsg(t('onboarding.router.key_empty'), true); return }
+      if (!router && !token) { onbMsg(t('onboarding.step1.token_empty'), true); return }
       authBtn.disabled = true; onbMsg(t('onboarding.saving'))
       try {
-        const res = await fetch('/api/onboarding/claude-auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) })
+        const payload = router ? { routerKey, routerModel } : { token }
+        const res = await fetch('/api/onboarding/claude-auth', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
         const d = await res.json().catch(() => ({}))
-        if (!res.ok) { authBtn.disabled = false; if (await onbOwnerRefused(d)) return; onbMsg(d.code === 'owner_session_required' ? t('onboarding.step1.owner_login_required') : (d.error || t('onboarding.error')), true); return }
+        if (!res.ok) { authBtn.disabled = false; if (await onbOwnerRefused(d)) return; onbMsg(d.code === 'owner_session_required' ? t('onboarding.step1.owner_login_required') : onbAuthErrorText(d, router), true); return }
         // Fresh-install path: the server restarts the (previously
         // unauthenticated) channels session right after the first auth save --
         // surface that, and on failure show the manual restart step instead of
         // silently advancing.
         if (d.restartError) { authBtn.disabled = false; onbMsg(t('onboarding.step1.saved_restart_failed', { cmd: d.restartCommand || '' }), true); setTimeout(refreshOnboarding, 6000); return }
         if (d.restarted) { onbMsg(t('onboarding.step1.saved_restarted')); setTimeout(refreshOnboarding, 2500); return }
+        if (d.router) { onbMsg(t('onboarding.router.saved', { model: d.model || '' })); await refreshOnboarding(); return }
         onbMsg(d.verified ? t('onboarding.step1.saved_verified') : t('onboarding.step1.saved_unverified'))
         await refreshOnboarding()
       } catch (e) { authBtn.disabled = false; onbMsg((e && e.message) || t('onboarding.error'), true) }
@@ -16520,7 +17751,8 @@ function wireOnboarding(step) {
         // #1878 (6): a failed restart is said at once, not after the ~2 min wait below.
         if (d.restartError) { botBtn.disabled = false; onbMsg(t('onboarding.step2.saved_restart_failed', { cmd: d.restartCommand || '' }), true); return }
         onbMsg(d.restarted ? t('onboarding.step2.saved_restarted') : t('onboarding.step2.saved'))
-        onbMsg(t('onboarding.step2.waiting_channel'))
+        // INSTTGPOLLWARN1119: onbMsg replaces its text, so the note rides with the message that stays during the wait.
+        onbMsg(t('onboarding.step2.waiting_channel') + (d.pollerNote ? ' ' + t('channel.telegram.poller_unverifiable') : ''))
         const outcome = await waitForChannelLive(fetchOnboardingStatus, 3000, 40)  // ~2 min bound
         if (outcome === 'live') { await refreshOnboarding() }
         else { botBtn.disabled = false; onbMsg(t('onboarding.step2.channel_slow'), true) }
@@ -16673,10 +17905,10 @@ function fallbackCopyToClipboard(text, btn) {
       btn.textContent = t('common.copied')
       setTimeout(() => { btn.textContent = t('common.copy') }, 1500)
     } else {
-      showToast(t('common.toast.copy_failed'))
+      showToast(t('common.toast.copy_failed'), 'error')
     }
   } catch {
-    showToast(t('common.toast.copy_failed'))
+    showToast(t('common.toast.copy_failed'), 'error')
   }
   document.body.removeChild(ta)
 }
@@ -16740,7 +17972,7 @@ document.getElementById('chSlackManifestBtn').addEventListener('click', async ()
     const data = await res.json()
     showSlackManifestModal(data.manifest, data.instructions)
   } catch {
-    showToast(t('channel.toast.manifest_failed'))
+    showToast(t('channel.toast.manifest_failed'), 'error')
   } finally {
     btn.disabled = false
   }
@@ -16954,8 +18186,8 @@ async function loadBgTasksPage() {
 async function startBgTask() {
   const agent = document.getElementById('bgAgent').value
   const prompt = document.getElementById('bgPrompt').value.trim()
-  if (!agent) { showToast(t('bgTasks.select_agent')); return }
-  if (!prompt) { showToast(t('bgTasks.enter_task')); return }
+  if (!agent) { showToast(t('bgTasks.select_agent'), 'warn'); return }
+  if (!prompt) { showToast(t('bgTasks.enter_task'), 'warn'); return }
 
   const btn = document.getElementById('bgStartBtn')
   btn.disabled = true
@@ -16967,14 +18199,14 @@ async function startBgTask() {
     })
     const data = await res.json()
     if (!res.ok) {
-      showToast(data.error || t('common.error'))
+      showToast(data.error || t('common.error'), 'error')
       return
     }
     document.getElementById('bgPrompt').value = ''
-    showToast(t('bgTasks.toast.started'))
+    showToast(t('bgTasks.toast.started'), 'success')
     loadBgTasks()
   } catch {
-    showToast(t('bgTasks.toast.start_error'))
+    showToast(t('bgTasks.toast.start_error'), 'error')
   } finally {
     btn.disabled = false
   }
@@ -17029,7 +18261,7 @@ async function loadBgTasks() {
 async function viewBgTask(id) {
   try {
     const res = await fetch(`/api/background-tasks/${id}`)
-    if (!res.ok) { showToast(t('bgTasks.load_error')); return }
+    if (!res.ok) { showToast(t('bgTasks.load_error'), 'error'); return }
     const task = await res.json()
     const output = task.liveOutput || task.output || t('bgTasks.no_output')
     const modal = document.createElement('div')
@@ -17045,7 +18277,7 @@ async function viewBgTask(id) {
     modal.addEventListener('click', e => { if (e.target === modal) modal.remove() })
     document.getElementById('bgModalClose').addEventListener('click', () => modal.remove())
   } catch {
-    showToast(t('bgTasks.load_error'))
+    showToast(t('bgTasks.load_error'), 'error')
   }
 }
 
@@ -17061,13 +18293,13 @@ async function cancelBgTask(id, agent) {
   try {
     const res = await fetch(`/api/background-tasks/${encodeURIComponent(id)}`, { method: 'DELETE' })
     if (res.ok) {
-      showToast(t('bgTasks.toast.stopped'))
+      showToast(t('bgTasks.toast.stopped'), 'success')
       loadBgTasks()
     } else {
-      showToast(t('bgTasks.toast.stop_error'))
+      showToast(t('bgTasks.toast.stop_error'), 'error')
     }
   } catch {
-    showToast(t('bgTasks.toast.stop_error'))
+    showToast(t('bgTasks.toast.stop_error'), 'error')
   }
 }
 
@@ -17148,7 +18380,7 @@ async function setAutonomyLevel(key, level) {
     })
     if (!res.ok) {
       const data = await res.json().catch(() => ({}))
-      showToast(data.error || t('common.error_save'))
+      showToast(data.error || t('common.error_save'), 'error')
       return
     }
     // Refresh the settings tab autonomy grid if it is visible
@@ -17156,7 +18388,7 @@ async function setAutonomyLevel(key, level) {
     const tabFooter = document.getElementById('settingsAutonomyUpdatedAt')
     if (tabGrid) renderAutonomyContent(tabGrid, tabFooter)
   } catch {
-    showToast(t('kanban.toast.save_error'))
+    showToast(t('kanban.toast.save_error'), 'error')
   }
 }
 
@@ -17354,21 +18586,40 @@ function _renderApprovalsPagination(total) {
 
 async function _resolveApproval(id, decision) {
   try {
+    const payload = { status: decision, resolved_by: 'dashboard' }
+    // AGENTCREATEPR2-1119: a new agent is approved on the WHOLE server-rendered spec (the table shows 80 characters),
+    // and the click sends back the hash the owner was shown; the server decides with it.
+    const row = _approvalsAll.find(a => a.id === id)
+    if (row && row.category === 'agent_create' && decision === 'approved') {
+      const pre = document.createElement('pre')
+      pre.className = 'approval-spec-text'
+      pre.style.whiteSpace = 'pre-wrap'
+      pre.textContent = row.action_description
+      const ok = await confirmDialog({
+        title: t('approvals.agent_create.confirm_title'),
+        message: t('approvals.agent_create.confirm_message', { code: String(row.content_hash || '').slice(0, 8) }),
+        okLabel: t('approvals.agent_create.confirm_ok'),
+        content: pre,
+        wide: true,
+      })
+      if (!ok) return
+      payload.content_hash = row.content_hash
+    }
     const res = await fetch(`/api/approvals/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status: decision, resolved_by: 'dashboard' }),
+      body: JSON.stringify(payload),
     })
     const data = await res.json()
-    if (!res.ok) { showToast(t('approvals.toast.error', { msg: refusalReason(res, data) })); return }
-    showToast(t(decision === 'approved' ? 'approvals.toast.approved' : 'approvals.toast.rejected'))
+    if (!res.ok) { showToast(t('approvals.toast.error', { msg: refusalReason(res, data) }), 'error'); return }
+    showToast(t(decision === 'approved' ? 'approvals.toast.approved' : 'approvals.toast.rejected'), decision === 'approved' ? 'success' : undefined)
     // Update in-place to avoid full reload flicker
     const idx = _approvalsAll.findIndex(a => a.id === id)
     if (idx !== -1) _approvalsAll[idx] = data
     _renderApprovalsStats()
     _renderApprovalsTable()
   } catch (err) {
-    showToast(t('approvals.toast.error', { msg: String(err.message || err) }))
+    showToast(t('approvals.toast.error', { msg: String(err.message || err) }), 'error')
   }
 }
 
@@ -17422,6 +18673,404 @@ function markSettingDirty(key, input, originalValue, type, errorEl) {
 
 const SETTINGS_ACTIVE_TAB_KEY = 'settings-active-tab'
 
+// === Two-step sign-in (TOTP, DOCKERHTTPS1119) ===
+// Off by default. The login overlay and the wizard's sign-in ask for the code after a right password (401
+// totp_required); Settings and the wizard's optional step turn it on and off. Every branch is keyed on the contract's
+// `code`, never on the English `error` text. The calls go through window.mvTotpCall (the unwrapped fetch).
+
+// What an answer of these endpoints means. Pure, so the tests run the shipped code.
+function totpOutcome(status, body) {
+  const CODE_KINDS = {
+    totp_invalid: 'invalid',
+    totp_pending_expired: 'expired',
+    totp_store_unavailable: 'unavailable',
+    totp_already_enabled: 'already_on',
+    totp_not_enabled: 'not_on',
+    totp_setup_missing: 'setup_missing',
+    totp_code_required: 'code_required',
+    owner_session_required: 'owner',
+  }
+  const b = body && typeof body === 'object' ? body : {}
+  const code = typeof b.code === 'string' ? b.code : ''
+  if (!status) return { kind: 'network' }
+  if (status >= 200 && status < 300) {
+    return {
+      kind: 'ok',
+      backupUsed: b.backup_code_used === true,
+      left: Number.isInteger(b.backup_codes_left) ? b.backup_codes_left : null,
+    }
+  }
+  if (status === 429) return { kind: 'throttled', retry: Number.isInteger(b.retry_after_s) ? b.retry_after_s : 0 }
+  if (code === 'totp_required') {
+    return typeof b.pending === 'string' && b.pending ? { kind: 'totp_required', pending: b.pending } : { kind: 'other' }
+  }
+  if (Object.prototype.hasOwnProperty.call(CODE_KINDS, code)) {
+    const kind = CODE_KINDS[code]
+    return kind === 'owner' ? { kind, setupRequired: b.setup_required === true } : { kind }
+  }
+  // A 401 without a code is the password's: "Invalid credentials" at login, at disable (and at enable).
+  if (status === 401 && !code) return { kind: 'bad_password' }
+  return { kind: 'other' }
+}
+function totpOutcomeText(o) {
+  switch (o && o.kind) {
+    case 'invalid': return t('auth.totp.err_invalid')
+    case 'expired': return t('auth.totp.err_expired')
+    case 'unavailable': return t('auth.totp.err_unavailable')
+    case 'throttled': return t('auth.login.err_throttled') + (o.retry ? ` (${o.retry}s)` : '')
+    case 'bad_password': return t('auth.totp.err_password')
+    case 'code_required': return t('auth.totp.err_code_required')
+    case 'owner': return t(o.setupRequired ? 'auth.totp.err_owner_setup' : 'auth.totp.err_owner')
+    case 'already_on': return t('auth.totp.err_already_on')
+    case 'not_on': return t('auth.totp.err_not_on')
+    case 'setup_missing': return t('auth.totp.err_setup_missing')
+    case 'network': return t('auth.login.err_network')
+    default: return t('auth.card.err_generic')
+  }
+}
+// After a backup-code sign-in: the count, and at 0-2 the way to new codes.
+function totpBackupLeftText(n) {
+  const left = Number.isInteger(n) ? n : 0
+  return t('auth.totp.backup_left', { n: left }) + (left <= 2 ? ' ' + t('auth.totp.backup_low') : '')
+}
+// The base32 key in groups of four, for typing it by hand.
+function totpGroupSecret(secret) {
+  return String(secret || '').replace(/\s+/g, '').replace(/(.{4})(?=.)/g, '$1 ')
+}
+
+// The code step of the sign-in (the login overlay and the wizard). The pending token stays in this closure only.
+// opts: pending, idPrefix, title?, formClass, descClass, errClass, inputClass?, submitClass?, cancel? {label, onClick},
+// onExpired(msg). The markup is static; ids and classes are set on the elements (data-totp names the parts).
+function buildTotpCodeStep(opts) {
+  const p = opts.idPrefix
+  let pending = opts.pending
+  const form = document.createElement('form')
+  form.className = (opts.formClass || '') + ' totp-code-step'
+  form.id = p + '-form'
+  form.innerHTML =
+    (opts.title ? `<h2>${escapeHtml(opts.title)}</h2>` : '') +
+    `<p data-totp="desc"></p>` +
+    `<input data-totp="code" type="text" autocapitalize="off" autocorrect="off" spellcheck="false">` +
+    `<button type="button" class="totp-switch" data-totp="switch"></button>` +
+    `<button type="submit" data-totp="submit">${escapeHtml(t('auth.totp.verify'))}</button>` +
+    `<div data-totp="err" role="alert"></div>`
+  const descEl = form.querySelector('[data-totp="desc"]')
+  const codeEl = form.querySelector('[data-totp="code"]')
+  const switchEl = form.querySelector('[data-totp="switch"]')
+  const submitEl = form.querySelector('[data-totp="submit"]')
+  const errEl = form.querySelector('[data-totp="err"]')
+  descEl.className = opts.descClass || 'auth-muted'
+  descEl.id = p + '-desc'
+  codeEl.className = opts.inputClass || ''
+  codeEl.id = p + '-code'
+  switchEl.id = p + '-switch'
+  submitEl.className = opts.submitClass || ''
+  submitEl.id = p + '-submit'
+  errEl.className = opts.errClass || 'auth-form-msg err'
+  errEl.id = p + '-err'
+  if (opts.cancel) {
+    const c = document.createElement('button')
+    c.type = 'button'
+    c.className = 'btn-secondary btn-compact'
+    c.id = p + '-cancel'
+    c.textContent = opts.cancel.label
+    c.addEventListener('click', opts.cancel.onClick)
+    form.appendChild(c)
+  }
+  let backup = false
+  const setMode = (toBackup) => {
+    backup = toBackup
+    codeEl.value = ''
+    descEl.textContent = t(backup ? 'auth.totp.login_backup_desc' : 'auth.totp.login_code_desc')
+    codeEl.placeholder = t(backup ? 'auth.totp.backup_placeholder' : 'auth.totp.code_placeholder')
+    codeEl.setAttribute('inputmode', backup ? 'text' : 'numeric')
+    codeEl.setAttribute('autocomplete', backup ? 'off' : 'one-time-code')
+    codeEl.maxLength = backup ? 40 : 7
+    switchEl.textContent = t(backup ? 'auth.totp.use_app_code' : 'auth.totp.use_backup')
+    errEl.textContent = ''
+    setTimeout(() => codeEl.focus(), 50)
+  }
+  switchEl.addEventListener('click', () => setMode(!backup))
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault()
+    const code = (codeEl.value || '').trim()
+    if (!code) { errEl.textContent = t('auth.totp.err_code_required'); return }
+    errEl.textContent = ''
+    submitEl.disabled = true
+    const r = await window.mvTotpCall('POST', '/api/auth/login/totp', { pending, code })
+    submitEl.disabled = false
+    const o = totpOutcome(r.status, r.body)
+    if (o.kind === 'ok') {
+      pending = null
+      if (!o.backupUsed) { window.location.reload(); return }
+      // Signed in with a backup code: the remaining count first, then on.
+      for (const el of [codeEl, switchEl, submitEl, errEl]) el.remove()
+      const cancelEl = form.querySelector('.btn-secondary')
+      if (cancelEl) cancelEl.remove()
+      descEl.id = p + '-left'
+      descEl.textContent = totpBackupLeftText(o.left)
+      const go = document.createElement('button')
+      go.type = 'button'
+      go.className = opts.submitClass || ''
+      go.id = p + '-continue'
+      go.textContent = t('auth.totp.continue')
+      go.addEventListener('click', () => window.location.reload())
+      form.appendChild(go)
+      setTimeout(() => go.focus(), 50)
+      return
+    }
+    if (o.kind === 'expired') { pending = null; opts.onExpired(totpOutcomeText(o)); return }
+    errEl.textContent = totpOutcomeText(o)
+    if (o.kind === 'invalid') codeEl.select()
+  })
+  setMode(false)
+  return form
+}
+
+// Turning it on: setup -> QR + key -> password and code -> enable -> the backup codes, once. The same component in
+// Settings and in the wizard. The key and the URI live only in this closure, the QR and the grouped key under it;
+// they and the codes are dropped when the component closes. opts: idPrefix, cancelLabel, onDone(enabledNow).
+// The markup is static; the parts are found by data-totp and get their ids (idPrefix + name) after rendering.
+function mountTotpSetup(host, opts) {
+  const p = opts.idPrefix
+  let secret = null
+  let uri = null
+  let codes = null
+  const close = (enabled) => {
+    secret = null; uri = null; codes = null
+    host.innerHTML = ''
+    opts.onDone(enabled)
+  }
+  const name = (el) => el.dataset.totp.charAt(0).toUpperCase() + el.dataset.totp.slice(1)
+  const tagIds = () => { host.querySelectorAll('[data-totp]').forEach((el) => { el.id = p + name(el) }) }
+  const say = (text, isErr) => {
+    const m = host.querySelector('[data-totp="msg"]')
+    if (!m) return
+    m.className = 'auth-form-msg' + (isErr ? ' err' : ' ok')
+    m.textContent = text
+  }
+  function renderError(text, alreadyOn) {
+    host.innerHTML = `<div class="totp-setup"><p class="auth-form-msg err" data-totp="msg"></p>` +
+      `<div class="totp-actions"><button type="button" class="btn-secondary btn-compact" data-totp="close"></button></div></div>`
+    tagIds()
+    host.querySelector('[data-totp="msg"]').textContent = text
+    const btn = host.querySelector('[data-totp="close"]')
+    btn.textContent = opts.cancelLabel
+    btn.addEventListener('click', () => close(alreadyOn))
+  }
+  async function start(note) {
+    host.innerHTML = `<p class="auth-muted">${escapeHtml(t('common.loading'))}</p>`
+    const r = await window.mvTotpCall('POST', '/api/auth/totp/setup', {})
+    if (!host.isConnected) return
+    const o = totpOutcome(r.status, r.body)
+    if (o.kind !== 'ok' || !r.body || typeof r.body.secret !== 'string' || typeof r.body.otpauth_uri !== 'string') {
+      renderError(o.kind === 'ok' ? t('auth.card.err_generic') : totpOutcomeText(o), o.kind === 'already_on')
+      return
+    }
+    secret = r.body.secret
+    uri = r.body.otpauth_uri
+    renderScan(note)
+  }
+  function renderScan(note) {
+    host.innerHTML =
+      `<div class="totp-setup">` +
+        `<p class="auth-muted">${escapeHtml(t('auth.totp.setup_scan'))}</p>` +
+        `<div class="totp-qr" data-totp="qr"></div>` +
+        `<p class="auth-muted" data-totp="secretLabel">${escapeHtml(t('auth.totp.setup_manual'))}</p>` +
+        `<div class="totp-secret-row"><code class="totp-secret" data-totp="secret"></code>` +
+          `<button type="button" class="btn-secondary btn-compact" data-totp="copySecret">${escapeHtml(t('auth.totp.copy'))}</button></div>` +
+        `<p class="auth-muted">${escapeHtml(t('auth.totp.setup_confirm'))}</p>` +
+        `<div class="auth-form">` +
+          `<input data-totp="pass" type="password" autocomplete="current-password" placeholder="${escapeHtml(t('auth.card.current_password'))}">` +
+          `<input data-totp="code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="${escapeHtml(t('auth.totp.code_placeholder'))}">` +
+          `<div class="totp-actions">` +
+            `<button type="button" class="btn-primary btn-compact" data-totp="enable">${escapeHtml(t('auth.totp.turn_on'))}</button>` +
+            `<button type="button" class="btn-secondary btn-compact" data-totp="cancel"></button>` +
+          `</div>` +
+          `<div class="auth-form-msg" data-totp="msg"></div>` +
+        `</div>` +
+      `</div>`
+    tagIds()
+    host.querySelector('[data-totp="secret"]').textContent = totpGroupSecret(secret)
+    host.querySelector('[data-totp="cancel"]').textContent = opts.cancelLabel
+    const qrBox = host.querySelector('[data-totp="qr"]')
+    let drawn = false
+    if (typeof qrcode === 'function') {
+      try {
+        const qr = qrcode(0, 'M')
+        qr.addData(uri)
+        qr.make()
+        qrBox.innerHTML = qr.createSvgTag({ cellSize: 5, margin: 2, scalable: true })
+        drawn = true
+      } catch { /* drawn stays false: the key alone */ }
+    }
+    if (!drawn) {
+      // No QR library (CDN blocked) or a failed draw: only the key, said plainly.
+      qrBox.hidden = true
+      host.querySelector('[data-totp="secretLabel"]').textContent = t('auth.totp.setup_no_qr')
+    }
+    if (note) say(note, true)
+    const copyBtn = host.querySelector('[data-totp="copySecret"]')
+    copyBtn.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(secret || ''); copyBtn.textContent = t('auth.totp.copied') } catch { /* clipboard blocked: the key is on screen */ }
+    })
+    host.querySelector('[data-totp="cancel"]').addEventListener('click', () => close(false))
+    host.querySelector('[data-totp="enable"]').addEventListener('click', enable)
+    host.querySelector('[data-totp="code"]').addEventListener('keydown', (e) => { if (e.key === 'Enter') enable() })
+  }
+  async function enable() {
+    const passEl = host.querySelector('[data-totp="pass"]')
+    const codeEl = host.querySelector('[data-totp="code"]')
+    const btn = host.querySelector('[data-totp="enable"]')
+    const password = passEl.value || ''
+    const code = (codeEl.value || '').trim()
+    if (!password) { say(t('auth.totp.err_password_required'), true); return }
+    if (!code) { say(t('auth.totp.err_code_required'), true); return }
+    btn.disabled = true
+    say('')
+    const r = await window.mvTotpCall('POST', '/api/auth/totp/enable', { password, code })
+    if (!host.isConnected) return
+    const o = totpOutcome(r.status, r.body)
+    if (o.kind === 'ok' && r.body && Array.isArray(r.body.backup_codes)) {
+      passEl.value = ''
+      secret = null
+      uri = null
+      renderCodes(r.body.backup_codes)
+      return
+    }
+    btn.disabled = false
+    if (o.kind === 'setup_missing') { await start(t('auth.totp.err_setup_missing')); return }
+    if (o.kind === 'already_on') { renderError(totpOutcomeText(o), true); return }
+    say(totpOutcomeText(o), true)
+    if (o.kind === 'invalid') codeEl.select()
+    else if (o.kind === 'bad_password') passEl.select()
+  }
+  function renderCodes(list) {
+    codes = list.map(String)
+    host.innerHTML =
+      `<div class="totp-setup">` +
+        `<p class="totp-codes-title" data-totp="codesTitle">${escapeHtml(t('auth.totp.codes_title'))}</p>` +
+        `<p class="auth-muted">${escapeHtml(t('auth.totp.codes_note'))}</p>` +
+        `<ol class="totp-codes" data-totp="codes"></ol>` +
+        `<div class="totp-actions">` +
+          `<button type="button" class="btn-secondary btn-compact" data-totp="copyCodes">${escapeHtml(t('auth.totp.copy'))}</button>` +
+          `<button type="button" class="btn-secondary btn-compact" data-totp="downloadCodes">${escapeHtml(t('auth.totp.download'))}</button>` +
+        `</div>` +
+        `<label class="totp-saved"><input type="checkbox" data-totp="saved"> <span>${escapeHtml(t('auth.totp.codes_saved'))}</span></label>` +
+        `<div class="totp-actions"><button type="button" class="btn-primary btn-compact" data-totp="done" disabled>${escapeHtml(t('auth.totp.codes_done'))}</button></div>` +
+      `</div>`
+    tagIds()
+    const ol = host.querySelector('[data-totp="codes"]')
+    for (const c of codes) { const li = document.createElement('li'); li.textContent = c; ol.appendChild(li) }
+    const copyBtn = host.querySelector('[data-totp="copyCodes"]')
+    copyBtn.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText((codes || []).join('\n')); copyBtn.textContent = t('auth.totp.copied') } catch { /* clipboard blocked: the codes are on screen */ }
+    })
+    host.querySelector('[data-totp="downloadCodes"]').addEventListener('click', () => {
+      const text = t('auth.totp.file_header') + '\n\n' + (codes || []).join('\n') + '\n'
+      const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }))
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'backup-codes.txt'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    })
+    const saved = host.querySelector('[data-totp="saved"]')
+    const done = host.querySelector('[data-totp="done"]')
+    saved.addEventListener('change', () => { done.disabled = !saved.checked })
+    done.addEventListener('click', () => { if (saved.checked) close(true) })
+  }
+  start()
+}
+
+// The Settings block: status, on, off. Only for an owner session (renderAuthCard decides); a refusal shows its reason.
+async function renderTotpSection(body) {
+  let wrap = document.getElementById('authTotp')
+  if (!wrap || !body.contains(wrap)) {
+    wrap = document.createElement('div')
+    wrap.className = 'auth-device-keys auth-totp'
+    wrap.id = 'authTotp'
+    body.appendChild(wrap)
+  }
+  wrap.innerHTML = `<div class="auth-sessions-title">${escapeHtml(t('auth.totp.title'))}</div>` +
+    `<div id="authTotpBody"><p class="auth-muted">${escapeHtml(t('common.loading'))}</p></div>`
+  const inner = wrap.querySelector('#authTotpBody')
+  const r = await window.mvTotpCall('GET', '/api/auth/totp')
+  if (!inner.isConnected) return
+  if (r.status !== 200 || !r.body || typeof r.body.enabled !== 'boolean') {
+    inner.innerHTML = `<p class="auth-form-msg err" id="authTotpStatus"></p>`
+    inner.querySelector('#authTotpStatus').textContent = totpOutcomeText(totpOutcome(r.status === 200 ? 500 : r.status, r.body))
+    return
+  }
+  const on = r.body.enabled
+  const left = Number.isInteger(r.body.backup_codes_left) ? r.body.backup_codes_left : 0
+  inner.innerHTML =
+    `<p class="auth-muted">${escapeHtml(t('auth.totp.desc'))}</p>` +
+    `<p class="auth-totp-status" id="authTotpStatus"></p>` +
+    `<div class="auth-actions" id="authTotpActions">` +
+      `<button type="button" class="btn-secondary btn-compact" id="${on ? 'authTotpOffBtn' : 'authTotpOnBtn'}">${escapeHtml(t(on ? 'auth.totp.turn_off' : 'auth.totp.turn_on'))}</button>` +
+    `</div>` +
+    `<div id="authTotpFlow"></div>`
+  inner.querySelector('#authTotpStatus').textContent = on
+    ? t('auth.totp.status_on', { n: left }) + (left <= 2 ? ' ' + t('auth.totp.backup_low') : '')
+    : t('auth.totp.status_off')
+  const actions = inner.querySelector('#authTotpActions')
+  const flow = inner.querySelector('#authTotpFlow')
+  const again = () => renderTotpSection(body)
+  if (!on) {
+    inner.querySelector('#authTotpOnBtn').addEventListener('click', () => {
+      actions.hidden = true
+      mountTotpSetup(flow, { idPrefix: 'authTotpSetup', cancelLabel: t('auth.totp.cancel'), onDone: again })
+    })
+    return
+  }
+  inner.querySelector('#authTotpOffBtn').addEventListener('click', () => {
+    actions.hidden = true
+    flow.innerHTML =
+      `<p class="auth-muted">${escapeHtml(t('auth.totp.off_desc'))}</p>` +
+      `<div class="auth-form">` +
+        `<input id="authTotpOffPass" type="password" autocomplete="current-password" placeholder="${escapeHtml(t('auth.card.current_password'))}">` +
+        `<input id="authTotpOffCode" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="40" placeholder="${escapeHtml(t('auth.totp.off_code_placeholder'))}">` +
+        `<div class="totp-actions">` +
+          `<button type="button" class="btn-primary btn-compact" id="authTotpOffConfirm">${escapeHtml(t('auth.totp.turn_off'))}</button>` +
+          `<button type="button" class="btn-secondary btn-compact" id="authTotpOffCancel">${escapeHtml(t('auth.totp.cancel'))}</button>` +
+        `</div>` +
+        `<div class="auth-form-msg" id="authTotpOffMsg"></div>` +
+      `</div>`
+    const msg = flow.querySelector('#authTotpOffMsg')
+    const say = (text, isErr) => { msg.className = 'auth-form-msg' + (isErr ? ' err' : ' ok'); msg.textContent = text }
+    flow.querySelector('#authTotpOffCancel').addEventListener('click', again)
+    const btn = flow.querySelector('#authTotpOffConfirm')
+    btn.addEventListener('click', async () => {
+      const passEl = flow.querySelector('#authTotpOffPass')
+      const codeEl = flow.querySelector('#authTotpOffCode')
+      const password = passEl.value || ''
+      const code = (codeEl.value || '').trim()
+      if (!password) { say(t('auth.totp.err_password_required'), true); return }
+      if (!code) { say(t('auth.totp.err_code_required'), true); return }
+      btn.disabled = true
+      say('')
+      const res = await window.mvTotpCall('POST', '/api/auth/totp/disable', { password, code })
+      if (!flow.isConnected) return
+      btn.disabled = false
+      const o = totpOutcome(res.status, res.body)
+      if (o.kind === 'ok' || o.kind === 'not_on') {
+        passEl.value = ''
+        await again()
+        const st = document.getElementById('authTotpStatus')
+        if (st && o.kind === 'ok') st.textContent = t('auth.totp.turned_off')
+        return
+      }
+      say(totpOutcomeText(o), true)
+      if (o.kind === 'invalid') codeEl.select()
+      else if (o.kind === 'bad_password') passEl.select()
+    })
+    setTimeout(() => flow.querySelector('#authTotpOffPass').focus(), 50)
+  })
+}
+
 // === Dashboard browser login (optional) ===
 // The card in the Settings page lets the operator opt into a username+password
 // login (in addition to the always-available access token). All copy is framed
@@ -17447,6 +19096,8 @@ async function renderAuthCard() {
   if (status.setup_required) { renderCreateLoginForm(body) }
   else if (status.method === 'session') { renderSessionPanel(body, status) }
   else renderTokenModePanel(body, status)
+  // DOCKERHTTPS1119: two-step sign-in, only where the owner's session rides on this window.
+  if (status.owner_session === true && !status.setup_required) renderTotpSection(body)
   // Device keys are managed by token/session operators only (a device key
   // itself gets 403 from the management endpoints, so don't render the panel).
   // Once a login exists, issuing keys and pairing take the owner's session
@@ -17455,6 +19106,8 @@ async function renderAuthCard() {
     renderDeviceKeysSection(body)
     renderBridgeEnrollSection(body)
     renderOperatorAccessSection(body)
+    // FIGURAKULCS1125: a companion key needs the owner's session (no first-run pass), so only a signed-in owner sees it.
+    if (status.method === 'session') renderCompanionKeySection(body)
   }
 }
 
@@ -17589,9 +19242,16 @@ async function refreshDeviceKeyList() {
       const expires = k.expiresAt ? ` &middot; ${t('auth.devices.expires', { date: new Date(k.expiresAt * 1000).toLocaleDateString() })}` : ''
       const bridge = k.installId ? ` <span class="auth-device-bridge-badge">${t('auth.devices.bridge_badge')}</span>` : ''
         + (k.scope === 'operator' ? ` <span class="auth-device-bridge-badge">${t('auth.operator.badge')}</span>` : '')
+        + (k.scope === 'messenger' ? ` <span class="auth-device-bridge-badge">${t('auth.messenger.badge')}</span>` : '')
+        + (k.scope === 'companion' ? ` <span class="auth-device-bridge-badge">${t('auth.companion.badge')}</span>` : '')
+      // FIGURAKULCS1125: a companion key names whom it can write to, and the address it is bound to.
+      const companion = k.scope === 'companion'
+        ? ` &middot; ${t('auth.companion.list_recipients', { list: escapeHtml((k.recipients || []).join(', ')) })}`
+          + (k.bound_ip ? ` &middot; ${t('auth.companion.list_bound_ip', { ip: escapeHtml(k.bound_ip) })}` : '')
+        : ''
       return `<div class="auth-session-row auth-device-row" data-key-id="${k.id}">` +
         `<span class="auth-device-name">${escapeHtml(k.name)}${bridge}</span>` +
-        `<span class="auth-device-meta">${created} &middot; ${t('auth.devices.last_used', { date: lastUsed })}${expires}</span>` +
+        `<span class="auth-device-meta">${created} &middot; ${t('auth.devices.last_used', { date: lastUsed })}${expires}${companion}</span>` +
         `<button class="btn-secondary btn-compact auth-device-revoke" data-key-id="${k.id}">${t('auth.devices.revoke')}</button>` +
       `</div>`
     }).join('')
@@ -17780,6 +19440,103 @@ async function mintOperatorKey() {
         await navigator.clipboard.writeText(data.key)
         document.getElementById('opKeyCopyBtn').textContent = t('auth.devices.copied')
       } catch { document.getElementById('opKeyMintedVal').select() }
+    })
+    refreshDeviceKeyList()
+  } catch { msg.classList.add('err'); msg.textContent = t('auth.login.err_network') }
+}
+
+// === Desktop companion key (FIGURAKULCS1125) ===
+// The desktop companion sends the owner's typed messages to the agents listed
+// on its key (the main agent by default), and nothing else. The key always
+// expires (30 days by default, 90 at most) and is shown once, right after minting.
+
+const COMPANION_NAME_RE = /^[\p{L}\p{N} ._-]{1,64}$/u
+
+function renderCompanionKeySection(body) {
+  const wrap = document.createElement('div')
+  wrap.className = 'auth-device-keys'
+  wrap.id = 'authCompanionKey'
+  wrap.innerHTML =
+    `<div class="auth-sessions-title">${t('auth.companion.title')}</div>` +
+    `<p class="auth-muted">${t('auth.companion.desc')}</p>` +
+    `<div class="auth-muted">${t('auth.companion.recipients_label')}</div>` +
+    `<div id="compKeyRecipients"></div>` +
+    `<label class="auth-operator-switch"><input type="checkbox" id="compKeyBindIp"> ${t('auth.companion.bind_ip')}</label>` +
+    `<p class="auth-muted">${t('auth.companion.bind_ip_hint')}</p>` +
+    `<div class="auth-form auth-device-mint">` +
+      `<input id="compKeyName" type="text" autocapitalize="off" spellcheck="false" maxlength="64" placeholder="${t('auth.companion.name_placeholder')}">` +
+      `<div class="auth-muted">${t('auth.companion.expiry_placeholder')}</div>` +
+      `<input id="compKeyExpiry" type="number" min="1" max="90" value="30" placeholder="${t('auth.companion.expiry_placeholder')}" title="${t('auth.companion.expiry_placeholder')}">` +
+      `<input id="compKeyIp" type="text" autocapitalize="off" spellcheck="false" maxlength="64" placeholder="${t('auth.companion.ip_placeholder')}" hidden>` +
+      `<button class="btn-secondary" id="compKeyMintBtn">${t('auth.companion.mint')}</button>` +
+      `<div class="auth-form-msg" id="compKeyMsg"></div>` +
+      `<div id="compKeyMinted" hidden></div>` +
+    `</div>`
+  body.appendChild(wrap)
+  document.getElementById('compKeyBindIp').addEventListener('change', (ev) => {
+    document.getElementById('compKeyIp').hidden = !ev.target.checked
+  })
+  document.getElementById('compKeyMintBtn').addEventListener('click', mintCompanionKey)
+  loadCompanionRecipients()
+}
+
+// Default: only the main agent is ticked; every other fleet agent can be added.
+async function loadCompanionRecipients() {
+  const el = document.getElementById('compKeyRecipients')
+  if (!el) return
+  await ensureMarveenLoaded()
+  const main = mainAgentId()
+  let names = []
+  try {
+    const r = await fetch('/api/agents')
+    const list = r.ok ? await r.json() : []
+    if (Array.isArray(list)) names = list.map((a) => a && a.name).filter(Boolean)
+  } catch { /* the main agent alone keeps the form usable */ }
+  const all = [main, ...[...new Set(names)].filter((n) => n !== main).sort()]
+  el.innerHTML = all.map((n) =>
+    `<div><label class="auth-operator-switch"><input type="checkbox" data-comp-recipient="${escapeHtml(n)}"${n === main ? ' checked' : ''}> ${escapeHtml(n)}` +
+    (n === main ? ` (${t('auth.companion.main_agent')})` : '') + `</label></div>`).join('')
+}
+
+async function mintCompanionKey() {
+  const msg = document.getElementById('compKeyMsg')
+  const minted = document.getElementById('compKeyMinted')
+  const name = (document.getElementById('compKeyName').value || '').trim()
+  const days = Number(document.getElementById('compKeyExpiry').value)
+  const recipients = [...document.querySelectorAll('[data-comp-recipient]')].filter((cb) => cb.checked).map((cb) => cb.dataset.compRecipient)
+  const bindIp = document.getElementById('compKeyBindIp').checked
+  const ip = (document.getElementById('compKeyIp').value || '').trim()
+  msg.className = 'auth-form-msg'
+  msg.textContent = ''
+  minted.hidden = true
+  const fail = (text) => { msg.classList.add('err'); msg.textContent = text }
+  if (!name) return fail(t('auth.devices.err_name'))
+  if (!COMPANION_NAME_RE.test(name)) return fail(t('auth.companion.err_name'))
+  if (!Number.isInteger(days) || days < 1 || days > 90) return fail(t('auth.companion.err_expiry'))
+  if (!recipients.length) return fail(t('auth.companion.err_recipients'))
+  if (bindIp && !ip) return fail(t('auth.companion.err_ip'))
+  // The main agent alone is sent as no list: the key then follows the main agent (the server's default).
+  const payload = { name, scope: 'companion', expires_in_days: days }
+  if (!(recipients.length === 1 && recipients[0] === mainAgentId())) payload.recipients = recipients
+  if (bindIp) payload.bound_ip = ip
+  try {
+    const r = await fetch('/api/auth/device-keys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+    const data = await r.json().catch(() => ({}))
+    if (!r.ok) { msg.classList.add('err'); msg.textContent = data.error || t('auth.card.err_generic'); return }
+    document.getElementById('compKeyName').value = ''
+    minted.hidden = false
+    minted.innerHTML =
+      `<p class="auth-muted">${t('auth.companion.minted_hint', { date: new Date(data.expires_at * 1000).toLocaleDateString(), list: escapeHtml((data.recipients || []).join(', ')) })}</p>` +
+      `<p class="auth-form-msg err">${t('auth.companion.minted_risk')}</p>` +
+      `<div class="auth-form auth-device-minted-row">` +
+        `<input id="compKeyMintedVal" type="text" readonly value="${escapeHtml(data.key)}" onclick="this.select()">` +
+        `<button class="btn-secondary btn-compact" id="compKeyCopyBtn">${t('auth.devices.copy')}</button>` +
+      `</div>`
+    document.getElementById('compKeyCopyBtn').addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(data.key)
+        document.getElementById('compKeyCopyBtn').textContent = t('auth.devices.copied')
+      } catch { document.getElementById('compKeyMintedVal').select() }
     })
     refreshDeviceKeyList()
   } catch { msg.classList.add('err'); msg.textContent = t('auth.login.err_network') }
@@ -17999,21 +19756,21 @@ function wireFleetFreeze() {
         body: JSON.stringify({ reason, mode }),
       })
       const data = await res.json().catch(() => ({}))
-      if (!res.ok) { showToast(data.error || ('HTTP ' + res.status)); return }
+      if (!res.ok) { showToast(data.error || ('HTTP ' + res.status), 'error'); return }
       renderFleetFreeze(data)
-      showToast(t('fleet_freeze.toast.frozen'))
-    } catch (err) { showToast(String(err.message || err)) }
+      showToast(t('fleet_freeze.toast.frozen'), 'success')
+    } catch (err) { showToast(String(err.message || err), 'error') }
   })
   unfreezeBtn.addEventListener('click', async () => {
     if (!window.confirm(t('fleet_freeze.prompt.unfreeze'))) return
     try {
       const res = await fetch('/api/fleet/unfreeze', { method: 'POST' })
       const data = await res.json().catch(() => ({}))
-      if (res.status === 403) { showToast(t('fleet_freeze.toast.owner_only'), 8000); return }
-      if (!res.ok) { showToast(data.error || ('HTTP ' + res.status)); return }
+      if (res.status === 403) { showToast(t('fleet_freeze.toast.owner_only'), { kind: 'warn', duration: 8000 }); return }
+      if (!res.ok) { showToast(data.error || ('HTTP ' + res.status), 'error'); return }
       renderFleetFreeze({ frozen: false })
-      showToast(t('fleet_freeze.toast.unfrozen'))
-    } catch (err) { showToast(String(err.message || err)) }
+      showToast(t('fleet_freeze.toast.unfrozen'), 'success')
+    } catch (err) { showToast(String(err.message || err), 'error') }
   })
   pollFleetFreeze()
   setInterval(pollFleetFreeze, FLEET_FREEZE_POLL_MS)
@@ -18644,7 +20401,7 @@ async function copyClaudePlanLoginUrl() {
   if (!field || !field.value) return
   try {
     await navigator.clipboard.writeText(field.value)
-    showToast(t('settings.claude_plans.login.copied'))
+    showToast(t('settings.claude_plans.login.copied'), 'success')
   } catch {
     field.focus()
     field.select()
@@ -18703,7 +20460,7 @@ async function submitClaudePlanLoginCode() {
     let data = null
     try { data = await res.json() } catch { /* non-JSON error body */ }
     if (res.status === 201 && data) {
-      showToast(t(data.verified ? 'settings.claude_plans.login.done' : 'settings.claude_plans.login.done_unverified', { label: data.label || data.id }))
+      showToast(t(data.verified ? 'settings.claude_plans.login.done' : 'settings.claude_plans.login.done_unverified', { label: data.label || data.id }), data.verified ? 'success' : 'warn')
       resetClaudePlanForm()
       await loadClaudePlansList()
       return
@@ -18761,7 +20518,7 @@ async function switchToClaudePlan(plan) {
     if (!res.ok) {
       showToast((data && data.error) || t('settings.claude_plans.switch_error'), 'error')
     } else {
-      showToast(t('settings.claude_plans.switch_done', { label: plan.label }))
+      showToast(t('settings.claude_plans.switch_done', { label: plan.label }), 'success')
     }
   } catch {
     showToast(t('settings.claude_plans.switch_error'), 'error')
@@ -18803,12 +20560,12 @@ async function deleteClaudePlan(plan, rotationUsers = []) {
     const res = await fetch(`/api/claude-plans/${encodeURIComponent(id)}`, { method: 'DELETE' })
     const reply = await readActionReply(res)
     if (!reply.ok) {
-      showToast(t('common.not_done', { msg: refusalReason(res, reply.body) }))
+      showToast(t('common.not_done', { msg: refusalReason(res, reply.body) }), 'error')
     } else if (claudePlanFormEditing?.id === id) {
       resetClaudePlanForm()
     }
   } catch {
-    showToast(t('common.not_done', { msg: t('common.error') }))
+    showToast(t('common.not_done', { msg: t('common.error') }), 'error')
   }
   await loadClaudePlansList()
 }
@@ -18915,11 +20672,11 @@ async function probeClaudePlan(id, btn) {
       // 422) is not recorded, so surface it here.
       // A 429 is the per-plan probe throttle: the reloaded row already shows
       // the last measurement, so just say why nothing new happened.
-      if (res.status === 429) showToast(t('settings.claude_plans.probe_throttled'))
-      else if (res.status !== 502) showToast((data && data.error) || t('settings.claude_plans.probe_failed'))
+      if (res.status === 429) showToast(t('settings.claude_plans.probe_throttled'), 'warn')
+      else if (res.status !== 502) showToast((data && data.error) || t('settings.claude_plans.probe_failed'), 'error')
     }
   } catch {
-    showToast(t('settings.claude_plans.probe_failed'))
+    showToast(t('settings.claude_plans.probe_failed'), 'error')
   }
   btn.textContent = original
   await loadClaudePlansList()
@@ -19131,12 +20888,12 @@ function buildProvidersUI(container, providers) {
           const r = await fetch(`/api/custom-providers/${encodeURIComponent(id)}`, { method: 'DELETE' })
           if (!r.ok) {
             const err = await r.json().catch(() => ({}))
-            showToast(err.error || t('providers.toast.delete_error'))
+            showToast(err.error || t('providers.toast.delete_error'), 'error')
             return
           }
           renderProvidersContent(container)
           loadAvailableModels()
-        } catch { showToast(t('providers.toast.delete_error')) }
+        } catch { showToast(t('providers.toast.delete_error'), 'error') }
       })
     })
   } else {
@@ -19228,7 +20985,7 @@ function openAddProviderModal(container, editProvider = null) {
       : !baseUrl ? ['#cpBaseUrl', 'providers.form.base_url_required']
       : (authHeader !== 'none' && !vaultKey) ? ['#cpVaultKey', 'providers.form.vault_key_required']
       : null
-    if (missing) { overlay.querySelector(missing[0]).focus(); showToast(t(missing[1])); return }
+    if (missing) { overlay.querySelector(missing[0]).focus(); showToast(t(missing[1]), 'warn'); return }
     try {
       const r = await fetch('/api/custom-providers', {
         method: 'POST',
@@ -19237,13 +20994,13 @@ function openAddProviderModal(container, editProvider = null) {
       })
       if (!r.ok) {
         const err = await r.json().catch(() => ({}))
-        showToast(err.error || t('providers.toast.save_error'))
+        showToast(err.error || t('providers.toast.save_error'), 'error')
         return
       }
       overlay.remove()
       renderProvidersContent(container)
       loadAvailableModels()
-    } catch { showToast(t('providers.toast.save_error')) }
+    } catch { showToast(t('providers.toast.save_error'), 'error') }
   })
 }
 
@@ -19412,7 +21169,7 @@ async function resetSettingToDefault(def, row, btn, errorEl) {
   updateSettingsSaveBar()
   loadClaudePlansReadiness()
   const base = result.source === 'env' ? t('settings.toast.reset_env') : t('settings.toast.reset_default')
-  showToast(result.requiresRestart ? base + ' ' + t('settings.toast.reset_restart_suffix') : base)
+  showToast(result.requiresRestart ? base + ' ' + t('settings.toast.reset_restart_suffix') : base, 'success')
 }
 
 // One button per tab: every overridden row of this group back to its default.
@@ -19598,10 +21355,10 @@ async function resetSettingsGroupToDefault(group) {
   updateSettingsSaveBar()
   loadClaudePlansReadiness()
   if (failed) {
-    showToast(t('settings.toast.reset_tab_partial'), 6000)
+    showToast(t('settings.toast.reset_tab_partial'), { kind: 'error', duration: 6000 })
   } else {
     const base = t('settings.toast.reset_tab')
-    showToast(needsRestart ? base + ' ' + t('settings.toast.reset_restart_suffix') : base)
+    showToast(needsRestart ? base + ' ' + t('settings.toast.reset_restart_suffix') : base, 'success')
   }
 }
 
@@ -19657,7 +21414,7 @@ async function saveAllSettings() {
   if (errors.length) {
     showToast(t('settings.toast.partial_error'), 'error')
   } else {
-    showToast(needsRestart ? t('settings.toast.saved_restart') : t('settings.toast.saved'))
+    showToast(needsRestart ? t('settings.toast.saved_restart') : t('settings.toast.saved'), 'success')
   }
 }
 
@@ -20384,7 +22141,7 @@ function renderTuTimeline(data, filterAgent) {
   ctx.fillStyle = 'rgba(239, 68, 68, 0.15)'
   ctx.fillRect(legendX, legendY - 7, 10, 10)
   ctx.fillStyle = textSecondary; ctx.font = '10px sans-serif'
-  ctx.fillText('csúcsidő', legendX + 14, legendY + 2)
+  ctx.fillText(t('tokenUsage.chart.peak_legend'), legendX + 14, legendY + 2)
 
   // Store legend hit areas for click handling
   tuChartState = { barRects, pad, h, cssW, cssH, maxVal, maxCum, win5h, winWeekly, legendHits }
@@ -20958,10 +22715,10 @@ function wireNotesPage() {
       if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
       if (contentEl) contentEl.value = ''
       if (dueEl) dueEl.value = ''
-      showToast(t('notes.toast.added'))
+      showToast(t('notes.toast.added'), 'success')
       loadNotesPage()
     } catch (err) {
-      showToast(t('notes.toast.error', { msg: String(err.message || err) }))
+      showToast(t('notes.toast.error', { msg: String(err.message || err) }), 'error')
     } finally {
       if (btn) btn.disabled = false
     }
@@ -20981,11 +22738,11 @@ function wireNotesPage() {
       })
       const data = await r.json().catch(() => ({}))
       if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
-      showToast(t('notes.toast.deleted'))
+      showToast(t('notes.toast.deleted'), 'success')
       loadNotesPage()
     } catch (err) {
       btn.disabled = false
-      showToast(t('notes.toast.error', { msg: String(err.message || err) }))
+      showToast(t('notes.toast.error', { msg: String(err.message || err) }), 'error')
     }
   })
 }
@@ -21156,7 +22913,7 @@ function openIdeaEdit(id) {
 
 async function saveIdea() {
   const title = document.getElementById('ideaTitleInput').value.trim()
-  if (!title) { document.getElementById('ideaTitleInput').focus(); showToast(t('ideas.form.title_required'), 'error'); return }
+  if (!title) { document.getElementById('ideaTitleInput').focus(); showToast(t('ideas.form.title_required'), 'warn'); return }
   const impactRaw = document.getElementById('ideaImpactInput').value
   const effortRaw = document.getElementById('ideaEffortInput').value
   const body = {
@@ -21281,7 +23038,7 @@ document.getElementById('ideaAttachmentInput')?.addEventListener('change', async
         throw new Error(data.error || t('ideas.detail.attach.upload_error'))
       }
     }
-    if (files.length) showToast(t('ideas.detail.attach.uploaded'))
+    if (files.length) showToast(t('ideas.detail.attach.uploaded'), 'success')
     await loadIdeaAttachments(ideaDetailId)
   } catch (err) {
     showToast(err.message || t('ideas.detail.attach.upload_error'), 'error')
@@ -21344,7 +23101,7 @@ document.getElementById('ideaDetailScoreSave')?.addEventListener('click', async 
       idea.effort = effort ? Number(effort) : null
     }
     updateDetailScoreChip()
-    showToast(t('ideas.toast.score_saved'))
+    showToast(t('ideas.toast.score_saved'), 'success')
     renderIdeasList()
   } catch { showToast(t('ideas.toast.score_saved_error'), 'error') }
 })
@@ -21418,16 +23175,16 @@ async function promoteIdea(phase) {
   const data = await res.json()
   ideasPromoteId = null
   closeModal(document.getElementById('ideaPromoteOverlay'))
-  if (data.ok) showToast(t('kanban.toast.card_created') + ': ' + data.kanban_id)
+  if (data.ok) showToast(t('kanban.toast.card_created') + ': ' + data.kanban_id, 'success')
   loadIdeasPage()
 }
 
 async function setIdeaStatus(id, status) {
   try {
     const res = await fetch(`/api/ideas/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status }) })
-    if (!res.ok) { showToast(t('ideas.toast.status_error')); return }
+    if (!res.ok) { showToast(t('ideas.toast.status_error'), 'error'); return }
     loadIdeasPage()
-  } catch { showToast(t('ideas.toast.status_error')) }
+  } catch { showToast(t('ideas.toast.status_error'), 'error') }
 }
 
 // Promote an idea to the board via AI breakdown + per-subtask approval.
@@ -21445,8 +23202,8 @@ async function openIdeaBreakdown(id) {
   try {
     const res = await fetch(`/api/ideas/${id}/breakdown`, { method: 'POST', headers: { 'Content-Type': 'application/json' } })
     const data = await res.json()
-    if (!res.ok) { showToast(data.error || t('kanban.breakdown.failed')); return }
-    if (!data.subtasks || !data.subtasks.length) { showToast(t('ideas.toast.no_subtasks')); return }
+    if (!res.ok) { showToast(data.error || t('kanban.breakdown.failed'), 'error'); return }
+    if (!data.subtasks || !data.subtasks.length) { showToast(t('ideas.toast.no_subtasks'), 'warn'); return }
     breakdownMode = 'idea'
     breakdownIdeaId = id
     breakdownSubtasks = data.subtasks
@@ -21455,7 +23212,7 @@ async function openIdeaBreakdown(id) {
     const dodSection = document.getElementById('breakdownDoDSection')
     if (dodSection) { dodSection.style.display = ''; document.getElementById('breakdownSuccessCriteria').value = '' }
   } catch {
-    showToast(t('kanban.breakdown.failed'))
+    showToast(t('kanban.breakdown.failed'), 'error')
   }
 }
 
@@ -21499,11 +23256,11 @@ async function handleAgentLogin(agentName, btn) {
       showToast(t('agents.auth.toast_started'))
     } else {
       btn.textContent = t('agents.auth.btn_logged_in')
-      showToast(t('agents.auth.toast_success'))
+      showToast(t('agents.auth.toast_success'), 'success')
       setTimeout(() => loadAgents(), 1500)
     }
   } catch (e) {
-    showToast(`${t('common.error')}: ${e.message || e}`)
+    showToast(`${t('common.error')}: ${e.message || e}`, 'error')
     btn.textContent = origText
     btn.dataset.phase = 'start'
     btn.disabled = false
@@ -21629,7 +23386,7 @@ function openTerminalModal(agentName) {
     if (!terminalInputEnabled) {
       // Read-only mode: input gate is OFF. Drop the keystroke locally (server
       // would 403 it anyway) and nudge the user to the toggle.
-      showToast(t('terminal.input_off'))
+      showToast(t('terminal.input_off'), 'warn')
       return
     }
     const special = ESC_TO_SPECIAL[data]
@@ -21645,7 +23402,7 @@ function openTerminalModal(agentName) {
       const now = Date.now()
       if (now - terminalKeysRefusalToastAt < 5000) return
       terminalKeysRefusalToastAt = now
-      showToast(t('common.not_done', { msg: refusalReason(r, reply.body) }))
+      showToast(t('common.not_done', { msg: refusalReason(r, reply.body) }), 'error')
     }).catch(() => {})
   })
 
@@ -21680,7 +23437,7 @@ document.getElementById('terminalInputToggle')?.addEventListener('change', (e) =
     .then(async r => {
       const reply = await readActionReply(r)
       if (!reply.ok) {
-        showToast(t('common.not_done', { msg: refusalReason(r, reply.body) }))
+        showToast(t('common.not_done', { msg: refusalReason(r, reply.body) }), 'error')
         const cur = await fetch('/api/terminal-input').then(g => (g.ok ? g.json() : null)).catch(() => null)
         terminalInputEnabled = cur ? cur.enabled === true : false
         syncTerminalInputToggleUI()
@@ -21688,12 +23445,12 @@ document.getElementById('terminalInputToggle')?.addEventListener('change', (e) =
       }
       terminalInputEnabled = reply.body.enabled === true
       syncTerminalInputToggleUI()
-      showToast(t(terminalInputEnabled ? 'terminal.input_enabled' : 'terminal.input_disabled'))
+      showToast(t(terminalInputEnabled ? 'terminal.input_enabled' : 'terminal.input_disabled'), 'success')
     })
     .catch(() => {
       terminalInputEnabled = false
       syncTerminalInputToggleUI()
-      showToast(t('terminal.input_toggle_failed'))
+      showToast(t('terminal.input_toggle_failed'), 'error')
     })
 })
 
@@ -21914,10 +23671,10 @@ function renderFederationPage() {
     try {
       const res = await fetch('/api/federation/enabled', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) })
       const data = await res.json().catch(() => ({}))
-      if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); e.target.checked = !enabled; return }
-      showToast(enabled ? t('federation.toast.enabled') : t('federation.toast.disabled'))
+      if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) }), 'error'); e.target.checked = !enabled; return }
+      showToast(enabled ? t('federation.toast.enabled') : t('federation.toast.disabled'), 'success')
       fedRefreshAndReload()
-    } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })); e.target.checked = !enabled }
+    } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) }), 'error'); e.target.checked = !enabled }
   })
   document.querySelectorAll('input[name="fedRoutingMode"]').forEach((radio) => {
     radio.addEventListener('change', async (e) => {
@@ -21925,9 +23682,9 @@ function renderFederationPage() {
       try {
         const res = await fetch('/api/federation/routing-mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }) })
         const data = await res.json().catch(() => ({}))
-        if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); return }
+        if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) }), 'error'); return }
         showToast(t('federation.routing.toast_set', { mode: t('federation.routing.mode.' + mode + '.label') }))
-      } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+      } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) }), 'error') }
     })
   })
 
@@ -21981,14 +23738,14 @@ async function fedRevealToken(peerId, card) {
   try {
     const res = await fetch(`/api/federation/peers/${encodeURIComponent(peerId)}/inbound-token`)
     const data = await res.json().catch(() => ({}))
-    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); return }
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) }), 'error'); return }
     box.textContent = data.inboundToken
     box.hidden = false
     navigator.clipboard?.writeText(data.inboundToken).then(
-      () => showToast(t('federation.toast.token_copied')),
+      () => showToast(t('federation.toast.token_copied'), 'success'),
       () => {},
     )
-  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) }), 'error') }
 }
 
 // A peer's inbound token in the app's own dialog (the pairing showed it in a native prompt()): selectable,
@@ -22010,8 +23767,8 @@ async function fedShowInboundTokenDialog(peerId, token, messageKey) {
   if (!copy) return
   try {
     await navigator.clipboard.writeText(token)
-    showToast(t('federation.toast.token_copied'))
-  } catch { showToast(t('federation.token_dialog.copy_failed')) }
+    showToast(t('federation.toast.token_copied'), 'success')
+  } catch { showToast(t('federation.token_dialog.copy_failed'), 'error') }
 }
 
 async function fedRotateToken(peerId) {
@@ -22025,12 +23782,12 @@ async function fedRotateToken(peerId) {
   try {
     const res = await fetch(`/api/federation/peers/${encodeURIComponent(peerId)}/rotate-inbound-token`, { method: 'POST' })
     const data = await res.json().catch(() => ({}))
-    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); return }
-    showToast(t('federation.toast.rotated'))
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) }), 'error'); return }
+    showToast(t('federation.toast.rotated'), 'success')
     loadFederationPage()
     // The answer carries the new token: shown right away, like at pairing.
     if (data.inboundToken) await fedShowInboundTokenDialog(peerId, data.inboundToken, 'federation.token_dialog.rotated_hint')
-  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) }), 'error') }
 }
 
 async function fedToggleShareCap(peerId, share) {
@@ -22040,9 +23797,9 @@ async function fedToggleShareCap(peerId, share) {
       body: JSON.stringify({ shareCapabilitySummaries: share }),
     })
     const data = await res.json().catch(() => ({}))
-    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); loadFederationPage(); return }
-    showToast(share ? t('federation.toast.share_cap_on') : t('federation.toast.share_cap_off'))
-  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })); loadFederationPage() }
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) }), 'error'); loadFederationPage(); return }
+    showToast(share ? t('federation.toast.share_cap_on') : t('federation.toast.share_cap_off'), 'success')
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) }), 'error'); loadFederationPage() }
 }
 
 async function fedDeletePeer(peerId) {
@@ -22056,16 +23813,16 @@ async function fedDeletePeer(peerId) {
   try {
     const res = await fetch(`/api/federation/peers/${encodeURIComponent(peerId)}`, { method: 'DELETE' })
     const data = await res.json().catch(() => ({}))
-    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); return }
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) }), 'error'); return }
     // Sweep browser leftovers scoped to the removed peer.
     for (let i = localStorage.length - 1; i >= 0; i--) {
       const key = localStorage.key(i)
       if (key && key.startsWith('chat_last_seen_' + peerId + '/')) localStorage.removeItem(key)
     }
     if (chatSelectedAgent && chatSelectedAgent.startsWith(peerId + '/')) chatSelectedAgent = null
-    showToast(t('federation.toast.peer_deleted'))
+    showToast(t('federation.toast.peer_deleted'), 'success')
     loadFederationPage()
-  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) }), 'error') }
 }
 
 // Apply federation config changes to the RUNNING main agent by restarting it
@@ -22104,9 +23861,9 @@ async function fedApplyToMainAgent() {
       res = await apply(true)
       data = await res.json().catch(() => ({}))
     }
-    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); return }
-    showToast(t('federation.toast.applied'))
-  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) }), 'error'); return }
+    showToast(t('federation.toast.applied'), 'success')
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) }), 'error') }
 }
 
 // Re-poll peer reachability then re-render. Called after config mutations
@@ -22129,7 +23886,14 @@ function fedOpenPeerModal(peer) {
   document.getElementById('fedPeerOutboundToken').value = ''
   document.getElementById('fedPeerOutboundToken').placeholder = peer && peer.hasOutboundToken ? t('federation.modal.outbound_keep') : ''
   document.getElementById('fedPeerAbandonWindow').value = peer && peer.abandonWindowMinutes ? String(peer.abandonWindowMinutes) : ''
+  // FEDALLOWUI1121: the peer's allowedAgents, editable here instead of only through the API.
+  document.getElementById('fedPeerAllowedAgents').value = peer && Array.isArray(peer.allowedAgents) ? peer.allowedAgents.join(', ') : ''
   openModal(document.getElementById('fedPeerModalOverlay'))
+}
+
+// FEDALLOWUI1121: "a, b c" -> ['a', 'b', 'c']; the server validates each id and folds the case.
+function fedParseAllowedAgents(raw) {
+  return String(raw || '').split(/[\s,]+/).map((s) => s.trim()).filter(Boolean)
 }
 
 async function fedSavePeerModal() {
@@ -22139,6 +23903,7 @@ async function fedSavePeerModal() {
   const baseUrl = document.getElementById('fedPeerBaseUrl').value.trim()
   const outbound = document.getElementById('fedPeerOutboundToken').value.trim()
   const abandonRaw = document.getElementById('fedPeerAbandonWindow').value.trim()
+  const allowed = fedParseAllowedAgents(document.getElementById('fedPeerAllowedAgents').value)
   try {
     let res, data
     if (fedPeerModalEditId) {
@@ -22146,24 +23911,27 @@ async function fedSavePeerModal() {
       if (outbound) body.outboundToken = outbound
       if (abandonRaw) body.abandonWindowMinutes = parseInt(abandonRaw, 10)
       else body.abandonWindowMinutes = null
+      // An empty field clears the list (null), so every agent of the peer is visible again.
+      body.allowedAgents = allowed.length ? allowed : null
       res = await fetch(`/api/federation/peers/${encodeURIComponent(fedPeerModalEditId)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       data = await res.json().catch(() => ({}))
-      if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); return }
-      showToast(t('federation.toast.peer_saved'))
+      if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) }), 'error'); return }
+      showToast(t('federation.toast.peer_saved'), 'success')
     } else {
       const body = { id, baseUrl }
       if (outbound) body.outboundToken = outbound
+      if (allowed.length) body.allowedAgents = allowed
       res = await fetch('/api/federation/peers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       data = await res.json().catch(() => ({}))
-      if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); return }
+      if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) }), 'error'); return }
       // The minted inbound token is shown ONCE right away: the owner hands it
       // to the peer's operator during pairing.
       await fedShowInboundTokenDialog(id, data.inboundToken, 'federation.modal.minted_token_hint')
-      showToast(t('federation.toast.peer_added'))
+      showToast(t('federation.toast.peer_added'), 'success')
     }
     closeModal(document.getElementById('fedPeerModalOverlay'))
     fedRefreshAndReload()
-  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) }), 'error') }
 }
 
 async function fedRemoveAll() {
@@ -22177,7 +23945,7 @@ async function fedRemoveAll() {
   try {
     const res = await fetch('/api/federation/remove', { method: 'POST' })
     const data = await res.json().catch(() => ({}))
-    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) })); return }
+    if (!res.ok) { showToast(t('federation.toast.error', { msg: refusalReason(res, data) }), 'error'); return }
     federatedPeerStatus = []
     // Sweep browser leftovers for ALL federated (qualified) threads -- the
     // per-peer DELETE path does this per peer, full removal must do it wholesale.
@@ -22186,9 +23954,9 @@ async function fedRemoveAll() {
       if (key && /^chat_last_seen_[^/]+\//.test(key)) localStorage.removeItem(key)
     }
     if (chatSelectedAgent && chatSelectedAgent.includes('/')) chatSelectedAgent = null
-    showToast(t('federation.toast.removed'))
+    showToast(t('federation.toast.removed'), 'success')
     loadFederationPage()
-  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) })) }
+  } catch (err) { showToast(t('federation.toast.error', { msg: String(err.message || err) }), 'error') }
 }
 
 function wireFederationPage() {
@@ -22382,7 +24150,7 @@ function downloadMarkdown(name, content) {
     a.remove()
     setTimeout(() => URL.revokeObjectURL(url), 1000)
   } catch (e) {
-    showToast(t('common.toast.download_failed', { msg: String(e && e.message || e) }))
+    showToast(t('common.toast.download_failed', { msg: String(e && e.message || e) }), 'error')
   }
 }
 
@@ -23087,7 +24855,7 @@ function gromzoScheduleStatusRefresh(isConnected, reload, setT) {
         } else {
           restoreBtn.disabled = false
           restoreBtn.textContent = t('archived.btn.restore_to_board')
-          showToast(t('archived.restore_error'))
+          showToast(t('archived.restore_error'), 'error')
         }
       } catch {
         restoreBtn.disabled = false
@@ -23164,7 +24932,7 @@ function gromzoScheduleStatusRefresh(isConnected, reload, setT) {
             } else {
               btn.disabled = false
               btn.textContent = t('archived.btn.restore')
-              showToast(t('archived.restore_error'))
+              showToast(t('archived.restore_error'), 'error')
             }
           } catch {
             btn.disabled = false
@@ -23648,6 +25416,8 @@ function gromzoScheduleStatusRefresh(isConnected, reload, setT) {
   // Timeline / Archived buttons stayed dead. Catch up if the board is showing.
   if (document.getElementById('kanbanPage')?.hidden === false) initGanttViewSwitcher()
 })()
+
+revealAgentCatalogNav(fetch, document.getElementById('sbAgentCatalog'))
 
 // VIDEOREVIEW1002: reveal the sidebar link to the review page only when the
 // install has a video root configured. Failure-proof like the other optional

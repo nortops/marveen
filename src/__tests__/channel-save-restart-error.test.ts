@@ -35,7 +35,8 @@ describe('mainChannelsRestartOutcome', () => {
 })
 
 describe('the channel-save route returns restartError on both main-agent branches', () => {
-  const route = between(agentsSource, '// POST /api/agents/:name/channels/:provider (legacy: /telegram) -- setup', '// DELETE /api/agents/:name/channels/:provider')
+  // AGENTCREATEPR2-1119: the setup body is setupAgentChannel (same file); the route calls it.
+  const route = between(agentsSource, 'export async function setupAgentChannel(', 'export async function tryHandleAgents(')
 
   it('bot-token branch: the restart goes through the helper and the error reaches the response', () => {
     const botBranch = route.slice(route.indexOf('const { botToken'))
@@ -79,6 +80,24 @@ describe('channelsRestartCommand: this install\'s unit, per platform', () => {
     expect(cmd).toContain('launchctl kickstart -k gui/$(id -u)/com.jarvis.channels')
     expect(cmd).toContain('~/Library/LaunchAgents/com.jarvis.channels.plist')
     expect(cmd).not.toContain('marveen')
+  })
+})
+
+// HOSTINGERLANGFU1122: in the container there is no systemd/launchd; the tip names supervisor's channels program, run
+// on the host against this container (its hostname is the container id).
+describe('channelsRestartCommand in the Docker container', () => {
+  it('names supervisorctl with the image config, through docker exec on this container', () => {
+    expect(channelsRestartCommand('linux', 'marveen', 'docker', '3f2a9c1b7d4e'))
+      .toBe('docker exec 3f2a9c1b7d4e supervisorctl -c /opt/marveen-docker/supervisord.conf restart channels')
+  })
+  it('a native install keeps its unit (the Docker branch only with deployment docker)', () => {
+    expect(channelsRestartCommand('linux', 'jarvis', 'native', 'h')).toBe('systemctl --user restart jarvis-channels')
+  })
+  it('the supervisor program and the config path it names exist in the image', () => {
+    const conf = readFileSync(new URL('../../docker/supervisord.conf', import.meta.url), 'utf-8')
+    expect(conf).toMatch(/^\[program:channels\]$/m)
+    const dockerfile = readFileSync(new URL('../../Dockerfile', import.meta.url), 'utf-8')
+    expect(dockerfile).toMatch(/COPY[^\n]*docker\/ \/opt\/marveen-docker\//)
   })
 })
 

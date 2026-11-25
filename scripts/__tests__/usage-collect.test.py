@@ -231,6 +231,110 @@ class TestCollectClaudeAuthoritative(unittest.TestCase):
         self.assertIsNotNone(err)
         self.assertEqual(err_kind, "transient")
 
+    # USAGE401FALLBACK1123: a 401 refuses the SOURCE; the next one gets a try.
+    def _sources(self, available):
+        def read(skip=()):
+            for name in ("credentials_file", "keychain", "env_file"):
+                if name in available and name not in skip:
+                    return available[name], name
+            return None, None
+        return read
+
+    def _urlopen_by_token(self, answers):
+        import urllib.error
+        seen = []
+        def opener(req, timeout=10):
+            token = req.headers["Authorization"].split(" ", 1)[1]
+            seen.append(token)
+            code = answers[token]
+            if code == 200:
+                return self._mock_response({"five_hour": {"utilization": 5.0, "resets_at": "2026-07-22T16:29:59Z"}})
+            raise urllib.error.HTTPError(req.full_url, code, "x", {}, None)
+        return opener, seen
+
+    def test_stale_credentials_file_401_falls_through_to_keychain(self):
+        opener, seen = self._urlopen_by_token({"stale": 401, "good": 200})
+        with patch.object(uc, "_read_claude_token", side_effect=self._sources({"credentials_file": "stale", "keychain": "good"})), \
+             patch.object(uc, "_claude_cli_version", return_value="1.2.3"), \
+             patch("urllib.request.urlopen", side_effect=opener):
+            windows, err, err_kind = uc._collect_claude_authoritative()
+        self.assertIsNone(err)
+        self.assertEqual(windows["five_hour"]["used_percent"], 5.0)
+        self.assertEqual(seen, ["stale", "good"])
+
+    def test_every_source_401_is_permanent_and_names_them(self):
+        opener, seen = self._urlopen_by_token({"a": 401, "b": 401, "c": 401})
+        with patch.object(uc, "_read_claude_token", side_effect=self._sources({"credentials_file": "a", "keychain": "b", "env_file": "c"})), \
+             patch.object(uc, "_claude_cli_version", return_value="1.2.3"), \
+             patch("urllib.request.urlopen", side_effect=opener):
+            windows, err, err_kind = uc._collect_claude_authoritative()
+        self.assertIsNone(windows)
+        self.assertEqual(err_kind, "permanent")
+        self.assertIn("HTTP 401", err)
+        self.assertIn("credentials_file, keychain, env_file", err)
+        self.assertEqual(seen, ["a", "b", "c"])
+
+    def test_403_does_not_fall_through(self):
+        opener, seen = self._urlopen_by_token({"a": 403, "b": 200})
+        with patch.object(uc, "_read_claude_token", side_effect=self._sources({"credentials_file": "a", "keychain": "b"})), \
+             patch.object(uc, "_claude_cli_version", return_value="1.2.3"), \
+             patch("urllib.request.urlopen", side_effect=opener):
+            windows, err, err_kind = uc._collect_claude_authoritative()
+        self.assertIsNone(windows)
+        self.assertEqual(err_kind, "permanent")
+        self.assertIn("HTTP 403", err)
+        self.assertEqual(seen, ["a"])
+
+    def test_401_then_403_reports_the_401_first(self):
+        # Geri #3073: a stale file (401) and a .env setup-token (403 by design) must not read as a scope problem.
+        opener, seen = self._urlopen_by_token({"stale": 401, "setup": 403})
+        with patch.object(uc, "_read_claude_token", side_effect=self._sources({"credentials_file": "stale", "env_file": "setup"})), \
+             patch.object(uc, "_claude_cli_version", return_value="1.2.3"), \
+             patch("urllib.request.urlopen", side_effect=opener):
+            windows, err, err_kind = uc._collect_claude_authoritative()
+        self.assertIsNone(windows)
+        self.assertEqual(err_kind, "permanent")
+        self.assertTrue(err.startswith("HTTP 401 (credentials_file token)"), err)
+        self.assertIn("then HTTP 403 (env_file token)", err)
+
+    def test_a_redirect_is_not_followed(self):
+        # Dani #3073 N1: the bearer must never follow a redirect to another host.
+        import http.server, threading
+        hits = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append((self.path, self.headers.get("Authorization")))
+                if self.path == "/start":
+                    self.send_response(302)
+                    self.send_header("Location", "http://127.0.0.1:%d/landed" % srv.server_address[1])
+                    self.end_headers()
+                else:
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            import urllib.request, urllib.error
+            req = urllib.request.Request("http://127.0.0.1:%d/start" % srv.server_address[1], headers={"Authorization": "Bearer x"})
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(ctx.exception.code, 302)
+            self.assertEqual([p for p, _ in hits], ["/start"])
+        finally:
+            srv.shutdown()
+
+    def test_read_claude_token_skips_named_sources(self):
+        with patch.object(uc, "_read_keychain_token", return_value="kc"), \
+             patch("os.path.exists", return_value=False):
+            self.assertEqual(uc._read_claude_token(), ("kc", "keychain"))
+            self.assertEqual(uc._read_claude_token(skip=("keychain",)), (None, None))
+
     def test_no_token_returns_no_token_kind(self):
         with patch.object(uc, "_read_claude_token", return_value=(None, None)):
             windows, err, err_kind = uc._collect_claude_authoritative()
@@ -364,6 +468,12 @@ class TestCollectClaudeCacheFallback(unittest.TestCase):
     estimate; a stale/absent cache, a 403, or no token must still fall
     back to the estimate."""
 
+    def setUp(self):
+        # The header entry (TestRatelimitHeaderSource) would spawn node with the fake token: keep it out.
+        p = patch.object(uc, "_collect_claude_ratelimit_headers", return_value=(None, "not run in this test"))
+        p.start()
+        self.addCleanup(p.stop)
+
     def _write_latest(self, path, source, windows, generated_at):
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"generated_at": generated_at, "claude": {"source": source, "windows": windows}}, f)
@@ -474,6 +584,108 @@ class TestCollectClaudeCacheFallback(unittest.TestCase):
 
             mock_estimate.assert_called_once()
             self.assertEqual(result["source"], "estimate")
+
+
+class TestRatelimitHeaderSource(unittest.TestCase):
+    """collect_claude() last-resort source: when oauth/usage, the statusLine
+    file and (after a transient failure) the fresh authoritative cache gave
+    nothing, the compiled entry dist/claude-ratelimit-reading.js reads the
+    rate-limit headers (source "ratelimit_headers"). No node, no network:
+    subprocess.run is patched; a sentinel string stands in for the token."""
+
+    SENTINEL = "fake-token-SENTINEL-NEVER-PRINT"
+    WINDOWS = {
+        "five_hour": {"used_percent": 35.0, "resets_at": 1794300000, "status": "allowed"},
+        "seven_day": {"used_percent": 22.0, "resets_at": 1794800000, "status": "allowed_warning"},
+    }
+
+    def _collect(self, run_result, auth=(None, "HTTP 403 (env_file token)", "permanent"), cached=(None, None), built=True):
+        seen = []
+
+        def fake_run(argv, **kw):
+            seen.append((argv, kw))
+            if isinstance(run_result, BaseException):
+                raise run_result
+            return subprocess.CompletedProcess(argv, 0, stdout=run_result, stderr="")
+
+        real_isfile = os.path.isfile
+        with patch.object(uc, "_collect_claude_authoritative", return_value=auth), \
+             patch.object(uc, "_read_claude_statusline", return_value=(None, None)), \
+             patch.object(uc, "_read_cached_claude_authoritative", return_value=cached), \
+             patch.object(uc, "_read_claude_token", return_value=(self.SENTINEL, "env_file")), \
+             patch.object(uc.os.path, "isfile", side_effect=lambda p: built if p == uc.RATELIMIT_ENTRY else real_isfile(p)), \
+             patch.object(uc.subprocess, "run", side_effect=fake_run), \
+             patch.object(uc, "_collect_claude_estimate", return_value={"files_scanned": 0}) as est:
+            result = uc.collect_claude()
+        return result, seen, est
+
+    def _ok(self):
+        return json.dumps({"ok": True, "windows": self.WINDOWS}) + "\n"
+
+    def test_entry_reading_gives_a_trusted_snapshot(self):
+        result, seen, est = self._collect(self._ok())
+        est.assert_not_called()
+        self.assertEqual(result["source"], "ratelimit_headers")
+        self.assertEqual(result["windows"], self.WINDOWS)
+        self.assertIn("measured_at", result)
+        self.assertIn("403", result["auth_error"])
+        # one entry run; the token only in its environment, never in argv
+        self.assertEqual(len(seen), 1)
+        argv, kw = seen[0]
+        self.assertEqual(argv, ["node", uc.RATELIMIT_ENTRY])
+        self.assertEqual(kw["env"]["CLAUDE_RATELIMIT_TOKEN"], self.SENTINEL)
+        self.assertNotIn(self.SENTINEL, " ".join(argv))
+
+    def test_fresh_cache_after_a_transient_failure_wins_and_the_entry_does_not_run(self):
+        # #2839 B1: the authoritative cache is what the plan rotation sees; a header reading must not replace it.
+        cached = ({"five_hour": {"used_percent": 50.0, "resets_at": 1794300000}}, 12.0)
+        result, seen, est = self._collect(self._ok(), auth=(None, "HTTP 429", "transient"), cached=cached)
+        self.assertEqual(result["source"], "authoritative_cached")
+        self.assertEqual(seen, [])
+        est.assert_not_called()
+
+    def test_transient_failure_without_a_fresh_cache_runs_the_entry(self):
+        result, seen, _ = self._collect(self._ok(), auth=(None, "HTTP 429", "transient"), cached=(None, None))
+        self.assertEqual(result["source"], "ratelimit_headers")
+        self.assertEqual(len(seen), 1)
+
+    def test_entry_without_a_reading_falls_back_to_estimate_with_reason(self):
+        out = json.dumps({"ok": False, "reason": "rate_limited (HTTP 429)"}) + "\n"
+        result, _, est = self._collect(out)
+        est.assert_called_once()
+        self.assertEqual(result["source"], "estimate")
+        self.assertNotIn("windows", result)
+        self.assertEqual(result["ratelimit_headers_error"], "rate_limited (HTTP 429) (env_file token)")
+
+    def test_entry_not_built_falls_back_to_estimate(self):
+        result, seen, est = self._collect(self._ok(), built=False)
+        self.assertEqual(seen, [])
+        est.assert_called_once()
+        self.assertEqual(result["ratelimit_headers_error"], "dist/claude-ratelimit-reading.js not built")
+
+    def test_token_never_in_output(self):
+        # A crash or garbage output whose text carries the token must not leak it: only the exception type is recorded.
+        cases = [
+            subprocess.TimeoutExpired(["node", self.SENTINEL], 10, output=self.SENTINEL),
+            f"not json {self.SENTINEL}",
+            self._ok(),
+        ]
+        for case in cases:
+            result, _, _ = self._collect(case)
+            snapshot = {"generated_at": "2026-11-16T00:00:00+00:00", "generated_at_local": "x",
+                        "codex": {"ok": False, "error": "n/a"}, "claude": result}
+            out = json.dumps(result) + uc.render_summary(snapshot)
+            self.assertNotIn("SENTINEL", out)
+        self.assertEqual(self._collect(cases[0])[0]["ratelimit_headers_error"], "TimeoutExpired")
+        self.assertEqual(self._collect(cases[1])[0]["ratelimit_headers_error"], "JSONDecodeError")
+
+    def test_summary_shows_the_windows_for_the_new_source(self):
+        result, _, _ = self._collect(self._ok())
+        snapshot = {"generated_at": "2026-11-16T00:00:00+00:00", "generated_at_local": "x",
+                    "codex": {"ok": False, "error": "n/a"}, "claude": result}
+        text = uc.render_summary(snapshot)
+        self.assertIn("rate-limit headers", text)
+        self.assertIn("weekly limit: 22.0% used", text)
 
 
 def _resets_at_for_elapsed(now, window_len_sec, elapsed_fraction):
