@@ -100,6 +100,12 @@ export interface SettingDefinition {
    */
   overridesOnly?: boolean
   /**
+   * Optional: an overrides-only key whose `.env` line stays in effect all the same, because a consumer released
+   * before the key entered the registry reads it (ROOT_CLAUDEMD_EXCLUDE_AGENTS). The settings layer then reports the
+   * line as what it is, the 'env' source, and never as ignored (#2996 review B1).
+   */
+  envStillApplies?: boolean
+  /**
    * Optional (NETTARGETENV1104): ANY change of this key through the Settings route needs the owner (an owner session or
    * a full-scope device key), not the shared fleet token. Unlike `loosens` it does NOT make the key overrides-only: its
    * .env line keeps working. For keys that choose a TARGET (where the token, a prompt or memory text is sent) and whose
@@ -133,6 +139,31 @@ export function parseStoreWatchExclude(raw: string | undefined): Set<string> {
 }
 
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/
+// A Discord id, exactly as the Discord overlay's parseChannelPolicy accepts it (marveen-ext.ts SNOWFLAKE_ID).
+const DISCORD_SNOWFLAKE_RE = /^[0-9]{15,20}$/
+// DISCORD_CHANNEL_POLICY's on/off keys per channel, as the overlay's parseChannelPolicy reads them.
+const DISCORD_CHANNEL_POLICY_FLAGS = ['history', 'autoThread']
+
+// True for an absolute http(s) URL, e.g. "https://marveen.example.com" or "http://localhost:3420/prefix". A value with
+// no scheme ("marveen", "localhost:3420"), another scheme or any whitespace is not one: such a value, glued in front
+// of "/api/...", gives a relative path or a split word instead of an address. Exported for resolveDashboardOrigin
+// (agent-scaffold.ts), so the check on save and the check on use are the same one.
+export function isAbsoluteHttpUrl(v: string): boolean {
+  // The host must follow "//" at once: new URL() alone reads "https:///api" as the host "api".
+  if (!/^https?:\/\/[^/?#]/i.test(v) || /\s/.test(v)) return false
+  try {
+    return new URL(v).hostname !== ''
+  } catch {
+    return false
+  }
+}
+
+// A '' (unset) or an absolute http(s) URL: the two keys the agents' dashboard origin is resolved from.
+function validAbsoluteHttpUrlOrEmpty(v: string): string | null {
+  return v.trim() === '' || isAbsoluteHttpUrl(v)
+    ? null
+    : 'Üres érték vagy teljes http(s) URL szükséges, sémával együtt (pl. https://marveen.example.com vagy http://localhost:3420).'
+}
 
 // A '' (use the default) or a number in [0, 1], e.g. a cosine-similarity threshold.
 function validUnitFraction(v: string): string | null {
@@ -145,6 +176,23 @@ function validUnitFraction(v: string): string | null {
 // A '' (nobody) or a comma-separated list of agent names, e.g. "pm,reviewer".
 // Exported for the sub-agent rotation stage (claude-plan-subagent-rotation.ts), which puts a name into a heartbeat line.
 export const AGENT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,49}$/
+
+/** AGENT_DISALLOWED_TOOLS may only name these: built-in tools whose schema rides in every call and that no fleet
+ *  workflow depends on. A closed list, so the shared token cannot take Bash or Edit away from an agent.
+ *  scripts/main-extra-plugins-settings.sh repeats it for the main agent's launch (a test pins the two). */
+export const DISABLEABLE_TOOLS = ['Artifact', 'Workflow', 'SendFeedback', 'ReportFindings', 'ScheduleWakeup'] as const
+
+/** The AGENT_DISALLOWED_TOOLS entries that are on DISABLEABLE_TOOLS, in order, without repeats. */
+export function disallowedToolList(v: string): string[] {
+  return [...new Set(v.split(/[\s,]+/).filter((t) => (DISABLEABLE_TOOLS as readonly string[]).includes(t)))]
+}
+/** SKILL_LISTING_BUDGET_FRACTION as a number in (0, 1], or null when it is empty or not one. */
+export function skillListingBudgetFraction(v: string): number | null {
+  const t = v.trim()
+  if (!/^\d*\.?\d+$/.test(t)) return null
+  const n = Number(t)
+  return n > 0 && n <= 1 ? n : null
+}
 function validAgentNameList(v: string): string | null {
   const t = v.trim()
   if (t === '') return null
@@ -244,6 +292,8 @@ export const AGENT_MODEL_CHOICES: readonly string[] = [
   'claude-fable-5-2',
   'claude-opus-4-8[1m]',
   'claude-haiku-5-5',
+  'claude-haiku-4-5',
+  // Legacy dated id: existing settings and agent packages may still carry it, so it stays accepted.
   'claude-haiku-4-5-20251001',
 ]
 
@@ -484,6 +534,7 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     module: 'system',
     secret: false,
     requiresRestart: true,
+    validate: validAbsoluteHttpUrlOrEmpty,
     // NETTARGETENV1104: a network target (where the token, a prompt or memory text goes): owner-gated on the route.
     ownerGated: true,
   },
@@ -495,6 +546,7 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     module: 'system',
     secret: false,
     requiresRestart: true,
+    validate: validAbsoluteHttpUrlOrEmpty,
     // NETTARGETENV1104: a network target (where the token, a prompt or memory text goes): owner-gated on the route.
     ownerGated: true,
   },
@@ -665,6 +717,28 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     validate: (v) => validKeepAlive(v),
   },
   {
+    key: 'EMBED_MAX_CHARS',
+    type: 'int',
+    default: 2000,
+    min: 100,
+    max: 100000,
+    description: 'Egy embedding-hívásba küldött szöveg legfeljebb ennyi karakter (a hosszabb emléknek csak az eleje kerül a vektorba). Alapérték 2000. Csak GPU nélküli, lassú gépen érdemes csökkenteni: ott egy karakter kb. 40 ms, így a 2000 karakter túllépheti az időkorlátot (EMBED_TIMEOUT_SECONDS), és a félbehagyott hívások feltorlódnak. Váltás után nem kell újra embeddelni, a meglévő vektorok összehasonlíthatók maradnak.',
+    module: 'system',
+    secret: false,
+    requiresRestart: false,
+  },
+  {
+    key: 'EMBED_TIMEOUT_SECONDS',
+    type: 'int',
+    default: 90,
+    min: 5,
+    max: 3600,
+    description: 'Egy embedding-hívás időkorlátja másodpercben. Alapérték 90. Ennyi után a hívást eldobjuk, és az emlék vektor nélkül marad (a memória-keresés addig csak kulcsszóval talál). Lassú gépen az EMBED_MAX_CHARS csökkentése a jobb első lépés: a hosszabb korlát nem gyorsít, az Ollama ugyanannyi ideig számol, csak tovább várunk rá.',
+    module: 'system',
+    secret: false,
+    requiresRestart: false,
+  },
+  {
     key: 'MEMORY_RRF_FTS_WEIGHT',
     type: 'string',
     default: '1',
@@ -744,6 +818,18 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     min: 1,
     max: 24,
     description: 'A heartbeat aktív időablakának vége (helyi idő, 1-24). Ettől nem küld értesítést.',
+    module: 'heartbeat',
+    secret: false,
+    requiresRestart: false,
+  },
+  {
+    // Quota-gate tiers (src/quota-gate.ts). 0 keeps the gate exactly as it was.
+    key: 'QUOTA_GATE_HARD_AT_PERCENT',
+    type: 'int',
+    default: 0,
+    min: 0,
+    max: 100,
+    description: 'A kvóta-kapu kemény határa (%). 0 = ki: 85%-tól minden háttér-heartbeat áll, mint eddig. Beállítva (pl. 95): 85% és e határ között csak az essential: true jelölésű heartbeatek futnak, a határon és fölötte egy sem. 85 vagy annál kisebb érték mindenkire lejjebb hozza a vonalat (az essential sem fut). A task és command feladatokat nem érinti.',
     module: 'heartbeat',
     secret: false,
     requiresRestart: false,
@@ -855,12 +941,32 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     loosens: (oldValue: string, newValue: string) => oldValue.trim() !== 'audit' && newValue.trim() === 'audit',
   },
   {
+    // COLLANLOCK1120 (Refs #2929, Samu 82467): the precondition of turning the colleague login on with an open bind.
+    // auto (default) locks only while the colleague login is actually in use; existing installs that open WEB_HOST
+    // for their own remote access (Docker, VPS) change nothing until a colleague account exists.
+    key: 'COLLEAGUE_LAN_LOCK',
+    type: 'string',
+    default: 'auto',
+    valueSet: ['auto', 'on', 'off'],
+    description: 'Kolléga-zár nyitott hálózati címnél. Ha aktív, egy másik gépről (a LAN-ról, egy konténer-hálózatról) érkező kérés a sima HTTP-listeneren: a kolléga-felület (kolléga-belépés, a hatókörös tábla, a kolléga-oldal) változatlanul elérhető; a böngészős belépés (gazda-jelszó, TOTP, setup-kód, operátor-kulcs) tiltott; minden más kérésnél a zár minden böngésző-cookie-t eldob, így csak fejlécben vagy query-ben hozott gépi hitelesítés (ügynök- vagy dashboard-token, eszközkulcs, föderáció, Teams bot-token) érvényesül. A gazda böngészővel a LAN-ról nem tud belépni: a gépről, Tailscale Serve-en, SSH-tunnelen vagy a HTTPS nyilvános listeneren (WEB_PUBLIC_PORT) jön be. A gépi tokenek sima HTTP-n továbbra is titkosítatlanul utaznak (ez a TLS-kérdés, gazda-döntés). auto (alapértelmezés): akkor aktív, ha a WEB_HOST nem loopback, van legalább egy engedélyezett kolléga-fiók, és a hatókörös tábla be van kapcsolva; különben semmi nem változik. on: mindig aktív. off: soha. Az off megnyitja a LAN felé a gazda belépését és munkamenetét titkosítatlan HTTP-n, és a LAN-ról bárki kimerítheti a gazda belépési keretét; ezért az off és az on -> auto lazítás: csak dashboard-belépéssel állítható, a .env-ben álló lazító érték nem hat.',
+    module: 'system',
+    secret: false,
+    requiresRestart: false,
+    loosens: (oldValue: string, newValue: string) => {
+      const rank = (v: string) => ({ on: 2, auto: 1, off: 0 } as Record<string, number>)[v.trim().toLowerCase()] ?? 1
+      return rank(newValue) < rank(oldValue)
+    },
+  },
+  {
     // SKILLAPPROVALOFF1101 (owner, Slack 2026-11-01 22:35): switchable, OFF by default. The scan, the hash binding and
     // an audit line run in both positions; only the hold for the owner's approval is what the switch turns on.
+    // SKILLQUARANTINEDEF1109 (owner, Slack 2026-11-18, "Vevőknél is KI"; overrides Rec0CGYNBMRL0 = A of 2026-11-16):
+    // the default is OFF again, on customer installs too, so the skill factory is not slowed down. The scan, the hash
+    // binding, the audit line and the hold of a strong-shape finding run with the switch off as well.
     key: 'SKILL_QUARANTINE',
     type: 'boolean',
     default: '0',
-    description: 'Skill-karantén. Kikapcsolva (alapértelmezés) az új vagy javított skill (javaslat, generálás, import) azonnal élesedik; a scan, a hash-kötés és az auditsor ilyenkor is lefut, és ha a scan nem tudja a skillt teljesen megmutatni, az nem élesedik, hanem jóváhagyásra vár. Bekapcsolva minden új skill a gazda jóváhagyásáig karanténban vár. Kikapcsolni (lazítás) csak a dashboard-belépéssel lehet.',
+    description: 'Skill-karantén. Bekapcsolva minden új vagy javított skill (javaslat, generálás, import) a gazda jóváhagyásáig karanténban vár. Kikapcsolva (alapértelmezés) azonnal élesedik; a scan, a hash-kötés és az auditsor ilyenkor is lefut, és ha a scan nem tudja a skillt teljesen megmutatni (például mert a találati lista elérte a felső korlátját), vagy erős mintát talál benne (hamisított címke vagy fejléc, utasítás-felülírás, láthatatlan Unicode, letöltött kód futtatása, hosszú kódolt blob), az nem élesedik, hanem jóváhagyásra vár. Kikapcsolni (lazítás) csak a dashboard-belépéssel lehet.',
     module: 'audit',
     secret: false,
     requiresRestart: false,
@@ -986,6 +1092,65 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     requiresRestart: true,
   },
   {
+    key: 'INBOX_NUDGE_BATCH_MINUTES',
+    type: 'int',
+    default: 0,
+    min: 0,
+    max: 120,
+    description: 'A fő ágenst a neki jött, NEM sürgős ügynök-üzenetek csak akkor ébresztik, ha a legrégebbi már ennyi perce vár: addig gyűlnek, és egy körben dolgozza fel őket (kevesebb kör, kevesebb token). A sürgős, a rendszer- és a gazda-üzenet, valamint a magas prioritású sor azonnal ébreszt. A gazda bármely üzenete közben is mindent felvesz. 0 = kikapcsolva (a korábbi viselkedés: kb. 10 másodperc után ébreszt).',
+    module: 'system',
+    secret: false,
+    requiresRestart: false,
+  },
+  {
+    key: 'AGENT_DISALLOWED_TOOLS',
+    type: 'string',
+    default: '',
+    validate: (v) =>
+      v.split(/[\s,]+/).filter(Boolean).every((t) => (DISABLEABLE_TOOLS as readonly string[]).includes(t))
+        ? null
+        : `Csak ezek közül, vesszővel elválasztva: ${DISABLEABLE_TOOLS.join(', ')}.`,
+    description: 'Beépített Claude Code eszközök, amelyeket egyik ügynök (a fő ágens is) NEM kap meg: a leírásuk így nem utazik minden hívásban (kevesebb token). Csak a nem használt eszközök közül választható: Artifact, Workflow, SendFeedback, ReportFindings, ScheduleWakeup. Vesszővel elválasztva; üres = mind megmarad. Az ügynök következő indításakor lép életbe.',
+    module: 'system',
+    secret: false,
+    requiresRestart: true,
+  },
+  {
+    key: 'ROOT_CLAUDEMD_EXCLUDE_AGENTS',
+    type: 'string',
+    default: '',
+    // Adding an agent (or '*') drops the install root's CLAUDE.md, fleet rules included, for it: a loosening, so only
+    // the owner can save it. Taking one off restores the rules and stays open to everyone.
+    loosens: (oldValue, newValue) => {
+      const ids = (v: string) => new Set(v.split(/[\s,]+/).map((w) => w.trim()).filter(Boolean))
+      const old = ids(oldValue)
+      return [...ids(newValue)].some((id) => !old.has(id))
+    },
+    // agentExcludesRootClaudeMd reads the .env line too (the released path), so it must not be reported as ignored.
+    envStillApplies: true,
+    validate: (v) =>
+      v.split(/[\s,]+/).filter(Boolean).every((n) => n === '*' || AGENT_NAME_RE.test(n))
+        ? null
+        : 'Ügynöknevek vesszővel elválasztva (pl. pm,reviewer), vagy * minden al-ügynökre.',
+    description: 'Al-ügynökök, akik NEM töltik be a telepítés gyökerében álló CLAUDE.md-t (a fő ágens személyiségét és a közös szabályokat), csak a sajátjukat: így egy hívás a gyökér CLAUDE.md méretével kisebb. Vesszővel elválasztott ügynöknevek, vagy * minden al-ügynökre, a később létrehozottakra is. A fő ágensre nem hat. FIGYELEM: a kizárt ügynök a gyökér közös szabályait sem kapja meg, ezért előbb a saját CLAUDE.md-jébe kell kerülniük. Ügynököt felvenni csak bejelentkezett gazda-session tud (a közös tokennel és eszközkulccsal nem), levenni bárki. A .env ROOT_CLAUDEMD_EXCLUDE_AGENTS sora (a korábbi út) ettől függetlenül érvényes marad, a kettő összeadódik. A módosítás az ügynök következő indításakor lép életbe.',
+    module: 'system',
+    secret: false,
+    requiresRestart: true,
+  },
+  {
+    key: 'SKILL_LISTING_BUDGET_FRACTION',
+    type: 'string',
+    default: '',
+    validate: (v) =>
+      v.trim() === '' || skillListingBudgetFraction(v) !== null
+        ? null
+        : 'Tört 0 és 1 között, ponttal írva (pl. 0.005), vagy üresen a Claude Code saját értéke (0.01) él.',
+    description: 'Mekkora részét kaphatja a kontextusablaknak (karakterben) a skill-lista, amit a Claude Code minden al-ügynök munkamenetének elküld. Üresen a Claude Code saját értéke él (0.01, vagyis 1%). Kisebb érték kevesebb tokent jelent hívásonként: ha a lista nem fér bele, a legritkábban használt skillek LEÍRÁSA marad ki (a nevük megmarad és hívhatók), a többié teljes marad. Az al-ügynökök settings.json-jába kerül (skillListingBudgetFraction), a fő ágensébe nem; az érték törlésekor a következő indításnál kikerül onnan. A módosítás az ügynök következő indításakor lép életbe.',
+    module: 'system',
+    secret: false,
+    requiresRestart: true,
+  },
+  {
     key: 'NOTIFY_SLACK_TARGET',
     type: 'string',
     default: '',
@@ -1095,6 +1260,46 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     loosens: (oldValue: string, newValue: string) => oldValue.trim().toLowerCase() !== 'on' && newValue.trim().toLowerCase() === 'on',
   },
   {
+    // AGENTCREATEPR2-1119: a new way to create an agent (a request the owner approves in a channel), so off by default
+    // and switching it on needs the owner's session.
+    key: 'AGENT_CREATE_VIA_APPROVAL',
+    type: 'string',
+    default: 'off',
+    description: 'Ügynök-létrehozás jóváhagyással (AGENTCREATEPR2-1119): bekapcsolva (on) egy ügynök a közös tokennel is LEADHAT egy ügynök-specifikációt (POST /api/agent-specs); létrehozni nem tud. A szerver ellenőrzi és eltárolja a specifikációt, és jóváhagyást kér a gazdától; a gazdának mutatott szöveget a szerver állítja össze a tárolt specifikációból. Csak a gazda jóváhagyása után, a szerver hozza létre az ügynököt, ugyanazon az úton, mint a dashboardos létrehozás. Titok (bot-token) csak vault-hivatkozásként szerepelhet. Alapból KI.',
+    module: 'agents',
+    secret: false,
+    requiresRestart: false,
+    validate: (v: string) => (['on', 'off'].includes(v.trim().toLowerCase()) ? null : 'on vagy off'),
+    loosens: (oldValue: string, newValue: string) => oldValue.trim().toLowerCase() !== 'on' && newValue.trim().toLowerCase() === 'on',
+  },
+  {
+    // TEAMSAPPROVECARD1118 (Samu D3): one more way to approve, so off by default and switching it on needs the owner.
+    key: 'APPROVAL_TEAMS_CARDS',
+    type: 'string',
+    default: 'off',
+    description: 'Teams-kártyás jóváhagyás (TEAMSAPPROVECARD1118): bekapcsolva (on) a levélküldés (email_send) jóváhagyás-kérése kártyaként megy a gazda Teams 1:1 chatjébe a bottal, Jóváhagyom / Elutasítom gombbal. A kártyát a szerver állítja össze a tárolt borítékból (címzett, másolat, a levél szövege), és a kattintást a szerver maga ellenőrzi (Microsoft által aláírt csatorna-token, a bot tenantja, a gazda azonosítója, az elküldött kártya, egyszeri kód); az ügynök nincs az úton. Csak kifejezett TEAMS_OWNER_AAD_OBJECT_ID mellett, és csak olyan levélre, amelynek borítéka a horgonnyal egyezik; minden más kérés a dashboardon dől el. A Teams-plugin 0.3.2 utáni változata kell hozzá. Alapból KI.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: false,
+    validate: (v: string) => (['on', 'off'].includes(v.trim().toLowerCase()) ? null : 'on vagy off'),
+    loosens: (oldValue: string, newValue: string) => oldValue.trim().toLowerCase() !== 'on' && newValue.trim().toLowerCase() === 'on',
+  },
+  {
+    // TEAMSAPPROVECARD1118 (Samu D2): whose click approves. The plugin allowlist's single entry is an alert target only,
+    // never the approver, so this is explicit, and ANY change needs the owner's session (as SLACK_OWNER_USER_ID).
+    key: 'TEAMS_OWNER_AAD_OBJECT_ID',
+    type: 'string',
+    default: '',
+    description: 'A gazda Microsoft Entra objektum-azonosítója (GUID, pl. 6f1c2d3e-0000-4000-8000-000000000001). Ha a Teams-kártyás jóváhagyás be van kapcsolva, csak az ő kattintása dönt. Üresen a kártyás jóváhagyás nem működik (a döntés a dashboardon marad). A Teams-plugin párosítási listája (allowlist.json) ehhez nem elég: ott a riasztások címzettje áll, nem a jóváhagyóé.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: false,
+    validate: (v: string) => (v.trim() === '' || /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(v.trim())
+      ? null
+      : 'Entra objektum-azonosító (GUID) kell, pl. 6f1c2d3e-0000-4000-8000-000000000001. / An Entra object id (GUID) is required.'),
+    loosens: (oldValue: string, newValue: string) => oldValue.trim().toLowerCase() !== newValue.trim().toLowerCase(),
+  },
+  {
     key: 'SCHEDULED_DELIVERY_CHANNEL',
     type: 'string',
     default: '',
@@ -1105,6 +1310,19 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     // Where the main agent's scheduled results go: any change re-routes them, so it is overrides-only and a .env line
     // never counts (ENVRELAXGATE1104 follow-up, Samu 68119).
     loosens: (oldValue: string, newValue: string) => oldValue.trim() !== newValue.trim(),
+  },
+  {
+    key: 'USAGE_LIMIT_NOTICE_ROUTE',
+    type: 'string',
+    default: 'both',
+    valueSet: ['both', 'owner', 'main'],
+    description: 'Hová menjen az ütemező jelzése, ha egy ügynök sessionje kifogyott a keretből (usage-limit). both (alapértelmezés): a gazda privát chatje ÉS a fő ágens is megkapja; a fő ágens példányában nincs képernyő-szöveg, csak az ügynök neve és a tény. owner: csak a gazda chatje (a régi út). main: csak a fő ágens; ha az üzenet nem írható be, a gazda chatje kapja. Ha maga a fő ágens fogyott ki, mindig a gazda chatje kapja. Azonnal hat, újraindítás nélkül. A main értéket csak a gazda állíthatja be (felülírás-kulcs); a .env-ben álló main nem hat.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: false,
+    // Moving to 'main' takes the notice away from the owner, so only the owner may do it and a .env line 'main'
+    // is ignored (overrides-only, ENVRELAXGATE1104).
+    loosens: (oldValue: string, newValue: string) => oldValue.trim().toLowerCase() !== 'main' && newValue.trim().toLowerCase() === 'main',
   },
   {
     // ISSUE2556X (marveen#2556): with two paired DMs and the installer's ALLOWED_CHAT_ID=0 the alert resolver refuses
@@ -1197,6 +1415,113 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     module: 'channels',
     secret: false,
     requiresRestart: true,
+  },
+  {
+    // TELEGRAM_REPLY_BUTTONS_MAX_AGE_HOURS (owner request, 2026-11-08): a tap on a button of an old question
+    // delivers nothing. Baked into the plugin source by scripts/patch-telegram-plugin.py at the channel start.
+    key: 'TELEGRAM_REPLY_BUTTONS_MAX_AGE_HOURS',
+    type: 'int',
+    default: 0,
+    min: 0,
+    max: 8760,
+    description: 'Válasz-gombok lejárata órában. Ha be van állítva (például 24), egy ennél régebbi kérdés gombjára koppintás nem jut el az ügynökhöz: a felugró üzenet azt kéri, hogy a választ írd be, és a kérdés gombjai helyére egyetlen „⏱ Lejárt, írd be a választ” gomb kerül. A kor a kérdés elküldési idejétől számít, így a plugin újraindítása után is érvényes. 0 = a gombok nem járnak le (a mai működés). A beállítást a csatorna-indítás a Telegram plugin forrására teszi (scripts/patch-telegram-plugin.py). Alapértelmezés: 0. A módosítás a csatorna következő indításakor lép életbe.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: true,
+  },
+  {
+    // TELEGRAM_REACTIONS_ENABLED (owner request, 2026-11-09): the owner's emoji reactions reach the agent. Baked into
+    // the plugin source by scripts/patch-telegram-plugin.py at the channel start (the tgreact1119 patch).
+    key: 'TELEGRAM_REACTIONS_ENABLED',
+    type: 'boolean',
+    default: '0',
+    description: 'Telegram-reakciók továbbítása: bekapcsolva ha a párosított tulajdonos a privát chatben egy üzenetre emoji-reakciót tesz, az ügynök megkapja „(reaction 👍)” alakban, a reagált üzenet azonosítójával, és ha az ügynök küldte a plugin indulása óta, egy rövid kivonatával. Csak a hozzáadott reakció megy tovább, a levétel nem. Minden reakció egy újabb kör az ügynöknek, ezért alapból ki van kapcsolva. A kapcsolót a csatorna-indítás a Telegram plugin forrására teszi (scripts/patch-telegram-plugin.py). Alapértelmezés: kikapcsolva. A módosítás a csatorna következő indításakor lép életbe.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: true,
+  },
+  {
+    // DCEXT1111: Marveen's version of the Discord plugin (vendor/discord-plugin) over the official one. Off puts the
+    // official file back, and with it the official permission relay that asks EVERY paired DM: a loosening.
+    key: 'DISCORD_PLUGIN_EXT',
+    type: 'boolean',
+    default: '1',
+    description: 'A Marveen Discord-kiegészítései (vendor/discord-plugin): válasz-gombok, eszköz-jóváhagyás csak a gazdától (DISCORD_OWNER_USER_ID), a párosított DM-ek újraindítás után is elérhetők, hangüzenet-jelölés, kiesett üzenetek pótlása (DISCORD_BACKFILL), szál nyitása és lapozás a régebbi üzenetek között. Bekapcsolva a csatorna-indítás a Discord plugin forrását a Marveen-változatra cseréli, de csak akkor, ha a telepített plugin pontosan az ismert verzió; egy plugin-frissítés után a hivatalos plugin fut, és a napló egy sorban jelzi. Kikapcsolva a csatorna következő indításakor a hivatalos plugin áll vissza változatlanul. Alapértelmezés: bekapcsolva. A kikapcsoláshoz a gazda kell.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: true,
+    loosens: (oldValue: string, newValue: string) => ['1', 'true', 'yes', 'on'].includes(oldValue.trim().toLowerCase()) && !['1', 'true', 'yes', 'on'].includes(newValue.trim().toLowerCase()),
+  },
+  {
+    // DCEXT1111: the twin of TELEGRAM_OWNER_USER_ID for the Discord permission relay. Never the first of several DMs.
+    key: 'DISCORD_OWNER_USER_ID',
+    type: 'string',
+    default: '',
+    description: 'A gazda Discord-felhasználói azonosítója (17-20 jegyű szám, a bejövő üzenetek user_id mezője): csak ő kapja meg Discordon az eszköz-jóváhagyás kérését, és csak az ő gombja vagy "yes <kód>" válasza dönt. Üresen a fő bot egyetlen párosított DM-je a gazda; ha több DM van párosítva, a rendszer nem találgat: a jóváhagyás-kérés nem megy ki Discordra (a terminálban marad), amíg ezt be nem állítod. Beállítva a dashboard parancsai (/status, /usage...) Discord slash-parancsként is elérhetők, csak a bottal folytatott DM-ben és csak neki (az egyetlen-DM tartalék itt nem számít); Discordról csak az olvasó parancsok futnak. A csatorna következő indításakor lép életbe.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: true,
+    validate: (v: string) => (v.trim() === '' || /^[1-9][0-9]{16,19}$/.test(v.trim())
+      ? null
+      : 'Discord-felhasználói azonosító kell (17-20 jegyű szám). / A Discord user id is required (a 17-20 digit number).'),
+    // who approves a tool from Discord: ANY change needs the owner's session, as TELEGRAM_OWNER_USER_ID
+    loosens: (oldValue: string, newValue: string) => oldValue.trim() !== newValue.trim(),
+  },
+  {
+    key: 'DISCORD_BACKFILL',
+    type: 'boolean',
+    default: '1',
+    description: 'Kiesett Discord-üzenetek pótlása (csak DISCORD_PLUGIN_EXT mellett): ha a Discord plugin állt (újraindulás, kiesés), induláskor a párosított DM-ekből és az engedélyezett csatornákból behozza az azóta jött üzeneteket, csatornánként legfeljebb 50-et és legfeljebb 24 órára visszamenőleg, ugyanazzal a hozzáférés-ellenőrzéssel, "pótolt" jelöléssel. Legfeljebb 10 percenként egyszer fut, így egy újraindulás-hurok sem terheli a Discordot. Alapértelmezés: bekapcsolva. A csatorna következő indításakor lép életbe.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: true,
+  },
+  {
+    // DCEXT1111 B1: per-channel extras for the Discord overlay. Not in access.json: `/discord:access group add`
+    // rewrites a channel's object there. Any change can widen who may talk to the agent: owner only.
+    key: 'DISCORD_CHANNEL_POLICY',
+    type: 'string',
+    default: '',
+    description: 'Discord csatornánkénti kiegészítések (csak DISCORD_PLUGIN_EXT mellett), JSON: {"<csatorna-ID>": {"allowRoles": ["<szerep-ID>", ...], "history": true, "autoThread": true}}. A "history": true (alapból ki) a botnak szóló üzenet elé teszi, amit a csatornában a bot utolsó üzenete óta írtak (legfeljebb 20, csak az írásra jogosultaktól). Az "autoThread": true (alapból ki) a botnak szóló üzenetre szálat nyit, és a válasz abba megy. Ha egy csatornához szerepek vannak megadva, ott az írhat a botnak, aki a csatorna engedélyezett felhasználói között van, VAGY rendelkezik valamelyik szereppel (üres felhasználói lista mellett csak a szerep birtokosai). Az eszköz-jóváhagyás ettől független, az mindig csak a gazdáé. A hibás JSON-t a csatorna-indítás egy sorral jelzi és figyelmen kívül hagyja. A csatorna következő indításakor lép életbe.',
+    module: 'channels',
+    secret: false,
+    requiresRestart: true,
+    validate: (v: string) => {
+      const t = v.trim()
+      if (t === '') return null
+      let o: unknown
+      try {
+        o = JSON.parse(t)
+      } catch {
+        return 'Érvénytelen JSON. / Invalid JSON.'
+      }
+      if (!o || typeof o !== 'object' || Array.isArray(o)) return 'JSON-objektum kell. / A JSON object is required.'
+      // The plugin drops anything that is not a Discord id, and the channel then falls back to the old rule:
+      // say so on save instead (a role NAME is the usual mistake).
+      for (const [ch, v] of Object.entries(o as Record<string, unknown>)) {
+        if (!DISCORD_SNOWFLAKE_RE.test(ch)) return `Nem Discord csatorna-ID: ${JSON.stringify(ch)}. / Not a Discord channel id: ${JSON.stringify(ch)}.`
+        if (!v || typeof v !== 'object' || Array.isArray(v)) return `${ch}: JSON-objektum kell. / ${ch}: a JSON object is required.`
+        // The overlay honours only a literal true and ignores unknown keys: a typo ("histroy") or "true" would
+        // be saved and silently do nothing.
+        for (const [k, flag] of Object.entries(v as Record<string, unknown>)) {
+          if (k === 'allowRoles') continue
+          if (!DISCORD_CHANNEL_POLICY_FLAGS.includes(k)) {
+            return `${ch}: ismeretlen kulcs: ${JSON.stringify(k)} (ismert: allowRoles, ${DISCORD_CHANNEL_POLICY_FLAGS.join(', ')}). / ${ch}: unknown key ${JSON.stringify(k)} (known: allowRoles, ${DISCORD_CHANNEL_POLICY_FLAGS.join(', ')}).`
+          }
+          if (typeof flag !== 'boolean') return `${ch}.${k}: true vagy false kell (idézőjel nélkül). / ${ch}.${k}: true or false is required (no quotes).`
+        }
+        if (!('allowRoles' in v)) continue
+        const roles = (v as { allowRoles: unknown }).allowRoles
+        if (!Array.isArray(roles)) return `${ch}.allowRoles: lista kell. / ${ch}.allowRoles: a list is required.`
+        for (const r of roles) {
+          if (typeof r !== 'string' || !DISCORD_SNOWFLAKE_RE.test(r)) {
+            return `${ch}.allowRoles: nem Discord szerep-ID (a szerep ID-ja kell, nem a neve): ${JSON.stringify(r)}. / ${ch}.allowRoles: not a Discord role id (the role's id, not its name): ${JSON.stringify(r)}.`
+          }
+        }
+      }
+      return null
+    },
+    loosens: (oldValue: string, newValue: string) => oldValue.trim() !== newValue.trim(),
   },
   {
     key: 'TELEGRAM_INBOUND_REPLAY_ENABLED',
@@ -1305,6 +1630,17 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
   // numbers. With a healthy active plan it costs nothing, hence default ON;
   // this key is the operator's off switch. Independent of
   // CLAUDE_ROTATION_ENABLED.
+  {
+    key: 'CLAUDE_ROTATION_CHECK_EVERY_MIN',
+    type: 'int',
+    default: 10,
+    min: 1,
+    max: 1440,
+    description: 'Milyen sűrűn ellenőrzi a dashboard a Claude-plan rotációt (percben). Az ellenőrzés a dashboard háttérfolyamatában fut, ügynök-kör nélkül, így egy kimerült fő ügynök is leváltható. Az első ellenőrzés 2 perccel az indulás után jön. Csak bekapcsolt rotációnál (CLAUDE_ROTATION_ENABLED=1) kérdez le bármit.',
+    module: 'claude-plans',
+    secret: false,
+    requiresRestart: true,
+  },
   {
     key: 'CLAUDE_PLAN_USAGE_REFRESH',
     type: 'boolean',

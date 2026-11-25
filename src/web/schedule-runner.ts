@@ -16,6 +16,7 @@ import { isRepoShippedScript } from './precheck-trust.js'
 import { preCheckScriptPath } from './precheck-path.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { logger } from '../logger.js'
+import { agentTextLang } from './agent-text-lang.js'
 import { decideDesktopGate, readDesktopLock, recordDesktopSkip } from './desktop-lock.js'
 import {
   PROJECT_ROOT,
@@ -28,8 +29,10 @@ import {
 } from '../config.js'
 import { ownerAlertChatOverride, resolveOwnerChatId, configuredOwnerChatFor, normalizeChatId } from '../owner-chat.js'
 import { getEffectiveSettingValue } from '../settings-store.js'
+import { AGENT_NAME_RE } from '../config-registry.js'
 import {
   appendTaskRun,
+  markTaskRunFireError,
   getHeartbeatKanbanLive,
   hasHeartbeatDigestSince,
   hasAgentMessageStartingWith,
@@ -82,7 +85,7 @@ import { listAgentNames, readFileOr, readAgentRemoteHost, readAgentRemoteConfig,
 import { enqueueWorksourceItem, worksourceItemStage, worksourcePendingHead, type WorksourceItemStage } from './worksource-queue.js'
 import { resolveAgentConfigDirForRead } from './claude-plans.js'
 import { readTranscriptMtimeAcrossConfigDirs, projectsDirFor } from './active-model.js'
-import { classifyDelivery, readUserPromptsSince, type DeliveryVerdict, type ReceivedPrompt } from './delivery-integrity.js'
+import { classifyDelivery, readUserPromptsSince, sessionAuthFailedSince, type DeliveryVerdict, type ReceivedPrompt } from './delivery-integrity.js'
 import { paneTyped } from './pane-text.js'
 import { mainConfigRoots } from './inbound-probe.js'
 import { channelStateDir, getProvider, readChannelToken, readTeamsCreds, type ChannelProviderType } from '../channel-provider.js'
@@ -108,10 +111,10 @@ import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { findTelegramTopic, telegramTopicsEnabled } from './telegram-topics.js'
 import { runCommandTask } from './command-task.js'
 import { trackDetachedGroup } from './detached-groups.js'
-import { decideQuotaAction, type QuotaWorkClass } from '../quota-gate.js'
+import { decideQuotaAction, quotaBlindness, type QuotaSnapshot, type QuotaWorkClass } from '../quota-gate.js'
 import { isAgentBudgetHeld } from './agent-budget-alerts.js'
 import { readQuotaSnapshot } from '../quota-snapshot.js'
-import { detectsFirstRunGate, detectPaneState, overfullParkedInputTail, type PaneState } from '../pane-state.js'
+import { detectsFeedbackDraftModal, detectsFirstRunGate, detectPaneState, overfullParkedInputTail, type PaneState } from '../pane-state.js'
 import { getInjectedPrompt, matchesInjectedPrompt, type InjectedPromptRecord } from './injected-prompt-registry.js'
 import { withSessionSendLock } from './session-send-lock.js'
 import { startSleepWakeDetector, systemSleptBetween } from './sleep-wake-detector.js'
@@ -443,6 +446,24 @@ export function checkTaskDeliveryIntegrity(
   if (verdict === 'tail-lost' && !final) return null
   if (verdict == null && final) return dirs.some((d) => dirExists(d)) ? 'not-arrived' : 'unverifiable'
   return verdict
+}
+
+// DOCKERUNAUTHRUN1118: did the session answer this run with nothing but "Not logged in"? Read from the same
+// transcripts as the delivery verdict, from the moment typing began (sessionAuthFailedSince, delivery-integrity.ts).
+// Only a typed local run has typedAt; a remote or worksource run gives no evidence here (false). An unreadable
+// transcript is false as well: the run keeps the ending it had before this check existed. `read` is injectable
+// so the decision is unit-tested without disk.
+export function checkTaskAuthFailure(
+  entry: Pick<TaskInflightEntry, 'typedAt' | 'workingDir' | 'configDirs'>,
+  read: (dirs: readonly string[], sinceMs: number) => boolean = sessionAuthFailedSince,
+): boolean {
+  if (entry.typedAt == null) return false
+  const dirs = [...new Set(entry.configDirs.map((c) => projectsDirFor(entry.workingDir, c)))]
+  try {
+    return read(dirs, entry.typedAt)
+  } catch {
+    return false
+  }
 }
 
 // Card 7d2b49b4: a once task is switched off after its first SUCCESSFUL run (isOnceRunSuccess: the run
@@ -1209,6 +1230,19 @@ export function readScheduledDeliveryDefault(
   return parsed
 }
 
+export type UsageLimitNoticeRoute = 'both' | 'owner' | 'main'
+
+/** Read fresh from the settings store only: override, else a tightening .env line, else the default.
+ * process.env is never read. Unknown or empty -> 'both'. */
+export function readUsageLimitNoticeRoute(
+  read: () => string | undefined = () => {
+    try { return String(getEffectiveSettingValue('USAGE_LIMIT_NOTICE_ROUTE') ?? '') } catch { return undefined }
+  },
+): UsageLimitNoticeRoute {
+  const value = (read() ?? '').trim().toLowerCase()
+  return value === 'owner' || value === 'main' ? value : 'both'
+}
+
 /** NOTIFY_TELEGRAM_FALLBACK=0: Telegram is never a fallback (read fresh, a read error keeps the default). */
 export function readTelegramFallbackOff(): boolean {
   try { return String(getEffectiveSettingValue('NOTIFY_TELEGRAM_FALLBACK') ?? '').trim() === '0' } catch { return false }
@@ -1423,6 +1457,114 @@ export function quotaWorkClass(task: Pick<ScheduledTask, 'type'>): QuotaWorkClas
   if (task.type === 'command') return 'free'
   if (task.type === 'heartbeat') return 'background'
   return 'owner-facing'
+}
+
+// QUOTA_GATE_HARD_AT_PERCENT, read live once per tick; 0 (tiers off) on any read error.
+function readQuotaHardAtPercent(): number {
+  try { return Number(getEffectiveSettingValue('QUOTA_GATE_HARD_AT_PERCENT')) || 0 } catch { return 0 }
+}
+
+// The gate fails open on an untrusted or stale snapshot (quota-gate.ts); that
+// must not be silent. One log line per state change, and one owner notice when
+// the gate goes blind. The blind kind and the source that were alerted on are kept
+// in store/ (no snapshot timestamp: a running collector rewrites an estimate every
+// 15 minutes), so a restart while the same blindness lasts does not notify again.
+// The key is forgotten only after the gate has seen the quota without a break for
+// QUOTA_BLIND_CLEAR_AFTER_MS: a source that flaps (statusline / estimate) alerts
+// once, not on every dip (QUOTABLINDFLAP1124). When that steady sight began is kept
+// in the same store, so a restart does not restart the clock.
+let quotaBlindState: ReturnType<typeof quotaBlindness> = null
+
+const QUOTA_BLIND_ALERT_PATH = join(PROJECT_ROOT, 'store', 'quota-blind-alert.json')
+const QUOTA_BLIND_CLEAR_AFTER_MS = 2 * 60 * 60_000
+
+export interface BlindAlert { key: string; seeingSinceMs: number | null }
+export interface AlertedKeyStore { read(): BlindAlert | null; write(alert: BlindAlert | null): void }
+
+export const blindAlertFileStore = (path: string): AlertedKeyStore => ({
+  read() {
+    try {
+      const j = JSON.parse(readFileSync(path, 'utf-8')) as { key?: unknown; seeingSinceMs?: unknown }
+      if (typeof j.key !== 'string' || !j.key) return null
+      return { key: j.key, seeingSinceMs: typeof j.seeingSinceMs === 'number' ? j.seeingSinceMs : null }
+    } catch { return null }
+  },
+  write(alert) {
+    try { atomicWriteFileSync(path, JSON.stringify(alert ?? { key: '' }) + '\n') } catch (err) {
+      logger.warn({ err }, 'schedule-runner: failed to persist the quota blind-alert key')
+    }
+  },
+})
+const fileAlertedKeyStore = blindAlertFileStore(QUOTA_BLIND_ALERT_PATH)
+
+export function noteQuotaBlindness(
+  snapshot: QuotaSnapshot | null,
+  nowMs: number,
+  notify: (text: string) => void = sendQuotaBlindNotice,
+  alerted: AlertedKeyStore = fileAlertedKeyStore,
+): void {
+  const next = quotaBlindness(snapshot, nowMs)
+  settleBlindAlert(next !== null, nowMs, alerted)
+  if (next === quotaBlindState) return
+  const prev = quotaBlindState
+  quotaBlindState = next
+  if (!next) {
+    logger.info({ previous: prev }, 'Quota gate sees the quota again (trusted, fresh snapshot)')
+    return
+  }
+  const at = snapshot?.generatedAtMs
+  const ageMinutes = typeof at === 'number' ? Math.round((nowMs - at) / 60_000) : null
+  logger.warn(
+    { state: next, source: snapshot?.source ?? null, ageMinutes },
+    'Quota gate is blind: background tasks run unchecked (fail open) until a trusted, fresh snapshot arrives',
+  )
+  if (prev) return
+  const key = `${next}|${snapshot?.source ?? 'none'}`
+  if (alerted.read()?.key === key) return // same blindness already alerted on, with no steady sight since
+  alerted.write({ key, seeingSinceMs: null })
+  const why = next === 'untrusted-source'
+    ? `a kvóta-pillanatkép forrása "${snapshot?.source ?? 'ismeretlen'}", ami nem mért szám`
+    : `a legutóbbi kvóta-pillanatkép ${ageMinutes ?? '?'} perce készült`
+  notify([
+    `[${BOT_NAME} scheduler] A kvóta-kapu nem látja a keretet: ${why}.`,
+    'A háttérfeladatok ettől még futnak, de a kapu nem tudja visszafogni őket, ha fogy a keret.',
+    'Javítás: a usage-collect feladat (scripts/usage-collect.py) adjon friss, mért számot; a részletek a dashboard.log-ban. Amíg így marad, nem szólok újra.',
+  ].join('\n'))
+}
+
+// Every tick: a blind tick stops the recovery clock; a seeing tick starts it, and
+// forgets the alerted key once the gate has seen steadily for QUOTA_BLIND_CLEAR_AFTER_MS.
+function settleBlindAlert(blind: boolean, nowMs: number, alerted: AlertedKeyStore): void {
+  const a = alerted.read()
+  if (!a) return
+  if (blind) {
+    if (a.seeingSinceMs !== null) alerted.write({ key: a.key, seeingSinceMs: null })
+    return
+  }
+  if (a.seeingSinceMs === null || nowMs < a.seeingSinceMs) alerted.write({ key: a.key, seeingSinceMs: nowMs })
+  else if (nowMs - a.seeingSinceMs >= QUOTA_BLIND_CLEAR_AFTER_MS) alerted.write(null)
+}
+
+/** Test helper: forget the last blind state. */
+export function resetQuotaBlindStateForTest(): void {
+  quotaBlindState = null
+}
+
+function sendQuotaBlindNotice(text: string): void {
+  const token = resolveSchedulerAlertToken()
+  const ownerChat = token ? resolveSchedulerOwnerChat() : null
+  if (!token || !ownerChat) {
+    logger.warn({ provider: CHANNEL_PROVIDER }, 'quota-blind notice suppressed: no channel bot token or owner chat')
+    return
+  }
+  ;(async () => {
+    try {
+      await sendSchedulerAlertMessage(token, ownerChat, text)
+      logger.info('quota-blind notice sent')
+    } catch (err) {
+      logger.warn({ err }, 'quota-blind notice delivery failed')
+    }
+  })()
 }
 
 // Where a task's preCheck script lives, by the same rule the registry hash
@@ -1828,22 +1970,68 @@ export function discordNoChannelNotice(taskName: string, agentName: string, sche
 // 30-minute skip window -- never a missed delivery. See usage-limit-gate.ts.
 const usageLimitEpisodes = new Map<string, UsageLimitEpisode>()
 
-// One owner notice per session per limit episode (the gate decides when). Same
-// sink and same fail-quiet rules as the other scheduler alerts: no token or no
-// owner chat is a WARN, never a throw into the fire path.
-function sendUsageLimitNotice(agentName: string, session: string, banner: string, skipUntilMs: number): void {
-  const token = resolveSchedulerAlertToken()
-  const ownerChat = token ? resolveSchedulerOwnerChat() : null
-  if (!token || !ownerChat) {
-    logger.warn({ agent: agentName, session, provider: CHANNEL_PROVIDER }, 'usage-limit notice suppressed: no channel bot token or owner chat')
-    return
+// The main agent's copy of the usage-limit notice. It is a `system`-authored
+// message, which the main agent treats as unforgeable, so it carries NO pane
+// text: the banner is a verbatim screen line whose tail is arbitrary. Only the
+// agent name, the fact, and scheduler-authored text (the probe time is computed
+// here, not read from the screen). The owner's copy keeps the banner.
+export function usageLimitMainAgentText(agentName: string, skipUntilMs: number, route: UsageLimitNoticeRoute): string {
+  const minutes = Math.round(USAGE_LIMIT_PROBE_INTERVAL_MS / 60_000)
+  if (agentTextLang() === 'hu') {
+    const safeAgentName = AGENT_NAME_RE.test(agentName) ? agentName : '[ismeretlen ügynöknév]'
+    const probeAt = new Date(skipUntilMs).toLocaleTimeString('hu-HU', { hour: '2-digit', minute: '2-digit', timeZone: APP_TZ })
+    return [
+      `[USAGE-LIMIT] A(z) ${safeAgentName} session kifogyott a keretből (usage-limit).`,
+      'Az ütemezett feladatokat nem küldöm bele, mert úgysem tudná lefuttatni őket: a sűrűn futó (skipIfBusy) feladatok "skipped-usage-limit" státusszal kimaradnak, a többi "usage-limited" okkal a várakozó sorba kerül, és a próba vagy a keret visszatérése után lefut.',
+      `${minutes} percenként egy feladatot átengedek próbának (a következőt ${probeAt} után); amint a keret visszajön, a szokásos rend helyreáll.`,
+      route === 'main'
+        ? 'A gazda privát chatje ezt a jelzést nem kapja meg (USAGE_LIMIT_NOTICE_ROUTE=main). Döntsd el, kell-e beavatkozni (például az ágens átállítása másik keretre vagy a munkája átosztása), és ha a gazdának tudnia kell róla, te szólj neki.'
+        : 'A gazda ugyanezt a jelzést a privát chatjében is megkapja. Döntsd el, kell-e beavatkozni (például az ágens átállítása másik keretre vagy a munkája átosztása).',
+    ].join('\n')
   }
+  const safeAgentName = AGENT_NAME_RE.test(agentName) ? agentName : '[unrecognised agent name]'
+  const probeAt = new Date(skipUntilMs).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: APP_TZ })
+  return [
+    `[USAGE-LIMIT] The ${safeAgentName} session has run out of usage (usage-limited).`,
+    'Scheduled tasks are not typed into it, because it could not run them: frequent (skipIfBusy) tasks are recorded as "skipped-usage-limit", the others are queued with reason "usage-limited" and run after the probe or once the usage is back.',
+    `Every ${minutes} minutes one task is let through as a probe (the next one after ${probeAt}); once the usage is back, the normal order resumes.`,
+    route === 'main'
+      ? "The owner's private chat does not get this notice (USAGE_LIMIT_NOTICE_ROUTE=main). Decide whether to act (for example move the agent to another plan or reassign its work), and if the owner needs to know, tell them."
+      : 'The owner gets the same notice in their private chat. Decide whether to act (for example move the agent to another plan or reassign its work).',
+  ].join('\n')
+}
+
+// One notice per session per limit episode. USAGE_LIMIT_NOTICE_ROUTE decides
+// who gets it: both (default) = the owner chat with the banner AND the main
+// agent without it; owner = the owner chat only; main = the main agent only,
+// falling back to the owner chat when the inter-agent write fails. When the
+// main agent itself is limited, only the owner chat. Missing token/chat warns.
+function sendUsageLimitNotice(agentName: string, session: string, banner: string, skipUntilMs: number): void {
   const probeAt = new Date(skipUntilMs).toLocaleTimeString('hu-HU', { hour: '2-digit', minute: '2-digit', timeZone: APP_TZ })
   const text = [
     `[${BOT_NAME} scheduler] A(z) ${agentName} session kifogyott a keretből, a képernyőjén ez áll: "${banner}"`,
     'Az ütemezett feladatokat nem küldöm bele, mert úgysem tudná lefuttatni őket: a sűrűn futó (skipIfBusy) feladatok "skipped-usage-limit" státusszal kimaradnak, a többi "usage-limited" okkal a várakozó sorba kerül, és a próba vagy a keret visszatérése után lefut.',
     `${Math.round(USAGE_LIMIT_PROBE_INTERVAL_MS / 60_000)} percenként egy feladatot átengedek próbának (a következőt ${probeAt} után); amint a keret visszajön, a szokásos rend helyreáll.`,
   ].join('\n')
+  const route = readUsageLimitNoticeRoute()
+  const mainAgentLimited = agentName === MAIN_AGENT_ID
+  let toOwner = route !== 'main' || mainAgentLimited
+  if (route !== 'owner' && !mainAgentLimited) {
+    try {
+      createAgentMessage('system', MAIN_AGENT_ID, usageLimitMainAgentText(agentName, skipUntilMs, route))
+      logger.info({ agent: agentName, session, to: MAIN_AGENT_ID, route }, 'usage-limit notice sent to the main agent')
+    } catch (err) {
+      logger.warn({ err, agent: agentName, session, route }, 'usage-limit notice to the main agent failed; the owner chat gets it')
+      toOwner = true
+    }
+  }
+  if (!toOwner) return
+  const token = resolveSchedulerAlertToken()
+  const ownerChat = token ? resolveSchedulerOwnerChat() : null
+  if (!token || !ownerChat) {
+    logger.warn({ agent: agentName, session, provider: CHANNEL_PROVIDER }, 'usage-limit notice suppressed: no channel bot token or owner chat')
+    return
+  }
   ;(async () => {
     try {
       await sendSchedulerAlertMessage(token, ownerChat, text)
@@ -2211,6 +2399,8 @@ async function attemptFireTask(
     }
   }
 
+  // TASKRUNERRDUP1109: declared before the try, so the catch knows whether this attempt already opened its run row.
+  let firedRunId: number | null = null
   try {
     let prefix: string
     const silentTag = silentTaskTag(task)
@@ -2378,7 +2568,6 @@ async function attemptFireTask(
     // caught up, without any new alert/polling path that could race other
     // running tasks. Read-only w.r.t. everything else in this function.
     // Bookkeeping id for the run we are about to open; the watchdog closes it.
-    let firedRunId: number | null = null
     if (lateCatchUpMs != null) {
       firedRunId = appendTaskRun(task.name, agentName, 'fired_late')
       logger.warn(
@@ -2505,6 +2694,15 @@ async function attemptFireTask(
           // Host-aware so a remote agent's post-send stuck-check + recovery
           // Enter hit the laptop session, not a (nonexistent) local one.
           const pane = capturePane(session, host)
+          // The session died after the send (a placeholder clear's Ctrl-C quit the TUI, measured 2026-11-24 03:30):
+          // the prompt never ran, and a null pane reads "not parked" below. The run is an error, and the
+          // occurrence is retried once the session is back, like 'giveup'.
+          if (pane == null && !sessionExistsOnHost(host, session)) {
+            logger.warn({ task: task.name, session, attempt }, 'Scheduled prompt: the session is gone after the send -- run marked error, retried once the session is back')
+            if (firedRunId != null) markTaskRunFireError(firedRunId)
+            insertPendingTaskRetryIfNew(task.name, agentName, now, 'session-gone')
+            return 'done'
+          }
           const stuck = isScheduledPromptStuck(pane, marker)
             || isOwnPromptParkedOverfull(pane, getInjectedPrompt(session))
           const action = decideScheduledResubmitAction(attempt, stuck)
@@ -2576,9 +2774,20 @@ async function attemptFireTask(
     return 'fired'
   } catch (err) {
     logger.warn({ err, task: task.name }, 'Failed to fire scheduled task')
-    appendTaskRun(task.name, agentName, 'error')
+    recordFireError(task.name, agentName, firedRunId)
     return 'error'
   }
+}
+
+/**
+ * TASKRUNERRDUP1109: a fire that failed is ONE error run. When the attempt already opened its run row (the throw came
+ * after the 'fired'/'fired_late'/'fired_busy' row was written), that row becomes the error and is closed; only an
+ * attempt that failed before any row writes a new 'error' row. A second row used to make one failed attempt count as
+ * two runs on the tasks-today tile.
+ */
+export function recordFireError(name: string, agent: string, firedRunId: number | null): void {
+  if (firedRunId != null && markTaskRunFireError(firedRunId)) return
+  appendTaskRun(name, agent, 'error')
 }
 
 // A worksource agent takes this prompt through its queue instead of the
@@ -2653,6 +2862,35 @@ async function queueScheduledToWorksource(
     deliveryPending: false,
   })
   return 'fired'
+}
+
+// PRECHECKBUSY1119: would attemptFireTask answer a plain 'busy' for this target
+// right now -- the one answer a skipIfBusy task drops? Asked BEFORE the pre-check
+// runs, because a pre-check may move its own state on (the nav-adategeszseg one
+// starts the next measurement and marks its finding "already reported"): run on
+// a tick that is then dropped for a busy agent, the finding is lost without a
+// trace (B-1119-C01, measured order: pre-check at the cron loop, skipIfBusy drop
+// after the fire attempt). Mirrors attemptFireTask's order and returns false for
+// every state that is NOT dropped there: a missing session (auto-start), the
+// main session respawning, a first-run dialog, a refused target -- those keep
+// their own path. A pane held by the feedback-draft modal counts as free (the
+// probe types nothing; attemptFireTask dismisses the modal as before).
+// This NARROWS the loss, it does not close it: a target that turns busy while
+// the pre-check runs is still dropped after the pre-check advanced its state.
+export async function targetBusyForSkipIfBusy(task: ScheduledTask, agentName: string, now: number): Promise<boolean> {
+  if (targetSessionRefused(task)) return false
+  if (isRestartInFlight(agentName)) return true
+  const { session, host } = resolveTaskTarget(task, agentName)
+  if (!sessionExistsOnHost(host, session)) return false
+  if (session === MAIN_CHANNELS_SESSION && mainRespawnHold(now)) return false
+  if (await isSessionReadyForPrompt(session, host)) return false
+  const pane = capturePane(session, host)
+  if (pane != null && detectsFirstRunGate(pane)) return false
+  // A feedback-draft modal is NOT dismissed here (no keystrokes from a probe):
+  // the pane counts as free, the pre-check runs, and attemptFireTask dismisses
+  // the modal exactly as before.
+  if (pane != null && detectsFeedbackDraftModal(pane)) return false
+  return true
 }
 
 // Injection priority within one tick: when several tasks are due in the same
@@ -3526,7 +3764,25 @@ export function startScheduleRunner(): NodeJS.Timeout {
           )
         }
       }
-      if (decision === 'done' || decision === 'abandoned') {
+      if (decision === 'done' && checkTaskAuthFailure(entry)) {
+        // DOCKERUNAUTHRUN1118: the pane went idle after a turn, but the only reply was Claude Code's own "Not logged
+        // in" error: the session could not work, so this is not a success. Recorded as outcome 'unauth' (the
+        // delivery verdict stays what the transcript showed: the prompt did arrive). Not a success for a once task
+        // either, so settleOnceAfterRun is not called and the task stays enabled. No retry is queued: a redelivery
+        // would meet the same login wall, and the session itself is the reauth healer's to report.
+        logger.warn(
+          { task: entry.taskName, agent: entry.agentName, session: entry.session, runId: entry.runId, delivery: entry.deliveryVerdict ?? null },
+          'Scheduled run hit a session that is not logged in -- the only reply was an authentication error; recorded as unauth, NOT as done',
+        )
+        if (entry.runId != null) {
+          try {
+            markTaskRunCompleted(entry.runId, 'unauth', now)
+          } catch (err) {
+            logger.warn({ err, task: entry.taskName, runId: entry.runId }, 'Failed to record task-run completion')
+          }
+        }
+        taskInflightMap.delete(key)
+      } else if (decision === 'done' || decision === 'abandoned') {
         // 'done' is genuine success (sawTurn was true) -- this occurrence's
         // lost-redelivery count, if any, no longer applies to a FUTURE
         // occurrence of the same task@agent key. 'abandoned' means max-track
@@ -3771,6 +4027,8 @@ export function startScheduleRunner(): NodeJS.Timeout {
     // fleet draws on ONE subscription quota pool, so the gate below asks the
     // same snapshot about all of them.
     const quotaSnapshot = readQuotaSnapshot()
+    noteQuotaBlindness(quotaSnapshot, now)
+    const quotaHardAtPercent = readQuotaHardAtPercent()
 
     for (const task of tasks) {
       if (!task.enabled) continue
@@ -3843,6 +4101,8 @@ export function startScheduleRunner(): NodeJS.Timeout {
         snapshot: quotaSnapshot,
         nowMs: now,
         workClass: quotaWorkClass(task),
+        essential: task.essential === true,
+        hardAtPercent: quotaHardAtPercent,
       })
       if (quota.action === 'defer') {
         logger.info(
@@ -3870,7 +4130,29 @@ export function startScheduleRunner(): NodeJS.Timeout {
         persistScheduleLastRun()
         continue
       }
-      const targetAgents = budget.run
+      let targetAgents = budget.run
+
+      // PRECHECKBUSY1119: a skipIfBusy task drops its tick for a busy target
+      // anyway, so its pre-check must not run for that target -- a pre-check
+      // that advances its own state (marks a finding reported, starts the next
+      // measurement) would lose the finding on a dropped tick. Busy targets are
+      // recorded exactly like the drop below ('skipped', no last-run stamp);
+      // when no target is left, the pre-check does not run at all. forceSend is
+      // exempt, as in the drop. Tasks without a pre-check keep the old path.
+      if (task.preCheck && task.skipIfBusy && !task.forceSend) {
+        const free: string[] = []
+        for (const target of targetAgents) {
+          if (pendingKeys.has(`${task.name}@${target}`)) { free.push(target); continue }
+          if (await targetBusyForSkipIfBusy(task, target, now)) {
+            logger.info({ task: task.name, agent: target }, 'Schedule busy, skipIfBusy=true: dropping tick before its pre-check runs')
+            appendTaskRun(task.name, target, 'skipped')
+          } else {
+            free.push(target)
+          }
+        }
+        if (free.length === 0) continue
+        targetAgents = free
+      }
 
       // Run pre-check once per task (not per agent) since it queries shared
       // state (DB, filesystem) that does not vary by target agent.

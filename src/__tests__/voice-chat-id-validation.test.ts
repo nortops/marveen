@@ -14,12 +14,22 @@ import type { RouteContext } from '../web/routes/types.js'
 
 // Voice calls as if the toolkit and every fixture existed, so the handler
 // walks through validation instead of bailing at install checks or missing
-// .env / .onnx paths. Only existsSync is forced true; reads still hit the
-// real filesystem (a missing token/onnx just returns null/false, which the
-// happy-path assertions don't depend on).
+// .env / .onnx paths. existsSync is forced true; readFileSync is forced too,
+// but ONLY for access.json (TTSBIND1125's allowlist gate, #3125) -- every
+// other read (the .env token, the piper .onnx) still hits the real
+// filesystem (a missing one just returns null/false, which the happy-path
+// assertions don't depend on), and must NOT silently resolve to this fake
+// JSON.
 vi.mock('node:fs', async (orig) => {
   const actual = await orig<typeof import('node:fs')>()
-  return { ...actual, existsSync: () => true }
+  return {
+    ...actual,
+    existsSync: () => true,
+    readFileSync: (path: string, ...rest: unknown[]) =>
+      path.endsWith('access.json')
+        ? JSON.stringify({ allowFrom: ['-1004417391961', '8027010441'] })
+        : (actual.readFileSync as (...a: unknown[]) => unknown)(path, ...rest),
+  }
 })
 
 // POST /api/voice/tts runs `piper` via runProc; replace the spawn with a

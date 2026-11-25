@@ -280,11 +280,16 @@ _resolve_main_model_raw() {
   # probe exactly as on the TS side (empty = unmeasured).
   # The probe needs the SAME binary the launch runs. The watchdogs call this
   # seam under a narrow launchd PATH, so after PATH try the dirs the TS side
-  # probes (platform.ts KNOWN_BIN_DIRS); a miss is unmeasured = fail-open.
+  # probes (platform.ts knownBinDirs(): the custom Homebrew prefix bin, from
+  # scripts/lib/helper-path.sh helper_brew_prefix_bin by the rule of the block
+  # below marked ISSUE1968BREWPREFIX, right after ~/.local/bin); a miss is
+  # unmeasured = fail-open.
   local _claude="${CLAUDE:-}"
   [ -z "$_claude" ] && _claude="$(command -v claude 2>/dev/null || true)"
   if [ -z "$_claude" ]; then
-    for _c in "$HOME/.local/bin/claude" "$HOME/.bun/bin/claude" /opt/homebrew/bin/claude /usr/local/bin/claude /usr/bin/claude /bin/claude; do
+    local _bpc
+    _bpc="$(. "$INSTALL_DIR/scripts/lib/helper-path.sh" 2>/dev/null && helper_brew_prefix_bin)" || _bpc=""
+    for _c in "$HOME/.local/bin/claude" ${_bpc:+"$_bpc/claude"} "$HOME/.bun/bin/claude" /opt/homebrew/bin/claude /usr/local/bin/claude /usr/bin/claude /bin/claude; do
       [ -x "$_c" ] && { _claude="$_c"; break; }
     done
   fi
@@ -720,6 +725,7 @@ fi
 . "$INSTALL_DIR/scripts/main-extra-plugins-settings.sh"
 # shellcheck disable=SC2086 # word-split on purpose: space-separated plugin ids
 EXTRA_SETTINGS_FLAG="$(main_extra_settings_flag "$INSTALL_DIR" "$PLUGIN_ID" $CHANNEL_PLUGINS_EXTRA)"
+EXTRA_SETTINGS_FLAG="${EXTRA_SETTINGS_FLAG}$(main_disallowed_tools_flag "$INSTALL_DIR")"
 
 # ROOT-CAUSE NOTE (kali-linux WSL, claude-code 2.1.152, 2026-05-27):
 # Inbound MCP notifications from the `--channels` plugin go through a SECOND
@@ -757,7 +763,7 @@ unset TMUX
 # NATIVECLAUDEFIRST1011 (#1896): $HOME/.local/bin leads, so `command -v claude`
 # below picks the install user's native launcher (~/.local/bin/claude) over a
 # Homebrew/npm copy in /opt/homebrew/bin -- the order the dashboard's launchd
-# PATH and platform.ts KNOWN_BIN_DIRS already use. With /opt/homebrew/bin first,
+# PATH and platform.ts knownBinDirs() already use. With /opt/homebrew/bin first,
 # a Mac that also had an older shared claude there ran the main session on that
 # one while the sub-agents ran the native build, and claude_is_native looked at
 # the wrong binary. Every other directory keeps its relative order.
@@ -771,12 +777,12 @@ unset TMUX
 BREW_PREFIX_BIN=""
 while IFS= read -r -d : _bp_dir; do
   case "$_bp_dir" in
-    /*/opt/node@[0-9]/bin|/*/opt/node@[0-9][0-9]/bin) ;;
+    /?*/opt/node@[0-9]/bin|/?*/opt/node@[0-9][0-9]/bin) ;;
     *) continue ;;
   esac
   _bp_bin="${_bp_dir%/opt/node@*/bin}/bin"
   case "$_bp_bin" in
-    /opt/homebrew/bin|/usr/local/bin) continue ;;
+    /opt/homebrew/bin|/usr/local/bin|/usr/bin|/bin) continue ;;
   esac
   if [ -d "$_bp_bin" ]; then
     BREW_PREFIX_BIN="$_bp_bin:"
@@ -1502,6 +1508,10 @@ EOF_MA
     fi
     if [ -n "$_cp_env" ]; then
       CUSTOM_PROVIDER_ENV="$_cp_env"
+      # HOSTINGERROUTER1122: the provider's model comes as ANTHROPIC_MODEL in the env above. A --model flag (from
+      # MAIN_AGENT_MODEL, .claude/settings.json or the shipped default) would override it and send the provider a model
+      # it may not serve, so with a custom provider the flag is dropped.
+      MODEL_FLAG=""
       echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: main-agent custom-provider env injected" >> "$INSTALL_DIR/store/channels-failures.log"
     fi
     unset _cp_env _cp_rc _cp_cfg_dir
@@ -1650,6 +1660,31 @@ export "$STATE_ENV_VAR"="$MAIN_CHAN_DIR"
 STATE_DIR_ENV="export ${STATE_ENV_VAR}=$(sh_single_quote "$MAIN_CHAN_DIR") && "
 # gromzo has no channel state dir (no token, no access.json): nothing to export (GROMZONOPROVIDER1108).
 [ "$CHANNEL_PROVIDER" = "gromzo" ] && STATE_DIR_ENV=""
+# TEAMSAPPROVECARD1118: the main agent's Teams plugin (0.3.3+) forwards a click on the dashboard's email approval card
+# to this URL and never hands it to the session (claude-channel-teams docs/approval-cards.md). The plugin accepts only a
+# loopback URL (127.0.0.1, [::1], localhost), so the URL names the loopback address the dashboard listens on for its
+# WEB_HOST. Measured with node 22 on macOS: an unset/empty WEB_HOST, 127.0.0.1, 0.0.0.0 and :: all answer on 127.0.0.1;
+# ::1 answers only on [::1]; localhost binds whichever address the resolver gives first (::1 on macOS), so it stays
+# localhost and the plugin's fetch resolves it the same way (Bun tried both addresses). A dashboard bound to one
+# non-loopback address is not reachable on loopback: nothing is exported, and the plugin answers such a click with its
+# fixed "decide on the dashboard" card.
+if [ "$CHANNEL_PROVIDER" = "teams" ]; then
+  _approval_port="$(grep -E '^WEB_PORT=' "$INSTALL_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r"'"'"' ')"
+  case "$_approval_port" in ''|*[!0-9]*) _approval_port=3420 ;; esac
+  _approval_host="$(grep -E '^WEB_HOST=' "$INSTALL_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r"'"'"' ')"
+  case "$_approval_host" in
+    ''|127.0.0.1|0.0.0.0|::) _approval_origin="127.0.0.1" ;;
+    ::1|'[::1]') _approval_origin="[::1]" ;;
+    localhost) _approval_origin="localhost" ;;
+    *) _approval_origin="" ;;
+  esac
+  if [ -n "$_approval_origin" ]; then
+    STATE_DIR_ENV="${STATE_DIR_ENV}export MARVEEN_APPROVAL_URL=$(sh_single_quote "http://${_approval_origin}:${_approval_port}/api/approvals/teams-card-action") && "
+  else
+    echo "[channels] TEAMSAPPROVECARD1118: WEB_HOST=$_approval_host is not loopback; Teams approval-card clicks are not forwarded"
+  fi
+fi
+# TEAMSAPPROVECARD1118 end
 
 # CHANNELEXTRASTATEDIR1111: CHANNEL_PLUGINS_EXTRA co-listen providers (e.g.
 # Discord alongside a Telegram primary) need their OWN *_STATE_DIR exported

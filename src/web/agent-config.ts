@@ -4,10 +4,12 @@ import { homedir } from 'node:os'
 import { PROJECT_ROOT, MAIN_AGENT_ID, DEFAULT_AGENT_MODEL } from '../config.js'
 import { atomicWriteFileSync } from './atomic-write.js'
 import { readEnvFile } from '../env.js'
+import { getEffectiveSettingValue } from '../settings-store.js'
 import { parseExtraChannels, wantsGromzo } from './agent-extra-channels.js'
 import type { ChannelProviderType } from '../channel-provider.js'
 import { logger } from '../logger.js'
 import { safeJoin } from './sanitize.js'
+import { isHiddenByInstallMarker } from './agent-package/marker.js'
 import { isValidModelId, InvalidModelIdError } from '../model-id.js'
 import {
   resolveAgentModelFromConfig,
@@ -36,7 +38,7 @@ export const MODEL_ALIASES: Record<string, string> = {
   'sonnet5': 'claude-sonnet-5',
   'opus-5': 'claude-opus-5',
   'opus5': 'claude-opus-5',
-  'haiku': 'claude-haiku-4-5-20251001',
+  'haiku': 'claude-haiku-4-5',
   'haiku-5-5': 'claude-haiku-5-5',
   'haiku55': 'claude-haiku-5-5',
   'fable': 'claude-fable-5',
@@ -519,6 +521,45 @@ export function writeAgentMemoryIsolation(name: string, enabled: boolean): void 
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }
 
+// CODEMODEFLAG1119: opt-in per-agent Claude Code "Code Mode" (default OFF). When true, the launcher exports
+// CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=1 for this sub-agent; otherwise the variable is unset at launch, so an
+// inherited value can never switch it on. Absent/false = off.
+export function readAgentCodeMode(name: string): boolean {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    const config = JSON.parse(readFileOr(configPath, '{}'))
+    return config.codeMode === true
+  } catch { /* fall through */ }
+  return false
+}
+
+// Persist the opt-in codeMode flag. `false` removes the key, as for memoryIsolation.
+export function writeAgentCodeMode(name: string, enabled: boolean): void {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  const config = readJsonObjectForWrite(configPath)
+  if (enabled) config.codeMode = true
+  else delete config.codeMode
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
+// CODEMODEFLAG1119 (Q1): the mode the agent was last LAUNCHED in, recorded by startAgentProcess. A Code Mode session
+// resumed without Code Mode refuses to start, and a session started without it resumes without it even with the
+// variable set; so when the switch differs from this record the next start is fresh. Missing = launched without.
+export function readAgentCodeModeLaunched(name: string): boolean {
+  try {
+    return JSON.parse(readFileOr(join(agentDir(name), 'agent-config.json'), '{}')).codeModeLaunched === true
+  } catch { return false }
+}
+
+// `false` removes the key, so an agent that never ran in Code Mode keeps its agent-config.json as it was.
+export function writeAgentCodeModeLaunched(name: string, launched: boolean): void {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  const config = readJsonObjectForWrite(configPath)
+  if (launched) config.codeModeLaunched = true
+  else delete config.codeModeLaunched
+  atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
+}
+
 // Opt-in per-agent agent-state-observer mod (default OFF, MODSTERMEK1005).
 // When true the launcher loads plugins/agent-state-observer for this agent's
 // session (see state-observer.ts for the version gate and what it writes).
@@ -747,6 +788,10 @@ export function listAllAgentNames(): string[] {
   try { baseReal = realpathSync(AGENTS_BASE_DIR) } catch { baseReal = resolve(AGENTS_BASE_DIR) }
   return readdirSync(AGENTS_BASE_DIR).filter((f) => {
     if (f === MAIN_AGENT_ID) return false
+    // MIOAGENTINSTALL1114 (plan 4.2, 7.2): a folder under a VALID package install marker is an unfinished install,
+    // not an agent. This one choke point keeps it out of the roster, delivery, export and the scheduler. A marker
+    // that does not count is logged and ignored: the agent stays listed.
+    if (isHiddenByInstallMarker(f)) return false
     const path = join(AGENTS_BASE_DIR, f)
     try {
       const st = lstatSync(path)
@@ -862,6 +907,8 @@ export function writeAgentVoiceConfig(name: string, patch: Partial<AgentVoiceCon
 export function isKnownAgent(name: string): boolean {
   if (!name) return false
   if (name === MAIN_AGENT_ID) return true
+  // MIOAGENTINSTALL1114 (plan 4.2): an unfinished package install is not an agent (see listAllAgentNames).
+  if (isHiddenByInstallMarker(name)) return false
   try {
     const dir = agentDir(name)
     return existsSync(dir) && statSync(dir).isDirectory()
@@ -995,10 +1042,16 @@ export function agentMaySudo(name: string): boolean {
 // persona, an ancestor of agents/<name>). Dropping it drops fleet rules too, so it comes from the same place and with
 // the same parsing as SUDO_AGENTS above, never from the agent's own agent-config.json. The main agent never qualifies.
 // A '*' entry means every sub-agent, including ones created later (it is not a valid agent name, so no clash).
+// The Settings page value (owner-only to add, see the registry's loosens) adds to the .env line. The .env line is read
+// raw on purpose: the registry key is overrides-only, but dropping the released .env path would break installs using it.
+// The registry marks the key envStillApplies, so the Settings page and the boot log do not call that line ignored.
 export function agentExcludesRootClaudeMd(name: string): boolean {
   if (name === MAIN_AGENT_ID) return false
   try {
-    const raw = readEnvFile(['ROOT_CLAUDEMD_EXCLUDE_AGENTS']).ROOT_CLAUDEMD_EXCLUDE_AGENTS
+    const raw = [
+      String(getEffectiveSettingValue('ROOT_CLAUDEMD_EXCLUDE_AGENTS')),
+      readEnvFile(['ROOT_CLAUDEMD_EXCLUDE_AGENTS']).ROOT_CLAUDEMD_EXCLUDE_AGENTS ?? '',
+    ].join(',')
     if (typeof raw === 'string' && raw.split(/[\s,]+/).includes('*')) return true
     return parseSudoAgents(raw).includes(name)
   } catch {
@@ -1022,6 +1075,19 @@ export function readAgentCustomProvider(name: string): string | null {
     const config = JSON.parse(readFileOr(configPath, '{}'))
     const value = config.customProvider
     if (typeof value === 'string' && value.trim()) return value.trim()
+  } catch { /* fall through */ }
+  return null
+}
+
+/**
+ * HOSTINGERROUTER1122: the context window Claude Code is told for the custom provider's model
+ * (CLAUDE_CODE_MAX_CONTEXT_TOKENS), set only for a model Claude Code does not know. A positive integer, or null.
+ */
+export function readAgentCustomProviderContextTokens(name: string): number | null {
+  const configPath = join(agentDir(name), 'agent-config.json')
+  try {
+    const value = JSON.parse(readFileOr(configPath, '{}')).customProviderContextTokens
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return value
   } catch { /* fall through */ }
   return null
 }

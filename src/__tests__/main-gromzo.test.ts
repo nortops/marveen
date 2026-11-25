@@ -260,7 +260,7 @@ describe('the recovery respawn (channel-monitor)', () => {
     claudePath: '/usr/local/bin/claude', pluginId: 'telegram@claude-plugins-official', model: 'claude-opus-5',
     continueSession: false, config: mainConfigDecisionForTest(),
     channelStateEnv: { name: 'TELEGRAM_STATE_DIR', dir: '/opt/m/.claude/channels/telegram' },
-    customProviderEnv: null,
+    customProviderLaunchEnv: null,
   }
 
   it('with the gromzo id: exports the main slug and scope both, before claude starts', () => {

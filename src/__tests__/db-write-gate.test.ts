@@ -9,7 +9,7 @@
 // (Dani 56100). The gate is a text-based brake, not an OS boundary (stated in both messages).
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 // @ts-expect-error -- plain .mjs hook script, no types
-import { gateDecision, DB_GATE_MSG, GIT_GATE_MSG, INSTALL_FILE_GATE_MSG, PROTECTED_INSTALL_PATHS } from '../../scripts/hooks/db-write-gate.mjs'
+import { gateDecision, DB_GATE_MSG, GIT_GATE_MSG, INSTALL_FILE_GATE_MSG, PROTECTED_INSTALL_PATHS, withCaught } from '../../scripts/hooks/db-write-gate.mjs'
 // @ts-expect-error -- plain .mjs hook script, no types
 import { SECURITY_TABLES, gateDecision as selfPaceDecision } from '../../scripts/self-pace-gate.mjs'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, readFileSync, realpathSync } from 'node:fs'
@@ -39,6 +39,8 @@ function scaffold(dir: string): void {
   writeFileSync(join(dir, 'store', 'extra-hooks.json'), '{}')
   writeFileSync(join(dir, 'store', 'autonomy-config.json'), '{}')
   writeFileSync(join(dir, 'store', 'agent-sender-role-gates.json'), '{}')
+  writeFileSync(join(dir, 'store', 'board-access.json'), '{}')
+  writeFileSync(join(dir, 'store', 'colleague-accounts.json'), '{}')
 }
 // The install is a main checkout (a .git directory), the worktree has a .git file, as git makes them.
 function gitScaffold(): void {
@@ -70,10 +72,10 @@ const ALLOW = { deny: false }
 describe('1. SQL writes on the security tables', () => {
   // APPROVALSLACK1030 (2): approval_slack_posts joins (the posted Slack request the owner's reaction is checked against).
   // SUPPORTKULCS1109 D5: the two support tables joined the list.
-  it('the table list is the decided nine', () => {
-    expect(SECURITY_TABLES).toEqual(['approvals', 'approval_events', 'approval_slack_posts', 'auth_sessions', 'dashboard_users', 'device_keys', 'vault_ssh_keys', 'support_consents', 'support_password_state'])
+  it('the table list is the decided sixteen (inbound_sig_log: HMACINBOUND1125; custom_commands: CHANINBOUNDFORGE1125; approver_scopes: DELEGAPPROVER1123; approval_teams_cards: TEAMSAPPROVECARD1118; agent_create_specs: AGENTCREATEPR2-1119; approval_gromzo_posts: AGENTCREATEPR3-1119; colleague_sessions: #2929 B1)', () => {
+    expect(SECURITY_TABLES).toEqual(['approvals', 'approval_events', 'approval_slack_posts', 'approval_teams_cards', 'approval_gromzo_posts', 'agent_create_specs', 'auth_sessions', 'colleague_sessions', 'dashboard_users', 'device_keys', 'vault_ssh_keys', 'support_consents', 'support_password_state', 'approver_scopes', 'custom_commands', 'inbound_sig_log'])
   })
-  for (const t of ['approvals', 'approval_events', 'approval_slack_posts', 'auth_sessions', 'dashboard_users', 'device_keys', 'vault_ssh_keys', 'support_consents', 'support_password_state']) {
+  for (const t of ['approvals', 'approval_events', 'approval_slack_posts', 'approval_teams_cards', 'approval_gromzo_posts', 'agent_create_specs', 'auth_sessions', 'colleague_sessions', 'dashboard_users', 'device_keys', 'vault_ssh_keys', 'support_consents', 'support_password_state', 'approver_scopes', 'custom_commands', 'inbound_sig_log']) {
     it.each([
       `UPDATE ${t} SET x=1`,
       `INSERT INTO ${t} VALUES (1)`,
@@ -144,6 +146,9 @@ describe('1. SQL writes on the security tables', () => {
   it.each([
     ['a SELECT', `sqlite3 ${DB} "SELECT * FROM approvals WHERE status='pending'"`],
     ['a read-only open', `sqlite3 -readonly ${DB} "SELECT count(*) FROM auth_sessions"`],
+    // #2929 B1: a colleague session row is read freely, only a write is denied (the loop in section 1 pins those)
+    ['a SELECT on colleague_sessions', `sqlite3 ${DB} "SELECT username, created_at FROM colleague_sessions"`],
+    ['a read-only open on colleague_sessions', `sqlite3 -readonly ${DB} "SELECT count(*) FROM colleague_sessions"`],
     ['UPDATE agent_messages (the global skills)', `sqlite3 ${DB} "UPDATE agent_messages SET status='done' WHERE id=5"`],
     ['the daily_logs date fix (CLAUDE.md)', `sqlite3 ${DB} "UPDATE daily_logs SET date='2026-10-29' WHERE id=12; SELECT changes();"`],
     ['a longer table name', `sqlite3 ${DB} "UPDATE approvals_archive SET x=1"`],
@@ -226,11 +231,23 @@ describe('3. this install\'s gate wiring and autonomy levels', () => {
     // NETTARGETENV1104, Dani 68849: the network-target origins recorded at the last boot.
     'store/.net-target-hosts.json',
     // GATEFILES1110: the owner-gated agent settings (a provider's baseUrl, the context-guard values)
-    'store/custom-providers.json', 'store/context-guard.json']
+    'store/custom-providers.json', 'store/context-guard.json',
+    // DOCKERHTTPS1119 (Dani 81107 B2): the dashboard login's TOTP secrets and replay state
+    'store/.dashboard-totp.json',
+    // WDSANDBOXNODE1119 (Dani 81206 B1): the node the dashboard runs on, which the watchdog runs
+    'store/.dashboard-node',
+    // HOSTINGERROUTER1122: the platform marker that offers the billed Hostinger AI Router
+    'store/.platform',
+    // WDSANDBOXMARKER1119: the per-agent launch files every restart path reads (a file under each directory)
+    'store/bash-sandbox/soma.settings.json', 'store/code-mode/soma.on',
+    // PR #2912 review B1 (Dani): the scoped board's confinement, read on each request.
+    'store/board-access.json',
+    // PR #2929: the colleague logins of the scoped board, the same class as B1.
+    'store/colleague-accounts.json']
   it('the protected list is the decided one', () => {
     expect(PROTECTED_INSTALL_PATHS.map((t: { rel?: string, home?: string }) => t.rel ?? `~/${t.home}`)).toEqual(['.claude/settings.json',
       '.claude/settings.local.json', 'scripts/hooks', 'scripts/self-pace-gate.mjs', 'store/extra-hooks.json', 'store/autonomy-config.json',
-      'store/agent-sender-role-gates.json', 'store/config-overrides.json', 'store/.owner-slack-target', 'store/.net-target-hosts.json', 'store/custom-providers.json', 'store/context-guard.json', '.git/config', '.git/packed-refs', '.git/refs/remotes', '.git/hooks', '~/.gitconfig', '~/git/config',
+      'store/agent-sender-role-gates.json', 'store/config-overrides.json', 'store/.owner-slack-target', 'store/.net-target-hosts.json', 'store/custom-providers.json', 'store/context-guard.json', 'store/.dashboard-totp.json', 'store/.inbound-sig-key', 'store/.dashboard-node', 'store/.platform', 'store/bash-sandbox', 'store/code-mode', 'store/board-access.json', 'store/colleague-accounts.json', '.git/config', '.git/packed-refs', '.git/refs/remotes', '.git/hooks', '~/.gitconfig', '~/git/config',
       // ENVRELAXGATE1104 (Samu 67797): every agent's own Claude settings, one-segment patterns
       'agents/*/.claude/settings.json', 'agents/*/.claude/settings.local.json', 'agents/*/.claude-config/settings.json',
       // SUPPORTKULCS1109 D5: the support state of this machine, one folder
@@ -269,6 +286,61 @@ describe('3. this install\'s gate wiring and autonomy levels', () => {
   it('the root comes from the gate\'s own place, not from the cwd: a worktree cwd does not move it', () => {
     expect(file('Write', join(root, 'store', 'autonomy-config.json'), wt)).toEqual(DENY_FILE)
     expect(file('Write', join(wt, 'store', 'autonomy-config.json'), root)).toEqual(ALLOW)
+  })
+  it('DOCKERHTTPS1119 (Dani 81107 B2): deleting, emptying or replacing the TOTP store is denied; reading it passes', () => {
+    const p = join(root, 'store', '.dashboard-totp.json')
+    expect(bash(`rm ${p}`)).toEqual(DENY_FILE)
+    expect(bash(`rm -f store/.dashboard-totp.json`)).toEqual(DENY_FILE)
+    expect(bash(`: > ${p}`)).toEqual(DENY_FILE)
+    expect(bash(`mv /tmp/x.json ${p}`)).toEqual(DENY_FILE)
+    expect(bash(`cat ${p}`)).toEqual(ALLOW)
+  })
+  // WDSANDBOXMARKER1119: an agent deleting or editing its own sandbox settings or Code Mode marker would change how it
+  // comes back at the next restart; reading them stays free.
+  it.each([
+    ['store/bash-sandbox', 'soma.settings.json'],
+    ['store/code-mode', 'soma.on'],
+  ])('WDSANDBOXMARKER1119: writes under %s are denied; reads pass', (dir, name) => {
+    mkdirSync(join(root, dir), { recursive: true })
+    writeFileSync(join(root, dir, name), '{}')
+    const p = join(root, dir, name)
+    const bare = dir.split('/')[1]
+    for (const tool of ['Write', 'Edit']) expect(file(tool, p)).toEqual(DENY_FILE)
+    expect(file('Write', join(root, dir, 'zara.new'))).toEqual(DENY_FILE)
+    expect(bash(`rm ${p}`)).toEqual(DENY_FILE)
+    expect(bash(`rm -f ${dir}/${name}`)).toEqual(DENY_FILE)
+    expect(bash(`: > ${p}`)).toEqual(DENY_FILE)
+    expect(bash(`echo '{"sandbox":{"enabled":false}}' > ${p}`)).toEqual(DENY_FILE)
+    expect(bash(`mv /tmp/x.json ${p}`)).toEqual(DENY_FILE)
+    expect(bash(`truncate -s 0 ${p}`)).toEqual(DENY_FILE)
+    expect(bash(`chmod 755 ${join(root, dir)}`)).toEqual(DENY_FILE)
+    expect(bash(`rm -rf ${join(root, dir)}`)).toEqual(DENY_FILE)
+    expect(bash(`rm -rf ${bare}`, join(root, 'store'))).toEqual(DENY_FILE)
+    // the agent the switch is about is a sub-agent: the same verdict in that mode
+    const asSub = (command: string) => gateDecision('Bash', { command }, { cwd: join(root, 'agents', 'soma'), root, subAgent: true })
+    expect(asSub(`rm ${p}`)).toEqual(DENY_FILE)
+    expect(asSub(`echo '{}' > ${p}`)).toEqual(DENY_FILE)
+    expect(asSub(`cat ${p}`)).toEqual(ALLOW)
+    expect(bash(`cat ${p}`)).toEqual(ALLOW)
+    expect(bash(`ls ${join(root, dir)}`)).toEqual(ALLOW)
+    // a worktree's own copy is free
+    expect(file('Write', join(wt, dir, name), wt)).toEqual(ALLOW)
+  })
+  // WDSANDBOXNODE1119 (Dani 81206 B1): the node the dashboard runs on, which the watchdog runs, recorded directly in the
+  // store (not under the 0555 store/bash-sandbox/), and denied there on its own entry.
+  it('WDSANDBOXNODE1119: writing, replacing or deleting the recorded node file is denied; reading it passes', () => {
+    const p = join(root, 'store', '.dashboard-node')
+    writeFileSync(p, '/usr/bin/node\n')
+    for (const tool of ['Write', 'Edit']) expect(file(tool, p)).toEqual(DENY_FILE)
+    expect(bash(`printf '/tmp/x/node' > ${p}`)).toEqual(DENY_FILE)
+    expect(bash(`mv /tmp/x ${p}`)).toEqual(DENY_FILE)
+    expect(bash(`rm -f store/.dashboard-node`)).toEqual(DENY_FILE)
+    expect(bash(`cat ${p}`)).toEqual(ALLOW)
+    const asSub = (command: string) => gateDecision('Bash', { command }, { cwd: join(root, 'agents', 'soma'), root, subAgent: true })
+    expect(asSub(`printf '/tmp/x/node' > ${p}`)).toEqual(DENY_FILE)
+    expect(asSub(`cat ${p}`)).toEqual(ALLOW)
+    // a worktree's own copy is free
+    expect(file('Write', join(wt, 'store', '.dashboard-node'), wt)).toEqual(ALLOW)
   })
   it('another file of the install is not protected', () => {
     expect(file('Write', join(root, 'scripts', 'other.py'))).toEqual(ALLOW)
@@ -457,6 +529,31 @@ describe('3. this install\'s gate wiring and autonomy levels', () => {
   it('the gate store: a read passes in the install, a write passes in the worktree', () => {
     expect(bash(`cat store/agent-sender-role-gates.json | jq .`)).toEqual(ALLOW)
     expect(bash(`echo '{}' > store/agent-sender-role-gates.json`, wt)).toEqual(ALLOW)
+  })
+  // PR #2912 review B1 (Dani): the scoped board's confinement. A confined agent that "fixes" its board access
+  // by switching the feature off or widening its own role is denied; reading it stays free.
+  it.each([
+    ['a redirect', `echo '{"enabled":false}' > store/board-access.json`],
+    ['tee', `echo '{}' | tee @ROOT@/store/board-access.json`],
+    ['sed -i', `sed -i 's/"self"/"all"/' store/board-access.json`],
+    ['python writing it', `python3 -c "open('store/board-access.json','w').write('{}')"`],
+    ['a temp file renamed onto it', `echo '{}' > /tmp/b.json && mv /tmp/b.json @ROOT@/store/board-access.json`],
+    ['rm of it', `rm store/board-access.json`],
+  ])('the board confinement: %s is denied in the install', (_, cmd) => {
+    expect(bash(cmd)).toEqual(DENY_FILE)
+  })
+  // PR #2929: the colleague logins. An agent that writes an account (a hash it knows) signs in as that colleague.
+  it.each([
+    ['a redirect', `echo '{"accounts":[]}' > store/colleague-accounts.json`],
+    ['sed -i', `sed -i 's/"generation":1/"generation":0/' store/colleague-accounts.json`],
+    ['python writing it', `python3 -c "open('store/colleague-accounts.json','w').write('{}')"`],
+    ['rm of it', `rm store/colleague-accounts.json`],
+  ])('the colleague logins: %s is denied in the install', (_, cmd) => {
+    expect(bash(cmd)).toEqual(DENY_FILE)
+  })
+  it('the board confinement: a read passes in the install, a write passes in the worktree', () => {
+    expect(bash(`cat store/board-access.json | jq .enabled`)).toEqual(ALLOW)
+    expect(bash(`echo '{}' > store/board-access.json`, wt)).toEqual(ALLOW)
   })
   it.each([
     ['cat', `cat .claude/settings.json`],
@@ -662,14 +759,17 @@ describe('4. git: the main checkout and the remote it pulls from', () => {
   })
   // APPROVALDBGATE1030 scope (Marveen 60242, Dani 60251, measured through the install's hook: probes/dbgate-git-scope.sh):
   // an own worktree OUTSIDE the install is free, also from an agent's dir inside it, when the target is a literal path;
-  // a variable, a substitution or a cd chained with ";" leaves the target unknown, and that is the install.
+  // a variable, a substitution or a cd chained with ";" leaves the target unknown, and that is the install -- except a
+  // variable the same command gives one unconditional literal value first (VARDEFDB1121).
   it('an own worktree outside the install, from an agent\'s dir: a literal target passes, an unknown one is the install', () => {
     gitScaffold()
     const agent = join(root, 'agents', 'dani')
     expect(bash('git -C @WT@ checkout -q --detach 0123abc', agent)).toEqual(ALLOW)
     expect(bash('cd @WT@ && git checkout -q --detach 0123abc', agent)).toEqual(ALLOW)
     expect(bash('cd @WT@ && git fetch -q origin main && git merge-tree --write-tree origin/main HEAD', agent)).toEqual(ALLOW)
-    expect(bash('W=@WT@; git -C $W checkout -q --detach 0123abc', agent)).toEqual(DENY_GIT)
+    expect(bash('W=@WT@; git -C $W checkout -q --detach 0123abc', agent)).toEqual(ALLOW)
+    expect(bash('W=@WT@; x=$(date); git -C $W checkout -q --detach 0123abc', agent)).toEqual(DENY_GIT)
+    expect(bash('W=@WT@; W=/tmp/other; git -C $W checkout -q --detach 0123abc', agent)).toEqual(DENY_GIT)
     expect(bash('git -C $(echo @WT@) checkout -q --detach 0123abc', agent).deny).toBe(true)
     expect(GIT_GATE_MSG).toContain('de a celt LITERALIS abszolut uttal add meg: "git -C /Users/marvin/<worktree> ..." vagy "cd /Users/marvin/<worktree> && git ..."')
   })
@@ -864,7 +964,10 @@ describe('4. git: the main checkout and the remote it pulls from', () => {
   })
   it('the deny text names the rescue section by its file', () => {
     // Samu 60400 (APPROVALDBGATE1030): a sqlite3 in a $(...) stays denied; the line names the way round it.
-    expect(DB_GATE_MSG).toContain('Olvasni szabad (SELECT, sqlite3 -readonly), mas tablat irni is (agent_messages, daily_logs). Egy $(...) behelyettesitesben allo sqlite3-at (idezojellel benne) viszont a kapu nem olvassa, es tiltja: futtasd a sqlite3-at kulon parancskent, behelyettesites nelkul')
+    expect(DB_GATE_MSG).toContain('Egy $(...) behelyettesitesben allo sqlite3-at (idezojellel benne) viszont a kapu nem olvassa, es tiltja: futtasd a sqlite3-at kulon parancskent, behelyettesites nelkul')
+    // CHANINBOUNDFORGE1125: the text says what stays open on agent_messages, and what does not
+    expect(DB_GATE_MSG).toContain("UPDATE status/result szabadon; content csak WHERE from_agent='<sajat neved>' mellett")
+    expect(DB_GATE_MSG).toContain('foglalt vagy ismeretlen feladot')
     expect(gateDecision('Bash', { command: 'echo "x: $(sqlite3 -readonly store/claudeclaw.db "SELECT count(*) FROM agent_messages")"' }, { cwd: root, root }))
       .toEqual({ deny: true, reason: 'db' })
     expect(GIT_GATE_MSG).toContain('docs/db-write-gate.md')
@@ -894,7 +997,14 @@ describe('the gate itself', () => {
     expect(d.status).toBe(0)
     expect(JSON.parse(d.stdout).hookSpecificOutput.permissionDecision).toBe('deny')
     const w = run({ tool_name: 'Write', cwd: '/tmp', tool_input: { file_path: join(REPO, 'store', 'autonomy-config.json'), content: '{}' } })
-    expect(JSON.parse(w.stdout).hookSpecificOutput.permissionDecisionReason).toBe(INSTALL_FILE_GATE_MSG)
+    const autonomy = join(REPO, 'store', 'autonomy-config.json')
+    expect(JSON.parse(w.stdout).hookSpecificOutput.permissionDecisionReason).toBe(withCaught(INSTALL_FILE_GATE_MSG, autonomy))
+    // the short deny names what it caught right after the rule: the protected path, the git call
+    const reason = (payload: unknown) => String(JSON.parse(run(payload).stdout).hookSpecificOutput.permissionDecisionReason)
+    const cp = reason({ tool_name: 'Bash', cwd: '/tmp', tool_input: { command: `cp /tmp/x.json ${autonomy}` } })
+    expect(cp).toMatch(/^Telepitesi kapu-fajl irasa TILTOTT [^.]*\. Elkapva: [^.]*autonomy-config\.json/)
+    const git = reason({ tool_name: 'Bash', cwd: REPO, tool_input: { command: 'git status && git reset --hard HEAD~1' } })
+    expect(git).toMatch(/^Git-iras a telepitesben TILTOTT [^.]*\. Elkapva: git status \| git reset --hard HEAD~1\. Helyes ut: /)
     const a = run({ tool_name: 'Bash', cwd: REPO, tool_input: { command: 'ls -la' } })
     expect(a.status).toBe(0)
     expect(a.stdout).toBe('')

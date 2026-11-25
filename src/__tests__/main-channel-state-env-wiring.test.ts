@@ -32,13 +32,16 @@ describe('buildMainSessionRespawnCmd call-site parity', () => {
   // hard restart -- silently, because the launch otherwise succeeds. This is the
   // same shape of check as the channelStateEnv parity test above, for the SAME
   // reason: a hand-maintained list of call sites to fix is the bug's shape, not
-  // its guard. customProviderEnv is a REQUIRED field on the builder's opts (see
-  // channel-monitor.ts), so a call site that omits it fails to compile -- this
+  // its guard. customProviderLaunchEnv is a REQUIRED field on the builder's opts
+  // (see channel-monitor.ts), so a call site that omits it fails to compile -- this
   // test additionally pins that every site resolves it from the live source
   // (buildCustomProviderLaunchEnv(MAIN_AGENT_ID)), not a hardcoded null/stub.
-  it('every call site resolves customProviderEnv from buildCustomProviderLaunchEnv(MAIN_AGENT_ID)', () => {
+  // Distinct from customProviderEnv (HOSTINGERRETEST1125, main-custom-provider-respawn.test.ts):
+  // that one is the main session's OWN Hostinger-style provider; this one is the
+  // per-agent LiteLLM/OpenCode provider. Both can be wired at once.
+  it('every call site resolves customProviderLaunchEnv from buildCustomProviderLaunchEnv(MAIN_AGENT_ID)', () => {
     const sites = MONITOR_SRC.split('= buildMainSessionRespawnCmd({').length - 1
-    const wired = MONITOR_SRC.split('customProviderEnv: buildCustomProviderLaunchEnv(MAIN_AGENT_ID)').length - 1
+    const wired = MONITOR_SRC.split('customProviderLaunchEnv: buildCustomProviderLaunchEnv(MAIN_AGENT_ID)').length - 1
     expect(sites).toBeGreaterThanOrEqual(3)
     expect(wired).toBe(sites)
   })
@@ -66,7 +69,7 @@ describe('buildMainSessionRespawnCmd with a non-Telegram provider', () => {
       config: mainConfigDecisionForTest(),
       continueSession: false,
       channelStateEnv: { name: 'DISCORD_STATE_DIR', dir: '/opt/marveen/.claude/channels/discord' },
-      customProviderEnv: null,
+      customProviderLaunchEnv: null,
     })
     expect(cmd).toContain("export DISCORD_STATE_DIR='/opt/marveen/.claude/channels/discord'")
     expect(cmd).not.toContain('TELEGRAM_STATE_DIR')
@@ -85,7 +88,7 @@ describe('buildMainSessionRespawnCmd with a co-listen extra', () => {
       continueSession: false,
       channelStateEnv: { name: 'TELEGRAM_STATE_DIR', dir: '/opt/marveen/.claude/channels/telegram' },
       extraChannelStateEnvs: [{ name: 'DISCORD_STATE_DIR', dir: '/opt/marveen/.claude/channels/discord' }],
-      customProviderEnv: null,
+      customProviderLaunchEnv: null,
     })
     expect(cmd).toContain("export TELEGRAM_STATE_DIR='/opt/marveen/.claude/channels/telegram'")
     expect(cmd).toContain("export DISCORD_STATE_DIR='/opt/marveen/.claude/channels/discord'")
@@ -101,7 +104,7 @@ describe('buildMainSessionRespawnCmd with a co-listen extra', () => {
       config: mainConfigDecisionForTest(),
       continueSession: false,
       channelStateEnv: { name: 'TELEGRAM_STATE_DIR', dir: '/s' },
-      customProviderEnv: null,
+      customProviderLaunchEnv: null,
     })
     expect(cmd).not.toContain('_STATE_DIR=undefined')
   })

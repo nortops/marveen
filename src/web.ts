@@ -2,18 +2,28 @@ import http from 'node:http'
 import { existsSync, mkdirSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { execFileSync } from 'node:child_process'
 import { runLsof } from './lsof.js'
-import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID, STORE_DIR } from './config.js'
+import { readPortHolder, selectReclaimVictims } from './port-reclaim.js'
+import { PROJECT_ROOT, WEB_HOST, WEB_PUBLIC_PORT, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID, STORE_DIR } from './config.js'
 import { watchEgressAllowlistBaseline, queueAllowlistReport } from './web/egress-allowlist-baseline.js'
 import { loadOrCreateDashboardToken } from './web/dashboard-auth.js'
 import { gateRequest, requiresAuth, type AuthResult } from './web/auth-gate.js'
+import { isPublicRequest, issueSetupCode, markPublicRequest, publicListenerPort, SETUP_CODE_TTL_MS } from './web/public-access.js'
 import { createAgentTokenResolver } from './web/agent-tokens.js'
 import { operatorGateDecision } from './web/operator-gate.js'
 import { readOperatorAccess } from './web/operator-access.js'
+import { boardGateDecision, readBoardAccess } from './web/board-access.js'
+import { tryHandleBoard } from './web/routes/board.js'
+import { colleagueGateDecision } from './web/colleague-gate.js'
+import { approverGateDecision } from './web/approver-gate.js'
+import { lanLockPreAuth, lanLockActiveNow, keepOnlyColleagueCookie, LAN_LOCK_CUT_OFF } from './web/colleague-lan-lock.js'
+import { tryHandleColleague } from './web/routes/colleague.js'
+import { sweepExpiredColleagueSessions } from './web/colleague-sessions.js'
 import { tryHandleOperatorAccess } from './web/routes/operator-access.js'
 import { tryHandleSupportAccess } from './web/routes/support-access.js'
 import { startSupportReconcile } from './web/support-standby-runtime.js'
+import { startRotationBackend, defaultRotationBackendDeps } from './web/claude-rotation-backend.js'
+import { withRotationLock } from './web/claude-rotation-lock.js'
 import { tryHandleOperator } from './web/routes/operator.js'
 import { sweepExpiredSessions } from './web/auth-sessions.js'
 import { sweepExpiredDeviceKeys } from './web/auth-device-keys.js'
@@ -22,13 +32,14 @@ import { json } from './web/http-helpers.js'
 import { detectLanIp } from './web/network-info.js'
 import { AGENTS_BASE_DIR, listAgentNames, listAllAgentNames } from './web/agent-config.js'
 import { forEachAgentIsolated } from './web/agent-seed-loop.js'
-import { ensureRotationHeartbeatTask } from './web/claude-rotation-heartbeat.js'
-import { ensureAgentHooks, ensureProjectRootInClaudeMd, ensureAgentStalenessHook, ensureAgentProvenanceHook, ensureEgressGate, ensureBashEgressDeny, ensureBashEgressParser, ensureMainScopeBashEgressParser, ensureGovernanceGateCommands, ensureTelegramCopyGate, ensureChildClaudeGuard, ensureWebSearchEnvelope, ensureExtraHookEntries, ensureQuarantineReader, watchEgressAllowlistForReaderRender, ensureDefaultScheduledTasks, agentSettingsPath, ensureAutonomySection, ensureSkillsPathTrapSection, ensureSystemDirectiveAuthSection, ensureAgentIdHeaderSection, ensureMemorySearchLabelSection, ensureFleetAuthSection, ensureEvidenceSection, ensureMcpListChannelSection, ensureMessageCloseSection, ensureApiHelperSection, ensureBackgroundCheckpointSection, ensurePaneAtEscapeSection } from './web/agent-scaffold.js'
+import { retireRotationHeartbeatTask } from './web/claude-rotation-heartbeat.js'
+import { ensureAgentHooks, ensureProjectRootInClaudeMd, ensureAgentStalenessHook, ensureAgentProvenanceHook, ensureEgressGate, ensureBashEgressDeny, ensureBashEgressParser, ensureMainScopeBashEgressParser, ensureGovernanceGateCommands, ensureTelegramCopyGate, ensureChildClaudeGuard, ensureWebSearchEnvelope, ensureExtraHookEntries, ensureMainScopeExtraHookEntries, extraHooksConfigPath, ensureQuarantineReader, watchEgressAllowlistForReaderRender, ensureDefaultScheduledTasks, agentSettingsPath, ensureAutonomySection, ensureSkillsPathTrapSection, ensureSystemDirectiveAuthSection, ensureAgentIdHeaderSection, ensureMemorySearchLabelSection, ensureMemoryFactChangeSection, ensureFleetAuthSection, ensureEvidenceSection, ensureMcpListChannelSection, ensureMessageCloseSection, ensureApiHelperSection, ensureBackgroundCheckpointSection, ensurePaneAtEscapeSection } from './web/agent-scaffold.js'
 import { shouldRegisterHooks, shouldRunBackgroundServices, ALLOW_SECOND_INSTANCE_SERVICES_KEY, pruneStaleHooksFromSettingsFile } from './web/hook-registration-guard.js'
+import { extraHookScriptNames } from './web/extra-hook-entries.js'
 import { mainAgentConfigDirIfSeparate } from './web/agent-process.js'
 import { refreshMarveenBotUsername } from './web/telegram.js'
 import { startMessageRouter } from './web/message-router.js'
-import { createAgentMessage } from './db.js'
+import { countDashboardUsers, createAgentMessage } from './db.js'
 import { setOwnerChatMissingSink, setOwnerRelayLang, setOwnerRelaySink } from './notify.js'
 import { approvalTextLang } from './web/agent-text-lang.js'
 import { startUpdateChecker } from './web/update-checker.js'
@@ -59,6 +70,7 @@ import { tryHandleSecurity } from './web/routes/security.js'
 import { tryHandleBridgeServicePorts } from './web/routes/bridge-service-ports.js'
 import { tryHandleProfiles } from './web/routes/profiles.js'
 import { tryHandleMessages } from './web/routes/messages.js'
+import { tryHandleCompanion } from './web/routes/companion.js'
 import { tryHandleFederation } from './web/routes/federation.js'
 import { startFederationPoller } from './web/federation/poller.js'
 import { registerBuiltinCommands } from './web/builtin-commands.js'
@@ -91,6 +103,7 @@ import { tryHandleConnectors } from './web/routes/connectors.js'
 import { tryHandleDocs } from './web/routes/docs.js'
 import { tryHandleResearch } from './web/routes/research.js'
 import { tryHandleConnectorsHu } from './web/routes/connectors-hu.js'
+import { tryHandleAgentPackages } from './web/routes/agent-packages.js'
 import { tryHandleAgentsSkills } from './web/routes/agents-skills.js'
 import { tryHandleSkills } from './web/routes/skills.js'
 import { tryHandleReviewAction } from './web/routes/review-action.js'
@@ -106,6 +119,8 @@ import { tryHandleOnboarding } from './web/routes/onboarding.js'
 import { tryHandleStatus } from './web/routes/status.js'
 import { tryHandleAutonomy } from './web/routes/autonomy.js'
 import { tryHandleApprovals, startApprovalTimeoutSweeper, startApprovalReactionSweeper } from './web/routes/approvals.js'
+import { registerAgentCreateConsumer, sweepAgentCreateOnStart } from './web/agent-create-approval.js'
+import { startGromzoDecisionWatch } from './web/agent-create-gromzo.js'
 import { tryHandleDesktopLock, sweepExpiredDesktopLock } from './web/routes/desktop-lock.js'
 import { tryHandleFleetFreeze } from './web/routes/fleet-freeze.js'
 import { initGromzoConsentWatch, tryHandleGromzo } from './web/routes/gromzo.js'
@@ -126,6 +141,8 @@ import { tryHandleVoice } from './web/routes/voice.js'
 import { tryHandleVaultSsh } from './web/routes/vault-ssh.js'
 import { tryHandleFleet } from './web/routes/fleet.js'
 import { tryHandleVaultSshKeys } from './web/routes/vault-ssh-keys.js'
+import { tryHandleVaultWebLogins } from './web/routes/vault-web-logins.js'
+import { startAgentBrowserWatchdog } from './web/agent-browser.js'
 import { tryHandleCustomProviders } from './web/routes/custom-providers.js'
 import type { RouteContext } from './web/routes/types.js'
 import { isMalformedBodyError } from './web/malformed-body.js'
@@ -190,6 +207,20 @@ export function startWebServer(port = 3420): http.Server {
       return
     }
 
+    // COLLANLOCK1120 (colleague-lan-lock.ts): while the colleague LAN lock is active, a non-loopback peer on the plain
+    // listener is decided here, on the socket's own address, BEFORE authentication: the colleague surface keeps only its
+    // own mv_colleague cookie (COLLCOOKIE1121), the browser login routes (owner password, TOTP, setup code, operator key)
+    // are refused, and every other request goes on to the gate below with all its cookies dropped, so only a header or
+    // query credential can authenticate it.
+    const lan = lanLockPreAuth({ req, path, method, publicListener: isPublicRequest(req) }, () => lanLockActiveNow(WEB_HOST))
+    if (lan.action === 'deny') {
+      res.writeHead(403, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Forbidden from this network', rule: 'colleague-lan-lock', reason: lan.result.status === 403 ? lan.result.reason : undefined }))
+      return
+    }
+    if (lan.action === 'strip-cookies') delete req.headers.cookie
+    if (lan.action === 'colleague-cookie-only') keepOnlyColleagueCookie(req.headers)
+
     // Auth gate: resolve the request's principal once via the extracted gate
     // (bearer -> SSE ?token= -> endpoint-scoped federation token -> mv_session
     // cookie). Bearer stays highest precedence and byte-identical, so every
@@ -204,8 +235,33 @@ export function startWebServer(port = 3420): http.Server {
       dashboardToken: DASHBOARD_TOKEN,
       resolveAgentToken,
       mainAgentId: MAIN_AGENT_ID,
+      publicListener: isPublicRequest(req),
     })
     if (auth === null) return
+    // Colleague board login (colleague-gate.ts): a colleague session reaches
+    // /api/board, /api/colleague and its own page only. Decided here, for EVERY
+    // path (public ones and pages too), before any handler runs.
+    const colleagueDenied = colleagueGateDecision(auth, path, method)
+    if (colleagueDenied) {
+      if (colleagueDenied.status === 302) {
+        res.writeHead(302, { Location: colleagueDenied.location, 'Cache-Control': 'no-store' })
+        res.end()
+        return
+      }
+      logger.warn({ path, method, colleague: auth.kind === 'colleague' ? auth.colleague : undefined, reason: colleagueDenied.reason }, 'colleague gate: denied')
+      res.writeHead(403, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Forbidden for this credential', rule: 'colleague-scope', reason: colleagueDenied.reason }))
+      return
+    }
+    // DELEGAPPROVER1123 (approver-gate.ts): an approver session reaches its sign-in and the approval decision only,
+    // decided here for EVERY path, before any handler runs.
+    const approverDenied = approverGateDecision(auth, path, method)
+    if (approverDenied) {
+      logger.warn({ path, method, approver: auth.kind === 'approver' ? auth.user : undefined, reason: approverDenied }, 'approver gate: denied')
+      res.writeHead(403, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Forbidden for this credential', rule: 'approver-scope', reason: approverDenied }))
+      return
+    }
     // DASHOPERATOR1005: an operator-scoped key reaches /api/operator/* only,
     // decided here, before ANY handler (including network-info below) runs.
     if (requiresAuth(path, method)) {
@@ -216,6 +272,16 @@ export function startWebServer(port = 3420): http.Server {
         res.end(JSON.stringify({ error: 'Forbidden for this credential', reason: operatorDenied }))
         return
       }
+      // Scoped board (board-access.ts): a sub-agent token listed in
+      // store/board-access.json is kept off the whole /api/kanban* family and
+      // served by /api/board/* only; /api/board/* is refused to everyone else.
+      const boardDenied = boardGateDecision(auth, path, () => readBoardAccess())
+      if (boardDenied) {
+        logger.warn({ path, method, agent: auth.kind === 'token' ? auth.tokenAgent : undefined, reason: boardDenied }, 'board gate: denied')
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Forbidden for this credential', rule: 'board-scope', reason: boardDenied }))
+        return
+      }
     }
     const fedPeerForCtx: string | null = auth.kind === 'federation' ? auth.peer : null
     const ctxAuth =
@@ -223,6 +289,9 @@ export function startWebServer(port = 3420): http.Server {
       : auth.kind === 'device' ? { kind: 'device' as const, device: auth.device, deviceId: auth.deviceId, scope: auth.scope }
       : auth.kind === 'session' ? { kind: 'session' as const, user: auth.user }
       : auth.kind === 'federation' ? { kind: 'federation' as const, peer: auth.peer }
+      : auth.kind === 'setup' ? { kind: 'setup' as const }
+      : auth.kind === 'colleague' ? { kind: 'colleague' as const, colleague: auth.colleague, person: auth.person }
+      : auth.kind === 'approver' ? { kind: 'approver' as const, user: auth.user }
       : undefined
 
     // The mobile-login QR needs a URL the phone can actually reach. When the
@@ -240,11 +309,13 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleAuth(routeCtx)) return
       if (await tryHandleOperatorAccess(routeCtx)) return
       if (await tryHandleOperator(routeCtx, WEB_DIR)) return
+      if (await tryHandleColleague(routeCtx, WEB_DIR)) return
       if (await tryHandleSupportAccess(routeCtx)) return
       if (await tryHandleSecurity(routeCtx)) return
       if (await tryHandleBridgeServicePorts(routeCtx)) return
       if (await tryHandleProfiles(routeCtx)) return
       if (await tryHandleMessages(routeCtx)) return
+      if (await tryHandleCompanion(routeCtx)) return
       if (await tryHandleFederation(routeCtx)) return
       if (await tryHandleDailyLog(routeCtx)) return
       if (await tryHandlePrLedger(routeCtx)) return
@@ -253,6 +324,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleHomoglyphs(routeCtx)) return
       if (await tryHandleMemories(routeCtx)) return
       if (await tryHandleMigrate(routeCtx)) return
+      if (await tryHandleBoard(routeCtx)) return
       if (await tryHandleKanban(routeCtx)) return
       if (await tryHandleKanbanProjects(routeCtx)) return
       if (await tryHandleHeartbeat(routeCtx)) return
@@ -261,6 +333,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleConnectors(routeCtx)) return
       if (await tryHandleDocs(routeCtx)) return
       if (await tryHandleResearch(routeCtx)) return
+      if (await tryHandleAgentPackages(routeCtx)) return
       if (await tryHandleAgentsSkills(routeCtx)) return
       if (await tryHandleReviewAction(routeCtx)) return
       if (await tryHandleSkills(routeCtx)) return
@@ -296,6 +369,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleSettings(routeCtx)) return
       if (await tryHandleVoice(routeCtx)) return
       if (await tryHandleVaultSshKeys(routeCtx)) return
+      if (await tryHandleVaultWebLogins(routeCtx)) return
       if (await tryHandleVaultSsh(routeCtx)) return
       if (await tryHandleCustomProviders(routeCtx)) return
       if (await tryHandleAuditLog(routeCtx)) return
@@ -333,33 +407,18 @@ export function startWebServer(port = 3420): http.Server {
 
   server.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE') {
-      // Try to reclaim the port only if the listener is another node/dashboard
-      // process owned by us. Blind `lsof -ti | xargs kill -9` would take down
-      // whatever happens to be on the port (e.g. an unrelated dev server),
-      // and under launchd it also race-kills the not-yet-dead predecessor.
+      // Try to reclaim the port only from THIS install's own dashboard (a predecessor that has not exited yet).
+      // Blind `lsof -ti | xargs kill -9` would take down whatever happens to be on the port, and "any same-user
+      // node process" took down the live CRM when a dashboard was started on its port (PORTRECLAIM1123).
       logger.warn({ port }, 'Web port foglalt, probalok felszabaditani...')
       try {
         const pidsRaw = (runLsof(['-ti', `:${port}`], 3000) ?? '').trim()
         const pids = pidsRaw.split('\n').map(s => s.trim()).filter(Boolean).map(Number).filter(n => Number.isFinite(n) && n > 0)
         const uid = typeof process.getuid === 'function' ? process.getuid() : null
-        const victims: number[] = []
-        for (const pid of pids) {
-          if (pid === process.pid) continue
-          let cmd = ''
-          try {
-            cmd = execFileSync('/bin/ps', ['-p', String(pid), '-o', 'comm='], { timeout: 2000, encoding: 'utf-8' }).trim()
-          } catch { continue }
-          if (uid !== null) {
-            try {
-              const ownerUid = parseInt(execFileSync('/bin/ps', ['-p', String(pid), '-o', 'uid='], { timeout: 2000, encoding: 'utf-8' }).trim(), 10)
-              if (Number.isFinite(ownerUid) && ownerUid !== uid) continue
-            } catch { continue }
-          }
-          if (!/node|tsx/i.test(cmd)) {
-            logger.warn({ port, pid, cmd }, 'Port held by non-node process -- refusing to kill')
-            continue
-          }
-          victims.push(pid)
+        const { victims, foreign } = selectReclaimVictims(pids, process.pid, readPortHolder, PROJECT_ROOT, uid)
+        for (const { pid, holder } of foreign) {
+          // The command line can carry secrets in its arguments: only its first word goes into the log.
+          logger.warn({ port, pid, cmd: holder.command.split(/\s+/)[0] ?? '' }, 'Port held by a process that is not this install\'s dashboard -- refusing to stop it')
         }
         for (const pid of victims) {
           try { process.kill(pid, 'SIGTERM') } catch { /* already gone */ }
@@ -388,8 +447,40 @@ export function startWebServer(port = 3420): http.Server {
     }
   })
 
+  // DOCKERHTTPS1119: the public listener (public-access.ts). Same handler; each of its requests is marked public
+  // first, so the gate accepts only browser cookies on it. Only when WEB_PUBLIC_PORT is set (first-boot, with
+  // MARVEEN_DOMAIN); the compose file never publishes this port to the host, Caddy reaches it on the compose network.
+  const publicPort = publicListenerPort({ WEB_PUBLIC_PORT })
+  if (publicPort !== null && publicPort !== port) {
+    const publicServer = http.createServer((req, res) => {
+      markPublicRequest(req)
+      server.emit('request', req, res)
+    })
+    publicServer.on('error', (err) => logger.error({ err, port: publicPort }, 'public listener error'))
+    publicServer.listen(publicPort, WEB_HOST, () => {
+      logger.info({ port: publicPort }, 'Web dashboard: public listener (cookies only)')
+      // The one-time setup code, while no dashboard login exists: to stdout (the container log), never to the
+      // structured log, and only its hash is kept.
+      if (countDashboardUsers(true) === 0) {
+        const code = issueSetupCode()
+        const site = DASHBOARD_PUBLIC_URL || 'your HTTPS address'
+        process.stdout.write(
+          `\n  Marveen setup code (one use, valid ${SETUP_CODE_TTL_MS / 3600000} hours): ${code}\n` +
+          `  Open ${site} and enter it to set the dashboard password. Restart the container for a new code.\n\n`,
+        )
+      }
+    })
+  }
+
   server.listen(port, WEB_HOST, () => {
     logger.info({ port }, `Web dashboard: http://localhost:${port}`)
+    // COLLANLOCK1120: name what an active colleague LAN lock cuts off, so the owner sees it in the log at once.
+    try {
+      if (lanLockActiveNow(WEB_HOST)) {
+        logger.warn({ webHost: WEB_HOST, cutOffFromNonLoopback: LAN_LOCK_CUT_OFF },
+          'colleague LAN lock active: from the LAN the owner cannot sign in to the dashboard (the login is refused and every browser cookie outside the colleague board is ignored); the colleague board and header/query credentials pass; the owner gets in from this machine, through Tailscale Serve, an SSH tunnel or the HTTPS public listener. Machine tokens still cross plain HTTP unencrypted.')
+      }
+    } catch { /* a startup log line never stops the server */ }
     // Do NOT log the bearer token: launchd/journal/pipe captures of the
     // structured log would otherwise carry a root-equivalent credential.
     // Printing to stderr keeps it out of the pino stream -- but under launchd
@@ -528,6 +619,8 @@ export function startWebServer(port = 3420): http.Server {
   const pluginMonitorInterval = servicesOff ? undefined : startChannelPluginMonitor()
   // SUPPORTKULCS1109 (terv-v7 3.8): the support reconcile, shortly after the start and then daily.
   if (!servicesOff) startSupportReconcile()
+  // PLANROTATEDEADLOCK1115: the plan rotation runs here, with no agent turn (an exhausted main agent cannot run one).
+  const rotationBackend = servicesOff ? undefined : startRotationBackend()
   if (!servicesOff) logger.info('Channel plugin health monitor started (60s poll)')
 
   // Userbot inbound-probe (gold-standard deafness detector). Safe no-op until
@@ -624,6 +717,11 @@ export function startWebServer(port = 3420): http.Server {
   // Sweep timed-out pending approvals every minute
   const approvalTimeoutInterval = startApprovalTimeoutSweeper()
   const approvalReactionInterval = startApprovalReactionSweeper()
+  // AGENTCREATEPR2-1119: the agent_create consumer, and the start-up sweep of requests decided while it could not run
+  registerAgentCreateConsumer()
+  void sweepAgentCreateOnStart().catch((err) => logger.error({ err }, 'agent_create start-up sweep failed'))
+  // AGENTCREATEPR3-1119: the owner's Gromzo answers to agent_create rows, read from mxd every 15 s
+  if (!servicesOff) startGromzoDecisionWatch()
 // Desktop-lock TTL sweeper. Independent of the schedule gate on purpose: an
 // abandoned lock must expire (and be reported) even on a day when no
 // desktop-driving round happens to be due.
@@ -638,6 +736,8 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
       if (swept > 0) logger.info({ swept }, 'Expired auth sessions swept')
       const sweptKeys = sweepExpiredDeviceKeys()
       if (sweptKeys > 0) logger.info({ swept: sweptKeys }, 'Expired device keys swept')
+      const sweptColleague = sweepExpiredColleagueSessions()
+      if (sweptColleague > 0) logger.info({ swept: sweptColleague }, 'Expired colleague board sessions swept')
     } catch (err) {
       logger.warn({ err }, 'Auth session sweep failed')
     }
@@ -652,6 +752,9 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
       .catch(err => logger.warn({ err }, 'Startup token usage collection failed'))
     logger.info('Token usage auto-collect started (1h poll + startup)')
   }
+
+  // VAULTLOGIN1112: every sub-agent a vault web login allows keeps its own browser running (a no-op with none).
+  if (!servicesOff) startAgentBrowserWatchdog()
 
   // NOTE: startMcpListChecker() is intentionally NOT called here.
   //
@@ -686,6 +789,7 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
     ensureSystemDirectiveAuthSection(MAIN_AGENT_ID)
     ensureAgentIdHeaderSection(MAIN_AGENT_ID)
     ensureMemorySearchLabelSection(MAIN_AGENT_ID)
+    ensureMemoryFactChangeSection(MAIN_AGENT_ID)
     ensureFleetAuthSection(MAIN_AGENT_ID)
     ensureEvidenceSection(MAIN_AGENT_ID)
     ensureMcpListChannelSection(MAIN_AGENT_ID)
@@ -744,6 +848,8 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
       // settings and only while the switch is on. FIRST, because ensureBashEgressDeny
       // below reads it to decide whether the main agent may lose the legacy rules.
       if (ensureMainScopeBashEgressParser()) logger.info({ path: '.claude/settings.local.json' }, 'bash-egress-parser --main-scope hook (un)registered to follow BASH_EGRESS_HOST_ALLOW')
+      // The main agent's install-local extras (store/extra-hooks.json, "scope": "main") into the same file.
+      if (ensureMainScopeExtraHookEntries()) logger.info({ path: '.claude/settings.local.json' }, 'main-scope extra hook entries (store/extra-hooks.json) synced')
       // Include the main agent (MAIN_AGENT_ID) so the voice hook is also seeded
       // into ~/.claude/settings.json alongside existing hooks (e.g. telegram_progress.py).
       // listALLAgentNames, not listAgentNames (HBGATEWIRE826): the
@@ -753,11 +859,13 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
       // digest-provenance-gate included), and heartbeat-worker froze at the
       // partial set from its last pre-hiding seed. Hidden technical workers
       // need the guard hooks MORE than visible agents, not less.
+      // A hook the install moved into local-hooks/ counts as ours for the prune below.
+      const extraHookNames = extraHookScriptNames(extraHooksConfigPath())
       forEachAgentIsolated([MAIN_AGENT_ID, ...listAllAgentNames()], (agentName) => {
         // Self-heal FIRST: drop entries this app previously wrote whose script
         // file no longer exists (e.g. a deleted worktree instance's paths), so
         // the re-registration below lands on a clean, unblocked settings file.
-        pruned.push(...pruneStaleHooksFromSettingsFile(agentSettingsPath(agentName)))
+        pruned.push(...pruneStaleHooksFromSettingsFile(agentSettingsPath(agentName), extraHookNames, PROJECT_ROOT))
         if (ensureAgentHooks(agentName)) patched.push(agentName)
         // HOSTMOVE923: same guard as the hook writes -- a worktree instance must
         // not re-anchor the live fleet's CLAUDE.md onto ITS root.
@@ -833,15 +941,14 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
       logger.warn({ err }, 'Scheduled tasks seed skipped')
     }
 
-    // Claude plan rotation needs its heartbeat task; installs that turned
-    // rotation on before this was automatic (or updated into it) get it here.
-    // Never overwrites an existing task, and honors an operator's deletion.
-    try {
-      const seeded = ensureRotationHeartbeatTask({ respectRemoval: true })
-      if (seeded === 'created') logger.info('Claude rotation heartbeat task created')
-      if (seeded === 'upgraded') logger.info('Claude rotation heartbeat prompt upgraded (sub-agent lines)')
-    } catch (err) {
-      logger.warn({ err }, 'Claude rotation heartbeat seed skipped')
+    // PLANROTATEDEADLOCK1115 P5: the plan rotation runs in the backend (startRotationBackend above), so the old
+    // main-agent task is no longer seeded; it is retired here instead, in the branch its seed used (it writes the
+    // user-global dir too) and only with the services on, like the backend: an unedited seed is removed, an edited
+    // one switched off and the owner told once. Under the rotation lock: it writes the side-car.
+    if (!servicesOff) {
+      void withRotationLock(() => retireRotationHeartbeatTask(defaultRotationBackendDeps()))
+        .then((r) => { if (r.result !== 'none') logger.info({ result: r.result, told: r.told }, 'Old Claude rotation heartbeat task retired') })
+        .catch((err) => logger.warn({ err }, 'Old Claude rotation heartbeat task retirement failed'))
     }
   }
 
@@ -863,6 +970,7 @@ setInterval(() => { try { sweepExpiredDesktopLock() } catch { /* never kill the 
     clearInterval(routerInterval)
     clearInterval(scheduleInterval)
     clearInterval(heartbeatGapInterval)
+    rotationBackend?.stop()
     if (pluginMonitorInterval) clearInterval(pluginMonitorInterval)
     workerLivenessCancelled = true
     if (workerLivenessInterval) clearInterval(workerLivenessInterval)

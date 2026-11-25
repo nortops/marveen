@@ -18,13 +18,13 @@ export interface RouteContext {
   /** Resolved auth principal for this request, set by the gate. Absent means
    *  the request carried no valid credential (only possible on ungated public
    *  paths, which are reached without a principal). `user` is set for the
-   *  'session' kind; `peer` mirrors fedPeer for the 'federation' kind;
+   *  'session' and 'approver' (DELEGAPPROVER1123, ../approver-access.ts) kinds; `peer` mirrors fedPeer for the 'federation' kind;
    *  `device` is the key name for the 'device' kind. `agent` is the caller's
    *  SELF-ASSERTED fleet-agent id (X-Agent-Id, 'token' kind only): validated
    *  against the roster but NOT authenticated -- one shared token means it can
    *  be typed by anyone, so it may warn and attribute, never authorize.
    *  Lets routes distinguish a human session from a token/fleet caller. */
-  auth?: { kind: 'token' | 'session' | 'federation' | 'device'; user?: string; peer?: string; device?: string; deviceId?: number; agent?: string; scope?: 'full' | 'operator'
+  auth?: { kind: 'token' | 'session' | 'federation' | 'device' | 'setup' | 'colleague' | 'approver'; user?: string; peer?: string; device?: string; deviceId?: number; agent?: string; scope?: 'full' | 'operator' | 'messenger' | 'companion'
     /** Set only for kind 'token' when the bearer was a sub-agent's OWN token
      *  (agents/<name>/.dashboard-token, AGENT_TOKENS; `agent` then carries the
      *  same name). AUTHENTICATED, unlike `agent` on the shared token: by the
@@ -36,7 +36,12 @@ export interface RouteContext {
      *  stay bound to the caller enforces it in the write itself, as
      *  PUT /api/messages/:id does with closeMessageAsRecipient. Authorization
      *  decisions read THIS field, never `agent`. */
-    tokenAgent?: string }
+    tokenAgent?: string
+    /** Set only for kind 'colleague' (a colleague board login, colleague-sessions.ts): the account's username and the
+     *  board-access.json person it acts as. Both come from the server-side session and account, never from the
+     *  request. The colleague gate (colleague-gate.ts) keeps this kind on /api/board and /api/colleague only. */
+    colleague?: string
+    person?: string }
 }
 
 export type RouteHandler = (ctx: RouteContext) => Promise<boolean>

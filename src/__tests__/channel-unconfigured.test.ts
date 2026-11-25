@@ -310,7 +310,7 @@ describe('the TS respawn builder and the monitor', () => {
     continueSession: false,
     mainAgentId: 'marveen',
     pluginId: 'telegram@claude-plugins-official',
-    customProviderEnv: null,
+    customProviderLaunchEnv: null,
   }
   it('unconfigured: no --channels at all', () => {
     expect(buildMainSessionRespawnCmd({ ...base, channelConfigured: false })).not.toContain('--channels')

@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3'
 import { join } from 'node:path'
 import { existsSync, mkdirSync, readFileSync, renameSync, chmodSync, openSync, closeSync, statSync } from 'node:fs'
-import { STORE_DIR, DB_FILENAME, ALLOWED_CHAT_ID, OLLAMA_URL, APP_TZ, EMBED_URL, EMBED_MODEL, EMBED_DIMS, MAIN_AGENT_ID } from './config.js'
+import { STORE_DIR, DB_FILENAME, ALLOWED_CHAT_ID, OLLAMA_URL, APP_TZ, EMBED_URL, EMBED_API_KEY, EMBED_MODEL, EMBED_DIMS, MAIN_AGENT_ID } from './config.js'
 import { isSearchStopword } from './memory-search-stopwords.js'
 import { getEffectiveSettingValue } from './settings-store.js'
 import { logger } from './logger.js'
@@ -9,6 +9,7 @@ import { TOOL_TIMEOUTS } from './tool-timeouts.js'
 import { triggerLikeClause } from './homoglyph.js'
 import type { LiveKanban } from './web/heartbeat-kanban-verify.js'
 import { compareDeliveryOrder, deliveryRankSql } from './delivery-order.js'
+import { ensureInboundSigKey, rowSigOk, signRow } from './inbound-sig.js'
 import { toBudapestTs, type TsRange } from './date-range.js'
 
 let db: Database.Database
@@ -162,6 +163,48 @@ export function getEmbeddingCacheSize(): number { return embeddingCache.size }
 // STILL gets pre-create + tighten -- this lets the permission tests exercise the
 // tightening logic on a throwaway file instead of touching the prod DB. The
 // STORE_DIR mkdir stays prod-only; a temp-file override owns its own directory.
+/** Test seam (DELEGAPPROVER1123): runs inside the approval_events rebuild, after the old table is dropped and before
+ *  the new one takes its name, so a test can fail the rebuild at its most dangerous point. */
+let approvalEventsRebuildHookForTest: (() => void) | null = null
+export function _setApprovalEventsRebuildHookForTest(fn: (() => void) | null): void { approvalEventsRebuildHookForTest = fn }
+
+/**
+ * DELEGAPPROVER1123: rebuilds approval_events so its CHECK accepts 'decided'. The whole rebuild (new table, copy, drop,
+ * rename, index) is ONE transaction (BEGIN IMMEDIATE ... COMMIT, ROLLBACK on any error): a failure or a crash midway
+ * leaves the original audit table and every row of it as they were, and the next start runs it again. Idempotent: a
+ * table that already accepts 'decided' (or a fresh one) is left alone. Throws after the rollback.
+ */
+function migrateApprovalEventsDecided(): void {
+  const aeSchema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='approval_events'").get() as { sql: string } | undefined
+  if (!aeSchema?.sql || aeSchema.sql.includes("'decided'")) return
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    db.exec(`
+      CREATE TABLE approval_events_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        approval_id TEXT NOT NULL,
+        event TEXT NOT NULL CHECK(event IN ('consumed','consume_refused','consumed_backfill','decided')),
+        reason TEXT,
+        actor TEXT,
+        ref TEXT,
+        created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+      )
+    `)
+    db.exec(`
+      INSERT INTO approval_events_new (id, approval_id, event, reason, actor, ref, created_at)
+        SELECT id, approval_id, event, reason, actor, ref, created_at FROM approval_events
+    `)
+    db.exec('DROP TABLE approval_events')
+    approvalEventsRebuildHookForTest?.()
+    db.exec('ALTER TABLE approval_events_new RENAME TO approval_events')
+    db.exec('CREATE INDEX IF NOT EXISTS idx_approval_events_approval ON approval_events(approval_id, created_at)')
+    db.exec('COMMIT')
+  } catch (err) {
+    if (db.inTransaction) db.exec('ROLLBACK')
+    throw err
+  }
+}
+
 export function initDatabase(dbPathOverride?: string): void {
   embeddingCache.clear() // ids are per database: a re-init (tests, ':memory:') must not reuse vectors
   const useOverride = dbPathOverride !== undefined
@@ -1227,6 +1270,20 @@ export function initDatabase(dbPathOverride?: string): void {
   // every row whose sender did not ask; the only stored value is 'unblocks' (src/web/unblocks-interrupt.ts). Unlike
   // urgent, the flag is the main agent's own explicit field on POST /api/messages, never inferred from the text.
   try { db.exec('ALTER TABLE agent_messages ADD COLUMN affects_current_work TEXT') } catch { /* exists */ }
+  // HMACINBOUND1125: the server's HMAC over the row's fields (src/inbound-sig.ts). NULL on every older row and on a
+  // row written while the key was missing; such a row never gets the owner's voice or a STOP/urgent/priority effect.
+  try { db.exec('ALTER TABLE agent_messages ADD COLUMN inbound_sig TEXT') } catch { /* exists */ }
+  // HMACINBOUND1125 (Dani 85038, 1): the delivery log of signed rows that speak with the owner's voice or carry a
+  // flag. A signed row verifies forever, so a delivered one put back to pending by a raw UPDATE would speak again;
+  // `delivered` counts the deliveries and `allowed` the ones the server granted (1, plus one per server re-queue,
+  // requeueDeliveredOpenForAgent). In SECURITY_TABLES (scripts/self-pace-gate.mjs), so no agent writes it.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS inbound_sig_log (
+      msg_id INTEGER PRIMARY KEY,
+      delivered INTEGER NOT NULL DEFAULT 0,
+      allowed INTEGER NOT NULL DEFAULT 1
+    )
+  `)
 
   // INVARIANT: a row that says 'delivered' must carry a delivered_at.
   //
@@ -1716,6 +1773,28 @@ export function initDatabase(dbPathOverride?: string): void {
     )
   `)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_vault_ssh_servers_name ON vault_ssh_servers(name)`)
+
+  // --- Vault web logins (VAULTLOGIN1112) ---
+  // The password lives in the AES-256-GCM vault as web-login-<id>; this row holds only what is not secret. An empty
+  // allowed_agents list ('[]', the default) means no agent may log in with it. locked_at is set after a wrong password
+  // and cleared only by the owner (the unlock route).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS vault_web_logins (
+      id TEXT PRIMARY KEY,
+      origin TEXT NOT NULL,
+      username TEXT NOT NULL,
+      login_url TEXT,
+      user_selector TEXT,
+      pass_selector TEXT,
+      allowed_agents TEXT NOT NULL DEFAULT '[]',
+      locked_at INTEGER,
+      last_result TEXT,
+      last_attempt_at INTEGER,
+      last_agent TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `)
   // Migrations for installs that ran earlier schema versions. MUST run before
   // the ssh_key_id index below: on an install where vault_ssh_servers already
   // existed (pre-dating this column), CREATE TABLE IF NOT EXISTS above is a
@@ -1807,10 +1886,67 @@ export function initDatabase(dbPathOverride?: string): void {
     'decided_by_ts TEXT', 'binding TEXT', 'notice_ts TEXT',
     // APPROVALTAGEN1108: the language the post was made in (its words decide); NULL = hu, as every older row.
     'lang TEXT',
+    // AGENTCREATEPR3-1119: the content hash of a hash-bound request (agent_create) the post showed; the reply decides
+    // against it. NULL for every other category and every older row (they bind the posted text only).
+    'content_hash TEXT',
   ]) {
     try { db.exec(`ALTER TABLE approval_slack_posts ADD COLUMN ${col}`) } catch { /* already exists */ }
   }
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_slack_posts_decided_by ON approval_slack_posts(channel, decided_by_ts) WHERE decided_by_ts IS NOT NULL')
+  // TEAMSAPPROVECARD1118: the Teams approval card the SERVER posted for one request (web/approval-teams-card.ts).
+  // conversation_id + activity_id name the posted card, so a click counts only on that card; owner_aad is a snapshot of
+  // TEAMS_OWNER_AAD_OBJECT_ID at posting; content_hash is the request's anchor the card showed; nonce_sha256 is the hash
+  // of the one-time value only the card carries. decided_at closes the row once; decided_activity_id / decided_by_aad
+  // are the audit of the click that decided (the request itself gets resolved_by = 'teams_card').
+  // AGENTCREATEPR2-1119: the stored spec behind an agent_create approval. spec_json is the canonical JSON the owner was
+  // shown (the text is rendered from it) and content_hash its sha256, equal to the approvals row's. The consumer stamps
+  // consumed_at in the same transaction as the approval's consume, then the outcome. A security table.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_create_specs (
+      approval_id TEXT PRIMARY KEY,
+      spec_json TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      requested_by TEXT NOT NULL,
+      requested_at INTEGER NOT NULL,
+      consumed_at INTEGER,
+      created_agent TEXT,
+      outcome TEXT,
+      outcome_at INTEGER
+    )
+  `)
+  // A security table: the db-write-gate denies an agent's write on it, like approvals.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS approval_teams_cards (
+      approval_id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      activity_id TEXT NOT NULL,
+      owner_aad TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      nonce_sha256 TEXT NOT NULL,
+      card_sha256 TEXT NOT NULL,
+      lang TEXT NOT NULL,
+      posted_at INTEGER NOT NULL,
+      decided_at INTEGER,
+      decision TEXT,
+      decided_activity_id TEXT,
+      decided_by_aad TEXT
+    )
+  `)
+  // AGENTCREATEPR3-1119: an approval posted to the owner's Gromzo app through mxd's decisions verbs. mxd_hash is the hash
+  // mxd computed over the posted row (the one its consume is spent against); spec_hash is the approval's content hash the
+  // posted row showed (the core decides against it, never the approval's current hash). state: pending (waiting for the owner's
+  // answer), consuming (the answer was approve and mxd's consume is under way), done, failed. A security table.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS approval_gromzo_posts (
+      approval_id TEXT PRIMARY KEY,
+      mxd_hash TEXT NOT NULL,
+      spec_hash TEXT NOT NULL,
+      state TEXT NOT NULL,
+      posted_at INTEGER NOT NULL,
+      updated_at INTEGER,
+      note TEXT
+    )
+  `)
   // Every consume call leaves a row here, the refused ones too: a second send
   // attempt on a used approval is exactly the event worth seeing afterwards.
   // consumed_backfill is for a one-off data fix of rows a past send never
@@ -1819,13 +1955,20 @@ export function initDatabase(dbPathOverride?: string): void {
     CREATE TABLE IF NOT EXISTS approval_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       approval_id TEXT NOT NULL,
-      event TEXT NOT NULL CHECK(event IN ('consumed','consume_refused','consumed_backfill')),
+      event TEXT NOT NULL CHECK(event IN ('consumed','consume_refused','consumed_backfill','decided')),
       reason TEXT,
       actor TEXT,
       ref TEXT,
       created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
     )
   `)
+  // DELEGAPPROVER1123: 'decided' is an approver's decision (who, on which scope, on which content hash). SQLite cannot
+  // alter a CHECK, so a table created before it is rebuilt once, rows and ids kept (migrateApprovalEventsDecided).
+  try {
+    migrateApprovalEventsDecided()
+  } catch (err) {
+    logger.warn({ err }, 'approval_events decided-event migration failed and was rolled back -- continuing')
+  }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_approval_events_approval ON approval_events(approval_id, created_at)`)
 
   // --- Control-bot custom commands (CMD920 3.12) ---
@@ -1880,6 +2023,33 @@ export function initDatabase(dbPathOverride?: string): void {
       disabled INTEGER NOT NULL DEFAULT 0
     )
   `)
+  // DOCKERHTTPS1119: whether the login's TOTP second factor is on. The secret lives in store/.dashboard-totp.json
+  // (0600); this flag is the record that it EXISTS, in a table the agent DB-write gate protects, so deleting or
+  // emptying that file cannot turn the second factor off: the login fails closed (503) instead.
+  const dashUserCols = (db.prepare('PRAGMA table_info(dashboard_users)').all() as { name: string }[]).map((c) => c.name)
+  if (!dashUserCols.includes('totp_enabled')) db.exec('ALTER TABLE dashboard_users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0')
+  // DELEGAPPROVER1123: the login's role. 'owner' is every login that existed before (the column's default), and every
+  // login created the old ways (POST /api/auth/users, the dashboard-user CLI). 'approver' is a human the owner lets
+  // decide approval requests within approver_scopes, and nothing else: it is never the owner (routes/auth.ts
+  // mayActAsOwner refuses it), it signs in only with TOTP, and its session is fenced to the approval routes
+  // (approver-gate.ts).
+  if (!dashUserCols.includes('role')) {
+    db.exec("ALTER TABLE dashboard_users ADD COLUMN role TEXT NOT NULL DEFAULT 'owner' CHECK(role IN ('owner','approver'))")
+  }
+  // DELEGAPPROVER1123: what an approver may decide: one row per (login, category, agent), agent '*' for every agent.
+  // Only the owner writes it (routes/auth.ts /api/auth/approvers); a removed row is gone (the approver's sessions go
+  // with it, auth-sessions.ts revokeAllForUser), so a live scope is simply an existing row.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS approver_scopes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      category TEXT NOT NULL,
+      agent TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      created_by TEXT,
+      UNIQUE(user_id, category, agent)
+    )
+  `)
   // Browser login sessions. NOT named `sessions` -- that table already maps
   // Telegram chats to Claude session ids. Only sha256(session_id) is stored, so
   // a DB leak does not hand out live sessions. Rows survive dashboard restarts;
@@ -1921,6 +2091,11 @@ export function initDatabase(dbPathOverride?: string): void {
   // DASHOPERATOR1005: what a key may reach. 'full' = every existing key and the
   // default, so this column changes nothing until an 'operator' key is minted.
   try { db.exec(`ALTER TABLE device_keys ADD COLUMN scope TEXT NOT NULL DEFAULT 'full'`) } catch { /* column already exists */ }
+  // FIGURAKULCS1125: a 'companion' key's own limits. companion_recipients is a JSON array of agent ids the key may send
+  // to (null = the main agent only); bound_ip the one source address it is accepted from (null = any, the default).
+  // Null on every other key, so these change nothing until a companion key is minted.
+  try { db.exec(`ALTER TABLE device_keys ADD COLUMN companion_recipients TEXT`) } catch { /* column already exists */ }
+  try { db.exec(`ALTER TABLE device_keys ADD COLUMN bound_ip TEXT`) } catch { /* column already exists */ }
 
   // --- OTel Distributed Tracing (card def5a189) ---
   // SQLite-native span store. No external OTel SDK: spans are written via
@@ -2070,16 +2245,22 @@ export interface DashboardUser {
   created_at: number
   updated_at: number
   disabled: number
+  /** DOCKERHTTPS1119: 1 while the TOTP second factor is on (the secret itself is in store/.dashboard-totp.json). */
+  totp_enabled: number
+  /** DELEGAPPROVER1123: 'owner' (every login before it, and the default) or 'approver'. */
+  role: DashboardUserRole
 }
 
-export type DashboardUserPublic = Omit<DashboardUser, 'password_hash'>
+export type DashboardUserRole = 'owner' | 'approver'
 
-export function createDashboardUser(username: string, passwordHash: string): DashboardUser {
+export type DashboardUserPublic = Omit<DashboardUser, 'password_hash' | 'totp_enabled'>
+
+export function createDashboardUser(username: string, passwordHash: string, role: DashboardUserRole = 'owner'): DashboardUser {
   const now = Math.floor(Date.now() / 1000)
   const info = db
-    .prepare('INSERT INTO dashboard_users (username, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?)')
-    .run(username, passwordHash, now, now)
-  return { id: Number(info.lastInsertRowid), username, password_hash: passwordHash, created_at: now, updated_at: now, disabled: 0 }
+    .prepare('INSERT INTO dashboard_users (username, password_hash, created_at, updated_at, role) VALUES (?, ?, ?, ?, ?)')
+    .run(username, passwordHash, now, now, role)
+  return { id: Number(info.lastInsertRowid), username, password_hash: passwordHash, created_at: now, updated_at: now, disabled: 0, totp_enabled: 0, role }
 }
 
 export function getDashboardUser(username: string): DashboardUser | undefined {
@@ -2090,7 +2271,7 @@ export function getDashboardUser(username: string): DashboardUser | undefined {
 
 export function listDashboardUsers(): DashboardUserPublic[] {
   return db
-    .prepare('SELECT id, username, created_at, updated_at, disabled FROM dashboard_users ORDER BY username COLLATE NOCASE')
+    .prepare('SELECT id, username, created_at, updated_at, disabled, role FROM dashboard_users ORDER BY username COLLATE NOCASE')
     .all() as DashboardUserPublic[]
 }
 
@@ -2105,6 +2286,52 @@ export function countDashboardUsers(includeDisabled = false): number {
 export function updateDashboardUserPassword(userId: number, passwordHash: string): void {
   db.prepare('UPDATE dashboard_users SET password_hash = ?, updated_at = ? WHERE id = ?')
     .run(passwordHash, Math.floor(Date.now() / 1000), userId)
+}
+
+/** DOCKERHTTPS1119: the record that the TOTP second factor is on for this user (see dashboard-totp.ts). */
+export function setDashboardUserTotpEnabled(userId: number, enabled: boolean): void {
+  db.prepare('UPDATE dashboard_users SET totp_enabled = ?, updated_at = ? WHERE id = ?')
+    .run(enabled ? 1 : 0, Math.floor(Date.now() / 1000), userId)
+}
+
+/** DELEGAPPROVER1123: the role of a session's login, read on every request that carries a session cookie (so a role or
+ *  a disable takes effect at once). undefined when the login row is gone. */
+export function getDashboardUserAccess(userId: number): Pick<DashboardUser, 'role' | 'disabled' | 'totp_enabled'> | undefined {
+  return db.prepare('SELECT role, disabled, totp_enabled FROM dashboard_users WHERE id = ?').get(userId) as
+    Pick<DashboardUser, 'role' | 'disabled' | 'totp_enabled'> | undefined
+}
+
+/** DELEGAPPROVER1123: turn an approver login off (the caller revokes its sessions in the same step). */
+export function disableApproverUser(userId: number): boolean {
+  return db.prepare("UPDATE dashboard_users SET disabled = 1, updated_at = ? WHERE id = ? AND role = 'approver'")
+    .run(Math.floor(Date.now() / 1000), userId).changes > 0
+}
+
+export interface ApproverScope {
+  id: number
+  user_id: number
+  category: string
+  /** The requesting agent's id, or '*' for every agent. */
+  agent: string
+  created_at: number
+  created_by: string | null
+}
+
+export function listApproverScopes(userId?: number): ApproverScope[] {
+  return (userId === undefined
+    ? db.prepare('SELECT * FROM approver_scopes ORDER BY user_id, category, agent').all()
+    : db.prepare('SELECT * FROM approver_scopes WHERE user_id = ? ORDER BY category, agent').all(userId)) as ApproverScope[]
+}
+
+/** Adds a scope; false when the same (login, category, agent) row already exists. */
+export function addApproverScope(userId: number, category: string, agent: string, createdBy: string | null): boolean {
+  return db.prepare('INSERT OR IGNORE INTO approver_scopes (user_id, category, agent, created_at, created_by) VALUES (?, ?, ?, ?, ?)')
+    .run(userId, category, agent, Math.floor(Date.now() / 1000), createdBy).changes > 0
+}
+
+export function removeApproverScope(userId: number, category: string, agent: string): boolean {
+  return db.prepare('DELETE FROM approver_scopes WHERE user_id = ? AND category = ? AND agent = ?')
+    .run(userId, category, agent).changes > 0
 }
 
 export function deleteDashboardUser(username: string): boolean {
@@ -2341,9 +2568,12 @@ function withoutRank<T extends { rank: number }>(rows: T[]): Omit<T, 'rank'>[] {
   return rows.map(({ rank: _rank, ...rest }) => rest)
 }
 
+// MEMCHATID1123: no chat_id filter. One install has one owner and one memory store; the column carried whatever
+// chat id the WRITER had (the API and the daily-log mirror ALLOWED_CHAT_ID, the nightly digest the resolved owner
+// chat), so a filter on one of them hid the other's rows, and every row written before a change of ALLOWED_CHAT_ID.
+// The writers and the column are unchanged.
 export function searchMemories(
   query: string,
-  chatId: string,
   limit = 3,
   allowRelaxed = true,
   category?: string,
@@ -2358,10 +2588,10 @@ export function searchMemories(
       db.prepare(
         `SELECT m.*, f.rank AS rank FROM memories m
          JOIN memories_fts f ON m.id = f.rowid
-         WHERE f.memories_fts MATCH ? AND m.chat_id = ?${category ? ' AND m.category = ?' : ''} AND m.retracted_at IS NULL${dt.sql}
+         WHERE f.memories_fts MATCH ?${category ? ' AND m.category = ?' : ''} AND m.retracted_at IS NULL${dt.sql}
          ORDER BY rank
          LIMIT ?`
-      ).all(terms, chatId, ...(category ? [category] : []), ...dt.params, limit * RECENCY_OVERSAMPLE) as (Memory & { rank: number })[]
+      ).all(terms, ...(category ? [category] : []), ...dt.params, limit * RECENCY_OVERSAMPLE) as (Memory & { rank: number })[]
       , allowRelaxed)
     if (trace) trace.relaxed = relaxed
     return withoutRank(reRankByRecency(rows, limit)) as Memory[]
@@ -2459,7 +2689,8 @@ export function decayMemories(): void {
 // staleBefore (card ca046c9a, #570): only rows whose LAST WRITE
 // (updated_at, or created_at when it was never updated) is older than this
 // unix time -- the "hot for a week and nobody touched it" view.
-export function getMemoriesForChat(chatId: string, limit = 10, offset = 0, category?: string, range?: TsRange, staleBefore?: number): Memory[] {
+// MEMCHATID1123: every row of the store, no chat_id filter (see searchMemories).
+export function getMemoriesForChat(limit = 10, offset = 0, category?: string, range?: TsRange, staleBefore?: number): Memory[] {
   // id DESC tie-break (#947): accessed_at has 1-second granularity, so a bulk
   // import leaves hundreds of rows sharing one value; without a stable
   // secondary sort SQLite may order the ties differently between queries, and
@@ -2476,8 +2707,8 @@ export function getMemoriesForChat(chatId: string, limit = 10, offset = 0, categ
   const dt = tsClause('created_at', range)
   const stale = staleBefore !== undefined ? ' AND COALESCE(updated_at, created_at) < ?' : ''
   return db
-    .prepare(`SELECT * FROM memories WHERE chat_id = ?${category ? ' AND category = ?' : ''} AND retracted_at IS NULL${dt.sql}${stale} ORDER BY accessed_at DESC, id DESC LIMIT ? OFFSET ?`)
-    .all(chatId, ...(category ? [category] : []), ...dt.params, ...(staleBefore !== undefined ? [staleBefore] : []), limit, offset) as Memory[]
+    .prepare(`SELECT * FROM memories WHERE retracted_at IS NULL${category ? ' AND category = ?' : ''}${dt.sql}${stale} ORDER BY accessed_at DESC, id DESC LIMIT ? OFFSET ?`)
+    .all(...(category ? [category] : []), ...dt.params, ...(staleBefore !== undefined ? [staleBefore] : []), limit, offset) as Memory[]
 }
 
 // --- In-process memory cache (TTL-based) ---
@@ -2843,8 +3074,9 @@ export function updateMemory(id: number, content: string, category?: string, age
   // live and stay correct, while hybridSearch keeps fusing the stale vector's
   // ranking in. Dropping it to NULL hands the row back to backfillEmbeddings,
   // which processes exactly `WHERE embedding IS NULL` and is therefore
-  // idempotent and resumable. Deliberately NOT regenerating here: that would
-  // put a synchronous Ollama call in the path of a DB write.
+  // idempotent and resumable. Deliberately NOT regenerating synchronously here:
+  // that would put an Ollama call in the path of a DB write. The asynchronous
+  // re-embed after the write (REEMBEDONUPDATE1117, below) fills it in.
   //
   // The trigger is the embedded TEXT changing, which is content AND keywords:
   // both saveAgentMemory and backfillEmbeddings embed `content + ' ' + keywords`,
@@ -2855,7 +3087,8 @@ export function updateMemory(id: number, content: string, category?: string, age
   // resends the unchanged body on a category-only edit), so presence alone says
   // nothing about a change.
   const keywordsChanged = keywords !== undefined && (before?.keywords ?? null) !== keywords
-  if (before && (before.content !== content || keywordsChanged)) {
+  const embeddedTextChanged = !!before && (before.content !== content || keywordsChanged)
+  if (embeddedTextChanged) {
     sets.push('embedding = NULL')
     sets.push('embedding_model = NULL')
   }
@@ -2878,6 +3111,17 @@ export function updateMemory(id: number, content: string, category?: string, age
     } else {
       if (before?.agent_id) memoryCacheInvalidate(before.agent_id)
       if (agentId && agentId !== before?.agent_id) memoryCacheInvalidate(agentId)
+    }
+    // REEMBEDONUPDATE1117: re-embed the new text right away, fire-and-forget,
+    // the same way saveAgentMemory does. Without this the row stayed NULL until
+    // the next backfill (the nightly Dream Engine round), so for up to a day
+    // the vector half of hybrid search could not see a freshly edited memory.
+    // It stays off the write path: scheduleEmbedding never blocks, a backend
+    // outage just leaves the NULL for backfill as before, and its UPDATE is
+    // guarded by `content = ? AND keywords IS ?`, so a slow reply for text
+    // that has been edited again in the meantime is discarded, not stored.
+    if (embeddedTextChanged) {
+      scheduleEmbedding(id, content, keywords !== undefined ? keywords : (before?.keywords ?? undefined))
     }
   }
   return changed
@@ -5082,6 +5326,8 @@ export interface AgentMessage {
   // REPLAYNOENVELOPE1114: when requeueDeliveredOpenForAgent put this delivered row back to pending (see the
   // migration). Optional in the type for the same reason as urgent; null on every row it did not touch.
   redelivered_at?: number | null
+  // HMACINBOUND1125: the server's signature (src/inbound-sig.ts), null on an unsigned row.
+  inbound_sig?: string | null
 }
 
 export function createAgentMessage(
@@ -5104,11 +5350,25 @@ export function createAgentMessage(
   const priority: 0 | 1 = opts?.priority === 1 ? 1 : 0
   const remoteRef = opts?.remoteRef ?? null
   const affectsCurrentWork = opts?.affectsCurrentWork ?? null
-  const info = db.prepare(
-    'INSERT INTO agent_messages (from_agent, to_agent, content, status, created_at, origin_note, trace_id, span_id, parent_span_id, urgent, stop_authorized, priority, remote_ref, affects_current_work) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(from, to, content, 'pending', now, originNote ?? null, traceCtx?.trace_id ?? null, traceCtx?.span_id ?? null, traceCtx?.parent_span_id ?? null, urgent, stopAuthorized, priority, remoteRef, affectsCurrentWork)
+  // HMACINBOUND1125: insert and sign in one transaction; the signature covers the id, which exists only after the
+  // insert. The dashboard creates the key at boot; this creates it too when missing (this process is the server). A
+  // store that cannot hold it leaves the row unsigned: delivered as an ordinary, untrusted row.
+  const key = ensureInboundSigKey()
+  let inboundSig: string | null = null
+  const id = db.transaction(() => {
+    const info = db.prepare(
+      'INSERT INTO agent_messages (from_agent, to_agent, content, status, created_at, origin_note, trace_id, span_id, parent_span_id, urgent, stop_authorized, priority, remote_ref, affects_current_work) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(from, to, content, 'pending', now, originNote ?? null, traceCtx?.trace_id ?? null, traceCtx?.span_id ?? null, traceCtx?.parent_span_id ?? null, urgent, stopAuthorized, priority, remoteRef, affectsCurrentWork)
+    const newId = Number(info.lastInsertRowid)
+    if (key) {
+      inboundSig = signRow({ id: newId, from_agent: from, to_agent: to, content, created_at: now, stop_authorized: stopAuthorized, urgent, priority, affects_current_work: affectsCurrentWork }, key)
+      db.prepare('UPDATE agent_messages SET inbound_sig = ? WHERE id = ?').run(inboundSig, newId)
+    }
+    return newId
+  })()
+  if (!key) logger.warn({ id, from, to }, 'agent message written unsigned: the inbound signature key is missing (store/.inbound-sig-key)')
   return {
-    id: Number(info.lastInsertRowid),
+    id,
     from_agent: from, to_agent: to, content, status: 'pending',
     result: null, created_at: now, delivered_at: null, seen_at: null, completed_at: null,
     origin_note: originNote ?? null,
@@ -5121,6 +5381,7 @@ export function createAgentMessage(
     remote_ref: remoteRef,
     affects_current_work: affectsCurrentWork,
     redelivered_at: null,
+    inbound_sig: inboundSig,
   }
 }
 
@@ -5151,12 +5412,51 @@ export function getMessageStatus(id: number): string | null {
 // it stored: review point 1, a priority only reorders peer traffic), a granted peer high, the rest.
 export function getPendingMessages(toAgent?: string): AgentMessage[] {
   const rank = deliveryRankSql()
-  if (toAgent) {
-    return db.prepare(`SELECT * FROM agent_messages WHERE status = 'pending' AND to_agent = ? ORDER BY ${rank.sql} DESC, created_at ASC, id ASC`)
+  const rows = toAgent
+    ? db.prepare(`SELECT * FROM agent_messages WHERE status = 'pending' AND to_agent = ? ORDER BY ${rank.sql} DESC, created_at ASC, id ASC`)
       .all(toAgent, ...rank.params) as AgentMessage[]
-  }
-  return db.prepare(`SELECT * FROM agent_messages WHERE status = 'pending' ORDER BY ${rank.sql} DESC, created_at ASC, id ASC`)
-    .all(...rank.params) as AgentMessage[]
+    : db.prepare(`SELECT * FROM agent_messages WHERE status = 'pending' ORDER BY ${rank.sql} DESC, created_at ASC, id ASC`)
+      .all(...rank.params) as AgentMessage[]
+  return withTrustedFlags(rows)
+}
+
+// HMACINBOUND1125: the delivery log (inbound_sig_log). True when this row's deliveries already used up what the
+// server granted: a delivered signed row that was put back to pending without a server re-queue.
+export function signedRowReplayed(id: number): boolean {
+  const r = db.prepare('SELECT delivered, allowed FROM inbound_sig_log WHERE msg_id = ?').get(id) as { delivered: number; allowed: number } | undefined
+  return r !== undefined && r.delivered >= r.allowed
+}
+
+// HMACINBOUND1125 (Dani, #3117 review 2): true when a signed row was DELIVERED more often than the server allowed: a
+// delivered row put back to pending by a raw UPDATE and delivered again. A row's first, legitimate delivery leaves
+// delivered = allowed, so this is `>`, not the `>=` signedRowReplayed uses before a delivery.
+export function signedRowOverDelivered(id: number): boolean {
+  const r = db.prepare('SELECT delivered, allowed FROM inbound_sig_log WHERE msg_id = ?').get(id) as { delivered: number; allowed: number } | undefined
+  return r !== undefined && r.delivered > r.allowed
+}
+
+// HMACINBOUND1125: count one delivery of a signed row. markMessageDelivered and closeMessagesWithoutDelivery do it
+// themselves; drain-inbox calls this one after it classified the rows claimPendingForAgent already marked delivered
+// (the claim must not count them, or the classification right after it would read every claimed row as a replay).
+export function recordSignedDelivery(id: number): void {
+  recordSignedDeliveryIfSigned(id)
+}
+
+// HMACINBOUND1125: the flags that change delivery (STOP, urgent, priority, unblock) count only on a row the server
+// signed and that is not a replay. Applied where the queue is READ, so no caller of these readers can act on a
+// forged flag. The row keeps every other field; a neutralized row no longer verifies, which is right: it is not a
+// row the server wrote. The order is restored afterwards, because the SQL ranked the rows by the raw flags.
+function withTrustedFlags(rows: AgentMessage[]): AgentMessage[] {
+  let changed = false
+  const out = rows.map((m) => {
+    const flagged = (m.stop_authorized ?? 0) !== 0 || (m.urgent ?? 0) !== 0 || (m.priority ?? 0) !== 0 || m.affects_current_work != null
+    if (!flagged) return m
+    if (rowSigOk(m) && !signedRowReplayed(m.id)) return m
+    changed = true
+    logger.warn({ id: m.id, from: m.from_agent, to: m.to_agent, signed: m.inbound_sig != null }, 'agent message flags ignored: the row is not server-signed or is a replay (HMACINBOUND1125)')
+    return { ...m, stop_authorized: 0, urgent: 0, priority: 0 as const, affects_current_work: null }
+  })
+  return changed ? out.sort(compareDeliveryOrder) : out
 }
 
 // Card ad771121 (K3): the high rows one sender got accepted for one recipient since `sinceSec`. Keyed
@@ -5192,7 +5492,20 @@ export function lastMessageFromAgentAt(agent: string): number | null {
 // result either.
 export function markMessageDelivered(id: number): boolean {
   const now = Math.floor(Date.now() / 1000)
-  return db.prepare("UPDATE agent_messages SET status = 'delivered', delivered_at = ? WHERE id = ? AND status = 'pending'").run(now, id).changes > 0
+  return db.transaction(() => {
+    const ok = db.prepare("UPDATE agent_messages SET status = 'delivered', delivered_at = ? WHERE id = ? AND status = 'pending'").run(now, id).changes > 0
+    // HMACINBOUND1125: every delivery of a signed row counts against what the server granted (inbound_sig_log).
+    if (ok) recordSignedDeliveryIfSigned(id)
+    return ok
+  })()
+}
+
+function recordSignedDeliveryIfSigned(id: number): void {
+  db.prepare(
+    `INSERT INTO inbound_sig_log (msg_id, delivered, allowed)
+       SELECT id, 1, 1 FROM agent_messages WHERE id = ? AND inbound_sig IS NOT NULL
+     ON CONFLICT(msg_id) DO UPDATE SET delivered = delivered + 1`,
+  ).run(id)
 }
 
 // Freshness/supersession signal (SB hardening 2026-08-22): how many STRICTLY
@@ -5428,7 +5741,13 @@ export function closeMessagesWithoutDelivery(ids: number[], reason: string): num
   )
   const run = db.transaction((rows: number[]) => {
     let n = 0
-    for (const id of rows) n += stmt.run(now, note, id).changes
+    for (const id of rows) {
+      const c = stmt.run(now, note, id).changes
+      // HMACINBOUND1125: a row closed without delivery is used up too, so a raw UPDATE back to pending cannot revive
+      // it with the owner's voice or its flags.
+      if (c) recordSignedDeliveryIfSigned(id)
+      n += c
+    }
     return n
   })
   return run(ids)
@@ -5486,11 +5805,11 @@ export function claimPendingForAgent(toAgent: string, limit: number): AgentMessa
          ORDER BY ${rank.sql} DESC, created_at ASC, id ASC
          LIMIT ?
        )
-     RETURNING id, from_agent, to_agent, content, status, result, created_at, delivered_at, seen_at, completed_at, priority, urgent, stop_authorized, redelivered_at`,
+     RETURNING id, from_agent, to_agent, content, status, result, created_at, delivered_at, seen_at, completed_at, priority, urgent, stop_authorized, redelivered_at, affects_current_work, inbound_sig`,
   ).all(now, now, toAgent, ...rank.params, limit) as AgentMessage[]
   // RETURNING row order is unspecified; restore the delivery order (card ad771121: high first, then
-  // FIFO with id as the tiebreaker for same-second inserts).
-  return rows.sort(compareDeliveryOrder)
+  // FIFO with id as the tiebreaker for same-second inserts). HMACINBOUND1125: untrusted flags neutralized first.
+  return withTrustedFlags(rows).sort(compareDeliveryOrder)
 }
 
 export function markMessageDone(id: number, result?: string): boolean {
@@ -5675,9 +5994,16 @@ export function requeueDeliveredOpenForAgent(agent: string, opts: RequeueDeliver
     const skip = db.prepare(
       `UPDATE agent_messages SET requeue_skipped_at = ? WHERE id = ? AND ${guards}`
     )
+    // HMACINBOUND1125: this server re-queue is a granted redelivery, so a signed row it puts back may speak once more
+    // (a raw UPDATE back to pending has no such grant and is caught as a replay).
+    const grant = db.prepare('UPDATE inbound_sig_log SET allowed = allowed + 1 WHERE msg_id = ?')
     return {
       rows,
-      revive: (m) => revive.run(now, now, m.id).changes === 1,
+      revive: (m) => {
+        if (revive.run(now, now, m.id).changes !== 1) return false
+        grant.run(m.id)
+        return true
+      },
       skip: (m) => skip.run(now, m.id).changes === 1,
     }
   })
@@ -6090,8 +6416,13 @@ export function appendTaskRun(name: string, agent: string, status = 'fired'): nu
   return Number(info.lastInsertRowid)
 }
 
-/** How a run ENDED. Distinct from `status`, which is how it was dispatched. */
-export type TaskRunOutcome = 'done' | 'abandoned' | 'lost' | 'interrupted'
+/**
+ * How a run ENDED. Distinct from `status`, which is how it was dispatched.
+ * 'unauth' (DOCKERUNAUTHRUN1118): the session took the prompt and went idle, but its only reply was Claude Code's
+ * "Not logged in" authentication error, so nothing ran. Not 'done': duration statistics and once-task success
+ * filter on 'done' and must not count it.
+ */
+export type TaskRunOutcome = 'done' | 'abandoned' | 'lost' | 'interrupted' | 'unauth'
 
 /**
  * Close a run. Idempotent by design: the WHERE clause refuses to overwrite an
@@ -6107,6 +6438,15 @@ export function setTaskRunDelivery(runId: number, verdict: string): boolean {
   const info = db.prepare(
     'UPDATE task_runs SET delivery = ? WHERE id = ? AND delivery IS NULL'
   ).run(verdict, runId)
+  return info.changes > 0
+}
+
+/**
+ * TASKRUNERRDUP1109: an attempt that opened its run row and then failed: that row becomes the 'error' run and is closed
+ * now (an already-closed row keeps its completed_at). No second row. Returns true when the row was updated.
+ */
+export function markTaskRunFireError(runId: number, now = Date.now()): boolean {
+  const info = db.prepare("UPDATE task_runs SET status = 'error', completed_at = COALESCE(completed_at, ?) WHERE id = ?").run(now, runId)
   return info.changes > 0
 }
 
@@ -6214,10 +6554,9 @@ export function listTaskRunHistory(name: string, limit: number): TaskRunHistoryE
 // not counted until someone decides it opens a run.
 //   fired, fired_late, fired_busy: the scheduler's typed and queued fires
 //   sent-direct: the direct heartbeat digest (DIRECT_DIGEST_RUN_STATUS)
-//   error: a fire that failed. Kept as before: when the send throws after the
-//     'fired' row was written, this is a second row for the same attempt, and
-//     the row alone cannot tell that case apart from a fire that failed before
-//     any row was opened.
+//   error: a fire that failed. One row per failed attempt: when the throw comes
+//     after the run row was written, that row is turned into the error
+//     (markTaskRunFireError, TASKRUNERRDUP1109) instead of a second row.
 const RUN_OPENING_STATUSES = ['fired', 'fired_late', 'fired_busy', 'sent-direct', 'error'] as const
 const RAN_STATUS_SQL = `status IN (${RUN_OPENING_STATUSES.map(s => `'${s}'`).join(', ')})`
 
@@ -6374,6 +6713,14 @@ export function clearPendingTaskRetryOwnerAlert(taskName: string, agentName: str
 // the same outage stay at debug so a machine without Ollama does not fill
 // the log; a success re-arms the warning for the next outage.
 let embeddingBackendWarned = false
+// The structured fields of the latest embedding failure, for the backfill warning (null after a success).
+let lastEmbedFailure: EmbedFailureFields | null = null
+
+// The error code of the latest failure. Read through a function: inside backfillEmbeddings TypeScript narrows the
+// module-level variable to null after its reset and would not see the assignments the embedding calls make.
+function lastEmbedErrCode(): string | undefined {
+  return lastEmbedFailure?.errCode
+}
 
 // Pure: which level the next embedding failure is logged at.
 export function decideEmbeddingFailureLevel(alreadyWarned: boolean): 'warn' | 'debug' {
@@ -6418,22 +6765,108 @@ function embedKeepAlive(): string | number | undefined {
   try { return parseEmbedKeepAlive(String(getEffectiveSettingValue('EMBED_KEEP_ALIVE') ?? '')) } catch { return undefined }
 }
 
+// #3023: a CPU-only host embeds about 40 ms per character, so a 2000-character chunk can overrun the deadline, and the
+// abandoned calls pile up behind Ollama's single slot. Both limits are settings, read per call; the defaults are the
+// previous fixed values. A value that is not a positive integer (set outside the settings UI) falls back to the default.
+export const DEFAULT_EMBED_MAX_CHARS = 2000
+function positiveIntSetting(key: string): number | undefined {
+  try {
+    const n = Number(getEffectiveSettingValue(key))
+    return Number.isSafeInteger(n) && n > 0 ? n : undefined
+  } catch { return undefined }
+}
+export function embedMaxChars(): number {
+  return positiveIntSetting('EMBED_MAX_CHARS') ?? DEFAULT_EMBED_MAX_CHARS
+}
+export function embedTimeoutMs(): number {
+  const s = positiveIntSetting('EMBED_TIMEOUT_SECONDS')
+  return s !== undefined ? s * 1000 : TOOL_TIMEOUTS['ollama-embedding']
+}
+
+// The embedding key must never reach a log line, so an embedding failure is logged as STRUCTURED fields only: the
+// error name, its code (ECONNREFUSED, ENOTFOUND, ...) and the HTTP status. Neither the error text (fetch can quote
+// the request URL or a rejected header value) nor the EMBED_URL content is ever logged: the key belongs in
+// EMBED_API_KEY, and whatever else is in EMBED_URL does not appear in the error log. This removes the whole class of
+// spellings (raw, percent-encoded, double-encoded, in the host, port, userinfo, path or query) instead of chasing them.
+class EmbedHttpError extends Error {
+  constructor(readonly status: number) {
+    super(`embedding backend answered HTTP ${status}`)
+    this.name = 'EmbedHttpError'
+  }
+}
+
+// The key is a bearer secret, so it only ever travels over TLS or to this very host. Pure: whether `url` may
+// carry the EMBED_API_KEY, i.e. it is https, or http to a loopback host (localhost, 127.0.0.0/8, ::1). Anything
+// else is refused, and so is a string that does not parse: nothing proves it is safe. `url` is the exact string
+// fetch is about to be given. WHATWG URL normalises the host (numeric IPv4 spellings, IPv6 zeros, case), and an
+// anchored test keeps look-alikes such as 127.0.0.1.example.com or localhost.example.com out.
+export function embedUrlMayCarryKey(url: string): boolean {
+  let parsed: URL
+  try { parsed = new URL(url) } catch { return false }
+  if (parsed.protocol === 'https:') return true
+  if (parsed.protocol !== 'http:') return false
+  const host = parsed.hostname
+  return host === 'localhost' || host === '[::1]' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
+}
+
+// Thrown BEFORE any request when a key is set and the URL is not allowed to carry it: the call never leaves
+// the process, and the failure takes the same warn-once path as an unreachable backend.
+class EmbedInsecureUrlError extends Error {
+  readonly code = 'EMBED_INSECURE_URL'
+  constructor() {
+    super('EMBED_API_KEY is set but EMBED_URL is neither https nor loopback; the key is not sent')
+    this.name = 'EmbedInsecureUrlError'
+  }
+}
+
+type EmbedFailureFields = { errName?: string; errCode?: string; httpStatus?: number }
+
+// A name or code is only logged when it is a short plain token, so no free text can ride along in it.
+const SAFE_LOG_TOKEN = /^[A-Za-z0-9_.-]{1,64}$/
+
+function embedFailureFields(err: unknown): EmbedFailureFields {
+  const e = err as { name?: unknown; code?: unknown; cause?: { code?: unknown } } | null | undefined
+  const token = (v: unknown): string | undefined => (typeof v === 'string' && SAFE_LOG_TOKEN.test(v) ? v : undefined)
+  const out: EmbedFailureFields = {}
+  const errName = token(e?.name)
+  const errCode = token(e?.code) ?? token(e?.cause?.code)
+  if (errName) out.errName = errName
+  if (errCode) out.errCode = errCode
+  if (err instanceof EmbedHttpError) out.httpStatus = err.status
+  return out
+}
+
 export async function generateEmbedding(text: string, kind: 'query' | 'document' = 'document'): Promise<number[] | null> {
   try {
     const keepAlive = embedKeepAlive()
-    const resp = await fetch(`${EMBED_URL}/api/embeddings`, {
+    const embedEndpoint = `${EMBED_URL}/api/embeddings`
+    // No request, and no Authorization header, to a plain-http remote host: the key would cross the network in clear.
+    if (EMBED_API_KEY && !embedUrlMayCarryKey(embedEndpoint)) throw new EmbedInsecureUrlError()
+    const resp = await fetch(embedEndpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(EMBED_API_KEY ? { Authorization: `Bearer ${EMBED_API_KEY}` } : {}),
+      },
+      // With a key set, a redirect is an error: the Authorization header must never follow a 3xx to
+      // another host. An Ollama-compatible /api/embeddings endpoint has no reason to redirect.
+      ...(EMBED_API_KEY ? { redirect: 'error' as const } : {}),
       body: JSON.stringify({
         model: EMBED_MODEL,
-        prompt: embedPrefix(kind) + text.slice(0, 2000),
+        prompt: embedPrefix(kind) + text.slice(0, embedMaxChars()),
         ...(keepAlive !== undefined ? { keep_alive: keepAlive } : {}),
       }),
-      signal: AbortSignal.timeout(TOOL_TIMEOUTS['ollama-embedding']),
+      signal: AbortSignal.timeout(embedTimeoutMs()),
     })
+    // An explicit HTTP error (401 from a wrong or missing EMBED_API_KEY, 404 for a missing model) must
+    // surface through the same warn-once path as an unreachable backend; before, its JSON body had no
+    // `embedding` and the call returned null without a trace. `=== false` keeps a bare stub without `ok`
+    // working.
+    if (resp.ok === false) throw new EmbedHttpError(Number(resp.status))
     const data = await resp.json() as { embedding?: number[] }
     if (!data.embedding || data.embedding.length === 0) return null
     embeddingBackendWarned = false
+    lastEmbedFailure = null
     // Matryoshka truncation. Only ever CUT, never pad: slicing a vector that is
     // already shorter than EMBED_DIMS would silently store a dimension that
     // does not match what the model produces.
@@ -6447,11 +6880,17 @@ export async function generateEmbedding(text: string, kind: 'query' | 'document'
     // diagnosable.
     const level = decideEmbeddingFailureLevel(embeddingBackendWarned)
     embeddingBackendWarned = true
+    // Structured fields only: no error text and no EMBED_URL content (see embedFailureFields).
+    lastEmbedFailure = embedFailureFields(err)
     logger[level](
-      { err: (err as Error)?.message ?? String(err), embedUrl: EMBED_URL, embedModel: EMBED_MODEL },
-      level === 'warn'
-        ? 'Embedding generation failed -- embedding backend unreachable or model missing (Ollama not installed/running at EMBED_URL?). Memory search runs FTS-only until it recovers; further failures are logged at debug.'
-        : 'Embedding generation failed (backend still unavailable)',
+      { ...lastEmbedFailure, embedModel: EMBED_MODEL },
+      err instanceof EmbedInsecureUrlError
+        ? (level === 'warn'
+            ? 'Embedding not sent -- EMBED_API_KEY is set but EMBED_URL is neither https nor a loopback address, so the key is never sent over plain http. Use an https EMBED_URL (or drop the key). Memory search runs FTS-only until then; further failures are logged at debug.'
+            : 'Embedding not sent (EMBED_API_KEY with a non-https, non-loopback EMBED_URL)')
+        : level === 'warn'
+          ? 'Embedding generation failed -- embedding backend unreachable or model missing (Ollama not installed/running at EMBED_URL?). Memory search runs FTS-only until it recovers; further failures are logged at debug.'
+          : 'Embedding generation failed (backend still unavailable)',
     )
     return null
   }
@@ -6772,6 +7211,9 @@ export interface BackfillResult {
 export async function backfillEmbeddings(): Promise<BackfillResult> {
   const rows = db.prepare('SELECT id, content, keywords FROM memories WHERE (embedding IS NULL OR (embedding_model IS NOT NULL AND embedding_model != ?)) AND retracted_at IS NULL').all(embedIdentity()) as { id: number; content: string; keywords: string | null }[]
   let count = 0
+  // The failure fields of an EARLIER run must not decorate this run's warning: an empty 200 answer returns null
+  // without touching them, so without the reset a stale errName / httpStatus would be reported as the cause.
+  lastEmbedFailure = null
   for (const row of rows) {
     const text = row.content + (row.keywords ? ' ' + row.keywords : '')
     const emb = await generateEmbedding(text)
@@ -6789,8 +7231,10 @@ export async function backfillEmbeddings(): Promise<BackfillResult> {
     // The 2026-09-24/25 signature: work pending, nothing embedded, no error
     // surfaced. One WARN per run names it.
     logger.warn(
-      { pending: rows.length, embedUrl: EMBED_URL, embedModel: EMBED_MODEL },
-      'Embedding backfill embedded 0 of the pending memories -- the embedding backend answered none of them (Ollama not installed/running, or EMBED_MODEL missing); the backlog stays until it does',
+      { pending: rows.length, ...(lastEmbedFailure ?? {}), embedModel: EMBED_MODEL },
+      lastEmbedErrCode() === 'EMBED_INSECURE_URL'
+        ? 'Embedding backfill embedded 0 of the pending memories -- no request was sent: EMBED_API_KEY is set but EMBED_URL is neither https nor loopback; the backlog stays until EMBED_URL is https (or the key is dropped)'
+        : 'Embedding backfill embedded 0 of the pending memories -- the embedding backend answered none of them (Ollama not installed/running, or EMBED_MODEL missing); the backlog stays until it does',
     )
   }
   return { attempted: rows.length, embedded: count, failed: rows.length - count }
@@ -7991,6 +8435,117 @@ export function resolveApproval(id: string, status: 'approved' | 'rejected' | 't
   `).run(status, now, resolvedBy, telegramMessageId ?? null, id).changes > 0
 }
 
+// AGENTCREATEPR1-1119: the channel-independent decision core. A channel adapter (Slack, the Teams card, later more)
+// verifies on its own who decided, where and on which message, without any agent in the chain; the core then records
+// the decision with the same rules for every channel. The adapters keep their own decision rows (approval_slack_posts,
+// approval_teams_cards) and close them in the same transaction as the core's write.
+
+/** What a channel adapter verified about one decision. */
+export interface ApprovalEvidence {
+  /** The channel whose adapter verified the decision: 'slack', 'teams', ... */
+  channel: string
+  /** How the owner decided there ('reaction', 'reply', 'card'), or the refusal mode that turned it into a rejection. */
+  mode: string
+  /**
+   * The verified ids the audit names in resolved_by, in order (the owner's user id, the deciding message, a refusal
+   * reason). A channel with its own decision row (the Teams card) keeps its ids there and passes none.
+   */
+  trail?: readonly string[]
+}
+
+/** The audit value of a decision: `<channel>_<mode>` and then the trail, colon separated. */
+export function approvalResolvedBy(e: ApprovalEvidence): string {
+  return [`${e.channel}_${e.mode}`, ...(e.trail ?? [])].join(':')
+}
+
+export type ApprovalDecideOutcome = 'decided' | 'not_pending' | 'content_changed' | 'expired'
+
+/**
+ * The core's one write, run INSIDE the caller's transaction. In this order: the request must be pending; when the
+ * adapter showed the owner a content hash, the request must still carry exactly that hash; an approval must come before
+ * the timeout (a rejection may land after it). Only then is the request resolved, and the UPDATE repeats every condition.
+ */
+/**
+ * AGENTCREATEPR2-1119: categories whose approval is bound to content the server stored (agent_create: the spec). Such a
+ * request is approved only when it carries a content hash AND the adapter showed the owner exactly that hash; a missing
+ * hash on either side is never an approval. A rejection needs neither.
+ */
+export const HASH_BOUND_APPROVAL_CATEGORIES: ReadonlySet<string> = new Set(['agent_create'])
+
+function decideApprovalInTx(p: {
+  approvalId: string; status: 'approved' | 'rejected'; resolvedBy: string; expectedContentHash?: string; now: number
+}): ApprovalDecideOutcome {
+  const before = db.prepare('SELECT status, category, content_hash, timeout_at FROM approvals WHERE id = ?').get(p.approvalId) as
+    Pick<Approval, 'status' | 'category' | 'content_hash' | 'timeout_at'> | undefined
+  if (!before || before.status !== 'pending') return 'not_pending'
+  const checksHash = p.expectedContentHash !== undefined
+  // A null is never a hash the owner was shown (a JS caller can still pass one): it matches nothing.
+  if (checksHash && (p.expectedContentHash === null || before.content_hash !== p.expectedContentHash)) return 'content_changed'
+  if (p.status === 'approved' && HASH_BOUND_APPROVAL_CATEGORIES.has(before.category)
+    && (!checksHash || typeof before.content_hash !== 'string' || !before.content_hash)) return 'content_changed'
+  if (p.status === 'approved' && before.timeout_at != null && before.timeout_at <= p.now) return 'expired'
+  const changed = db.prepare(`
+    UPDATE approvals SET status = ?, resolved_at = ?, resolved_by = ?
+    WHERE id = ? AND status = 'pending' AND (? = 0 OR content_hash IS ?) AND (? = 'rejected' OR timeout_at IS NULL OR timeout_at > ?)
+  `).run(p.status, p.now, p.resolvedBy, p.approvalId, checksHash ? 1 : 0, p.expectedContentHash ?? null, p.status, p.now).changes > 0
+  return changed ? 'decided' : 'not_pending'
+}
+
+/**
+ * A category's consumer: what runs after an approval of that category is decided as approved (PR-2: agent_create). It
+ * runs after the transaction committed, at most once per decision; a throw is logged and never undoes the decision.
+ * No category registers one yet: email_send's consumer is still the 30-minute send window on the send path.
+ */
+export type ApprovalConsumer = (approval: Approval) => void
+const approvalConsumers = new Map<string, ApprovalConsumer>()
+
+export function registerApprovalConsumer(category: string, consumer: ApprovalConsumer): void {
+  if (approvalConsumers.has(category)) throw new Error(`approval consumer already registered: ${category}`)
+  approvalConsumers.set(category, consumer)
+}
+
+/** Call only for a decision the core recorded ('decided'); runs the consumer of an approved request's category. */
+function runApprovalConsumer(approvalId: string): void {
+  // The consumer runs after the decision committed (Dani, #2903): inside a caller's transaction a consumer's own write
+  // would commit or roll back with the caller's, and a consumer that creates something must not.
+  if (db.inTransaction) throw new Error('approval consumer called inside a transaction; it runs after the commit')
+  const approval = getApproval(approvalId)
+  if (!approval || approval.status !== 'approved') return
+  const consumer = approvalConsumers.get(approval.category)
+  if (!consumer) return
+  try {
+    consumer(approval)
+  } catch (err) {
+    logger.error({ approvalId, category: approval.category, err: err instanceof Error ? err.message : String(err) }, 'approval consumer failed; the decision stands')
+  }
+}
+
+/**
+ * One decision from a channel adapter that has no decision row of its own, in one transaction, then the category's
+ * consumer. The Slack and Teams adapters call the same core inside their own transactions (decideApprovalFromSlack,
+ * decideApprovalFromTeams).
+ */
+export function decideApproval(p: {
+  approvalId: string; status: 'approved' | 'rejected'; evidence: ApprovalEvidence; expectedContentHash?: string
+  /** DELEGAPPROVER1123: an approval_events 'decided' row, written in the same transaction, only when the core decided. */
+  decidedEvent?: { actor: string; reason: string; ref: string | null }
+}): { outcome: ApprovalDecideOutcome; approval: Approval | undefined } {
+  const outcome = db.transaction(() => {
+    const now = Math.floor(Date.now() / 1000)
+    const o = decideApprovalInTx({
+      approvalId: p.approvalId, status: p.status, resolvedBy: approvalResolvedBy(p.evidence),
+      expectedContentHash: p.expectedContentHash, now,
+    })
+    if (o === 'decided' && p.decidedEvent) {
+      db.prepare('INSERT INTO approval_events (approval_id, event, reason, actor, ref, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(p.approvalId, 'decided', p.decidedEvent.reason, p.decidedEvent.actor, p.decidedEvent.ref, now)
+    }
+    return o
+  })()
+  if (outcome === 'decided') runApprovalConsumer(p.approvalId)
+  return { outcome, approval: getApproval(p.approvalId) }
+}
+
 // APPROVALSLACK1030 (2): the posted request (approval_slack_posts).
 export interface ApprovalSlackPostRow {
   approval_id: string
@@ -8010,17 +8565,18 @@ export interface ApprovalSlackPostRow {
   binding: string | null
   notice_ts: string | null
   lang: string | null
+  content_hash?: string | null
 }
 
 export function recordApprovalSlackPost(p: {
   approvalId: string; channel: string; ts: string; textSha256: string; ownerUserId: string; botUserId: string
-  contentBasis?: string; reactionMode?: boolean; replyMode?: boolean; lang?: 'hu' | 'en'
+  contentBasis?: string; reactionMode?: boolean; replyMode?: boolean; lang?: 'hu' | 'en'; contentHash?: string | null
 }): boolean {
   return db.prepare(`
-    INSERT OR IGNORE INTO approval_slack_posts (approval_id, channel, ts, text_sha256, owner_user_id, bot_user_id, posted_at, content_basis, reaction_mode, reply_mode, lang)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT OR IGNORE INTO approval_slack_posts (approval_id, channel, ts, text_sha256, owner_user_id, bot_user_id, posted_at, content_basis, reaction_mode, reply_mode, lang, content_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(p.approvalId, p.channel, p.ts, p.textSha256, p.ownerUserId, p.botUserId, Math.floor(Date.now() / 1000),
-    p.contentBasis ?? null, p.reactionMode === false ? 0 : 1, p.replyMode === true ? 1 : 0, p.lang === 'en' ? 'en' : null).changes > 0
+    p.contentBasis ?? null, p.reactionMode === false ? 0 : 1, p.replyMode === true ? 1 : 0, p.lang === 'en' ? 'en' : null, p.contentHash ?? null).changes > 0
 }
 
 /**
@@ -8065,23 +8621,114 @@ export function decideApprovalFromSlack(p: {
   decidedByTs?: string | null; binding?: string | null
 }): { outcome: SlackDecisionOutcome; changed: boolean } {
   const now = Math.floor(Date.now() / 1000)
+  let res: { outcome: SlackDecisionOutcome; changed: boolean }
   try {
-    return db.transaction(() => {
+    res = db.transaction(() => {
       const closed = db.prepare(`
         UPDATE approval_slack_posts SET decided_at = ?, decision = ?, decided_by_ts = ?, binding = ?
         WHERE approval_id = ? AND decided_at IS NULL
       `).run(now, p.decision, p.decidedByTs ?? null, p.binding ?? null, p.approvalId).changes > 0
       if (!closed) return { outcome: 'already_decided' as const, changed: false }
-      const changed = db.prepare(`
-        UPDATE approvals SET status = ?, resolved_at = ?, resolved_by = ?
-        WHERE id = ? AND status = 'pending' AND (? = 'rejected' OR timeout_at IS NULL OR timeout_at > ?)
-      `).run(p.status, now, p.resolvedBy, p.approvalId, p.status, now).changes > 0
-      return { outcome: 'recorded' as const, changed }
+      // The Slack post binds the message text (checked before this call). AGENTCREATEPR3-1119: a hash-bound request's
+      // post also recorded the content hash it showed, and the decision is bound to it (agent_create).
+      const post = db.prepare('SELECT content_hash FROM approval_slack_posts WHERE approval_id = ?').get(p.approvalId) as { content_hash: string | null } | undefined
+      const core = decideApprovalInTx({ approvalId: p.approvalId, status: p.status, resolvedBy: p.resolvedBy, now,
+        ...(post?.content_hash ? { expectedContentHash: post.content_hash } : {}) })
+      return { outcome: 'recorded' as const, changed: core === 'decided' }
     })()
   } catch (err) {
     if (err instanceof Error && /UNIQUE constraint failed/.test(err.message)) return { outcome: 'reply_already_used', changed: false }
     throw err
   }
+  if (res.changed) runApprovalConsumer(p.approvalId)
+  return res
+}
+
+// AGENTCREATEPR3-1119: the Gromzo approval rows (see the table's comment).
+export interface ApprovalGromzoPost { approval_id: string; mxd_hash: string; spec_hash: string; state: string; posted_at: number; updated_at: number | null; note: string | null }
+export function recordApprovalGromzoPost(approvalId: string, mxdHash: string, specHash: string): boolean {
+  return db.prepare('INSERT OR IGNORE INTO approval_gromzo_posts (approval_id, mxd_hash, spec_hash, state, posted_at) VALUES (?, ?, ?, ?, ?)')
+    .run(approvalId, mxdHash, specHash, 'pending', Math.floor(Date.now() / 1000)).changes > 0
+}
+/** The rows waiting for the owner's answer, their approval still pending. */
+export function pendingApprovalGromzoPosts(limit = 50): ApprovalGromzoPost[] {
+  return db.prepare(`
+    SELECT g.* FROM approval_gromzo_posts g JOIN approvals a ON a.id = g.approval_id
+    WHERE g.state = 'pending' AND a.status = 'pending' ORDER BY g.posted_at ASC LIMIT ?
+  `).all(limit) as ApprovalGromzoPost[]
+}
+/** Rows a stopped server left between mxd's consume and the commit (swept at the watcher's start). */
+export function consumingApprovalGromzoPosts(): ApprovalGromzoPost[] {
+  return db.prepare("SELECT * FROM approval_gromzo_posts WHERE state = 'consuming' ORDER BY posted_at ASC").all() as ApprovalGromzoPost[]
+}
+export function getApprovalGromzoPost(approvalId: string): ApprovalGromzoPost | undefined {
+  return db.prepare('SELECT * FROM approval_gromzo_posts WHERE approval_id = ?').get(approvalId) as ApprovalGromzoPost | undefined
+}
+/** Moves the row from [from] to [to] (one step, compare-and-set): true when it moved. */
+export function moveApprovalGromzoPost(approvalId: string, from: string, to: string, note: string | null = null): boolean {
+  return db.prepare('UPDATE approval_gromzo_posts SET state = ?, updated_at = ?, note = COALESCE(?, note) WHERE approval_id = ? AND state = ?')
+    .run(to, Math.floor(Date.now() / 1000), note, approvalId, from).changes > 0
+}
+
+// TEAMSAPPROVECARD1118: the Teams approval card rows (see the table's comment).
+export interface ApprovalTeamsCard {
+  approval_id: string
+  conversation_id: string
+  activity_id: string
+  owner_aad: string
+  content_hash: string
+  nonce_sha256: string
+  card_sha256: string
+  lang: string
+  posted_at: number
+  decided_at: number | null
+  decision: string | null
+  decided_activity_id: string | null
+  decided_by_aad: string | null
+}
+
+export function recordApprovalTeamsCard(p: {
+  approvalId: string; conversationId: string; activityId: string; ownerAad: string; contentHash: string
+  nonceSha256: string; cardSha256: string; lang: string
+}): void {
+  db.prepare(`
+    INSERT INTO approval_teams_cards (approval_id, conversation_id, activity_id, owner_aad, content_hash, nonce_sha256, card_sha256, lang, posted_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(p.approvalId, p.conversationId, p.activityId, p.ownerAad, p.contentHash, p.nonceSha256, p.cardSha256, p.lang, Math.floor(Date.now() / 1000))
+}
+
+export function getApprovalTeamsCard(approvalId: string): ApprovalTeamsCard | undefined {
+  return db.prepare('SELECT * FROM approval_teams_cards WHERE approval_id = ?').get(approvalId) as ApprovalTeamsCard | undefined
+}
+
+export type TeamsCardDecisionOutcome = 'decided' | 'card_already_used' | 'not_pending' | 'expired' | 'content_changed'
+
+/**
+ * One owner click on the server-posted Teams card, in ONE transaction: the card row closes once (the click's activity
+ * id and the owner's object id recorded), and the request is resolved only while it is still pending, its content_hash
+ * still the one the card showed, and (for an approval) its timeout not passed. The caller has already checked the
+ * channel token, the tenant, the owner, the card binding and the nonce.
+ */
+export function decideApprovalFromTeams(p: {
+  approvalId: string; status: 'approved' | 'rejected'; activityId: string; ownerAad: string
+}): { outcome: TeamsCardDecisionOutcome; approval: Approval | undefined } {
+  const now = Math.floor(Date.now() / 1000)
+  const res = db.transaction(() => {
+    const card = db.prepare('SELECT content_hash FROM approval_teams_cards WHERE approval_id = ? AND decided_at IS NULL').get(p.approvalId) as { content_hash: string } | undefined
+    if (!card) return { outcome: 'card_already_used' as const, approval: getApproval(p.approvalId) }
+    // The card showed the owner this content_hash: the core decides only while the request still carries it.
+    const outcome: TeamsCardDecisionOutcome = decideApprovalInTx({
+      approvalId: p.approvalId, status: p.status, resolvedBy: approvalResolvedBy({ channel: 'teams', mode: 'card' }),
+      expectedContentHash: card.content_hash, now,
+    })
+    db.prepare(`
+      UPDATE approval_teams_cards SET decided_at = ?, decision = ?, decided_activity_id = ?, decided_by_aad = ?
+      WHERE approval_id = ? AND decided_at IS NULL
+    `).run(now, outcome === 'decided' ? p.status : `${p.status}:${outcome}`, p.activityId, p.ownerAad, p.approvalId)
+    return { outcome, approval: getApproval(p.approvalId) }
+  })()
+  if (res.outcome === 'decided') runApprovalConsumer(p.approvalId)
+  return res
 }
 
 // The CREATE path stamps the owner-notification message id onto the row
@@ -8267,7 +8914,7 @@ export function consumeCategoryApproval(params: {
 export interface ApprovalEvent {
   id: number
   approval_id: string
-  event: 'consumed' | 'consume_refused' | 'consumed_backfill'
+  event: 'consumed' | 'consume_refused' | 'consumed_backfill' | 'decided'
   reason: string | null
   actor: string | null
   ref: string | null

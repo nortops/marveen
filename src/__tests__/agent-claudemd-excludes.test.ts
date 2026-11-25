@@ -28,18 +28,25 @@ vi.mock('../env.js', async (importOriginal) => {
   const orig = await importOriginal<typeof import('../env.js')>()
   return {
     ...orig,
-    readEnvFile: (keys?: string[]) =>
-      keys?.length === 1 && keys[0] === 'ROOT_CLAUDEMD_EXCLUDE_AGENTS'
-        ? (env.value === undefined ? {} : { [keys[0]]: env.value })
-        : orig.readEnvFile(keys),
+    // every read that asks for the key sees the test's value, the many-key read of getIgnoredEnvKeys too
+    readEnvFile: (keys?: string[]) => {
+      const out = orig.readEnvFile(keys)
+      if (keys?.includes('ROOT_CLAUDEMD_EXCLUDE_AGENTS')) {
+        delete out.ROOT_CLAUDEMD_EXCLUDE_AGENTS
+        if (env.value !== undefined) out.ROOT_CLAUDEMD_EXCLUDE_AGENTS = env.value
+      }
+      return out
+    },
   }
 })
 
-import { writeAgentSettingsFromProfile, agentSettingsPath } from '../web/agent-scaffold.js'
+import { writeAgentSettingsFromProfile, agentSettingsPath, ROOT_ONLY_RULE_GROUPS } from '../web/agent-scaffold.js'
 import { agentDir, agentExcludesRootClaudeMd } from '../web/agent-config.js'
 import { loadProfileTemplate } from '../web/profiles.js'
 import { MAIN_AGENT_ID } from '../config.js'
-import { getSettingDefinition } from '../config-registry.js'
+import { getSettingDefinition, isOverridesOnly, validateSettingValue } from '../config-registry.js'
+import { setOverride, clearOverride, getEffectiveSettingSource, getIgnoredEnvKeys, isEnvValueIgnored } from '../settings-store.js'
+import { logIgnoredEnvKeys } from '../settings-health.js'
 import { logger } from '../logger.js'
 
 const NAME = 'mdexcl-test-agent'
@@ -55,6 +62,7 @@ beforeEach(() => {
     writeFileSync(join(agentDir(a), 'agent-config.json'), '{}')
   }
   env.value = undefined
+  clearOverride(KEY)
 })
 afterEach(() => { vi.restoreAllMocks(); for (const a of [NAME, OTHER]) rmSync(agentDir(a), { recursive: true, force: true }) })
 afterAll(() => rmSync(sandbox.root, { recursive: true, force: true }))
@@ -66,9 +74,23 @@ it(`${KEY}: listed sub-agent gets the root CLAUDE.md excluded, an unlisted one d
   spawn(OTHER)
   expect(settingsOf(NAME).claudeMdExcludes).toEqual([ROOT_MD])
   expect(settingsOf(OTHER)).not.toHaveProperty('claudeMdExcludes')
-  // One dashboard-log line per listed agent, none for the unlisted one.
+  // One dashboard-log line per listed agent, none for the unlisted one; it names the root-only rule groups it loses.
   const lines = info.mock.calls.filter((c) => String(c[1]).includes(KEY))
-  expect(lines).toEqual([[{ agent: NAME }, `root CLAUDE.md excluded for this agent (${KEY})`]])
+  expect(lines).toHaveLength(1)
+  expect(lines[0][0]).toEqual({ agent: NAME, lost: ROOT_ONLY_RULE_GROUPS })
+  for (const g of ROOT_ONLY_RULE_GROUPS) expect(String(lines[0][1])).toContain(g)
+})
+
+it(`${KEY}: the spawn line never names the facts-vs-guesses rule, even before the agent's evidence block exists`, () => {
+  // The line runs before ensureEvidenceSection on the same start, so a missing block here says nothing about the agent.
+  env.value = NAME
+  writeFileSync(join(agentDir(NAME), 'CLAUDE.md'), '# x, no evidence block yet\n')
+  const info = vi.spyOn(logger, 'info')
+  spawn(NAME)
+  const lines = info.mock.calls.filter((c) => String(c[1]).includes(KEY))
+  expect(lines).toHaveLength(1)
+  expect(lines[0][0]).toEqual({ agent: NAME, lost: ROOT_ONLY_RULE_GROUPS })
+  expect(JSON.stringify(lines[0])).not.toMatch(/facts/i)
 })
 
 it(`${KEY}: '*' covers every sub-agent, also one not named anywhere, but never the main agent`, () => {
@@ -120,6 +142,42 @@ it(`${KEY}: settings.local.json (the operator's manual override) stays byte-iden
   }
 })
 
-it(`${KEY}: not a settings-registry key, so POST /api/settings cannot write it`, () => {
-  expect(getSettingDefinition(KEY)).toBeUndefined()
+it(`${KEY}: the Settings value works alone and adds to the .env line`, () => {
+  expect(setOverride(KEY, NAME)).toEqual({ ok: true })
+  spawn(NAME)
+  spawn(OTHER)
+  expect(settingsOf(NAME).claudeMdExcludes).toEqual([ROOT_MD])
+  expect(settingsOf(OTHER)).not.toHaveProperty('claudeMdExcludes')
+  env.value = OTHER
+  spawn(OTHER)
+  expect(settingsOf(OTHER).claudeMdExcludes).toEqual([ROOT_MD])
+  expect(setOverride(KEY, '*')).toEqual({ ok: true })
+  expect(agentExcludesRootClaudeMd(MAIN_AGENT_ID)).toBe(false)
+  clearOverride(KEY)
+  env.value = undefined
+  spawn(NAME)
+  expect(settingsOf(NAME)).not.toHaveProperty('claudeMdExcludes')
+})
+
+it(`${KEY}: registry key whose additions need the owner; its .env line is reported as in effect, never as ignored (#2996 B1)`, () => {
+  const def = getSettingDefinition(KEY)!
+  expect(isOverridesOnly(def)).toBe(true)
+  expect(def.loosens!('', NAME)).toBe(true)
+  expect(def.loosens!('', '*')).toBe(true)
+  expect(def.loosens!(`${NAME},${OTHER}`, NAME)).toBe(false)
+  expect(def.loosens!(NAME, '')).toBe(false)
+  expect(validateSettingValue(def, `${NAME}, *`).ok).toBe(true)
+  expect(validateSettingValue(def, 'bad/name').ok).toBe(false)
+  // the .env line excludes the agent, so every place that reports on it has to say so
+  env.value = NAME
+  expect(agentExcludesRootClaudeMd(NAME)).toBe(true)
+  expect(getEffectiveSettingSource(KEY)).toEqual({ value: NAME, source: 'env' })
+  expect(isEnvValueIgnored(KEY)).toBe(false)
+  expect(getIgnoredEnvKeys()).not.toContain(KEY)
+  expect(logIgnoredEnvKeys()).not.toContain(KEY)
+  // an override answers for the page, and the .env line still adds to it
+  expect(setOverride(KEY, OTHER)).toEqual({ ok: true })
+  expect(getEffectiveSettingSource(KEY)).toEqual({ value: OTHER, source: 'override' })
+  expect(isEnvValueIgnored(KEY)).toBe(false)
+  expect(agentExcludesRootClaudeMd(NAME)).toBe(true)
 })

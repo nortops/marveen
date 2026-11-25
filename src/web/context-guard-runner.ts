@@ -2,7 +2,7 @@ import { statSync, readFileSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join, relative } from 'node:path'
 import { logger } from '../logger.js'
 import { BOT_NAME, MAIN_AGENT_ID, PROJECT_ROOT } from '../config.js'
-import { hardRestartMarveenChannels, lastMainRespawnAt, MARVEEN_POST_RESPAWN_GRACE_MS, markAgentRestartPending } from './channel-monitor.js'
+import { hardRestartMarveenChannels, lastMainRespawnAt, MARVEEN_POST_RESPAWN_GRACE_MS, markAgentRestartPending, readConfiguredMainModel } from './channel-monitor.js'
 import { shouldDeferForRecentRespawn } from './stuck-tool-call-watcher.js'
 import { listAgentNames, listAllAgentNames, agentDir, readAgentModel, readAgentRemoteHost, readAgentWorksourceChannel } from './agent-config.js'
 import { configDirFor } from './main-transcript-root.js'
@@ -22,7 +22,7 @@ import { deliverWhenReady, RESUME_DELIVERY_OPTIONS } from './resume-delivery.js'
 import { notifyChannel } from '../notify.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { detectPaneState, hasBackgroundWork, paneShowsContextSaturation, paneShowsContextSaturationHardError } from '../pane-state.js'
-import { readContextTokensFromProjectDir, readActiveModelFromProjectDir, readTranscriptMtimeFromProjectDir, readTranscriptTailFromProjectDir } from './active-model.js'
+import { readContextTokensFromProjectDir, readActiveModelFromProjectDir, readTranscriptMtimeFromProjectDir, readTranscriptTailFromProjectDir, readLastTurnActivityMs } from './active-model.js'
 import { readContextGuardConfig } from './context-guard-store.js'
 import { agentHeavyJobs, gateAlive, heavyJobPaths, liveHeavyJobDeps, sessionPanePids, type GatedJob } from './heavy-job-owner.js'
 import {
@@ -59,6 +59,8 @@ import { createAgentMessage, countRestartQueueState, listKanbanCards, hasOpenInb
 import {
   decideGuard,
   contextLimitForModel,
+  withLaunchWindowMarker,
+  isKnownContextModel,
   calibrateLimit,
   handoffStaleMinutes,
   applyDailyHandoffSkipSweep,
@@ -515,7 +517,7 @@ export function handoffPrompt(pctRound: number, handoffPath: string): string {
     `[CONTEXT-GUARD] A munkakontextusod ~${pctRound}%-on van -- kritikus. ` +
     `NE folytasd a feladatot. EGYETLEN dolgod ebben a körben: írj HANDOFF.md-t a /handoff skill struktúrája szerint ide: ${handoffPath} ` +
     `(purpose: a folyamatban lévő feladat folytatása friss kontextusban; Goal / Current Progress / What Worked / What Didn't Work / Next Steps szekciók, ` +
-    `konkrét fájl-útvonalakkal és kanban kártya-azonosítókkal). Ha nincs aktív feladatod, írd bele hogy nincs. ` +
+    `konkrét fájl-útvonalakkal és kanban kártya-azonosítókkal; a Next Steps MINDEN tétele mellé írd a kártyája azonosítóját, vagy ha nincs kártyája, azt, hogy "KÁRTYA NÉLKÜL"). Ha nincs aktív feladatod, írd bele hogy nincs. ` +
     `Utána ÁLLJ MEG -- a rendszer friss kontextussal újraindít és a HANDOFF.md-ből folytatod.`
   )
 }
@@ -535,7 +537,7 @@ export function idleFlushHandoffPrompt(tokens: number, idleMinutes: number, hand
     `[CONTEXT-GUARD] Rutin karbantartás, nem vészhelyzet. A sessionöd kontextusa ~${Math.round(tokens / 1000)}k token, ` +
     `és ${idleMinutes} perce nincs benne aktivitás, ezért friss kontextussal indítalak újra -- így olcsóbb és gyorsabb lesz a következő kör. ` +
     `EGYETLEN dolgod: írj HANDOFF.md-t a /handoff skill struktúrája szerint ide: ${handoffPath} ` +
-    `(Goal / Current Progress / What Worked / What Didn't Work / Next Steps, konkrét fájl-útvonalakkal és kanban kártya-azonosítókkal). ` +
+    `(Goal / Current Progress / What Worked / What Didn't Work / Next Steps, konkrét fájl-útvonalakkal és kanban kártya-azonosítókkal; a Next Steps MINDEN tétele mellé írd a kártyája azonosítóját, vagy ha nincs kártyája, azt, hogy "KÁRTYA NÉLKÜL"). ` +
     `Ha nincs félbehagyott feladatod, írd bele hogy nincs -- az is teljes értékű válasz. ` +
     `Utána ÁLLJ MEG; a rendszer újraindít és a HANDOFF.md-ből folytatod.`
   )
@@ -556,7 +558,7 @@ export function dailyHandoffPrompt(atTime: string, handoffPath: string): string 
     `[CONTEXT-GUARD] Ütemezett napi újraindítás (${atTime}), nem vészhelyzet és nem hiba. ` +
     `A sessionöd hamarosan friss kontextussal indul újra, és ami nincs leírva, az nem éli túl. ` +
     `EGYETLEN dolgod ebben a körben: írj HANDOFF.md-t a /handoff skill struktúrája szerint ide: ${handoffPath} ` +
-    `(Goal / Current Progress / What Worked / What Didn't Work / Next Steps, konkrét fájl-útvonalakkal és kanban kártya-azonosítókkal). ` +
+    `(Goal / Current Progress / What Worked / What Didn't Work / Next Steps, konkrét fájl-útvonalakkal és kanban kártya-azonosítókkal; a Next Steps MINDEN tétele mellé írd a kártyája azonosítóját, vagy ha nincs kártyája, azt, hogy "KÁRTYA NÉLKÜL"). ` +
     `Ha nincs félbehagyott feladatod, írd bele hogy nincs -- az is teljes értékű válasz. ` +
     `Utána ÁLLJ MEG; a rendszer újraindít és a HANDOFF.md-ből folytatod.`
   )
@@ -572,7 +574,7 @@ export function periodicHandoffPrompt(everyMinutes: number, handoffPath: string)
     `[CONTEXT-GUARD] Ütemezett, ${everyMinutes} percenkénti frissítés, nem vészhelyzet és nem hiba. ` +
     `A sessionöd hamarosan friss kontextussal indul újra, és ami nincs leírva, az nem éli túl. ` +
     `EGYETLEN dolgod ebben a körben: írj HANDOFF.md-t a /handoff skill struktúrája szerint ide: ${handoffPath} ` +
-    `(Goal / Current Progress / What Worked / What Didn't Work / Next Steps, konkrét fájl-útvonalakkal és kanban kártya-azonosítókkal). ` +
+    `(Goal / Current Progress / What Worked / What Didn't Work / Next Steps, konkrét fájl-útvonalakkal és kanban kártya-azonosítókkal; a Next Steps MINDEN tétele mellé írd a kártyája azonosítóját, vagy ha nincs kártyája, azt, hogy "KÁRTYA NÉLKÜL"). ` +
     `Ha nincs félbehagyott feladatod, írd bele hogy nincs -- az is teljes értékű válasz. ` +
     `Utána ÁLLJ MEG; a rendszer újraindít és a HANDOFF.md-ből folytatod.`
   )
@@ -587,7 +589,7 @@ export function taskCloseHandoffPrompt(handoffPath: string): string {
     `[CONTEXT-GUARD] Lezárult az utolsó nyitott kanban-kártyád, és nincs megválaszolatlan bejövő üzeneted: ` +
     `ez természetes szünet, a sessionöd most friss kontextussal indul újra. Nem vészhelyzet és nem hiba. ` +
     `EGYETLEN dolgod ebben a körben: írj HANDOFF.md-t a /handoff skill struktúrája szerint ide: ${handoffPath} ` +
-    `(Goal / Current Progress / What Worked / What Didn't Work / Next Steps, konkrét fájl-útvonalakkal és kanban kártya-azonosítókkal). ` +
+    `(Goal / Current Progress / What Worked / What Didn't Work / Next Steps, konkrét fájl-útvonalakkal és kanban kártya-azonosítókkal; a Next Steps MINDEN tétele mellé írd a kártyája azonosítóját, vagy ha nincs kártyája, azt, hogy "KÁRTYA NÉLKÜL"). ` +
     `Ha nincs félbehagyott feladatod, írd bele hogy nincs -- az is teljes értékű válasz. ` +
     `Utána ÁLLJ MEG; a rendszer újraindít és a HANDOFF.md-ből folytatod.`
   )
@@ -711,18 +713,26 @@ export function resumePrompt(
     base + source + heavyJobResumeText(heavyJobs) +
     `Utána ellenőrizd a kanban tábládat (in_progress kártyák, assignee=${name}) és a hot memóriáidat, ` +
     `és FOLYTASD a megkezdett munkát magadtól. Ne kezdd elölről ami a handoff szerint már kész. ` +
+    // HANDOFFKARTYA1118: a fresh session that continued from the kanban alone
+    // dropped an agreed handoff item that had no card. Only when a handoff exists.
+    (hadHandoff
+      ? `A HANDOFF Next Steps MINDEN tétele teendő akkor is, ha nincs kártyája: ebben az első körben minden kártya nélküli tételre hozz létre kártyát ` +
+        `(vagy írd a tétel mellé, miért nem kell). A kanban NEM a teljes teendőlista. `
+      : '') +
     // ORSICTX912: msg 23670 was delivered SEVEN SECONDS after the guard kill
     // started, into the dying session -- the queue marked it delivered, the
     // fresh session had no reason to look, and completed_at is unused (0/37
     // measured), so the loss is invisible from the queue. The re-read must
-    // ride in the resume prompt (the fresh session's only context), and the
-    // ack-to-sender is the OBSERVABLE trace: without it, verifying this very
-    // instruction would run into the same blindness it exists to fix.
+    // ride in the resume prompt (the fresh session's only context). The OBSERVABLE
+    // trace is the closed row, not an ack message: every ack woke its sender for a
+    // full-context turn (24h, one install: 50 turns, 3.1% of the fleet's usage).
     `RESTART-ABLAK: az előző session utolsó ~15 percében kézbesített inter-agent üzenet elveszhetett. ` +
     `Olvasd vissza a saját sorodat erre az ablakra (GET /api/messages?agent=${name}, created_at szerint szűrve), ` +
-    `és minden ott talált, még el nem intézett kérést kezelj újként. KÖTELEZŐ MEGFIGYELHETŐ NYOM: minden ` +
-    `visszaolvasott tételről küldj rövid nyugtát a feladónak ("[RESTART-ABLAK] <id> felvéve a friss sessionben"), ` +
-    `akkor is, ha nincs belőle teendő -- e nélkül a visszaolvasás a sorból láthatatlan. ` +
+    `és minden ott talált, még el nem intézett kérést kezelj újként. KÖTELEZŐ MEGFIGYELHETŐ NYOM: a lezárt sor. ` +
+    `Ha egy visszaolvasott tételből van teendő, a valódi válasz vagy eredmény a nyom: azzal zárd le a szokásos módon. ` +
+    `Ha nincs belőle teendő, zárd le értesítés nélkül (PUT /api/messages/<id> {"status":"done","notify":false}, ` +
+    `a CLAUDE.md-d üzenet-lezárási receptje szerint). A feladónak külön nyugtát NE küldj: minden nyugta felébreszti, ` +
+    `és nála egy teljes kontextusú kört visz el. ` +
     // RESPAWNZAJ822/PRODFAAG822: a fresh session acting on a resume goal is
     // exactly the actor that branch-switched and committed on the live prod
     // tree (2026-08-22 10:10, PR #1036 duplicate). The constraint must ride in
@@ -788,6 +798,29 @@ export function measureIdleMs(name: string, nowMs: number): number | null {
   return Math.max(0, nowMs - mtime)
 }
 
+/** The model id the guard sizes the window for. Same root as the token read: the model decides the context LIMIT, so a
+ *  model read from a stale root produces a wrong pct from a right token count -- and pct is what the handoff threshold
+ *  compares. */
+function guardModelFor(name: string): string {
+  if (name !== MAIN_AGENT_ID) return readAgentModel(name) ?? ''
+  // The main agent's model is read from its transcript, where the "[1m]" marker of the launch id is lost; a sub-agent's
+  // comes from its config and keeps it. withLaunchWindowMarker puts it back from the configured launch model.
+  // shortcut: a temporary /model switch to another "[1m]" id is not seen (it is sized as the bare id until the
+  // calibration learns the window), upgrade when the hold flow needs it: main-model.ts knows the id it sent.
+  let launched: string | null = null
+  try { launched = readConfiguredMainModel(PROJECT_ROOT) } catch { /* no launch id: the transcript's id as it is */ }
+  return withLaunchWindowMarker(readActiveModelFromProjectDir(PROJECT_ROOT, undefined, configDirFor(name)), launched) ?? ''
+}
+
+/** CTXUNKNOWNMODEL1122: true when the pct is measured against the 200k fallback of a model id the guard does not know
+ *  (no limitTokens pinned). The dashboard badge says so. */
+export function contextWindowAssumed(name: string, cfgLimit: number | null): boolean {
+  return !cfgLimit && !isKnownContextModel(guardModelFor(name))
+}
+
+/** Agent -> model already warned about, so the unknown-model WARN is logged once per agent and model. */
+const unknownModelWarned = new Map<string, string>()
+
 export function measurePct(name: string, cfgLimit: number | null, opts: { learn?: boolean } = {}): number | null {
   const workingDir = workingDirFor(name)
   const configDir = configDirFor(name)
@@ -797,12 +830,14 @@ export function measurePct(name: string, cfgLimit: number | null, opts: { learn?
   if (cfgLimit) {
     limit = cfgLimit
   } else {
-    const model = (name === MAIN_AGENT_ID
-      // Same root as the token read above: the model decides the context LIMIT,
-      // so a model read from a stale root produces a wrong pct from a right
-      // token count -- and pct is what the handoff threshold compares.
-      ? readActiveModelFromProjectDir(PROJECT_ROOT, undefined, configDirFor(name))
-      : readAgentModel(name)) ?? ''
+    const model = guardModelFor(name)
+    if (!isKnownContextModel(model) && unknownModelWarned.get(name) !== model) {
+      unknownModelWarned.set(name, model)
+      logger.warn({ name, model, assumedLimit: contextLimitForModel(model) },
+        'context-guard: unknown model, the context window is ASSUMED (200k fallback); a smaller real window makes the ' +
+        'handoff tiers late. Pin it with limitTokens in the agent\'s context-guard config; the guard does not read ' +
+        'CLAUDE_CODE_MAX_CONTEXT_TOKENS')
+    }
     // Calibrate against the persisted per-(agent, model) maximum, not just
     // the live reading: a fresh post-restart session must not un-learn a
     // window the previous session already proved (see HighwaterMap above).
@@ -1001,6 +1036,16 @@ export function restartLossLine(
   return '.' + restartNoticeQueueText(queue)
 }
 
+/**
+ * How recent a transcript turn line has to be for an idle-looking pane to
+ * still count as mid-turn when a restart is about to fire. Same figure and
+ * same reason as SWITCH_TURN_QUIET_MS in session-control.ts: it only has to
+ * cover the moment the pane reads idle between two tool calls of a running
+ * turn. Kept here, not imported: session-control sits on the restart-gate
+ * runner, which imports this module.
+ */
+export const RESTART_TURN_QUIET_MS = 20_000
+
 async function checkAgent(name: string, nowMs: number): Promise<void> {
   const cfg = readContextGuardConfig(name)
   const state = guardStates.get(name) ?? INITIAL_GUARD_STATE
@@ -1137,9 +1182,7 @@ async function checkAgent(name: string, nowMs: number): Promise<void> {
           limitTokens: cfg.limitTokens,
           // The actionable field: this is what says WHAT to fix. Same branch as
           // measurePct's, and it only runs on this rare state change.
-          model: (name === MAIN_AGENT_ID
-            ? readActiveModelFromProjectDir(PROJECT_ROOT, undefined, configDirFor(name))
-            : readAgentModel(name)) ?? null,
+          model: guardModelFor(name) || null,
         },
         // Fleet-side checks should match on the fields above (name, model, pct,
         // thresholdPct), never on this wording: the message is prose and may be
@@ -1227,7 +1270,35 @@ async function checkAgent(name: string, nowMs: number): Promise<void> {
       : null,
   }
 
-  const decision = decideGuard(state, inputs, cfg)
+  let decision = decideGuard(state, inputs, cfg)
+
+  // An idle-looking pane is not a finished turn. Between two tool calls of a
+  // running turn the pane can read idle (the gap the restart gate's transcript
+  // quiet window and the /model switch already guard), and a restart decided
+  // on that reading cuts the turn. Measured on a live install: a hard-threshold
+  // restart was decided 80 ms after the session wrote two parallel tool calls;
+  // their results landed 40 ms after the decision and died with the session.
+  // So a restart that a not-busy reading allowed asks the transcript first: a
+  // turn line younger than RESTART_TURN_QUIET_MS means the turn is still
+  // running, and the decision is taken again with the pane read as busy -- the
+  // same deferral a busy pane gets. The saturation net ignores the busy
+  // signal, so its restart is decided the same either way. An unreadable
+  // transcript (null) keeps the decision: a wedged pane must still get the
+  // restart that is its only way out. One tail read per restart decision.
+  if (decision.action === 'restart' && !inputs.paneBusy) {
+    const turnAt = readLastTurnActivityMs(workingDirFor(name), configDirFor(name))
+    if (turnAt !== null && nowMs - turnAt < RESTART_TURN_QUIET_MS) {
+      const held = decideGuard(state, { ...inputs, paneBusy: true, paneIdle: false }, cfg)
+      if (held.action !== 'restart') {
+        logger.warn(
+          { name, phase: state.phase, wouldHave: decision.reason, turnAgoMs: Math.max(0, nowMs - turnAt), instead: held.action, insteadReason: held.reason },
+          'context-guard: pane read idle but the transcript shows a running turn -- restart held, decided again as busy',
+        )
+        decision = held
+      }
+    }
+  }
+
   // The heavy-job hold episode continues only through restart decisions;
   // the sweep closes it for every agent not noted here (heavy-job-hold.ts).
   if (continuesHoldEpisode(decision)) episodeContinuesThisSweep.add(name)
@@ -1627,6 +1698,7 @@ export function getContextGuardStatus(): Array<{
   agent: string
   phase: string
   pct: number | null
+  assumedWindow?: boolean
   enabled: boolean
   saturationRestart: boolean
   cooldownUntilMs?: number
@@ -1640,6 +1712,7 @@ export function getContextGuardStatus(): Array<{
       agent: name,
       phase: state?.phase ?? 'idle',
       pct: cfg.enabled && !remote ? measurePct(name, cfg.limitTokens, { learn: false }) : null,
+      ...(cfg.enabled && !remote && contextWindowAssumed(name, cfg.limitTokens) ? { assumedWindow: true } : {}),
       enabled: cfg.enabled,
       saturationRestart: cfg.saturationRestart,
       ...cooldownStatusExtra(state),
