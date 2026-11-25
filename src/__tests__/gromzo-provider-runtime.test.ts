@@ -115,7 +115,7 @@ describe('the TS respawn builder (channel-monitor)', () => {
     continueSession: false,
     mainAgentId: 'marveen',
     gromzoTokenFile: '/run/marveen-mxd/tokens/marveen.token',
-    customProviderEnv: null,
+    customProviderLaunchEnv: null,
   }
   it('gromzo ready: --channels plugin:gromzo-channel@gromzo-local, MXD_AGENT exported, not doubled from the extras', () => {
     const cmd = buildMainSessionRespawnCmd({ ...base, pluginId: 'gromzo-channel@gromzo-local', extraPluginIds: ['gromzo-channel@gromzo-local'], gromzoPrimaryReady: true })

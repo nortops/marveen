@@ -4433,7 +4433,7 @@ document.getElementById('saveContextGuardBtn').addEventListener('click', async (
     const cur = await fetch(`/api/agents/${encodeURIComponent(id)}/context-guard`)
     if (!cur.ok) throw new Error()
     current = (await cur.json()).contextGuard || {}
-  } catch { showToast(t('common.error_save')); return }
+  } catch { showToast(t('common.error_save'), 'error'); return }
   const cfg = Object.assign({}, current, {
     enabled: cgEnabled.checked,
     actPct,

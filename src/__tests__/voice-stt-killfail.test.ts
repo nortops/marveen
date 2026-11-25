@@ -100,13 +100,13 @@ vi.mock('../web/voice-directive.js', () => ({
   parseTtsRequest: () => null,
 }))
 
-const VENV = () => join(paths.home, '.local', 'share', 'marveen-voice', 'venv', 'bin', 'python')
-const VTOOLS = () => join(paths.home, '.local', 'share', 'marveen-voice', '_vtools.py')
+const VENV = () => join(paths.home, '.local', 'share', 'atlas-whisper', 'venv', 'bin', 'python')
+const VTOOLS = () => join(paths.home, '.local', 'share', 'atlas-whisper', '_vtools.py')
 
 beforeAll(() => {
   const home = mkdtempSync(join(tmpdir(), 'stt-probe-home-'))
   paths.home = home
-  mkdirSync(join(home, '.local', 'share', 'marveen-voice', 'venv', 'bin'), { recursive: true })
+  mkdirSync(join(home, '.local', 'share', 'atlas-whisper', 'venv', 'bin'), { recursive: true })
   writeFileSync(VENV(), '')
   writeFileSync(VTOOLS(), '')
   const stateDir = join(home, '.claude', 'channels', 'telegram')

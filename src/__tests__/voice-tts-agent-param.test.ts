@@ -31,9 +31,9 @@ const agentChannel = join(agentsBase, AGENT, '.claude', 'channels', 'telegram')
 beforeAll(() => {
   writeFileSync(join(H.store, '.dashboard-token'), 'x'.repeat(64))
   // the voice toolkit "installed" (the route answers 503 otherwise); nothing here runs it
-  mkdirSync(join(H.home, '.local', 'share', 'marveen-voice', 'venv', 'bin'), { recursive: true })
-  writeFileSync(join(H.home, '.local', 'share', 'marveen-voice', 'venv', 'bin', 'python'), '')
-  writeFileSync(join(H.home, '.local', 'share', 'marveen-voice', '_vtools.py'), '')
+  mkdirSync(join(H.home, '.local', 'share', 'atlas-whisper', 'venv', 'bin'), { recursive: true })
+  writeFileSync(join(H.home, '.local', 'share', 'atlas-whisper', 'venv', 'bin', 'python'), '')
+  writeFileSync(join(H.home, '.local', 'share', 'atlas-whisper', '_vtools.py'), '')
   mkdirSync(agentChannel, { recursive: true })
   writeFileSync(join(agentChannel, '.env'), 'TELEGRAM_BOT_TOKEN=not-a-real-token\n')
   // TTSBIND1125: the bot lets in one user, the chat the tests send to

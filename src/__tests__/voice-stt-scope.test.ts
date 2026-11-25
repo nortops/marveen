@@ -191,8 +191,8 @@ async function loadVoice(): Promise<typeof import('../web/routes/voice.js')> {
   return import('../web/routes/voice.js')
 }
 
-const VENV = () => join(paths.home, '.local', 'share', 'marveen-voice', 'venv', 'bin', 'python')
-const VTOOLS = () => join(paths.home, '.local', 'share', 'marveen-voice', '_vtools.py')
+const VENV = () => join(paths.home, '.local', 'share', 'atlas-whisper', 'venv', 'bin', 'python')
+const VTOOLS = () => join(paths.home, '.local', 'share', 'atlas-whisper', '_vtools.py')
 
 const sttSpawns = () => fake.recs.filter((r) => r.args.includes('transcribe'))
 const isolatedSpawns = () => sttSpawns().filter((r) => r.cmd === 'systemd-run')
@@ -225,7 +225,7 @@ beforeAll(() => {
   const home = mkdtempSync(join(tmpdir(), 'stt-scope-home-'))
   paths.home = home
   // The on-disk toolkit layout isVoiceInstalled() checks for.
-  mkdirSync(join(home, '.local', 'share', 'marveen-voice', 'venv', 'bin'), { recursive: true })
+  mkdirSync(join(home, '.local', 'share', 'atlas-whisper', 'venv', 'bin'), { recursive: true })
   writeFileSync(VENV(), '')
   writeFileSync(VTOOLS(), '')
   // A state dir isSafeStateDir() accepts: ~/.claude/channels/<provider>/.env
